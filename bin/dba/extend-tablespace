@@ -1,0 +1,171 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+use ariba::Ops::NotificationRequest;
+use ariba::monitor::Ticketmaster;
+use ariba::monitor::QueryManager;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::monitor::StatusPage;
+use POSIX qw(strftime);
+
+my $haveTTY = (-t STDIN || -t STDOUT) ? 1 : 0;
+my $debug = 0;
+
+sub main {
+    my($productname, $sid, $customer, @tablespaces) ;
+    my $report = "";
+
+    while(my $arg = shift(@ARGV)) {
+        if($arg =~ m/^-h$/o) { usage(); }
+        if($arg =~ m/^-d$/o) { $debug = 1; next; }
+        if($arg =~ m/^-customer$/o) { $customer = shift(@ARGV); next; }
+        if(!$productname) { $productname = $arg; next; }
+        if(!$sid) { $sid = $arg; next; }
+        push(@tablespaces, $arg);
+    }
+
+    if ( ( $productname =~ m/s2/i ) && ( !defined ( $customer ) ) ) {
+        usage ( "Error :: Undefined customer name for s2 product" );
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $product = ariba::rc::InstalledProduct->new($productname, $me->service(), undef, $customer);
+    my @connections = ariba::Ops::DBConnection->connectionsFromProducts($product);
+    my @sidConns = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections);
+    # Note that these two grep's will guarantee getting exactly one element in the final array @sidConns.
+    @sidConns = grep { $_->sid() =~ /^$sid$/i } @sidConns;
+    @sidConns = grep { !$_->isDR() } @sidConns;
+    my $host = $sidConns[0]->host();
+
+    my $user = "system";
+    my $pass = $me->default("dbainfo.system.password");
+
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my $machine  = ariba::Ops::Machine->new($hostname);
+    my $datacenter = $machine->datacenter();
+    my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+  
+    my $oc = ariba::Ops::OracleClient->new($user, $pass, $sid, $host);
+    if(!$oc->connect()) {
+        # Changed from using 'exit' alone to 'die' so there's a message to help users know why.
+        # The 'if' wrapper will prevent spew if run in a cron environment.
+        if (-t 1 && -t 2) # if both are opened to a tty ...
+        {
+            die "ERROR:  connection to host $host and SID $sid for user $user failed, exiting.\n";
+        }
+        else
+        {
+            exit 1;
+        }
+    }
+
+    my $status = "Success";
+
+    $report .= "*** Debug mode, no actions will be taken ***\n" if $debug;
+
+    $report .= "Connected to $sid on $host\n";
+    for my $ts (@tablespaces) {
+        $report .= "Working on tablespace $ts\n";
+        my($sql, @datafiles, @results, $count, $filetype, $filename);
+
+        $sql = qq`select file_name from dba_data_files where tablespace_name = '$ts'`;
+        $oc->executeSqlWithTimeout($sql, undef, \@datafiles);
+
+        $report .= "Existing datafiles:\n";
+        $report .= join("\n", @datafiles) . "\n";
+        $filetype = "datafile";
+        $filename = $datafiles[0];
+        $count = scalar @datafiles;
+
+        if($count == 0 or !$filename) {
+            $report .= "No datafiles listed for tablespace.  Aborting.\n\n";
+            next;
+        }
+        
+        $filename =~ s/_([^_]+)\.dbf$/_/;
+        my $numlength = length($1);
+        $filename .= sprintf("%0${numlength}d", $count + 1);
+        $filename .= ".dbf";
+
+        my @filelocation = split ('/', $filename);
+        my $fl = $filelocation[1];
+        my $qmName = "$tab/disk-usage";
+        if (ariba::monitor::QueryManager->objectWithNameExists($qmName)) {
+                my $qm = ariba::monitor::QueryManager->new($qmName);
+                my $skipTS;
+                my $queryFound;
+                foreach my $query ($qm->queries()) {
+                        my $qname =  $query->queryName();
+                        if ($qname =~ m/$fl used$/) {
+                                $queryFound = 1;
+                                if ($query->status eq "crit" ) {
+                                        $report .= "Please grow filesystem on $fl, skipped adding datafile\n";
+                                        $skipTS = 1;
+                                }
+                                last; 
+                        }
+                }
+                unless ($queryFound) {
+                    $report .= "Related query for $fl not found under the query manager\n";
+                }
+                if ($skipTS) {
+                    $status = "Fail";
+                    next;
+                }
+        }
+        else {
+            $report .= "Query Manager $qmName not found\n"; 
+        }
+        $report .= "Adding datafile $filename using sql:\n";
+
+        $sql = qq`alter tablespace $ts add $filetype '$filename' size 300M autoextend on next 100M maxsize UNLIMITED`;
+        $oc->executeSqlWithTimeout($sql, undef, \@results) unless $debug;
+
+        $report .= "$sql\n\n";
+        if($oc->error()) {
+            $report .= "Error running sql: ". $oc->error(). "\n";
+            $status = "Fail";
+        }
+    }
+    $oc->disconnect();
+    $report .= "Disconnected from $sid\n";
+
+    if($haveTTY) {
+        print $report;
+    } 
+
+    unless ($debug) {
+        my $timeStamp = POSIX::strftime("%Y-%m-%d", localtime(time()));
+        my $subject = "Tablespace(s) extended on $sid - $status at " . $timeStamp;
+        my $req = ariba::Ops::NotificationRequest->newWarn("extend-tablespace", $me->name(), $me->service(), undef, $me->currentCluster(), $subject, $report, "arb_dept_an_ops_dba_notifications\@sap.com", "dept_an_ops_sysadmin\@ariba.com");
+        $req->send();           
+    }
+
+return 0;
+}
+
+sub usage {
+    my $errorString=shift;
+    
+    if ( $errorString ) {
+        print "$errorString \n";
+    }
+
+    print "Usage: $0 [-d] [ -customer <customer name> ] <product> <sid> <tablespacename> \n\n";
+    print "  -d  Debug mode, just print actions. \n";
+    print "  -customer <customer name>  Enter the customer name if the product is s2. \n";
+    print "  <product>  Enter the product name. \n";
+    print "  <sid>  Enter the sid name. \n";
+    print "  <tablespacename>   multiple tablespacename can be used here for same sid, each tablespacename separated by space. \n";
+    exit ( 1 );
+}
+
+main();

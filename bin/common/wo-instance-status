@@ -1,0 +1,494 @@
+#!/usr/local/bin/perl -w
+
+#
+# $Id: $
+#
+# Script to monitor WOA status pages for health of WOF app instances
+#
+# Calculating possibly hung status of an application instance:
+#
+# First, for each web object adaptor, gather deadtimeout and requests served
+# for each app instance.
+#
+# To figure out wether an instance is hung or not we use the following
+# algorithm:
+#
+# 1) If any of the adaptors has seen this instance serve a request (i.e.
+#   the total number of requests served for this instances has increased since
+#   last polled), this instance is deemed to be ok and no further checking is
+#   needed.
+#
+# 2) If condition 1 fails, look for the smallest dead timeout value from all
+# adaptors.  If found, convert to incident time (i.e. unix time when the
+# timeout / incident occured).
+#
+# 3) Check to see if the incident time from condition 2 plus the interval 
+#
+# then we have a suspected hung instance, put this instance in warn
+# state.  This double check avoids marking something as hung when
+# it isn't getting any requests.
+#
+# If this behaviour persists for more than 10 minutes, we mark this
+# instance as hung and put it in crit state.  This 10 minute threshold
+# is to ensure that the instance is not restarting or just busy.
+#
+
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Url;
+use ariba::monitor::QueryManager;
+
+use HTML::TreeBuilder;
+
+my $HYSTERESIS = 60; # seconds
+my $DEADTIMER  = 60; # seconds 
+
+sub usage {
+    print   "Error: $_[0]\n" if $_[0];
+    print   "\n",
+        "Usage: \n",
+        "$0 [-d|-e|-p|-h] <product>\n",
+        "-d         turns on debugging\n",
+        "-e         send email notification\n",
+        "-p         send pager notification\n",
+        "-h         this help\n",
+		"<product>  product to monitor\n",
+        "\n";
+    exit(1);
+}
+
+sub main {
+	my $debug     = 0;
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+	my $productName   = undef;
+	my @serverRoles = qw(webserver adminserver);
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-h/o) { usage();                }
+		if ($arg =~ /^-d/o) { $debug       = 1;    next;}
+		if ($arg =~ /^-e/o) { $sendEmail   = 1;    next;}
+		if ($arg =~ /^-p/o) { $sendPage    = 1;    next;}
+		if ($arg !~ /^-/o)  { $productName = $arg; next;}
+	}
+	
+	my $me = ariba::rc::InstalledProduct->new();
+	my $ws = ariba::rc::InstalledProduct->new("ws", $me->service());
+
+	my $email = $me->default('notify.email');
+
+	for my $role (@serverRoles) { 
+		my @webservers = $ws->hostsForRoleInCluster($role, $ws->currentCluster());
+		my $httpsPort = $ws->default("${role}httpsport");
+
+		my %appInstanceHash = ();
+=pod
+	this will look like 
+	 $appInstanceHash{$appName}->{$webobjectsAdaptorUrl}->
+		[
+			{ 
+				$key1 => $value1,
+				$key2 => $value2,
+				....
+			},
+	
+			{
+				$key1 => $value1,
+				$key2 => $value2,
+				....
+			},
+			....
+		]
+	where the keys are the headers from the woa adaptor status page:
+	
+		"send/rcv buf"
+		"activereqs"
+		"refusingtimeout"
+		"cto / sto / rto"
+		"port",
+		"served",
+		"host",
+		"deadtimeout",
+		"community",
+		"pto / lto",
+		"conn pool peak/reused",
+		"failedpings",
+		"inst"
+
+	For now we are only monitoring "deadtimeout" as documented
+	at http://developer.apple.com/documentation/LegacyTechnologies/WebObjects/WebObjects_5.1/DeploymentAdditions/adaptors.html:
+
+			The WOAdaptorInfo page displays all application and instance settings in the
+			configuration. Additionally, the WOAdaptorInfo page displays the following
+			statistics for each instance:
+
+				* active reqs - The number of requests currently being serviced. This is
+					the number of requests which have been sent to the instance for which the
+					adaptor has not yet received a response (or timed out).
+				* served - The total number of requests serviced by the instance.
+				* conn pool peak - The peak number of connections to the instance in any
+					single adaptor process. (Typically this is 1 for Apache or CGI.)
+				* conn pool reused - The number of times a pooled connection to the instance has been reused.
+				* refusing timeout - The amount of time (in seconds) the adaptor will wait
+					before the load balancing can select the instance. This timer gets set to a
+					nonzero value if the adaptor receives a response from an instance indicating
+					the instance is refusing new sessions.
+				* dead timeout - If this time is nonzero it indicates a communications
+					failure has occurred with the instance. The timer is initialized with the
+					configured dead interval for the application. The dead timeout indicates the
+					remaining time from the dead interval. 
+
+	In particular, here is the section that explains what a dead timeout is:
+
+			Communications Failures
+
+			A communications failure is any abnormal condition encountered during sending a
+			request or receiving a response. Some examples of situations which generate
+			communications failures:
+
+			- The instance is not running, therefore the adaptor cannot connect to it.
+
+			- The instance crashes, so the adaptor cannot read a response.
+
+			- The instance hangs, so the adaptor times out waiting for a response.
+
+			- A network problem might cause the adaptor to time out either sending a
+			request or receiving a response.
+
+			- Connection pooling is enabled and the instance has restarted.
+
+			If the adaptors encounter a communications failure while processing a
+			request/response transaction to a particular instance, that instance is marked
+			as dead (and hence unusable for the term specified by the configured dead
+			interval) and a failure count for the request is incremented. If the failure
+			count is less than the configured retry count for that application then a new
+			instance is selected and the request is sent to the new instance. If the
+			failure count exceeds the retry count, or there is no instance that can be
+			selected then the request fails.
+
+			If connection pooling is in use and wotaskd is performing instance scheduling,
+			then when an instance restarts the first reuse of a pooled connection to the
+			instance will fail. This causes the instance to be marked dead. The same
+			situation occurs if an instance crashes and is restarted.
+
+=cut
+
+		for my $www (@webservers) {
+			my $urlString = sprintf("https://$www:$httpsPort%s", $ws->default('woadminurl'));
+			my $url = ariba::monitor::Url->new($urlString);
+			$url->setTimeout(35);
+			$url->useOutOfBandErrors();
+
+			print "hitting $urlString\n" if $debug;
+
+			my @page = $url->request();
+
+			# abort if *any* status page fails to load since this could cause
+			# workers to seem responsive when they really are not.
+			if ($url->error() || !@page) {
+				die "ERROR: wo-instance-status could not fetch $urlString (",$url->error(),"), giving up!";
+			}
+
+			parsePage(join("", @page), \%appInstanceHash, $urlString);
+		}
+
+		# figure out the list of instances visible via these web servers so we can
+		# catch instances that should be monitored but aren't
+		for my $product (ariba::rc::InstalledProduct->installedProductsList($me->service(), $productName)) {
+
+			my %queries = ();
+
+			for my $instance ($product->appInstancesVisibleViaRoleInCluster($role, $product->currentCluster())) {
+
+				my $appName = $instance->appName();
+				my $instanceString = $instance->instance();
+				my $community = $instance->community();
+				my $uiHint;
+
+				if (defined($community)) {
+					$uiHint = "community $community/$appName";
+				} else {
+					$uiHint = "default community/$appName";
+				}
+
+				my ($incidentTime, $requestsServed) = (0, 0);
+				my $currentTime = time();
+
+				for my $instanceHashRef (values %{$appInstanceHash{$instanceString}}) {
+					# aggreate the number of requests across all the WOAs
+					$requestsServed        += $instanceHashRef->{'served'};
+
+					# Choose the latest incident time, which means choosing
+					# the smallest deadtimeout.
+					#
+					# deadtimeouts come in two flavors:
+					# <number>  -- countdown in seconds from when the
+					#  				dead state was detected by the adaptor
+					# (<number>) --  means the instance's dead timeout has gone down
+					#               to zero, and it has been <number> of seconds
+					#               since the instance has been passed a request by
+					#               the adaptor.
+					#
+					# We treat both the same, as a timer starting at 0 and counting up
+					# to infinity.
+
+					my $adaptorIncidentTime = $instanceHashRef->{'deadtimeout'};
+
+					# if dead timeout for this instance is a straight '0', ignore it.
+					if ($adaptorIncidentTime) {
+
+						# normalize time to 0-infinity format in case this is a countdown
+						$adaptorIncidentTime =~ s/\((\d+)\)/-$1/;
+						$adaptorIncidentTime = $DEADTIMER - $adaptorIncidentTime;
+
+						$adaptorIncidentTime = $currentTime - $adaptorIncidentTime;
+
+						# If this adaptor reports a dead timeout for this instances
+						# and we don't have a value currently, use it.
+						# Otherwise, choose the lowest dead timeout from amongs all of
+						# the adaptors for this instance.
+						if (!$incidentTime || $incidentTime < $adaptorIncidentTime) {
+							$incidentTime = $adaptorIncidentTime 
+						}
+					}
+				}
+
+				my ($info, $warn, $crit);
+
+				$info = "defined(answer) && answer == 0";
+
+				# XXX 
+				# for testing purposes, only turn on crit in non-production
+				# environments for now
+				if ($me->service() eq 'prod') {
+					$warn = "!defined(answer) || answer > 0";
+					$crit = 0;
+				} else {
+					$warn = "defined(answer) && answer > 0";
+					$crit = "!defined(answer) || answer > 1";
+				}
+
+                $instanceString =~ m/.*(Node.*)/;
+				$queries{"$1 incidents of failure to serve requests"} = {
+					'info' => $info,
+					'warn' => $warn,
+					'crit' => $crit,
+					'perl' => sub { main::calculateIncidentCount($requestsServed, $incidentTime) },
+					'uiHint' => $uiHint,
+					'recordMaxResults' => 20000,
+					'recordDataType' => 'gauge',
+				};
+			}
+
+			my $monserver = ($product->hostsForRoleInCluster('monitor', $product->currentCluster()))[0];
+
+			my $qm = ariba::monitor::QueryManager->newWithDetails("http-urls-status", $product->name(),
+					$product->service(), $product->customer(), \%queries);
+
+			$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monserver);
+		}
+	}
+}
+
+sub calculateIncidentCount {
+	my $requestsServed = shift;
+	my $incidentTime   = shift;
+
+	my $results = 0;
+	my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+	# not $query->previousResults, since that would get the
+	# previous previousResults at this point.
+	my $previousResults = $query->results();
+
+	# retrieve previous incident and requestsServed
+	my $oldrequestsServed = $query->requestsServed();
+	my $oldIncidentTime  = $query->incidentTime();
+
+	# save incidentTime and requestsServed for next round
+	$query->setRequestsServed($requestsServed);
+	$query->setIncidentTime($incidentTime);
+
+	# if number of requests goes up it means we are still alive
+	if (!defined($oldrequestsServed) || $requestsServed > $oldrequestsServed) {
+		# clear any previous incident
+		$results = 0;
+
+	} elsif ($incidentTime) {
+
+		# we have a
+		# If we don't have a previous incident, or if the
+		# previous incident 
+		if (!$oldIncidentTime || ($incidentTime > $oldIncidentTime + $HYSTERESIS)) {
+			# We have a confirmed new incident
+			$results = 1;
+
+			if (defined($previousResults) && $previousResults > 0) {
+				# if we have previous incident, go to crit
+				$results += $previousResults;
+			}
+		}
+	}
+
+	return $results;
+}
+
+=pod
+
+This function takes as a string a WO Adaptor status page (e.g.
+https://web11.ariba.com:8445/scripts/WebObjects.dll/WOAdaptorInfo?svcops+n0t4u2see)
+and a hash ref.  It uses HTML::TreeBuilder to parse the page; this is
+what the relevant parse tree looks like:
+
+	<table> <!-- outer table -->
+	<tr> 
+		<td>
+	 		<table>
+				<tr><th><a href>[appname]</th></tr>
+				<tr><td> "L/B: ..." </td></tr>
+				<tr><td> ... </td></tr>
+				...
+			</table>
+		</td>
+		<td>
+	 		<table>
+				<tr align='center'>
+      				<th>"inst"</th>
+      				<th>"host"</th>
+      				<th>"port"</th>
+      				<th>"community"</th>
+      				<th>"active"<br>"reqs"</th>
+      				<th>"served"</th>
+      				<th>"conn pool" <br>" peak/reused"</th>
+      				<th>"cto / sto / rto"</th>
+      				<th>"send/rcv buf"</th>
+      				<th>"refusing" <br> "timeout" </th>
+      				<th>"dead"<br>"timeout"</th>
+      				<th>"pto / lto"</th>
+      				<th>"failed"<br>"pings"</th>
+				</tr>
+				<tr align='center'>
+					<td><a href="/scripts/WebObjects.dll/ANCXMLAuthenticationProcessor.woa/1241232" target="_blank">"1241232"</a></td>
+      				<td>"volans.ariba.com"</td>
+      				<td><a href="http://volans.ariba.com:1232/scripts/WebObjects.dll/ANCXMLAuthenticationProcessor.woa" target="_blank">"1232"</a></td>
+					<td>"1"</td>
+					<td>"0"</td>
+					<td>"9"</td>
+					<td>"0/0"</td>
+					<td>"3/10/30"</td>
+					<td>"32768/32768"</td>
+					<td>"0"</td>
+					<td>"0"</td>
+					<td>"210/150"</td>
+					<td>"0"</td>
+				</tr>
+				... [ repeat last <tr> for each instance ]
+			</table>
+		</td>
+	</tr>
+	.... [ repeat last <tr> for each app ]
+	</table> <!-- end outer table -->
+
+=cut
+sub  parsePage {
+	my $page = shift;
+	my $appInstanceHashRef = shift;
+	my $sourceUrl = shift;
+
+	my $root = HTML::TreeBuilder->new();
+	$root->parse($page);
+	$root->eof();
+
+	# find first table, which wraps the whole shebang
+	my $outerTable = $root->look_down('_tag', 'table');
+
+	# each row within this table represents an AN application
+	for my $appRow ( $outerTable->look_down('_tag', 'tr', sub {$_[0]->parent() == $outerTable}) ) {
+
+		my @cells = $appRow->look_down('_tag', 'td', sub { $_[0]->parent() == $appRow } );
+
+		# the first cell contains the appname
+		my $cell = shift(@cells);
+		#<td>   <!-- $cell -->
+	 	#	<table>
+		#		<tr><th><a href>[appname]</th></tr>
+		#		<tr><td> "L/B: ..." </td></tr>
+		#		<tr><td> ... </td></tr>
+		#		...
+		#	</table>
+		#</td>
+
+		my $href = $cell->look_down('_tag', 'a');
+		next unless $href;
+		my $appName = $href->as_text();
+
+		for $cell (@cells) {
+			# each cell contains a table which contains 2+ rows.
+			my @instanceRows = $cell->look_down('_tag', 'tr');
+
+			# first row is headers...
+			my $headerRow = shift(@instanceRows);
+			#	<tr align='center'>    <!-- $headerRow -->
+      		#		<th>"inst"</th>
+      		#		<th>"host"</th>
+      		#		<th>"port"</th>
+      		#		<th>"community"</th>
+      		#		<th>"active"<br>"reqs"</th>
+      		#		<th>"served"</th>
+      		#		<th>"conn pool" <br>" peak/reused"</th>
+      		#		<th>"cto / sto / rto"</th>
+      		#		<th>"send/rcv buf"</th>
+      		#		<th>"refusing" <br> "timeout" </th>
+      		#		<th>"dead"<br>"timeout"</th>
+      		#		<th>"pto / lto"</th>
+      		#		<th>"failed"<br>"pings"</th>
+			#	</tr>
+			
+			my @keys = ();
+			for my $header ($headerRow->look_down('_tag', 'th')) {
+				push(@keys, $header->as_text());
+			}
+
+			# ...second row and on are individual app instances
+			for my $instanceRow (@instanceRows) {
+				#	<tr align='center'>  <!-- $instanceRow -->
+				#		<td><a href="/scripts/WebObjects.dll/ANCXMLAuthenticationProcessor.woa/1241232" target="_blank">"1241232"</a></td>
+				#		<td>"volans.ariba.com"</td>
+				#		<td><a href="http://volans.ariba.com:1232/scripts/WebObjects.dll/ANCXMLAuthenticationProcessor.woa" target="_blank">"1232"</a></td>
+				#		<td>"1"</td>
+				#		<td>"0"</td>
+				#		<td>"9"</td>
+				#		<td>"0/0"</td>
+				#		<td>"3/10/30"</td>
+				#		<td>"32768/32768"</td>
+				#		<td>"0"</td>
+				#		<td>"0"</td>
+				#		<td>"210/150"</td>
+				#		<td>"0"</td>
+				#	</tr>
+
+				my @instanceValues = map { $_->as_text() } $instanceRow->content_list();
+				my $instanceHash = {};
+
+				@$instanceHash{@keys} = @instanceValues;
+
+				my $shortHost = $instanceHash->{'host'};
+				$shortHost =~ s/\.ariba\.com//ig;
+				my $instanceId = $appName . "-" . $instanceHash->{'inst'} . '@' . $shortHost;
+
+				$appInstanceHashRef->{$instanceId}->{$sourceUrl} = $instanceHash;
+			}
+		}
+
+	}
+
+	$root->delete();
+}
+
+main();

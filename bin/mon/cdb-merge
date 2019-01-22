@@ -1,0 +1,148 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/mon/cdb-merge#2 $
+#
+# Merges two cdb files based on a cutover date.
+#
+
+use strict;
+use FindBin;
+use Date::Parse;
+
+use lib "/usr/local/ariba/lib";
+use lib "$FindBin::Bin/../../lib"; 
+
+use ariba::monitor::CircularDB; 
+
+sub usage {
+	my $err = shift; 
+	
+	print "Usage: $0 <sourceCdb> <targetCdb> <cutoverDate> [mergedCdb] [-override|-h] \n";
+	print "Merges two cdb files based on a cutover date.\n\n"; 
+	print "\t<sourceCdb>    This is where the data before the cutover date will be\n"; 
+	print "\t               pulled from.\n"; 
+	print "\t<targetCdb>    This is where the headers and data on/after the cutover\n"; 
+	print "\t               date will be pulled from.\n"; 
+	print "\t<cutoverDate>  The cutover date of data from source to target in YYYY-MM-DD\n";
+	print "\t[mergedCdb]    The merged data will be written out to the specified file.\n"; 
+	print "\t               This is optional - defaults to <targetCdb>_merged.cdb\n";
+	print "\t               or writes over the <targetCdb> if -override is specified.\n";
+	print "\t-override      Overrides the original targetCdb with merged data\n";
+	print "\t               instead of writing to a new mergedCdb file. USE WITH CAUTION\n";
+	print "\t               as original data in targetCdb will be deleted.\n";
+	print "\t-h             Show this help.\n"; 
+	print "\n"; 
+
+	error($err) if ($err);
+	exit();
+}
+
+sub error {
+	my $msg = shift; 
+	my $exitCode = shift || 1; 
+
+	print "Error: $msg\n"; 
+	exit($exitCode);
+}
+
+sub computeMergedCdbFile {
+	my $targetCdbFile = shift; 
+	my $overrideTargetCdbFile = shift; 
+
+	return $targetCdbFile if ($overrideTargetCdbFile);
+
+	my $mergedSuffix = '_merged';
+	if ($targetCdbFile =~ /^(.*)(\.cdb)$/i) {
+		return "$1$mergedSuffix$2";
+	} else {
+		return "$targetCdbFile$mergedSuffix.cdb";
+	}
+}
+
+sub mergeCdbFiles {
+	my $sourceCdbFile = shift; 
+	my $targetCdbFile = shift; 	
+	my $mergedCdbFile = shift; 
+	my $cutoverTime = shift; 
+
+	print "Starting cdb merge with:\n"; 
+	print "    Source CDB: $sourceCdbFile\n"; 
+	print "     Taget CDB: $targetCdbFile\n"; 
+	print "    Merged CDB: $mergedCdbFile\n"; 
+	print "  Cutover Date: ", scalar(localtime($cutoverTime)), "\n\n";
+
+	my $sourceCdb = ariba::monitor::CircularDB->new($sourceCdbFile);
+	my $targetCdb = ariba::monitor::CircularDB->new($targetCdbFile);
+
+	my @sourceErrors = $sourceCdb->checkHeader();
+	my @targetErrors = $targetCdb->checkHeader();
+	error('Error(s) found in source cdb: ' . join(', ', @sourceErrors)) if (@sourceErrors);
+	error('Error(s) found in target cdb: ' . join(', ', @targetErrors)) if (@targetErrors);
+
+	my @sourceRecords = $sourceCdb->readRecords(undef, $cutoverTime - 1);
+	my @targetRecords = $targetCdb->readRecords($cutoverTime);
+
+	error('No records found in source cdb before cutover date') unless (@sourceRecords);
+	error('No records found in target cdb on/after cutover date') unless (@targetRecords); 
+
+	print "Read ", scalar(@sourceRecords), " out of ", $sourceCdb->numRecords(), " record(s) in source cdb before cutover date\n"; 
+	print "Read ", scalar(@targetRecords), " out of ", $targetCdb->numRecords(), " record(s) in target cdb on/after cutover date\n"; 
+
+	unlink($mergedCdbFile) if (-e $mergedCdbFile);
+	my $mergedCdb = ariba::monitor::CircularDB->new(
+		$mergedCdbFile, 
+		$targetCdb->name(1),
+		$targetCdb->maxRecords(),
+		$targetCdb->dataType(),
+		$targetCdb->units(),
+		$targetCdb->description()
+	);
+
+	$mergedCdb->writeRecords(@sourceRecords, @targetRecords);
+	print "Wrote ", $mergedCdb->numRecords(), " record(s) to merged cdb, which can store up to ", $mergedCdb->maxRecords(), " record(s).\n";
+}
+
+sub main {
+	my $sourceCdbFile; 
+	my $targetCdbFile; 
+	my $mergedCdbFile; 
+	my $cutoverDate;
+	my $cutoverTime;
+	my $overrideTargetCdbFile = 0;
+		
+	while (my $arg = shift) {
+		if ($arg =~ /^-override/)	{ $overrideTargetCdbFile++;	next; }
+		if ($arg =~ /^-/) 			{ usage();					next; }
+
+		if (!$sourceCdbFile) {
+			$sourceCdbFile = $arg; 
+		} elsif (!$targetCdbFile) {
+			$targetCdbFile = $arg; 
+		} elsif ($arg =~ /\d{4}-\d{1,2}-\d{1,2}/) {
+			$cutoverDate = $arg; 
+		} else {
+			$mergedCdbFile = $arg;
+		}
+	}
+
+	usage('sourceCdb is required') unless ($sourceCdbFile); 
+	usage('targetCdb is required') unless ($targetCdbFile); 
+	usage('cutoverDate is required') unless ($cutoverDate);
+	
+	$mergedCdbFile = computeMergedCdbFile($targetCdbFile, $overrideTargetCdbFile) unless ($mergedCdbFile);
+	$cutoverTime = str2time($cutoverDate);
+
+	error("sourceCdbFile $sourceCdbFile does not exist") unless (-e $sourceCdbFile); 
+	error("targetCdbFile $targetCdbFile does not exist") unless (-e $targetCdbFile);
+	error("mergedCdbFile $mergedCdbFile already exists") if (-e $mergedCdbFile && !$overrideTargetCdbFile);
+	error("Failed to parse cutoverDate '$cutoverDate'") unless ($cutoverTime);
+
+	# CircurlarDB.pm treats them differently without ./ for relative paths
+	$sourceCdbFile = "./$sourceCdbFile" if ($sourceCdbFile =~ /^\w/);
+	$targetCdbFile = "./$targetCdbFile" if ($targetCdbFile =~ /^\w/);
+	$mergedCdbFile = "./$mergedCdbFile" if ($mergedCdbFile =~ /^\w/);
+
+	mergeCdbFiles($sourceCdbFile, $targetCdbFile, $mergedCdbFile, $cutoverTime);
+} 
+
+main(@ARGV);

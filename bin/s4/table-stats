@@ -1,0 +1,124 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/s4/table-stats#3 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DateTime;
+
+my $debug = 0;
+
+sub usage {
+	my $error = shift; 
+
+	print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+	-e    Enables sending of email for monitor query.
+	-p    Enables sending of pages for monitor query.
+	-d    Turns on debug mode. 
+	-h    Shows this help.
+
+USAGE
+
+	print "(error) $error\n" if ($error);
+
+	exit();
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while (my $arg = shift) {
+		if ($arg =~ /^-h/o) { usage(); 			next; }
+		if ($arg =~ /^-d/o) { $debug++; 		next; }
+		if ($arg =~ /^-e/o) { $sendEmail = 1; 	next; }
+		if ($arg =~ /^-p/o) { $sendPage = 1; 	next; }
+
+		usage("Invalid argument: $arg");
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $service = $me->service(); 
+
+	exit unless (ariba::rc::InstalledProduct->isInstalled('s4', $service)); 
+
+	my $s4 = ariba::rc::InstalledProduct->new('s4', $service);
+	my @txDbcs = ariba::Ops::DBConnection->connectionsForProductOfDBType($s4, ariba::Ops::DBConnection->typeMain());
+
+	my %queries;
+	my @tables = qw(US_GROUPTAB US_BASEIDTAB US_USERTAB BASEIDTAB);
+
+	foreach my $dbc (@txDbcs) {	
+		my $host = $dbc->host(); 
+		my $sid = $dbc->sid();
+		my $schema = $dbc->user();
+
+		$queries{"Table stats on $host in $sid for $schema"} = {
+			noRowCount	=> 1,
+			uiHint	=> 'Table Stats',
+			info	=> 1,
+			warn	=> 0, # Allow query error to show as warn
+			perl	=> sub { main::gatherTableStatsForDbcAndTables($dbc, @tables); },
+		};
+	}
+
+	my $email = $me->default('notify.email');
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails('dba', $s4->name(), $s4->service(), $s4->customer(), \%queries);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+sub gatherTableStatsForDbcAndTables {
+	my $dbc = shift;
+	my @tables = @_; 
+	my $self = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+	my @errors;
+	my @results;
+
+	my $oc = ariba::Ops::OracleClient->newFromDBConnection($dbc);
+	if (!$oc->connect() || $oc->error()) {
+		my $error = $oc->error() || ('Failed to connect to ' . $dbc->sid() . ' on ' . 
+			$dbc->host() . ' using ' . $dbc->user());
+		push(@errors, $error);	
+	} elsif ($debug) {
+		print "Connected to ", $dbc->user(), '@', $dbc->sid(), ' on ', $dbc->host(), "\n"; 
+	}
+
+	unless (@errors) { 
+		foreach my $table (@tables) {
+			my $startTime = time();
+
+			my $sql = qq`exec DBMS_STATS.GATHER_TABLE_STATS (ownname =>null, tabname => '$table',
+				cascade => true, estimate_percent => 40, degree => 4 );`;
+			print "Executing $sql\n" if ($debug); 
+			if (!$oc->executeSqlWithTimeout($sql, 60 * 60) || $oc->error()) {
+				push(@errors, $oc->error() || "Failed to execute sql [$sql]"); 
+			} else {
+				my $totalTime = ariba::Ops::DateTime::scaleTime(time() - $startTime); 
+				my $result = "Stats for $table gathered in $totalTime"; 
+				push(@results, $result);
+			}
+		}
+	}
+
+	if (@errors) {
+		my $errors = join("\n", @errors); 
+		$self->setError($errors); 
+		return $errors;
+	} else {
+		return join("\n", @results);
+	}
+}
+
+main(@ARGV);
+
+__END__

@@ -1,0 +1,178 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/ccm-status#5 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Url;
+use XML::Simple;
+
+use Data::Dumper;
+
+my $debug = 0;
+
+sub usage {
+	my $error = shift; 
+
+	print <<USAGE;
+Usage: $0 [-e|-p|-d|-h] -product  <<product name>>
+
+	-e    Enables sending of email for monitor query.
+	-p    Enables sending of pages for monitor query.
+	-d    Turns on debug mode. 
+	-h    Shows this help.
+	-product <<product name>>
+
+USAGE
+
+	print "(error) $error\n" if ($error);
+
+	exit();
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $productName;
+	my $isRunningCCM = "";
+
+	while (my $arg = shift) {
+		if ($arg =~ m/^-h$/o) { usage();		next; }
+		if ($arg =~ m/^-d$/o) { $debug++; 		next; }
+		if ($arg =~ m/^-e$/o) { $sendEmail = 1;	next; }
+		if ($arg =~ m/^-p$/o) { $sendPage = 1; 	next; }
+		if ($arg =~ m/^-product$/o) { $productName = shift; next; }
+
+		usage("Invalid argument: $arg");
+	}
+	
+	unless ( defined($productName) ) {
+        usage("Product name required");
+	}
+
+
+	my $mon = ariba::rc::InstalledProduct->new();
+	exit(0) unless ariba::rc::InstalledProduct->isInstalled($productName, $mon->service());
+	my $me = ariba::rc::InstalledProduct->new($productName, $mon->service());
+	my %queries;
+
+	my ($instance) = $me->appInstancesWithNameInCluster("Manager");
+	my $url = $instance->ccmServerStatusURL();
+	my $monUrl = ariba::monitor::Url->new($url);
+	my @results = $monUrl->request(30);
+
+	my $xs = XML::Simple->new();
+
+## Expected input
+## <CCMState active="true">
+##   <SIDs>
+##     <SID name="BYRDV31" initialized="true">
+##       <Zone name="green" minConnections="0" maxConnections="1100" />
+##       <Connections open="94" used="33" maxDB="2000" />
+##     </SID>
+##     <SID name="BYRDV32" initialized="true">
+##       <Zone name="green" minConnections="0" maxConnections="1100" />
+##       <Connections open="72" used="33" maxDB="2000" />
+##     </SID>
+##   </SIDs>
+## </CCMState>
+
+	my $xml = $xs->XMLin(join("", @results));
+
+	print Dumper(\@results) if $debug > 1;
+	print Dumper($xml) if $debug > 1;
+
+    while( my ( $key,$value ) = each % { $xml } ) {
+        if ( $key = ~/running/i ) {
+            $isRunningCCM=$value;
+            last ;
+        }
+    }
+
+    if( $isRunningCCM =~/^true$/i ) {
+        while ( my ( $key, $value ) = each % { $xml->{'SIDs'}->{'SID'} } ) {
+            next if ( ref($value) ne "HASH" );
+
+            my $status = "";
+            my $minConns = "";
+            my $maxConns = "";
+            my $openConns = "";
+            my $usedConns = "";
+            my $limitConns = "";
+
+            if ( $key=~ /^Zone$/i ) {
+                $status = $xml->{'SIDs'}->{'SID'}->{'Zone'}->{'name'};
+                $minConns = $xml->{'SIDs'}->{'SID'}->{'Zone'}->{'minConnections'};
+                $maxConns = $xml->{'SIDs'}->{'SID'}->{'Zone'}->{'maxConnections'};
+            } elsif ( $key=~ /^Connections$/i ) {
+                $openConns =  $xml->{'SIDs'}->{'SID'}->{'Connections'}->{'open'};
+                $usedConns = $xml->{'SIDs'}->{'SID'}->{'Connections'}->{'used'};
+                $limitConns = $xml->{'SIDs'}->{'SID'}->{'Connections'}->{'maxDB'};
+            }
+
+
+            $queries{"$key CCM Status"} = {
+                warn	=> 'answer eq "yellow"',
+                crit	=> 'answer eq "red"',
+                perl	=> sub { return $status; },
+                uiHint	=> "CCM/$key",
+                ticketOnWarnOpenAfterMinutes	=> 1,
+                ticketOwner	=> 'unassigned-prodops',
+                severity	=> 0,
+                description => 'DB Connection consumption status', 
+                correctiveActions => [
+                Ops => 'Open CR for Engineering, S2 for warn, S0 escalation for crit', 
+                Engr => 'Analyze keepRunning logs', 
+                ],
+            };
+	
+            $queries{"$key CCM Minimum Connections"} = {
+                perl => sub { return $minConns; },
+                uiHint => "CCM/$key",
+                recordMaxResults => 51840,
+                description => 'DB Connection consumption minimum connections',
+            };
+
+            $queries{"$key CCM Maximum Connections"} = {
+                perl => sub { return $maxConns; },
+                uiHint => "CCM/$key",
+                recordMaxResults => 51840,
+                description => 'DB Connection consumption maximum connections',
+            };
+
+			$queries{"$key CCM Open Connections"} = {
+				perl => sub { return $openConns; },
+				uiHint => "CCM/$key",
+				recordMaxResults => 51840,
+				description => 'DB Connection consumption open connections',
+			};
+
+            $queries{"$key CCM Used Connections"} = {
+                perl => sub { return $usedConns; },
+                uiHint => "CCM/$key",
+                recordMaxResults => 51840,
+                description => 'DB Connection consumption used connections',
+            };
+
+            $queries{"$key CCM Connection Limit"} = {
+                perl => sub { return $limitConns; },
+                uiHint => "CCM/$key",
+                recordMaxResults => 51840,
+                description => 'DB Connection consumption connection limit',
+            };
+        }
+    }
+
+	my $email = $mon->default('notify.email');
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails('current-activity', $me->name(), $me->service(), $me->customer(), \%queries);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);
+
+__END__

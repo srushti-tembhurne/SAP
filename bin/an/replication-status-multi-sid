@@ -1,0 +1,108 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query; 
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+
+sub main{
+    my $debug = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while(my $arg=shift(@ARGV)){
+        if($arg =~ /^-d/o){ $debug = 1; }
+        if($arg =~ /^-e/o){ $sendEmail = 1; };
+        if($arg =~ /^-p/o){ $sendPage = 1; };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $an = ariba::rc::InstalledProduct->new("an", $me->service());
+    
+    my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+    my $communitiesList = join(", ", @communityIds);
+
+    my $oneYear = 4 * 24 * 365; ## runs every 15 minutes, want a year's worth of data
+    
+    my %queries = (
+
+        "Stalled Replication Tasks > 10 minutes" =>
+        {
+            description       => "Make sure replication tasks are not stalled",
+            runForCommunities => $communitiesList,
+            info => "answer == 0",
+            crit => "answer > 0",
+            recordMaxResults => $oneYear,
+            recordDatatype => "gauge",
+            recordItem => "answer",
+            aggregationMethod => "counts",
+            correctiveActions => [
+              Ops => "Open a ticket and escalate to AN team",
+            ],
+            sql => q`
+                select count(*) from scn_cache where heartbeattime < sysdate - 10/(24*60)
+            `,
+        },
+
+        "Replication Errors" =>
+        {
+            description       => "Report any replication errors",
+            runForCommunities => $communitiesList,
+            info => "answer <= 100",
+            crit => "answer > 100",
+            recordMaxResults => $oneYear,
+            recordDatatype => "gauge",
+            recordItem => "answer",
+            aggregationMethod => "counts",
+            correctiveActions => [
+              Ops => "Open a ticket and escalate to AN team",
+            ],
+            sql => q`
+                select count(*) from replication_scn_error where fixed is null and nvl(fix_attempts,0) >= 3
+            `,
+        },
+
+        "Replication Delay" =>
+        {
+            description       => "Report delay of replication by community",
+            runForCommunities => $communitiesList,
+            info => "answer <= 2",
+            crit => "answer > 2",
+            format    => "%0.2f",
+            recordMaxResults => $oneYear,
+            recordDatatype => "gauge",
+            recordItem => "answer",
+            correctiveActions => [
+              Ops => "Open a ticket and escalate to AN team",
+            ],
+            ## Talked with Judie, going to have Oracle do the math for me:
+            ## The query returns a fraction, a percentage of the DAY, multiplying this
+            ##  by 24 returns the number of hours
+            sql => q`
+                select ( x - y ) * 24
+                    from
+                    (select max(created) as x from rep_prop_queue_an),
+                    (select created as y from rep_prop_queue_an where id in (select last_id from scn_cache))
+            `,
+        },
+
+
+    );
+
+    my $email = $me->default('notify.email');
+
+    my $q = ariba::monitor::QueryManager->newWithDetails("replication-status", "an", $me->service(), $me->customer(), \%queries);
+
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $q);
+
+    $q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

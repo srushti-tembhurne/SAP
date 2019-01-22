@@ -1,0 +1,747 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/everywhere/log-viewer#52 $
+#
+# Program to vend keepRunning and other logs via http.
+#
+# Example: http://app314.ariba.com:61502/lspatsystem/load/buyer/
+#
+# Commands could be : 
+#  - lspat => To see standards logs
+#  - lspatapache => To see Apache logs ; Apache logs base directory must be provided via commandline (ex : -logdir /var/log/apache)
+#  - lspatarchive => To see archived logs ; A symlink to archived logs (archivedLogs) must exist in the product directory 
+#                   (/tmp/$service/$product)
+#  - lspatsystem=> To see system logs, including archived; A symlink to system logs (archivedLogs/System-Logs and 
+#                   archivedLogs/Archived-System-Logs) must exist in the product directory
+#  - cat => To see the content of a text file or to download a gziped file
+#  - catgz => To download a gzipped copy of a text file or to download a gziped file
+#  - tail => To see the tail of a file (only for text files)
+
+use strict;
+use Fcntl;
+use Socket;
+use Symbol;
+use lib qw(/usr/local/ariba/lib);
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Utils;
+use ariba::Ops::Constants;
+use ariba::util::Simplefind;
+use ariba::Ops::Machine;
+use ariba::rc::Globals;
+use ariba::Ops::Startup::Apache;
+
+my $version = 16;
+my $uptime = time();
+my $debug = 0;
+my $defaultPort = 61502;
+my $defaultLogDir = "/tmp";
+my $defaultTailLines = 100;
+my $fromaddr;
+my $logFH;
+
+$SIG{'PIPE'} = "IGNORE";
+
+# Create the server socket
+sub startServer {
+    my $port = shift;
+
+    my $backlog = 255;
+    my $socket  = gensym();
+
+    my $proto = getprotobyname('tcp');
+    socket($socket, AF_INET, SOCK_STREAM, $proto) || die "socket: $!";
+    setsockopt($socket, SOL_SOCKET, SO_REUSEADDR, pack("l", 1));
+
+    my $this = pack_sockaddr_in($port, INADDR_ANY);
+
+    #
+    # because we often try to run this multiple times
+    # don't print an error if bind fails
+    #
+    bind($socket, $this) || exit(1);
+    listen($socket, $backlog) || die "connect: $!";
+
+    return $socket;
+}
+
+
+# Construct a list of directories from the defaults ones, those passed by command line,
+# and those passed by the webpage
+sub logDirs {
+    my $proposedSubDir = shift;
+    my $additionalLogDirs = shift;
+    my $logDir = shift;# $defaultLogDir;
+
+    my @dirs = ();
+
+    #
+    # For security reasons :
+    # Match to make sure that product name does not contain
+    # relative path names, and it is a valid dir
+    #
+    
+    if (defined($proposedSubDir) && $proposedSubDir =~ m#\^.+|\?|\*#) {
+        print STDERR "Not a valid directory\n";
+        return @dirs;
+    }
+    
+    
+    #
+    # For default log dir, it has to have proposedSubDir if
+    # proposedSubDir is specified
+    #
+    if ($proposedSubDir) {
+        my $checkLogDir = "$logDir/$proposedSubDir/";
+        if (-d $checkLogDir) {
+            push(@dirs, $checkLogDir);
+        }
+    } else {
+            push(@dirs, "$logDir/");
+    }
+
+    #
+    # For additional log dirs, its optional to have proposedSubDir
+    # For ex:
+    # if additionalLogDirs is /home/svcdev/s4/logs proposedSubDir
+    # is not required to be present
+    # if additionalLogDirs is /var/log/apache proposedSubDir
+    # should be present
+    #
+    # Check if the additionalLogDir has proposedSubDir under it
+    # if so, use it, else use additionalLogDir by itself
+    #
+    my @otherLogDirs = split(/:/, $additionalLogDirs);
+    for (my $i = 0; $i < @otherLogDirs; $i++) {
+        my $checkLogDir = "$otherLogDirs[$i]/$proposedSubDir/";
+        if (-d $checkLogDir) {
+            push(@dirs, $checkLogDir);
+        } else {
+            push(@dirs, "$otherLogDirs[$i]/");
+        }
+    }
+
+    return @dirs;
+}
+
+
+# Each command is processed here
+sub command {
+    my $hostname = shift;
+    my $port = shift;
+    my $additionalLogDirs = shift;
+    my $command = shift;
+    my @argv = @_;
+
+    my @filesAllowed = (
+        "^spew-",
+        "^cc-scan-",
+        "^keepRunning-",
+        "^perf-",
+        "^perf_",
+        "^metrics-",
+        "^jgroups-",
+        "^jdbc-",
+        "^loadmeta-",
+        "AuditLog.txt\$",
+        "^piwik_log_",
+        "^heap-clean",
+        "\.sql\$",
+        "\.csv\$",
+        "\.gz\$",
+        "\.ser\$",
+        "^SimpleMigratorLog\.txt\$",
+        "^schemametrics-",
+        "^maillog",
+        "^kr-events",
+        "^dashboardmetrics-",
+        "^ccmDBState-",
+        "^ccmClientState-",
+        "^hadoop-",
+        "^active-accounts-",
+        "^realms-status-",
+        "^account-login",
+        "^CustomMigrator",
+        "^BuyerMigrationServer",
+        "^messages",
+        "^tls-security-",
+        "^remote-",
+	"^cycle-wof-apps-",
+    );
+    my @apacheFilesAllowed = (
+        "^access\.",
+        "^error\.",
+        "^balancer\.",
+        "^solr",
+        "^modjk.",
+        "^cluster.",
+        "^ssl_log",
+    );
+    my $filesAllowed = join('|', @filesAllowed);
+    my $apacheFilesAllowed = join('|', @apacheFilesAllowed);
+
+    
+    if ($debug) {
+        print STDERR "got command [$command]\n";
+        print STDERR "args are [", join(", ", @argv), "]\n";
+    }
+
+    if (!$command) {
+        print "HTTP/1.0 500 bogus command\n\n";
+        return;
+    }
+
+    if ($command eq "status") {
+        print "HTTP/1.0 200\n";
+        print "Content-Type: text/plain\n\n";
+        print "" . (join "\n", 
+            "Version: $version", 
+            "PID: $$",
+            "Uptime: " . (time() - $uptime)) . "\n";
+        return;
+    }
+
+    if( $command =~ /lspat/ ){
+
+        my %time = ();
+
+        my $matchPat = '';
+
+
+        
+
+        # Check if it uses new way or old way
+        # It will check if the first arg is a directory or not
+        #  -If yes it means it is a product name and not a pattern to match
+        #  -If no it means it is a pattern
+        #  
+
+        my $newWay = 0;
+
+        # If argv contains a '?' => new way of using pattern matching
+        if (grep ( /\?/, @argv)) {
+
+            # We want to have :
+            #  ex: s4/dir1/dir2?patternwithsomes? 
+            #       => argv = s4, dir1, dir2
+            #       => matchPat = patternwithsomes?
+            (my $newArgs, $matchPat) = split(/\?/, join('/', @argv), 2);
+            @argv = split(/\//, $newArgs);
+            $newWay = 1;
+
+        # Else, we don't know
+        } else {
+
+            # We retrieve the first argument in argv and we will check
+            # if it's a directory or not
+            my $oldWayPattern = $argv[0] || ""; 
+
+            # If it is blank => it's '//' and it is an old pattern
+            if ($oldWayPattern ne "") {
+
+                
+                # We are checking if it's a directory or not
+                my @oldDirs = logDirs("", $additionalLogDirs, $defaultLogDir); 
+                foreach my $dirToTest (@oldDirs) {
+                    if ( -d "$dirToTest$oldWayPattern") {
+                        $newWay = 1;
+                        last;
+                    }
+                }
+            }
+        }
+
+        $matchPat = shift @argv unless ($newWay);
+        my $subDir = join("/", @argv);
+
+        $subDir = "" unless ($subDir);
+
+        my @dirs; 
+
+        print STDERR "logDirs : [$subDir], [$additionalLogDirs], [$defaultLogDir]\n" if ($debug); 
+        @dirs = logDirs($subDir, $additionalLogDirs, $defaultLogDir); 
+
+        #
+        # if we proposed dir is dev/an, then we also want to include just an
+        # for backwards compatibility
+        #
+        my $altSubDir;
+        if(@argv == 2) {  # 'dev/an' --> 'an'
+            $altSubDir = $argv[1];
+            push(@dirs, logDirs($altSubDir, $additionalLogDirs, $defaultLogDir) );
+        } elsif(@argv == 3) { # 'dev/s2/honda' --> 's2/honda'
+            $altSubDir = $argv[1] . "/" . $argv[2];
+            push(@dirs, logDirs($altSubDir, $additionalLogDirs, $defaultLogDir) );
+        }
+            
+
+        print STDERR "Dirs : ",join(',', @dirs) , "\nmatchPAt : [$matchPat]\n newWay : [$newWay]\n" if ($debug);
+
+        if ( scalar(@dirs) == 0) {
+            print STDERR "No directories found...\n" if ($debug);
+            print "HTTP/1.0 406 not acceptable\n\n"; 
+            return;
+        }
+
+
+        print "HTTP/1.0 200\n";
+        print "Content-Type: text/html\n\n";
+        if ($matchPat) {
+            print "<b>Log files matching $matchPat on $hostname</b>\n\n";
+        } else {
+            print "<b>Log files on $hostname</b>\n\n";
+        }
+        print "<pre>\n";
+    
+        # No wildcards in patterns, just simple characters
+        $matchPat =~ s/([\$\?\[\]\{\}\(\)\^\.])/\\$1/og if ($matchPat);
+
+        #
+        # we do this so that UI-123456 matches both UI-123456 and UI123456
+        #
+        $matchPat =~ s/-/-?/ if($matchPat);
+
+        print STDERR "matchPat : $matchPat \n" if ($debug && $matchPat);
+
+        if ($subDir) {
+            $subDir .= '/';
+        }
+        if ($altSubDir) {
+            $altSubDir .= '/';
+        }
+        
+        for my $dir (@dirs) {
+
+            if ($command eq "lspatarchive" or $command eq "lspatsystem") {
+                $dir = $dir . "archivedLogs/";
+            }
+
+            print STDERR "Directory to test = $dir\n" if ($debug);
+            next unless (-d $dir);
+
+            next unless opendir(DIR, $dir);
+                
+            my @match;
+                
+            my @read = ();
+            # Used by lspatarchive to match a filename to its relative path to $dir
+            my %read = ();
+
+            
+            if ($command eq "lspatarchive") {
+                
+                my @yeardirs = readdir(DIR);
+                @yeardirs = grep /^\d+$/, @yeardirs;
+                foreach my $dir2 (@yeardirs) {
+                    $dir2 = $dir . "/" . $dir2;
+                    my $sf = ariba::util::Simplefind->new($dir2);
+                    my @readDirs = $sf->find();
+
+                    # Simplefind provide the full path but we just want a relative path
+                    # to $dir
+                    foreach my $fullPath (@readDirs) {
+                        $fullPath =~ s/$dir//;
+
+                        my $fileName = ariba::Ops::Utils::basename($fullPath);
+                        push (@read, $fileName);
+                        $read{$fileName} = $fullPath;
+                    }
+                }
+
+            } elsif ($command eq "lspatsystem") {
+                if(opendir(SYSDIR, "$dir/System-Logs/")) {
+                    my @sysdir = readdir(SYSDIR);
+                    foreach my $path (@sysdir) {
+                        $read{$path} = "System-Logs/$path";
+                    }
+                    push(@read, @sysdir);
+                    close(SYSDIR);
+                }
+                #if(opendir(SYSDIR, "$dir/Archived-System-Logs/")) {
+                #    my @sysdir = readdir(SYSDIR);
+                #    foreach my $path (@sysdir) {
+                #        $read{$path} = "Archived-System-Logs/$path";
+                #    }
+                #    push(@read, @sysdir);
+
+                #    my @yeardirs = grep /^\d+$/, @sysdir;
+                #    foreach my $dir2 (@yeardirs) {
+                #        $dir2 = $dir . "/Archived-System-Logs/" . $dir2;
+                #        my $sf = ariba::util::Simplefind->new($dir2);
+                #        my @readDirs = $sf->find();
+
+                #        # Simplefind provide the full path but we just want a relative path
+                #        # to $dir
+                #        foreach my $fullPath (@readDirs) {
+                #            $fullPath =~ s/$dir//;
+
+                #            my $fileName = ariba::Ops::Utils::basename($fullPath);
+                #            push (@read, $fileName);
+                #            $read{$fileName} = $fullPath;
+                #        }
+                #    }
+
+                #    close(SYSDIR);
+                #}
+            } else {
+                @read = readdir(DIR);
+            }
+    
+
+            my $filesDisplayed = "";
+
+            if ($command eq "lspat") {
+                $filesDisplayed = $filesAllowed;
+            } elsif ($command eq "lspatapache") {
+                $filesDisplayed = $apacheFilesAllowed;
+            } elsif ($command eq "lspatarchive" or $command eq "lspatsystem") {
+                $filesDisplayed = "$filesAllowed|$apacheFilesAllowed";
+            }
+            
+            print STDERR "Files allowed : $filesDisplayed \n" if ($debug);
+            
+            if ($matchPat) {
+                @match = grep (/$matchPat/ && /$filesDisplayed/, @read);
+            } elsif ($filesDisplayed) {
+                @match = grep (/$filesDisplayed/, @read);
+            } else {
+                @match = @read;
+            }
+
+            close(DIR);
+
+
+            if ($debug) {
+                print STDERR "dir = $dir\n";
+                print STDERR "pattern = $matchPat\n" if ($matchPat);
+                #print STDERR "found = $dir", join (", $dir", @read), "\n";
+                #print STDERR "filtered = $dir", join (", $dir", @match), "\n";
+            }
+    
+            # For each file we get its last modification time
+            for my $match (@match){
+                my $file = "$dir/$match";
+                $file = $dir.'/'.$read{$match} if ($command eq "lspatarchive" or $command eq "lspatsystem");
+
+                $time{$match} = (stat($file))[9];
+            }
+    
+            # Now we display everything
+            for my $match (sort {$time{$b} <=> $time{$a}} @match){
+                my $file = "$dir/$match";
+                my $relativeURLToFile = $match;
+
+                if ($dir =~ m|$subDir[/]*$|) {
+                    $relativeURLToFile = "$subDir$match";
+                } elsif ($dir =~ m|$altSubDir[/]*$|) {
+                    $relativeURLToFile = "$altSubDir$match";
+                }
+
+                if ($command eq "lspatarchive" or $command eq "lspatsystem") {
+                    $file = "$dir/$read{$match}";
+                }
+                
+                my $time = localtime($time{$match});
+                my $details = sprintf("%8d  %s ",-s $file, $time);
+
+                my $result = "";
+                if ($command eq "lspat" or $command eq "lspatapache") {
+                    if ($match =~ m/\.gz$/){
+                        $result = "$details No tail  <a href=\"http://$hostname:$port/cat/$relativeURLToFile\">$match</a>\n";
+                    } else {
+                        $result = "$details <a href=\"http://$hostname:$port/catgz/$relativeURLToFile.gz\">gzip</a>  <a href=\"http://$hostname:$port/tail/$relativeURLToFile/$defaultTailLines\">tail</a>  <a href=\"http://$hostname:$port/cat/$relativeURLToFile\">$match</a>\n";
+                    }
+                    
+                } elsif ($command eq "lspatarchive" or $command eq "lspatsystem") {
+                
+                    if ($match =~ m/\.gz$/){
+                        $result = "$details No tail  <a href=\"http://$hostname:$port/cat/${subDir}archivedLogs/$read{$match}\">$match</a>\n";
+                    } else {
+                        $result = "$details <a href=\"http://$hostname:$port/catgz/${subDir}archivedLogs/$read{$match}\">gzip</a>  <a href=\"http://$hostname:$port/tail/${subDir}archivedLogs/$read{$match}/$defaultTailLines\">tail</a>  <a href=\"http://$hostname:$port/cat/${subDir}archivedLogs/$read{$match}\">$match</a>\n";
+                    }
+                }
+                
+                $result =~ s#([^:])\/\/#$1\/#g;
+                print $result;
+            }
+        }
+
+
+        # If there was a pattern, a link to display everything without any pattern is proposed
+        if ($matchPat) {
+            print "\n\n";
+            
+            if ($command eq "lspat") {
+                print "<a href=\"http://$hostname:$port/lspat/$subDir\">All Logs</a> on $hostname\n";
+                print "<a href=\"http://$hostname:$port/lspatsystem/$subDir\">All System Logs</a> on $hostname\n";
+            } elsif ($command eq "lspatapache") {
+                print "<a href=\"http://$hostname:$port/lspatapache/\">All Apache Logs</a> on $hostname\n";
+            } elsif ($command eq "lspatarchive") {
+                print "<a href=\"http://$hostname:$port/lspatarchive/$subDir\">All Archived Logs</a> on $hostname\n";
+                print "<a href=\"http://$hostname:$port/lspatsystem/$subDir\">All System Logs</a> on $hostname\n";
+            }
+        } else {
+
+            print "\n\n";
+            
+            if ($command eq "lspatarchive") {
+                print "<a href=\"http://$hostname:$port/lspat/$subDir\">All Logs</a> on $hostname\n";
+                print "<a href=\"http://$hostname:$port/lspatsystem/$subDir\">All System Logs</a> on $hostname\n";
+            } elsif ($command eq "lspat") {
+                print "<a href=\"http://$hostname:$port/lspatarchive/$subDir\">All Archived Logs</a> on $hostname\n";
+                print "<a href=\"http://$hostname:$port/lspatsystem/$subDir\">All System Logs</a> on $hostname\n";
+            } elsif ($command eq "lspatsystem") {
+                print "<a href=\"http://$hostname:$port/lspat/$subDir\">All Logs</a> on $hostname\n";
+                print "<a href=\"http://$hostname:$port/lspatarchive/$subDir\">All Archived Logs</a> on $hostname\n";
+            }
+
+        }
+        print "</pre>\n";
+
+    }elsif ( ($command =~ m/cat/) || ($command =~ m/tail/) ) {
+
+        my %time = ();
+
+
+        #
+        # For tail, last argument is the number of lines to see
+        #
+        my $tailLines = $defaultTailLines;
+        if ($command eq "tail") {
+            if ($argv[-1] =~ m|^\d+$|) {
+                $tailLines = pop(@argv);
+            }
+        }
+
+        my $subDir = join("/", @argv);
+        my @dirs; 
+
+        print STDERR "logDirs : [$subDir], [$additionalLogDirs], [$defaultLogDir]\n" if ($debug); 
+        @dirs = logDirs('', $additionalLogDirs, $defaultLogDir); 
+
+        print STDERR "Dirs : ",join(',', @dirs) , "\n" if ($debug);
+
+        unless (@dirs) {
+            print STDERR "Nothing found\n" if ($debug);
+            print "HTTP/1.0 500 bogus command\n\n";
+            return;
+        }
+
+        my $subPath = "/" . join('/', @argv); 
+
+        # Needed to check if it's allowed to download this file
+        # (the filename match $apacheFilesAllowed or $filesAllowed at L427)
+        my $name = $subPath;
+        $name =~ s#/*.*/(.*)$#$1#;
+
+        if ( ($command eq "cat"  || $command eq "tail" || $command eq "catgz") &&
+             ( $name =~ m/$apacheFilesAllowed/ || $name =~ m/$filesAllowed/ )){
+
+            print "HTTP/1.0 200\n";
+            if ($name =~ m/.gz$/ || $command eq "catgz"){
+                print "Content-Type: application/x-gzip\n\n";
+            } else {
+                print "Content-Type: text/plain\n\n";
+            }
+
+            #
+            # Show the first file that matches
+            #
+
+            for my $dir (@dirs) {
+                my $file = "$dir$subPath"  ; 
+                print STDERR "file to test = $file\n" if ($debug);
+
+                unless(-f $file) {
+                    $file =~ s/\.gz$// if ($command eq 'catgz');
+                    next unless(-f $file);
+                }
+
+                logRequest($file);
+
+                print STDERR "file = $file\n" if ($debug);
+
+                if ($command ne "tail") {
+                    sysopen(FILE, $file, O_RDONLY) || warn "sysopen($file) $!\n";
+                } else {
+                    open(FILE, "/usr/bin/tail -$tailLines $file|") || warn "/usr/bin/tail -$tailLines $file, $!\n";
+                }
+
+                # We don't process anything if we send a gzipped file
+                if ($file =~ m/.gz$/){
+                    binmode(FILE);
+                    while (my $line = <FILE>) {
+                        print $line;
+                    }
+                } else { # If it's a text file, we hide passwords
+
+                    if($command eq "catgz") {
+                        close(FILE);
+                        open(FILE, "/usr/bin/gzip -c $file |");
+                        binmode(FILE);
+
+                        while (my $line = <FILE>) {
+                            print $line;
+                        }
+                        
+                    } else {
+
+                        while (my $line = <FILE>) {
+                            $line =~ s/password\s*=\s*\w+/password = HIDDEN-BY-LOG-VIEWER/o;
+                            print $line;
+                        }
+                    }
+                }
+                close(FILE);
+                last;
+            }
+
+        } else {
+            print STDERR "\nNo recognized command provided !\n Command was : [$command]\n\n" if ($debug);
+            print "HTTP/1.0 500 bogus command\n\n";
+        }
+    } else {
+        print STDERR "\nNo recognized command provided !\n Command was : [$command]\n\n" if ($debug);
+        print "HTTP/1.0 500 bogus command\n\n";
+    }
+}
+
+sub logRequest {
+    my $filename = shift;
+
+    my $timestamp = time();
+
+    print $logFH "$fromaddr $timestamp $filename\n";
+}
+
+sub main {
+    my (@args) = @_;
+
+    if ($#args != -1 && ($args[0] eq "--version" || $args[0] eq "-v")) {
+        print "$version\n";
+        exit(0);
+    }
+        
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my $port = $defaultPort;
+    my $logDirs = "";
+
+    #
+    # First thing is first -- give up root permissions
+    #
+    my $machine = ariba::Ops::Machine->new($hostname);
+    my $datacenter = $machine->datacenter();
+    my $service = (ariba::rc::Globals::servicesForDatacenter($datacenter))[0];
+    my $newuser = "svc$service";
+    my $newgroup = "ariba";
+    
+    my $logFile;
+    if(-w "/var/log") {
+        $logFile = "/var/log/logviewer";
+    } else {
+        $logFile = ariba::Ops::Constants->archiveLogBaseDir() . "/logviewer";
+    }
+
+    open($logFH, ">>$logFile") or die "Cannot open $logFile for writing: $!";
+
+    $) = getgrnam($newgroup);
+    $( = $);
+    $> = (getpwnam($newuser))[2]; # set euid to new user
+    $< = $>; # set real uid to new user -- no more root
+
+    #
+    # now open and write a PID file
+    #
+    my $pidFile = ariba::Ops::Constants->archiveLogBaseDir();
+    $pidFile .= "/" . ariba::Ops::Constants->logViewerPidFile();
+
+    if(open(PID, "> $pidFile")) {
+        print PID "$$\n";
+        close(PID); # this also gives us a time stamp of when we started.
+    }
+
+    #
+    # log-viewer can be started with a different port number and
+    # additional directories to look in for logs. Like:
+    # log-viewer 61505 -logdir /home/svcdev/s4/logs:/home/svcdev/s4/archives/logs
+    #
+    while (my $arg = shift(@ARGV) ) {
+        if ($arg =~ m|^\d+$|){ 
+            $port = $arg;
+        } elsif ($arg eq '-d'){
+            $debug = 1;
+        } elsif ($arg eq '-logdir'){
+            $logDirs = shift @ARGV;
+        }
+    }
+
+    #
+    # if we have apache logs, spew logs or flume kr logs, vend them as well.
+    #
+    if($logDirs eq "") {
+        my @additionalDirs;
+
+        my $apacheDir = ariba::Ops::Startup::Apache::apacheLogDir();
+        if( -d $apacheDir ) {
+            push(@additionalDirs, $apacheDir);
+        }
+
+        my $spewDir = ariba::Ops::Constants->spewDir();
+        push(@additionalDirs, $spewDir);
+
+        my $ccScanDir = ariba::Ops::Constants->creditCardScanDir();
+        push(@additionalDirs, $ccScanDir);
+
+        my $flumeKrDir = ariba::Ops::Constants->flumeKrDir();
+        push(@additionalDirs, $flumeKrDir);
+
+        my $simulatorReportDir = "/Simulator/report/"; ## Addding for Hanasim Product 
+
+        if (-d $simulatorReportDir) {
+           push(@additionalDirs, $simulatorReportDir)
+        }
+
+        my $mailLogDir = ariba::Ops::Constants->mailLogDir();
+        push(@additionalDirs, $mailLogDir);
+
+        ### HOA-62924 - add /nfs/never/monprod, /nfs/never/monprodru /nfs/never/monprodeu dirs
+        ### Add subzero as well - for devlabs
+        push(@additionalDirs, "/nfs/never/mon$service/tls-security-$service/");
+        push(@additionalDirs, "/subzero/opsdumps/tools/tls-security-test/");
+
+        $logDirs = join(':', @additionalDirs);
+    }
+
+    my $serverSocket = startServer($port);
+
+    while (1) {
+        (my $addr = accept(SOCK, $serverSocket)) || next;
+        my ($clientPort, $inetaddr) = unpack_sockaddr_in($addr);
+        $fromaddr = inet_ntoa($inetaddr);
+
+        select(SOCK);
+        ## Set a 5 second timeout on writing to the socket:
+        setsockopt( SOCK, SOL_SOCKET, SO_RCVTIMEO, pack('l!l!', 5, 0) );
+        chomp(my $input = <SOCK>);
+        $input =~ tr/\015//d;
+
+        print STDERR "Input is $input\n" if ($debug);
+
+        while (<SOCK>) { 
+            print STDERR $_ if ($debug);
+            last unless /^\w/o;
+        }
+
+        my ($httpcommand, $url, $httpversion) = split(/\s+/o, $input, 3);
+        print STDERR "httpcommand = $httpcommand, ", 
+                "url = $url, ", 
+                "version = $httpversion\n" if ($debug);
+
+        my ($junk, $command, @argv) = split(/\//o, $url);
+
+        command($hostname, $port, $logDirs, $command, @argv);
+
+        close(SOCK);
+    }
+}
+
+main(@ARGV);

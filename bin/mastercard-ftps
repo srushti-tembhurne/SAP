@@ -1,0 +1,572 @@
+#!/usr/local/tools/bin/perl
+use strict;
+use warnings;
+###############################################################################
+# $Id: //ariba/services/montor/bin/mastercard-ftps#2 $
+#
+# Copyright (c) 2014 SAP
+#
+###############################################################################
+
+=head1 NAME
+
+mastercard-ftps
+
+=head1 SYNOPSIS
+
+Downloads files from Mastercard via FPTS to local ram disk.  Post downloaded files via geturl to AN.
+
+Under normal operations this script is run from cron.  The options are used only when running the script manually.
+For full documentation see:  https://wiki.ariba.com:8443/display/ENGDPTS/Mastercard-%3EAN+FTPS+file+transfer
+
+mastercard-ftps [options]
+
+=head1 OPTIONS
+
+=over
+
+=item B<-file> <file>
+
+Manually attempt to process the specified file regardless of its status.  The script will look in both the primary and archive dirs for the file.
+
+=item B<-list>
+
+List the directory tree on the remote FTPS server.  This will not download or post any files.
+
+=item B<-account2>
+
+We have two accounts into the FTPS server.  This option will use the secondary account instead of the default one.
+Primary: Z619118    Secondary: Z619119
+
+=item B<-testdir>
+
+Use the test dir (T206) as the primary download dir instead of the production dir (T578).
+
+=item B<-archivedir>
+
+Use the archive dir (archive) as the primary download dir instead of the production dir (T578).
+
+=item B<-force>
+
+Ignore the error count for any files that previously failed to download and try to download them again.
+
+=item B<-debug|d>
+
+Turn on debug messaging.
+
+=item B<-e>
+
+Send an email for any warn/crit alerts.
+
+=item B<-e>
+
+Send a page to SRE for any crit alerts.
+
+=item B<-help|h>
+
+Print the usage information and exit.
+
+=item B<-man|m>
+
+Print the man page and exit.
+
+=back
+
+=head1 AUTHOR
+
+Greg Rogers C<< greg.rogers@sap.com> >>
+
+=head1 LICENSE
+
+Copyright 2014 SAP
+
+=cut
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib/";
+use lib "$FindBin::Bin/../../lib/perl";
+
+use Data::Dumper;
+local $Data::Dumper::Useqq  = 1;
+local $Data::Dumper::Indent = 3;
+
+$ENV{FTP_PASSIVE} = 1;
+use Pod::Usage;
+use Getopt::Long;
+use Time::Piece;
+use DateTime;
+use Date::Parse;
+use Scalar::Util;
+use File::Path;
+use File::Touch;
+use File::Slurp;
+
+require "geturl";
+
+use dmail::LockLib;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use ariba::monitor::StatusPage;
+
+# global constants and variables
+my $lockFile = '/tmp/.mastercard';
+my $dateToday = localtime->strftime('%Y%m%d');
+my $ramPath = "/dev/shm";
+my $debug = 0;
+my $sendEmail = 0;
+my $sendPage = 0;
+my $cert;
+my $certKey;
+my $caCert;
+my $ftpUser;
+my $ftpCertPass;
+
+my $SUCCESS = 'success';
+my $FAILDL = 'failed-downloading';
+my $FAILPOST = 'failed-posting';
+
+# These variables are global so the END block can clean them up
+my $dailyLogFileFH;
+my $globalStatus;
+my $statusLog;
+
+# the undef delcarations are to avoid 'Name "Net::FTPSSL::ERRSTR" used only once' warnings
+
+main(@ARGV);
+
+#
+# set a lock file to prevent multiple instances of this script running at the same time
+#
+sub lock {
+    my $lockTries = 1;
+
+    return( dmail::LockLib::requestlock( $lockFile, $lockTries ));
+}
+
+#
+# remove the lock file
+#
+sub unlock {
+    my $rc = 1;
+
+    if ( dmail::LockLib::haslock( $lockFile )) {
+        $rc = dmail::LockLib::releaselock( $lockFile );
+    }
+
+    return $rc;
+}
+
+#
+# get the current time and format it to be human readable
+#
+sub getTime {
+    my $time = localtime->strftime('%H:%M:%S');
+
+    return $time;
+}
+
+#
+# split a date string into year, month, day
+#
+sub dateSplit {
+    my $date = shift;
+
+    $date =~ m/^(\d\d\d\d)(\d\d)(\d\d)/;
+
+    return ( $1, $2, $3 );
+}
+
+#
+# print to file or file+stdout depending on $debug
+#
+sub myPrint {
+    my $msg = shift;
+
+    my $message = "$dateToday-" . getTime() . " $msg";
+
+    print $dailyLogFileFH $message if $dailyLogFileFH;
+    print $message if $debug;
+}
+
+sub openFile {
+    my $dir = shift;
+    my $file = shift;
+    my $action = shift;
+
+    my $fullPath = "$dir/$file";
+
+    # check if the log dir exists and create it if nescessary
+    unless ( -d $dir ) {
+        mkdir( $dir ) or die "Unable to create directory '$dir'. $!\n";
+    }
+
+    unless ( -f $fullPath ) {
+        $action = '+>';
+    }
+
+    # open the existing log file for reading or create a new one if it doesn't exist
+    open( my $fh, $action, "$fullPath" ) or die "Could not open file '$fullPath'. $!";
+    $fh->autoflush( 1 );
+
+    return $fh;
+}
+
+#
+# The daily log file tracks each session of the script.  Open it for appending.
+# If this is the first run of the day a new file will be created,
+#
+sub openDailyLogFile {
+    my $service = shift;
+
+    my $dir = "/tmp/$service";
+    my $file = "$dateToday-mastercard.log";
+
+    my $fh = openFile( $dir, $file, '>>' );
+
+    return $fh;
+}
+
+#
+# The status file contains a hash.  The hash is the processed status of each file
+# plus a global counter for ftps connection failures
+#
+sub read_status {
+
+    my $status;
+    eval {
+        $status = do $statusLog || {};
+    };
+    if( $@ ) {
+        cleanupAndQuit( "Could not read $statusLog, $@\n" );
+    }
+
+    return $status;
+}
+
+sub save_status {
+    my $status = shift;
+
+    return unless $status;
+    open my $fh, '>', $statusLog or cleanupAndQuit( "Could not write $statusLog, $!\n" );
+    print $fh Dumper $status;
+    close $fh;
+}
+
+#
+# Used to gracefully exit if we hit and error after we try to establish the ftps connection and before we start downloading files.
+#
+sub cleanupAndQuit {
+    my $message = shift;
+
+    myPrint ( $message );
+
+    exit 1;
+}
+
+sub generateQueries {
+    my $globalStatus = shift;
+
+    my $doc = "https://wiki.ariba.com:8443/display/ENGDPTS/Mastercard-%3EAN+FTPS+file+transfer";
+
+    my $me          = ariba::rc::InstalledProduct->new( 'mon' );
+    my $email       = $me->default('notify.email');
+    my $cluster     = $me->currentCluster();
+
+    my $processedFiles = $globalStatus->{ 'files' };
+    my @failedFiles;
+    my %queries = ();
+
+    # find all the files with 'failed' status and count >= 3.
+    foreach my $file ( keys( %{ $processedFiles } )) {
+        if ( $processedFiles->{ $file }->{ 'status' } =~ m/failed/ &&
+             $processedFiles->{ $file }->{ 'count' } >= 3 ) {
+            push( @failedFiles, $file . "  " .
+                                $processedFiles->{ $file }->{ 'date' } . "  " .
+                                $processedFiles->{ $file }->{ 'status' } );
+        }
+    }
+
+    my $enddate = `openssl x509 -enddate -in $cert -noout`;
+    $enddate =~ s/notAfter=//g;
+    my $end = str2time( $enddate );
+    my $daysleft = int( ( $end - time() ) / 86400 );
+
+    $queries{ "consecutive connection failures to mastercard FTPS server" } = {
+        'info'   => "answer == 0",
+        'warn'   => "answer > 0",
+        'crit'   => "answer >= 3",
+        'perl'   => sub { return $globalStatus->{ 'errorCount' } },
+        'note'   => "For debugging instructions see: $doc",
+    };
+
+    $queries{ "files failed to process" } = {
+        'info' => "numrows > -1",
+        'crit' => "numrows > 0",
+        'perl'   => sub { if ( @failedFiles ) {
+                               return join("\n", @failedFiles)
+                           } else {
+                               return undef;
+                           }
+                         },
+        'note'   => "For debugging instructions see: $doc",
+    };
+
+    $queries{ "days until cert ($cert) expires" } = {
+        'info'   => 1,
+        'warn'   => "answer < 60",
+        'crit'   => "answer < 30",
+        'perl'   => sub { return $daysleft },
+        'note'   => "For debugging instructions see: $doc",
+    };
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails(
+        'mastercard-ftps', 'an', $me->service(), undef, \%queries
+    );
+
+    $qm->processQueriesUsingServer( $debug, $email, $sendEmail, $sendPage );
+}
+
+sub getDirList {
+    my $subDir = shift;
+
+    my $cmd = "/usr/local/tools/bin/curl -q --ftp-ssl --ftp-pasv --disable-epsv --list-only --cacert $caCert --cert $cert --key $certKey -u $ftpUser: -v ftp://uprod.mfe.mastercard.com:16021/$subDir/";
+
+    myPrint ("getting dir list using command:\n");
+    myPrint ("$cmd\n");
+
+    my @output;
+    my $rc = ariba::rc::Utils::sshCover($cmd, undef, undef, 15, \@output, 'Enter PEM pass phrase:', $ftpCertPass );
+    if ($rc) {
+        myPrint "curl error: $rc.   Skipping file downloads.\n";
+        for my $line (@output) {     
+            myPrint "$line\n";
+        }
+    }
+    print join("\n", @output),"\n";
+    my @files;
+    foreach my $line (@output) {
+        if ( $line =~ /^MCI.AR.T578/ ) {
+            push @files, $line;
+        }
+    }
+
+    return ($rc, @files);
+}
+
+sub downloadFile {
+    my $pathAndFile = shift;
+
+    # We need to write the file to ram disk: $ramPath
+    my $file = ( split '/', $pathAndFile )[ -1 ];
+    my $cmd = "/usr/local/tools/bin/curl -q --ftp-ssl --ftp-pasv --disable-epsv --cacert $caCert --cert $cert --key $certKey -u $ftpUser: -v ftp://uprod.mfe.mastercard.com:16021/$pathAndFile -o $ramPath/$file";
+    my $status = $SUCCESS;
+
+    myPrint ("downloading file '$file' using command:\n");
+    myPrint ("$cmd\n");
+
+    my @output;
+    $status = "failed" if (ariba::rc::Utils::sshCover($cmd, undef, undef, 15, \@output, 'Enter PEM pass phrase:', $ftpCertPass ));
+    print join("\n", @output),"\n";
+
+    return $status;
+}
+
+sub main {
+    my $useAccount = 1;
+    my $listOnly = 0;
+    my $ftpSite = 'uprod.mfe.mastercard.com';
+    my $ftpDir = '0073075/production';         # root dir common to all ftps actions
+    my $productionDir = 'download/T578';       # dir repository for production files to process
+    my $testDir = 'download/T206';             # dir repository for test files
+    my $archiveDir = 'archive';                # dir repository for previously downloaded files
+    my $subPath = $productionDir;
+    my $singleFile;
+    my $force = 0;
+    my $ftpDebug = 0;
+    my $returnCode = 0;
+
+    pod2usage( -verbose => 1 ) unless GetOptions(
+        'file:s' => \$singleFile,
+        'list' => sub { $listOnly = 1 },
+        'debug|d' => sub { $debug = 1 },
+        'account2' => sub { $useAccount = 2 },
+        'force' => sub { $force = 1 },
+        'testdir' => sub { $subPath = $testDir },       # dir location for test files
+        'archivedir' => sub { $subPath = $archiveDir }, # debugging sometimes needs the primary dir to be the archive dir
+        'e' => sub { $sendEmail = 1 },
+        'p' => sub { $sendPage = 1 },
+        'help|h' => sub { pod2usage( -verbose => 1, exit => 2 ); },
+        'man|m' => sub { pod2usage( -verbose => 2, exit => 2 ); },
+    );
+
+    my $productObj = ariba::rc::InstalledProduct->new( 'mon' );
+    my $service = $productObj->service();
+       $cert = $productObj->default( "mccredentials.account${useAccount}.cert" );
+       $certKey = $productObj->default( "mccredentials.account${useAccount}.privatekey" );
+       $caCert = $productObj->default( "mccredentials.cacert" );
+       $ftpUser = $productObj->default( "mccredentials.account${useAccount}.username" );
+       $ftpCertPass = $productObj->default( "mccredentials.account${useAccount}.password" );
+    my $ftpPass = "anonymous";
+
+    $productObj = ariba::rc::InstalledProduct->new( 'an', $service );
+    my $url = $productObj->default( "payment.mastercardvca.inboundftpurl" );
+
+    # open log files
+    # ??? corner case.  If the host dies after downloading a file and before the status log is written we will lose track of the file.
+    # ??? The file will move from productionDir to archiveDir on the remote side and we won't find it on the next pass.
+    # ??? need to rewrite to scan both primary and archive dirs for files.
+    #
+    # Open the logs before we set the lock file.  This way if the lock fails we can log the event.
+    $statusLog = "/tmp/$service/status.log";
+    $dailyLogFileFH = openDailyLogFile( $service );
+    $globalStatus = read_status();
+    $globalStatus->{ 'errorCount' } = 0 unless $globalStatus->{ 'errorCount' };
+
+    unless ( lock() ) {
+        myPrint ( "Could not start new session.  Previous active lock file found: $lockFile.  Qutting.\n" );
+        exit 1;
+    }
+    myPrint ( "Session START\n" );
+
+    # Validate the ram disk is mounted and writeable
+    eval {
+        touch( "$ramPath/test" );
+        unlink( "$ramPath/test" );
+    };
+    if( $@ ) {
+        myPrint ( "Problem verifying ram disk.  $@\n" );
+        exit 1;
+    }
+
+    myPrint ( "FTP connection to '$ftpSite' established with user $ftpUser\n" );
+
+    # If @dirlist is null then assume there are no new files.
+    # There is no way to determine betewen a failed dir get and a successful dir get with 0 files.
+    # rc 226 is a successful transfer
+    my @dirList;
+    if ( $singleFile ) {
+        @dirList = ( $singleFile );
+    } else {
+        ($returnCode, @dirList) = getDirList( "$ftpDir/$subPath" );
+
+        # exit/abort if we're only getting a dir listing or if getting a dir listing failed
+        exit $returnCode if ($listOnly || $returnCode);
+    }
+
+    unless( @dirList ) {
+        myPrint ( "FTP remote dir $ftpDir/$subPath is empty.  No new files to download.\n" );
+    }
+
+    # Strip just the file names from the dir listing and create a hash.
+    my %files;
+    foreach my $line ( @dirList ) {
+        $files{ $line } = $singleFile ? 1 : 0;
+    }
+
+    # Add any previously failed files to the list.
+    my $processedFiles = $globalStatus->{ 'files' };
+    unless ( $singleFile ) {
+        foreach my $file ( keys %{ $processedFiles } ) {
+            $files{ $file } = 1 if ( $processedFiles->{ $file }->{ 'status' } =~ m/failed/ &&
+                                     $processedFiles->{ $file }->{ 'count' } <= 2 );
+        }
+    }
+
+    # process %files.  The constructed list of files to action
+    foreach my $file ( keys( %files )) {
+        unless ( $singleFile ) {
+            next if ( $processedFiles->{ $file }->{ 'status' } &&
+                      $processedFiles->{ $file }->{ 'status' } eq $SUCCESS );
+            next if ( $processedFiles->{ $file }->{ 'count' } &&
+                      $processedFiles->{ $file }->{ 'count' } >= 3 &&
+                      !$force );
+        }
+
+        # Download a file.  If this file previously failed it could be in the 'archive' dir.
+        my $status = downloadFile( "$ftpDir/$subPath/$file" );
+        if ( $status =~ m/failed/ && $files{ $file } ) {
+            $status = downloadFile( "$ftpDir/$archiveDir/$file" );
+        }
+        chomp $status;
+        myPrint ( "FTP download of file '$file': $status\n" );
+
+        $status =~ m/^([\w\-]+)/;
+        $status = $FAILDL if ( $1 eq "failed" );
+
+        # If the download was successful then post the file to AN
+        if ( $status eq $SUCCESS ) {
+            my @results = ();
+            eval { geturl( "-e", "-q", "-timeout", '15', "-results", \@results, "-postfile", "$ramPath/$file", $url) };
+            if ( $results[0] =~ m/^OK/ ) {
+                myPrint ( "Posting file '$file' to AN: success\n" );
+            } elsif ( $results[0] =~ m/Duplicated message/ ) {
+                myPrint ( "Duplicate content in file: '$file'.  Marking as: success\n" );
+            } else {
+                $status = $FAILPOST;
+                myPrint ( "Posting file '$file' to AN: failed\n" );
+                foreach ( @results ) {
+                    myPrint ( "      $_\n" );
+                }
+            }
+        }
+
+        # add/update the file in the hash
+        # track how many times we process each file
+        # if we have 3 failues on a file we will alert
+        my $count = $processedFiles->{ $file }->{ 'count' };
+        $count = $count++ ? $count : 1;
+        $processedFiles->{ $file } = {
+            date => $dateToday . ":" . getTime(),
+            status => $status,
+            count => $count,
+        };
+
+        unlink "$ramPath/$file";
+    }
+
+    myPrint ( "FTP connection to '$ftpSite' ended\n" );
+
+    # prune files from the processed hash that are older than 90 days
+    my $age = 90;
+    my ( $y, $m, $d ) = dateSplit( $dateToday );
+    my $now = DateTime->new(
+        year => $y,
+        month => $m,
+        day => $d
+    );
+    foreach my $file ( keys %{ $processedFiles } ) {
+        ( $y, $m, $d ) = dateSplit( $processedFiles->{ $file }->{ 'date' } );
+        my $then = DateTime->new(
+            year => $y,
+            month => $m,
+            day => $d
+        );
+        my $delta = $now->delta_days( $then );
+        delete $processedFiles->{ $file } if ( $delta->{ days } > $age );
+    }
+    $globalStatus->{ 'files' } = $processedFiles;
+
+    exit $returnCode;
+}
+
+END
+{
+    # rc 2 is sent from pod2usage (-h) thus nothing to clean up
+    unless ( $? == 2 ) {
+        if ( exists ( $globalStatus->{ errorCount } )) {
+            # update the global error count based on the exit code
+            if ( $? ) {
+                $globalStatus->{ errorCount }++;
+            } else {
+                $globalStatus->{ errorCount } = 0;
+            }
+            save_status( $globalStatus );
+        }
+
+        generateQueries( $globalStatus );
+
+        myPrint ( "Session END\n" );
+        close $dailyLogFileFH if Scalar::Util::openhandle( $dailyLogFileFH );
+        unlock();
+    }
+}

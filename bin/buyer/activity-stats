@@ -1,0 +1,124 @@
+#!/usr/local/bin/perl
+#
+# $Id: $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+
+sub main {
+	my $debug = 0;
+	my $quiet = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $productName;
+
+	while(my $arg=shift(@ARGV)){
+			print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+			if($arg =~ /^-d/o){ $debug=1; }
+			if($arg =~ /^-e/o){ $sendEmail=1; };
+			if($arg =~ /^-p$/o){ $sendPage=1; };
+			if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $cluster = $me->currentCluster();
+	my $service = $me->service();
+	my $email = $me->default('notify.email');
+	my $import_hr = 24;
+
+	my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+	unless (@products) {
+		exit(0);
+	}
+	for my $product (@products) {
+
+		my $skip = 0;
+		my %queries  = ();
+
+		$queries{"Realms with delayed loaddb in progress"} = {
+			'recordMaxResults' => 110000,
+			'recordDataType' => "gauge",
+			'skip' => $skip,
+			'info' => 1,
+			'sql' => "select name from realmtab where state = 'loading'",
+		};
+
+		$queries{"Realms in error state"} = {
+			'recordMaxResults' => 110000,
+			'recordDataType' => "gauge",
+			'recordItem' => 'numrows',
+			'info' => 1,
+			#'warn' => "numrows > 2",
+			'skip' => $skip,
+			#'crit' => "numrows > 3",
+			'sql' => "select name, state from realmtab where state = 'loadingError'",
+		};
+
+		$queries{"Realms in enablement error state"} = {
+			'recordMaxResults' => 110000,
+			'recordDataType' => "gauge",
+			'recordItem' => 'numrows',
+			'info' => 1,
+			'skip' => $skip,
+			'crit' => "numrows > 0",
+			'sql' => "select name, state from realmtab where state = 'enablementError'",
+		};
+
+		$queries{"Realms with ITK events stuck in process for more than $import_hr hrs"} = {
+			'recordMaxResults' => 110000,
+			'recordDataType' => "gauge",
+			'recordItem' => 'numrows',
+			'info' => 1,
+			'warn' => "numrows > 0",
+			'crit' => "numrows > 3",
+			'skip' => $skip,
+			'sql'  => "select ARL_UNIQUENAME, ARL_NODENAME, ARL_CLIENTTYPE, ARL_TIMECREATED,
+ ARL_TIMEUPDATED, ARL_STARTRUNDATE, ARL_ENDRUNDATE, ARL_STATUS
+ from IntegrationEventLogtab
+ where ARL_STATUS = 'In Process'
+ UNION ALL select STS_PARTITIONNAME || '-'
+ || STS_TASKNAME, STS_NODENAME, STS_TASKNAME, STS_TIMECREATED,
+ STS_TIMEUPDATED, STS_STARTTIME, STS_ENDTIME, '1 - Running'
+ from ScheduledTaskStatustab
+ where STS_STATUS = 1
+ AND (sysdate - STS_TIMEUPDATED)*24 > $import_hr
+ ORDER BY ARL_TIMEUPDATED, ARL_STARTRUNDATE",
+		};
+
+		$queries{"Imported receipts not in approved state"} = {
+			'recordMaxResults' => 110000,
+			'recordDataType' => "gauge",
+			'recordItem' => 'numrows',
+			'info' => 1,
+			'skip' => $skip,
+			'crit' => "numrows > 0",
+			'sql' => "SELECT App2.ap_UniqueName FROM ReceiptTab Rec1, ApprovableTab App2, ReceiptCoreApprovableTab Rec3 WHERE Rec3.rootId = Rec1.rootId AND App2.rootId = Rec1.rootId AND (Rec3.recCA_IsImported = 1 AND App2.ap_ApprovedState <> 4 AND App2.ap_Type = 'ariba.receiving.core.Receipt') AND (App2.ap_Active = 1) AND (App2.ap_PurgeState = 0)",
+		};
+		
+		my $hours = 2;
+		$queries{"Delayed loaddb stuck for more than $hours hrs"} = {
+			'info' => 1,
+			'warn' => "numrows > 0",
+			'crit' => "numrows > 3",
+			'skip' => $skip,
+			'sql' => "SELECT sts_PartitionName FROM ScheduledTaskStatusTab WHERE sts_TaskName = 'LateLoadDBTask'  AND sts_StartTime IS NOT NULL  AND sts_EndTime IS NULL  AND sts_Active = 1 AND sts_PurgeState = 0 AND (sysdate - sts_TimeUpdated)*24 > $hours ORDER BY sts_TimeCreated ASC",
+		};
+
+
+		my $q = ariba::monitor::QueryManager->newWithDetails(
+				"current-activity", $product->name(), $service, $product->customer(), \%queries
+				);
+
+		$q->setSQLConnectInfo($product->connectInfoForOracleClient());
+		$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+main();

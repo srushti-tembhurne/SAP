@@ -1,0 +1,46 @@
+#!/usr/local/bin/perl -w
+# This script does a cleanup of database alert log everymonth after taking a backup - oracle user
+#
+# Three month backup is retained for analysis purpose
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use File::Find::Rule;
+use File::Copy;
+use DateTime;
+use ariba::rc::Utils;
+
+sub main {
+
+    my $dt = DateTime->now->ymd;
+    my $gzip = gzipCmd() || die "Could not find gzip program \n";
+
+    my $excludeFiles = File::Find::Rule->file() ->name ('*.bak*') ->prune ->discard;
+    my $includeFiles = File::Find::Rule->file() ->name ('alert*');
+
+    my @files = File::Find::Rule->or($excludeFiles, $includeFiles) -> in ("/oracle/admin/diag/rdbms/");
+
+# Taking backup of the current alert log file, zipping it and emptying the original log.
+
+    foreach my $file (@files) {
+        copy ("$file", "$file.$dt.bak") or die "Copy Failed: $!\n";
+	    open my $ALERTLOG,">","$file" or die "Cannot overwrite file: $!\n";
+  	        close $ALERTLOG or die "Error closing $file $!\n";
+	    system ("$gzip $file.$dt.bak");
+    }
+
+    my @deleteFiles = File::Find::Rule->file() ->name('*.bak.gz') ->in ("/oracle/admin/diag/rdbms/");
+
+    foreach my $deleteFile (@deleteFiles) {
+        if(( -M "$deleteFile" > 90 )){
+            unlink $deleteFile;
+        }
+    }
+}
+
+main();
+
+__END__

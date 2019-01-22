@@ -1,0 +1,20 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+
+sub main{
+
+    my $file = "/var/tmp/cronlog.txt";
+    my $removeFile = `rm -rf $file`;
+
+    open LOGCRON, ">>", $file or die "Unbale to open File $!\n";
+
+    while (<STDIN>){
+        print LOGCRON $_;
+    }
+
+    close (LOGCRON);
+}
+
+main();

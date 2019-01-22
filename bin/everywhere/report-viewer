@@ -1,0 +1,256 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/everywhere/report-viewer#1 $
+#
+# Program to provide report access via http
+#
+# Example: http://srs100.lab1.ariba.com:61503/list
+#
+# commands supported:
+# - list => To see the directory listing
+# - cat  => To see the content of the report
+
+use strict;
+use warnings;
+use Fcntl;
+use Socket;
+use Symbol;
+use lib qw(/usr/local/ariba/lib);
+use Getopt::Long qw(GetOptions);
+use Pod::Usage qw(pod2usage);
+use ariba::Ops::NetworkUtils;
+use ariba::util::Simplefind;
+use ariba::Ops::Utils;
+use ariba::Ops::Constants;
+use CGI ();
+use URI::Escape;
+use Data::Dumper;
+
+# globals
+my $VERSION = "1.0";
+my $debug = 0;
+my $uptime = time();
+my $port;
+my $defaultPort = ariba::Ops::Constants->reportViewerPort();
+my $reportBaseDir;
+my $defaultReportBaseDir = ariba::Ops::Constants->DAReportBaseDir();
+
+
+=head1 SYNOPSIS
+
+    report-viewer -p <port> -report_dir <dir> -debug
+
+    Options:
+        --help|h          Show this help.
+        --debug|d         Turn on debug mode.
+        --port|p          Optional. Port to be used to start the server (default: 61503)
+        --report_dir|rd   Optional. The base report directory to list the reports.
+
+=cut
+
+
+$SIG{'PIPE'} = "IGNORE";
+
+# Create the server socket
+sub startServer {
+    my $port = shift;
+
+    my $backlog = 255;
+    my $socket  = gensym();
+
+    my $proto = getprotobyname('tcp');
+    socket($socket, AF_INET, SOCK_STREAM, $proto) || die "socket: $!";
+    setsockopt($socket, SOL_SOCKET, SO_REUSEADDR, pack("l", 1));
+
+    my $this = pack_sockaddr_in($port, INADDR_ANY);
+
+    #
+    # because we often try to run this multiple times
+    # don't print an error if bind fails
+    #
+    bind($socket, $this) || exit(1);
+    listen($socket, $backlog) || die "connect: $!";
+
+    return $socket;
+}
+
+# command to get basic status
+sub command_status {
+    print "HTTP/1.0 200\n";
+    print "Content-Type: text/plain\n\n";
+    print "Version: $VERSION\n";
+    print "PID: $$\n";
+    print "Uptime: " . (time() - $uptime) . "\n";
+}
+
+# command to list the directory contents
+sub command_list {
+    my $hostname = shift;
+    my $port     = shift;
+    my $subPath  = shift;
+
+    print "HTTP/1.0 200\n";
+    print "Content-Type: text/html\n\n";
+
+    my $findPath = $subPath ? join("/", $reportBaseDir, $subPath) : $reportBaseDir;
+    my $sf = ariba::util::Simplefind->new($findPath);
+    # We just want to list the directories and not recurse through it
+    $sf->setWillRecurse(0);
+    $sf->setReturnDirsInResults(1);
+
+    my $baseUrl = "http://$hostname:$port";
+    my @readDirs = $sf->find();
+    
+    print "<h2>Directory listing for /$subPath</h2><hr>\n";
+
+    print "<ul>\n";
+    foreach my $fullPath (sort {lc $a cmp lc $b} @readDirs) {
+        print STDERR "Full Path: $fullPath\n" if ($debug);
+
+        my $relativeURLToPath = $fullPath;
+        $relativeURLToPath =~ s/^$reportBaseDir\/?//;
+        my $fileName = ariba::Ops::Utils::basename($fullPath);
+
+        # For directories, end them with a '/', so as to identify them easily
+        my ($cmd, $dirTerminator) = (-d $fullPath) ? ('list', '/') : ('cat', '');
+
+        # if there are special characters like (<, >, etc) those should be escaped
+        my $escapedFilieName = CGI->escapeHTML($fileName);
+
+        print "<li><a href=\"$baseUrl/$cmd/$relativeURLToPath\">$escapedFilieName$dirTerminator</a></li>\n";
+    }
+    print "</ul><hr>\n";
+}
+
+# command to view the content of the file
+sub command_cat {
+    my $hostname = shift;
+    my $port     = shift;
+    my $subPath  = shift;
+
+    print "HTTP/1.0 200\n";
+    my $file = "$reportBaseDir/$subPath";
+
+    next unless(-f $file);
+    print STDERR "file = $file\n" if ($debug);
+
+    sysopen(FILE, $file, O_RDONLY) || warn "sysopen($file) $!\n";
+    if ($file =~/\.(gz|tgz|zip)$/) {
+        # do not open zipped files in the browser, instead download it
+        print "Content-Type: application/x-gzip\n\n";
+        binmode(FILE);
+    } elsif ($file =~ /\.txt$/) {
+        print "Content-Type: text/plain\n\n";
+    } else {
+        print "Content-Type: text/html\n\n";
+    }
+    while (my $line = <FILE>) {
+        print $line;
+    }
+    close(FILE);
+}
+
+# Each command is processed here
+sub processCommands {
+    my $hostname = shift;
+    my $port     = shift;
+    my $command  = shift;
+    my $subPath  = shift || '';
+
+    if (!$command) {
+        print "HTTP/1.0 500 bogus command\n\n";
+        return;
+    }
+
+    if ($debug) {
+        print STDERR "got command [$command]\n";
+        print STDERR "got sub path [$subPath]\n" if ($subPath);
+    }
+
+    if ($command =~ /^(status|list|cat)$/) {
+        my $method = "command_$1";
+        no strict 'refs';
+        # make sure to unescape URL encoding, if any 
+        $subPath = uri_unescape($subPath);
+        &$method($hostname, $port, $subPath);
+
+    } else {
+        print STDERR "\nNo recognized command provided !\n Command was : [$command]\n\n" if ($debug);
+        print "HTTP/1.0 500 bogus command\n\n";
+    }
+}
+
+sub main {
+    # Get the command line args
+    GetOptions(
+        'help|h'          => sub { pod2usage(1) },
+        'debug|d'         => \$debug,
+        'port|p=i'        => \$port,
+        'report_dir|rd=s' => \$reportBaseDir,
+    ) || pod2usage(1);
+
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my $machine  = ariba::Ops::Machine->new($hostname);
+
+    # make sure this host provides dareporting service
+    # exit unless this host provides 'dareporting' service
+    return unless (grep /dareporting/, $machine->providesServices());
+
+    # use default value, unless passed via command line arg
+    $port ||= $defaultPort;
+    $reportBaseDir ||= $defaultReportBaseDir;
+
+
+    # Give up root permissions
+    # DA reports are owned by sybase user:
+    my $newUser = ariba::Ops::Constants->DAReportOwner;
+    my $newGroup = 'ariba';
+    $) = getgrnam($newGroup);
+    $( = $);
+    $> = (getpwnam($newUser))[2]; # set euid to new user
+    $< = $>; # set real uid to new user -- no more root
+
+    # now create PID file
+    my $pidFile = "/tmp/" . ariba::Ops::Constants->reportViewerPidFile();
+    if (open(PID, "> $pidFile")) {
+        print PID "$$\n";
+        close(PID); # this also gives us a time stamp of when we started.
+    }
+
+    my $serverSocket = startServer($port);
+    print STDERR "Listening (report-viewer) at port: $port...\n";
+
+    while (1) {
+        (my $addr = accept(SOCK, $serverSocket)) || next;
+        my ($clientPort, $inetaddr) = unpack_sockaddr_in($addr);
+
+        select(SOCK);
+        # Set a 5 second timeout on writing to the socket:
+        setsockopt( SOCK, SOL_SOCKET, SO_RCVTIMEO, pack('l!l!', 5, 0) );
+        my $input = <SOCK>;
+        next unless ($input);
+        chomp($input);
+
+        $input =~ tr/\015//d;
+
+        print STDERR "Input is $input\n" if ($debug);
+
+        while (<SOCK>) {
+            print STDERR $_ if ($debug);
+            last unless /^\w/o;
+        }
+
+        my ($httpcommand, $url, $httpversion) = split(/\s+/o, $input, 3);
+        print STDERR "httpcommand = $httpcommand, ",
+                "url = $url, ",
+                "version = $httpversion\n" if ($debug);
+
+        my ($junk, $command, $subPath) = split(/\//o, $url, 3);
+
+        processCommands($hostname, $port, $command, $subPath);
+
+        close(SOCK);
+    }
+}
+
+main();

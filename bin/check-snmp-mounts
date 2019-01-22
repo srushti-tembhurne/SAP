@@ -1,0 +1,180 @@
+#!/usr/local/bin/perl
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Constants;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::CipherStore;
+use ariba::rc::Utils;
+use ariba::SNMP::Session;
+use Mail::Send;
+
+my $debug     = 0;
+my $sendEmail = 0;
+# The net-snmp provided snmp perl module does not support the '"' in the costum OID, so we need to get using the number
+# The OID is 'nsExtendOutLine."vxfsMountsInMtab".1'
+my $vxfsMountsInMtab_Oid = ".1.3.6.1.4.1.8072.1.3.2.4.1.2.16.118.120.102.115.77.111.117.110.116.115.73.110.77.116.97.98.1";
+
+my $stamp="/tmp/check-snmp-mounts_stamp";
+
+sub main {
+
+	while (my $arg = shift @ARGV) {
+		if($arg =~ /^-d/) { $debug++; next; }
+		if($arg =~ /^-e/) { $sendEmail++; next; }
+		if($arg =~ /^-h/) { usage(); }
+	}
+
+        my $me = ariba::rc::InstalledProduct->new();
+
+	my $INSTALLDIR     = $me->installDir();
+	my $cipherStore    = ariba::rc::CipherStore->new( $me->service() );
+	my $username       = "svc" . $me->service();
+	my $password       = $cipherStore->valueForName($username);
+
+	my @serversSnmpRestarted;
+        my @datacenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+	for my $datacenter (@datacenters) {
+		my %match = (
+				'datacenter'       => $datacenter,
+				'status'           => 'inservice',
+				'os'               => 'redhat',
+				'providesServices' => 'storage',
+			    );
+		my @machinesWithStorageService = ariba::Ops::Machine->machinesWithProperties(%match);
+		my @mtabMounts;
+
+		for my $machine (@machinesWithStorageService) {
+			my $restartSNMP = 0;
+			my $rebuildQueries = 0;
+			my $hostname = $machine->hostname();
+			my $hostStamp = $stamp . $hostname;
+
+			# Skip over bastion hosts that provide storage service.  We
+			# Can't sshCover to them.  See TMID:54757
+			next if grep(/^bastion$/, $machine->providesServices());
+
+			print "Checking $hostname in datacenter $datacenter:\n" if $debug;
+
+			my $snmp = ariba::SNMP::Session->newFromMachine($machine);
+
+			# We get the mtabVxFsMounts using a customOID that we define in snmpd.conf
+			my @mtabVxFsMounts = split(/ /, $snmp->valueForOidExpr($vxfsMountsInMtab_Oid));
+			print "  mtabVxFsMounts: @mtabVxFsMounts\n" if $debug;
+
+			my @hrFSMounts = valuesFromWalkOid($snmp, "hrFSMountPoint.1", $hostname);
+			print "  hrFSMounts: ", join(" ", @hrFSMounts), "\n" if $debug;
+
+			for my $mount (@mtabVxFsMounts) {
+				if (!grep(/^$mount$/, @hrFSMounts)) {
+					print "    Found $mount in mtab that is not in hrFSMountPoint on $hostname\n" if $debug;
+					$restartSNMP = 1;
+					last;
+				}
+			}
+
+			# If snmpd is restarted since the last time we ran, we need to rebuild queries for that host.
+			# See TMID:53293
+			my $snmpdRunTimeInSec = $snmp->valueForOidExpr("sysUpTime.0") / 100;
+			print "  snmpd process uptime on $hostname: $snmpdRunTimeInSec\n" if $debug;
+			my $lastCheckTimeInSec = (time - (stat($hostStamp))[9]);
+
+			if ( $snmpdRunTimeInSec < $lastCheckTimeInSec ) {
+				print "  snmpd has been restarted on $hostname since the last time we checked.\n" if $debug;
+				$rebuildQueries = 1;
+			}
+
+			if ($restartSNMP) {
+				print "  Restarting snmp.\n" if $debug;
+
+				my $command  = "ssh $username\@$hostname sudo /etc/init.d/snmpd restart";
+				print "  Running sshCover: $command\n" if $debug;
+				ariba::rc::Utils::sshCover($command, $password, undef, 60, 1) if $debug < 2;
+				push (@serversSnmpRestarted, $hostname);
+
+				$rebuildQueries = 1;
+			}
+
+			if ($rebuildQueries) {
+				print "  Rebuilding queries.\n" if $debug;
+				my $command  = "$FindBin::Bin/snmp/rebuild-queries -l $datacenter -host $hostname -i $INSTALLDIR/etc/system.cfg";
+				print "  Running: $command\n" if $debug; 
+				r($command) if $debug < 2;
+			}
+	
+			if (!$restartSNMP && !$rebuildQueries) { 
+				print "  All SNMP VxFS mounts accounted for.\n" if $debug;
+			}
+
+			# update the modification timestamp for the stamp file
+			open(STAMP, ">$hostStamp") || warn "can't write out stamp file $hostStamp";
+			close STAMP;
+		}
+	}
+
+	sendNotification(\@serversSnmpRestarted, $me->service()) if ($#serversSnmpRestarted >= 0);
+}
+
+sub valuesFromWalkOid {
+	my $snmp = shift;
+	my $oid  = shift;
+	my $hostname = shift;
+	my @values;
+
+	my %indexes = $snmp->walkOidExpr($oid);
+
+	for my $index (sort keys %indexes) {
+		my $value = $snmp->valueForOidExpr($index) || do {
+                                warn "Couldn't get a volume name for oid $oid running snmp query against $hostname!";
+                                next;
+                        };
+		print "$index: $value\n" if $debug >= 2;
+		push @values, $value;
+	}
+
+	return @values;
+
+}
+
+sub sendNotification {
+	my $serverListRef = shift;
+	my $service       = shift;
+
+	my $email = ariba::Ops::Constants->operationsSysadminEmailAddress();
+	my $hostsSNMPRestarted = $#$serverListRef + 1;
+
+	my $msgBody = "Found entries in /etc/mtab that are not reported via SNMP hrFSMountPoint on the following hosts:\n";
+	$msgBody   .= join("\n", @$serverListRef) . "\n";
+
+	if ($sendEmail) {
+		my $msg = Mail::Send->new(
+			To      => $email,
+			Subject => "[$0] - SNMP restarted on $hostsSNMPRestarted host(s) in $service",
+			);
+
+		my $fh      = $msg->open();
+		print $fh $msgBody;
+		$fh->close() or warn "[$0] couldn't send mail: $!" if $sendEmail;
+	}
+
+	print $msgBody if $debug;
+}
+
+sub usage {
+	print "usage: $0 [-h|-d] [-t <fstype>]\n",
+	      "  -h		This help message\n",
+	      "  -e		Send an email if snmp is restarted on a host\n",
+	      "  -d		Increase debug level. snmpd will not be restarted while running in debug mode.\n\n",
+	      "  This script checks that all mounts in /etc/mtab are reported by SNMP hrFSMountPoint\n",
+	      "  for all hosts that provide the storage service in a datacenter and restarts snmpd\n",
+	      "  on any host where it is found.\n\n";
+
+	exit 1;
+}
+
+main();

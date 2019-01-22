@@ -1,0 +1,80 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/emc-status#17 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub main {
+	my $quiet=0;
+	my $sendEmail=0;
+	my $sendPage=0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; }
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	my $me		= ariba::rc::InstalledProduct->new();
+	my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+
+	for my $dataCenter (@dataCenters) {
+
+		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($dataCenter);
+
+		my %queries = ();
+
+		my %match   = (
+			datacenter	=> $dataCenter,
+			status		=> 'inservice',
+			providesServices=> 'db',
+			os		=> 'hp-ux',
+		);
+
+		my @machines = sort {$a->hostname() cmp $b->hostname()} ariba::Ops::Machine->machinesWithProperties(%match);
+
+		for my $machine (@machines) {
+
+			my $hostname = $machine->hostname();
+
+			$queries{"$hostname discState"}  = {
+				noRowCount => 1,
+				info => "answer eq 'online'",
+				warn => "answer eq 'unknown'",
+				crit => "answer eq 'offline'",
+				snmp => "$hostname, discState.0, public, 1, 30727",
+			};
+
+			$queries{"$hostname discStatus"}  = {
+				noRowCount => 1,
+				info => "answer eq 'ok' or answer eq 'unknown' or answer =~ /warning/",
+				crit => "answer eq 'failed'",
+				snmp => "$hostname, discStatus.0, public, 1, 30727",
+			};
+		}
+
+		next unless scalar keys %queries > 0;
+
+		my $email = $me->default('notify.email');
+
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			'emc-status', $pn, $me->service(), $me->customer(), \%queries
+		);
+
+		$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+main();
+
+__END__

@@ -1,0 +1,351 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/hanasim/hanasim-node-status#12 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use JSON;
+use Net::Telnet;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+
+require "geturl";
+
+my $debug = 0;
+
+sub usage {
+    my $msg = shift;
+
+    print "Usage error: $msg\n\n" if $msg;
+
+    print "          [-product <product>]\n";
+    print "          [-d] Debug\n";
+    print "          [-e] Send email\n";
+    print "          [-p] Send page\n";
+
+    exit(1);
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $product;
+
+    while(my $arg=shift(@ARGV)){
+        if($arg =~ /^-d/o)       { $debug = 1; next;}
+        if($arg =~ /^-e/o)       { $sendEmail = 1; next;};
+        if($arg =~ /^-product/o) { $product = shift(@ARGV); next; };
+        if($arg =~ /^-p/o)       { $sendPage = 1; next;};
+
+        usage("Invalid argument passed");
+    }
+
+    usage("Need a Product") unless ($product);
+
+    my @lbeans = ('org.apache.flume.channel:type=etac',
+              'org.apache.flume.sink:type=LoadBalancerSink',
+              'org.apache.flume.source:type=es1'
+             );
+    my @ebeans =  ('org.apache.flume.channel:type=etac',
+           'org.apache.flume.sink:type=TimedFileSink',
+           'org.apache.flume.source:type=es1',
+           'ariba.simulator.cluster:type=Cluster',
+           'ariba.simulator.report:type=CumulativeReport',
+           'ariba.simulator.report:type=ENodeEngineReport'
+          );
+
+    
+    my $bean_hash = {
+                'org.apache.flume.channel:type=etac' => [   'EventPutSuccessCount', 
+                                        'EventPutAttemptCount', 
+                                        'EventTakeSuccessCount',
+                                        'EventTakeAttemptCount'
+                                    ],
+                'org.apache.flume.source:type=es1' => [
+                                        'OpenConnectionCount',
+                                        'AppendBatchAcceptedCount',
+                                        'AppendBatchReceivedCount',
+                                        'EventAcceptedCount',
+                                        'AppendReceivedCount',
+                                        'EventReceivedCount',
+                                        'AppendAcceptedCount'
+                                      ],
+                'org.apache.flume.sink:type=LoadBalancerSink' => [
+                                            'ConnectionFailedCount',
+                                            'BatchCompleteCount',
+                                            'BatchCompleteCount',
+                                            'EventDrainAttemptCount',
+                                            'ConnectionCreatedCount',
+                                            'BatchEmptyCount',
+                                            'ConnectionClosedCount',
+                                            'EventDrainSuccessCount',
+                                            'BatchUnderflowCount'
+    
+                                         ],
+                'ariba.simulator.report:type=CumulativeReport' => [
+                                             ##'TotalLatencyDiff|answer > 1000|anwer > 3000',
+                                             ## Removing Crit condition for lbnode/enode status per HOA-47046
+                                             'TotalLatencyDiff|answer > 1000', 
+                                            'SQLFailures',
+                                            'NumberOfQueries',
+                                            'UpdateFailures',
+                                            'RCValidationFailures'
+                                          ],
+                'ariba.simulator.report:type=ENodeEngineReport' =>  [
+                                            'EventsExecuted',
+                                            ##'ExecutionDriftInSeconds|answer > 300000|answer > 600000',
+                                            ## Removing Crit condition for lbnode/enode status per HOA-47046
+                                            'ExecutionDriftInSeconds|answer > 300000',
+                                            'EventsAdded',
+                                            'EventsInQueue'
+                                            ]
+                                            
+                                                                    
+            };
+
+    my @ltabeans = ('org.apache.flume.channel:type=ch_log' , 'ariba.logi.source:type=LogiSourceMBean'); # add sinks later by counting number of lbnodes.
+
+    my $lbcount =0;
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled($product, $me->service()));
+    my $hanasim = ariba::rc::InstalledProduct->new($product, $me->service());
+    my $cluster = 'primary' ;
+    my %queries;
+    $lbcount =0;
+    my @hanasimInstances = $hanasim->appInstancesInCluster($cluster);
+
+    my $instanceCount =0;
+    my $one;
+    my $warn;
+    my $crit;
+    foreach my $instance (@hanasimInstances) {
+        my $iname =   $instance->instanceName();
+        my @beans = @ebeans if($iname =~ /Enode/i);
+        @beans =  @lbeans, $lbcount++ if($iname =~ /lbnode/i);
+        next if($iname =~/zoo/);
+        $instanceCount ++;
+
+        foreach my $mbean(@beans){
+            foreach my $attribute(@{$bean_hash->{$mbean}}){
+                ## Coping $attribute to $attr so we can manipulate $attr per requirement , changeing $attribute is changing actual $beah_hash varibale becuase it's hash reference 
+                my $attr = $attribute;
+                my $param;
+                $warn = 'answer =~ "error"';
+                $crit = 'previousAnswer =~ "Error" && answer =~ "Error"';
+
+                if($attr =~ /\|/){
+                    ##($one,$warn,$crit) = split /\|/, $attr;
+                    ## Removing Crit condition for lbnode/enode status per HOA-47046
+                    ($one,$warn) = split /\|/, $attr;     
+                    $attr = $one;
+                }
+
+                $param = $mbean ."/" . $attr; 
+                my $directActionUrl = construct_url($instance, $param);
+                my $results = checkNodeStatus($instance, $instanceCount, $param, $directActionUrl);   
+
+                $queries{$instance->instanceName(). " $param " } = {
+                    recordMaxResults => 20000,
+                    recordDataType => 'counter',
+                    recordOnError => 1,
+                    warn    => $warn ,
+                    crit    => $crit ,
+                    perl    => sub { return getRunstate($results,$attr); },
+                    severity    => 1,
+                    description => "URL: $directActionUrl", 
+                    uiHint => $instance->instanceName(),
+                };
+            }
+        }
+
+        if($instance->instanceName() =~ /Enode/i){
+            my $param = 'ariba.simulator.cluster:type=Cluster/RunState';
+            my $attr = 'RunState';
+            my $directActionUrl = construct_url($instance, $param);
+            my $results = checkNodeStatus($instance, $instanceCount, $param, $directActionUrl);
+            $queries{$instance->instanceName(). " $param" } = {
+                warn    => 'answer =~ "error"',
+                crit    => 'previousAnswer =~ /Error/i && answer =~ /Error/i',
+                perl    => sub { return getRunstate($results,$attr); },
+                severity    => 1,
+                description => "URL: $directActionUrl", 
+                uiHint => $instance->instanceName(),
+            };
+
+        }
+    }
+
+    my $email = $me->default('notify.email');
+    my $qm = ariba::monitor::QueryManager->newWithDetails('Hanasim Nodes Status', $hanasim->name(), $hanasim->service(), $hanasim->customer(), $cluster, \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+    %queries = ();
+    my @ltahosts =  keys %{$hanasim->{'role_details'}->{'LTA-hosts'}};
+
+    for (my $co=1;$co <= $lbcount;$co++){
+        push (@ltabeans, 'org.apache.flume.sink:type=avro'.$co.'_sink');
+    }
+
+    my $param;
+    my $orig_bean;
+
+    $bean_hash = { 'org.apache.flume.channel:type=ch_log' => [
+                                                                'EventTakeSuccessCount',
+                                                                'EventPutAttemptCount',
+                                                                'EventPutSuccessCount'
+                                                             ],
+                   'org.apache.flume.sink'  =>   [
+                                                  'ConnectionFailedCount',
+                                                  'BatchCompleteCount',
+                                                  'EventDrainAttemptCount', 
+                                                  'ConnectionCreatedCount', 
+                                                  'BatchEmptyCount', 
+                                                  'ConnectionClosedCount',
+                                                  'EventDrainSuccessCount',
+                                                  'BatchUnderflowCount'
+                                                 ],
+                   'ariba.logi.source:type=LogiSourceMBean' =>  [
+                                                                    'NumberOfBackoffs',
+                                                                    'SentEvents',
+                                                                    'TotalSentEvents'
+                                                                 ]
+
+            };                                    
+    my $ltaport = 7777;
+    foreach my $ho ( @ltahosts){
+        foreach my $bean(@ltabeans){
+            if($bean =~/sink/) { 
+                $orig_bean = $bean; 
+                $bean = 'org.apache.flume.sink';
+            }
+
+            foreach my $attr( @{$bean_hash->{$bean}}){
+                if($bean =~ /sink/){
+                    $bean = $orig_bean;
+                }       
+
+                $param = $bean .'/'. $attr;
+                my $instanceID = $ho."-LTA:$ltaport";
+                my $directActionUrl = construct_url_lta($ho,$param,$ltaport);    
+                my $results = check_lta_status($ho, $param, $ltaport, $directActionUrl);
+
+                $queries{$instanceID. " $param " } = {
+                    recordMaxResults => 20000,
+                    recordDataType => 'counter',
+                    recordOnError => 1,
+                    warn    => 'answer =~ "error"',
+                    crit    => 'previousAnswer =~ /Error/i && answer =~ /Error/i',
+                    perl    => sub { return getRunstate($results,$attr); },
+                    severity    => 1,
+                    description => "URL: $directActionUrl",
+                    uiHint => $instanceID,
+                };
+            }
+        }
+
+        my $param = 'ariba.logi.source:type=LogiSourceMBean/LTAVersion';
+        my $attr = 'LTAVersion';
+        my $instanceID = $ho."-LTA:$ltaport";
+        my $directActionUrl = construct_url_lta($ho, $param, $ltaport);
+
+        my $results = check_lta_status($ho, $param, $ltaport, $directActionUrl);
+
+        $queries{$instanceID. " $param" } = {
+            warn    => 'answer =~ "error"',
+            crit    => 'previousAnswer =~ /Error/i && answer =~ /Error/i',
+            perl    => sub { return getRunstate($results,$attr); },
+            severity    => 1,
+            description => "URL: $directActionUrl",
+            uiHint => $instanceID,
+        };
+
+
+    }
+
+    $qm = ariba::monitor::QueryManager->newWithDetails('LTA Status', $hanasim->name(), $hanasim->service(), $hanasim->customer(), $cluster, \%queries);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+        
+}
+
+sub check_lta_status {
+    my $host = shift;
+    my $param = shift;
+    my $port = shift;;
+    my $url = shift;
+    my @output;
+    my @errors;
+    my $urlTimeout = 20;
+    print "URL  $url\n", if $debug;
+    eval { main::geturl('-e', '-q', '-timeout' => $urlTimeout, '-results' => \@output, '-errors' => \@errors, $url); };
+
+    if ( !scalar(@errors) && scalar(@output) ) {
+        return join " ", @output;
+    }
+
+    return join " ", @errors;
+
+}
+
+sub checkNodeStatus {
+    my $instance = shift; 
+    my $instanceCount = shift;
+    my $param = shift;
+    my $url = shift; 
+    my @output;
+    my @errors;
+    my $urlTimeout = 20;
+    print "URL  $url\n", if $debug;
+    eval { main::geturl('-e', '-q', '-timeout' => $urlTimeout, '-results' => \@output, '-errors' => \@errors, $url); };
+
+    if ( !scalar(@errors) && scalar(@output) ) {
+        return join " ", @output;
+    }   
+
+    return join " ", @errors;
+}
+
+sub construct_url {
+    my $instance = shift;
+    my $param = shift;
+    my $host = $instance->{'_info'}->{'host'};
+    my $port = $instance->port();
+
+    #construct url
+    my $url = 'http://'. $host.':'.$port.'/hsim/read/' . $param;
+    return $url;
+}
+
+sub construct_url_lta {
+    my $host = shift;
+    my $param = shift;
+    my $port = shift;
+
+    #construct url
+    my $url = 'http://'. $host.':'.$port.'/hsim/read/' . $param;
+    return $url;
+}
+
+sub getRunstate {
+    my $results = shift;
+    my $param = shift;
+    #process json and return runstate;
+    if($results =~ /error|refused|timed out/i){
+        return "Error in getting info through URL for $param";
+    }
+    my $decoded = decode_json($results);        
+    use Data::Dumper;
+    my $ret;
+    #foreach my $k(keys %{$decoded->{'value'}}){
+    $ret = $decoded->{'value'};
+    #}
+    return $ret;
+    
+}
+
+main(@ARGV);
+
+__END__

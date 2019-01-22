@@ -1,0 +1,362 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use lib "/usr/local/ariba/lib"; 
+use lib "../../lib"; 
+
+use IO::Zlib;
+use Text::CSV_XS;
+use File::Path;
+use HTTP::Date ();
+use Date::Parse;
+use DateTime;
+use POSIX qw(strftime);
+
+use ariba::Ops::Constants;
+use ariba::Ops::Logger;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+my $logger = ariba::Ops::Logger->logger();
+
+sub usage {
+	my $error = shift;
+
+	print <<USAGE;
+Usage: detailed-perf-logs [<productName> <service>] <-realm <name>> [-date <yyyy-mm-dd>]
+                          [-log <dir>] [-save <dir>] [-d|-h]
+Generates detailed perf log reports from all perf logs and save them
+into different files for each day. 
+
+	productName    Name of the product
+	service        Service name
+	-realm         Name of the realm to produce log for. Based on case insensitive regex compare.
+	-date          If specified, only parse logs where file name has the date.
+	               Must be in yyyy-mm-dd, or specify 'today' or 'yesterday'
+	-log           The directory with the raw perf logs
+	-save          The directory to save the generated perf logs
+	-d             Turn on debug mode
+	-h             Show is help
+
+USAGE
+	error($error) if ($error);
+	exit();	
+}
+
+sub perfLogDirForProductAndService {
+	my $product = shift;
+	my $service = shift;
+	my $perfLogDir;
+
+	if (ariba::rc::InstalledProduct->isInstalled($product, $service)) {
+		my $p = ariba::rc::InstalledProduct->new($product, $service); 
+		$perfLogDir = $p->default('System.Logging.ArchiveDirectoryName');
+	}
+
+	return $perfLogDir;
+}
+
+sub error { 
+	my $msg = shift;
+	my $exitCode = shift || 1;
+	
+	$logger->error($msg);
+	exit($exitCode);
+}
+
+sub initLogger {
+	my $debug = shift;
+
+	if ($debug) { 
+		$logger->setLogLevel(ariba::Ops::Logger->DEBUG_LOG_LEVEL());
+	} elsif (-t STDIN || -t STDOUT) {
+		$logger->setLogLevel(ariba::Ops::Logger->INFO_LOG_LEVEL());
+	} else {
+		$logger->setLogLevel(ariba::Ops::Logger->WARN_LOG_LEVEL());
+	}
+}
+
+sub perfLogsFromDirAndDate {
+	my $dir = shift;
+	my $date = shift;
+	my @logFiles;
+
+	my $dateDir = "$dir/$date";
+	unless (-d "$dateDir") {
+		debug("Log date dir ($dateDir) doesn't exist"); 
+		return @logFiles; 
+	}
+
+	if (opendir(my $dh, $dateDir)) {
+		my @files = grep(/^perf-UI/, readdir($dh));
+		closedir($dh);
+		@logFiles = map { "$dateDir/$_" } @files;
+	}
+
+	return @logFiles;
+}
+
+sub indexForHeader {
+	my $header = shift; 
+	my $headersRef = shift;
+
+	my @headers = @$headersRef;
+	return undef unless (@headers);
+
+	for (my $index = 0; $index <= $#headers; $index++) {
+		return $index if ($header eq $headers[$index]);	
+	}
+
+	return undef;
+}
+
+sub fileNameForRealmAndTime {
+	my $realm = shift;
+	my $time = shift;
+
+	my $date = strftime("%Y-%m-%d", localtime($time));
+
+	return "$realm-$date.csv";
+}
+
+sub saveDetailedReportsToDirForRealmAndFiles {
+	my $reportDir = shift;
+	my $desiredRealm = shift;
+	my @files = @_; 
+
+	my $csv = Text::CSV_XS->new({ binary => 1, eol => "\n" });
+	$desiredRealm =~ s/,/|/g;
+
+	foreach my $file (sort @files) {
+		$logger->info("Processing $file for realm $desiredRealm");
+		if (my $fh = IO::Zlib->new($file, 'r')) {
+			my %fhCache;
+			my $startTime = time();
+			my $rowCount = 0;
+			my $saveCount = 0;
+			my $unalignedCount = 0; 
+			my $unfixableUnalignedCount = 0;
+			my @headers;
+
+			# Get headers
+			my $headerLine = <$fh>;
+			my $validHeaderRegex = 'RuntimeMillis';
+			if ($headerLine =~ /$validHeaderRegex/ && $csv->parse($headerLine)) {
+				@headers = $csv->fields();		
+				map { $_ =~ s/^\s*|\s*$//g } @headers; # trim spaces
+			} else {
+				$logger->info("Failed to read header / invalid header in $file");
+				next;
+			}
+
+			my $sourceAreaIndex = indexForHeader('SourceArea', \@headers);
+			my $realmIndex = indexForHeader('Realm', \@headers);
+			my $typeIndex = indexForHeader('Type', \@headers);
+			my $sourcePageIndex = indexForHeader('SourcePage', \@headers);
+			my $dateIndex = indexForHeader('Date', \@headers);
+			my $runtimeMillisIndex = indexForHeader('RuntimeMillis', \@headers);
+			my $userIndex = indexForHeader('User', \@headers);
+			my $appDim1Index = indexForHeader('AppDimension1', \@headers);
+			my $appDim2Index = indexForHeader('AppDimension2', \@headers);
+
+			# Get data
+			while (my $line = <$fh>) {
+				$rowCount++;
+
+				next if ($line eq $headerLine);
+
+				if ($csv->parse($line)) {
+					my @columns = $csv->fields();
+					map { $_ =~ s/^\s*|\s*$//g } @columns; # trim spaces
+
+					# Skip invalid date
+					my $time = defined($dateIndex) && HTTP::Date::str2time($columns[$dateIndex]);
+					next unless ($time);
+
+					# Skip invalid runtimeMillis
+					my $runtimeMillis = defined($runtimeMillisIndex) && $columns[$runtimeMillisIndex];
+					next unless (defined($runtimeMillis) && $runtimeMillis ne '');
+						
+					my $skippable = 1;
+					# Default realm to 'System' if SourceArea is 'login'
+					if (defined($sourceAreaIndex) && defined($realmIndex)) {
+						my $sourceArea = $columns[$sourceAreaIndex];
+						if ($sourceArea && $sourceArea eq 'login') {
+							$columns[$realmIndex] = 'System' unless ($columns[$realmIndex]);
+							$skippable = 0;
+						}
+					}
+
+					# Skip if not desired realm
+					my $realm = defined($realmIndex) && $columns[$realmIndex];
+					next unless ($realm && $realm =~ /^(?:$desiredRealm)$/io);
+
+					if ($skippable) {
+						# Skip non-user types / actions
+						if (defined($typeIndex)) {
+							my $type = $columns[$typeIndex];
+							next unless ($type && $type eq 'User');
+						}
+						if (defined($userIndex)) {
+							my $user = $columns[$userIndex];
+							next unless ($user && $user ne '');
+						}
+						if (defined($sourcePageIndex)) {
+							my $sourcePage = $columns[$sourcePageIndex];
+							next if ($sourcePage && $sourcePage eq 'ariba.ui.sso.SSOActions');
+						}
+						if (defined($sourceAreaIndex)) {
+							my $sourceArea = $columns[$sourceAreaIndex];
+							next if ($sourceArea =~ /^(?:poll|awres|awimg|monitorStats|clientKeepAlive)$/);
+						}
+
+					}
+
+					# Fix unaligned columns
+					if (scalar(@columns) != scalar(@headers)) {
+						++$unalignedCount;
+						for (my $i = 0; $i <= $#columns; ++$i) {
+							my $value = $columns[$i];
+							if ($value =~ /^\s*ltd|llc|inc/i && $value !~ /^"/) {
+								$columns[$i-1] .= ',' . $columns[$i];
+								splice(@columns, $i, 1);
+							}
+						}
+
+						# If we were unable to fix the problem, reject it.
+						if (scalar(@columns) != scalar(@headers)) {
+							$logger->debug("Failed to fix unescaped comma in line $rowCount: $line");
+							++$unfixableUnalignedCount;
+							next;
+						}
+					}
+
+					# Transform data
+					$columns[$dateIndex] = strftime("%Y-%m-%d %H:%M:%S", localtime($time));
+					$columns[$userIndex] = "'" . $columns[$userIndex] if ($userIndex && $columns[$userIndex]);
+
+					# Add additional columns
+					my $shortDate = strftime("%Y-%m-%d", localtime($time)); 
+					my $hour = strftime("%H", localtime($time));
+					my ($appDim1First, $appDim1FirstType, $appDim1Second, $appDim1SecondType);
+					if ($appDim1Index && $columns[$appDim1Index] && 
+						$columns[$appDim1Index] =~ /^\w+:/) {
+						($appDim1First, $appDim1Second) = split(':', $columns[$appDim1Index], 2);
+						$appDim1FirstType = $1 if ($appDim1First && $appDim1First =~ /^([a-z]+)/i);
+						$appDim1SecondType = $1 if ($appDim1Second && $appDim1Second =~ /^([a-z]+)/i);
+
+					}
+					my $userType;
+					if ($userIndex && $columns[$userIndex]) {
+						if ($columns[$userIndex] =~ /\@/) {
+							$userType = 'Supplier';
+						} else {
+							$userType = ($realm eq 'bp1') ? 'BP' : $realm;
+						}
+					}
+					my @newHeaders = ('Short Date', 'Hour', 'AppDimension1 First', 
+						'AppDimension1 First Type', 'AppDimension1 Second', 
+						'AppDimension1 Second Type', 'User Type', @headers);
+					my @newColumns = ($shortDate, $hour, $appDim1First, $appDim1FirstType, 
+						$appDim1Second, $appDim1SecondType, $userType, @columns);
+						
+					# Save data to its own file	
+					my $fileName = fileNameForRealmAndTime($realm, $time);
+					my $file = "$reportDir/$fileName";
+					unless ($fhCache{$file}) {
+						my $writeHeader = !(-e $file);
+						if (open(my $fh, ">> $file")) {
+							$fhCache{$file} = $fh;
+							$logger->info("Appending to $file");
+							$csv->print($fh, \@newHeaders) if ($writeHeader);
+						} else {
+							$logger->info("Failed to write row #$rowCount to $file: $!");
+							next;
+						}
+					}
+					my $fh = $fhCache{$file};
+					$csv->print($fh, \@newColumns);
+					$saveCount++;
+				} else {
+					$logger->debug("Failed to parse row #$rowCount: " . $csv->error_input());
+				}
+			}
+			$fh->close();
+			map { $_->close() } values(%fhCache);
+			my $duration = time() - $startTime;
+			my $mins = sprintf("%.2f", $duration / 60);
+			$logger->info("Processed $rowCount rows in $mins min(s): $saveCount saved, $unalignedCount unaligned, $unfixableUnalignedCount unfixable.");
+		} else {
+			$logger->debug("Failed to read from $file");
+		}
+	}
+}
+
+sub main {
+	my $logDir;
+	my $saveDir;
+	my $productName;
+	my $service;
+	my $realm;
+	my $date;
+	
+	while (my $arg = shift) {
+		if ($arg =~ /-h/)		{ usage(); 						next; }
+		if ($arg =~ /-d$/)		{ $debug++; 					next; }
+		if ($arg =~ /-realm/i) 	{ $realm = shift; 				next; }
+		if ($arg =~ /-date/i) 	{ $date = shift; 				next; }
+		if ($arg =~ /-log/i) 	{ $logDir = shift; 				next; }
+		if ($arg =~ /-save/i) 	{ $saveDir = shift; 			next; }
+		if ($arg =~ /-/) 		{ usage("invalid argument"); 	next; }
+		unless ($productName) {
+			$productName = $arg; 
+		} else {
+			$service = $arg; 
+		}
+	}
+
+	initLogger($debug);
+
+	$logDir = perfLogDirForProductAndService($productName, $service) if ($productName && $service && !$logDir);
+	my $productDir = $productName && "/$productName" || '';
+	my $realmDir = $realm && "/$realm" || '';
+	$saveDir = ariba::Ops::Constants->monitorDir() . "/docroot/perf$productDir/detailed$realmDir" unless ($saveDir);
+	eval { mkpath($saveDir) }; 
+	$logger->info($@) if ($@);
+
+	usage('-log <dir> is required unless productName/service is provided') unless ($logDir);
+	usage('-save <dir> is required') unless ($saveDir);
+	usage('-realm <name> is required') unless ($realm);
+	usage('-date <today|yesterday|yyyy-mm-dd> is required') unless ($date);
+	error("Log dir ($logDir) doesn't exist") unless (-d $logDir); 
+	error("Save dir ($saveDir) is not writable") unless (-w $saveDir);
+
+	my $dt = DateTime->now( time_zone => 'local', time_zone => 'America/Los_Angeles' );	
+	if ($date eq 'yesterday') {
+		$dt->subtract( days => 1 );
+	} else {
+		my $time = str2time($date); 
+		error("Invalid date: $date") unless ($time);
+		$dt = DateTime->from_epoch( epoch => $time, time_zone => 'America/Los_Angeles' );
+	}
+	$date = $dt->ymd('/'); 
+
+	if ($debug) {
+		print "$0 started with:\n";
+		print "\t logDir: $logDir\n"; 
+		print "\tsaveDir: $saveDir\n";
+		print "\t  realm: $realm\n";
+		print "\t   date: $date\n" if ($date);
+	}
+	my $startTime = time();
+
+	my @logFiles = perfLogsFromDirAndDate($logDir, $date);
+	$logger->info("Found " . scalar(@logFiles) . " log files in $logDir/$date");
+	$logger->debug("Files: @logFiles\n") if ($debug > 1);
+
+	saveDetailedReportsToDirForRealmAndFiles($saveDir, $realm, @logFiles) unless ($debug > 1);
+	my $mins = sprintf("%.2f", (time() - $startTime) / 60);
+	$logger->info("$0 completed in $mins minutes(s)");
+}
+
+main(@ARGV);

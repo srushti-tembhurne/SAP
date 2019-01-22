@@ -1,0 +1,120 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib qw(/usr/local/ariba/lib);
+
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Machine;
+use ariba::rc::CipherStore;
+use ariba::Ops::CFEngine::MonitoringGlueUtils;
+
+my $debug = 0;
+my $rSync = "/usr/local/bin/rsync";
+
+sub main {
+
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my $machine = ariba::Ops::Machine->new($hostname);
+    my $service  = $machine->service();
+    my $user = "mon$service";
+    my $cipher = ariba::rc::CipherStore->new($service);
+    my $password = $cipher->valueForName($user);
+    my $server   = ariba::Ops::CFEngine::MonitoringGlueUtils::monitorServer($hostname);
+    my $dir = "/var/log/backupStatus";
+
+    unless (-d $dir) {
+        my $createDir = system("mkdir -p $dir");
+    }
+    
+    my $inProgress = "$dir/inProgress.txt";
+    
+    my $cmd = "/opt/omni/bin/omnistat  | grep ^20 | cut -d ' ' -f1 > $inProgress";
+    
+    my $task = system ($cmd);
+    my $IP;
+
+    open $IP, $inProgress or warn "Unable to open file $!";
+    
+    my @sessionID = <$IP>;
+    my $sessionData = "/opt/omni/bin/omnirpt -report single_session -session" ;
+    my $getPattern =  "egrep -i '^Specification: |Start Time|Status: |Duration|Session ID' | xargs";
+    
+    my $inProgressData = "$dir/inProgressData.txt";
+    my $removeOldFile = system("rm -f $inProgressData");
+
+    foreach my $s (@sessionID) {
+         chomp($s); 
+         my $task = system ("$sessionData $s|$getPattern >> $inProgressData");
+    } 
+    
+    my $inProgressCleanData = "$dir/inProgressCleanData.txt";
+    my $INPD;
+
+    open $INPD, '>', $inProgressCleanData or warn "Unable to open file $!";
+    my $time = localtime;
+    my $freq = "60 min";
+    print $INPD "Last Update: $time Next update after $freq\n";
+
+    my $IPD;
+    my @sessionData ;
+
+    if (-e $inProgressData) {
+        open $IPD, $inProgressData or warn "Unable to open file $!";
+        @sessionData = <$IPD>;
+        foreach my $sd (@sessionData) {
+            chomp($sd);
+            #Specification: Oracle8 SSSPRO7_FULL Session ID: 2016/09/28-10 Status: In Progress Start Time: 09/28/2016 03:51:57 AM Duration: 10:35
+            print $INPD "$1, $4, $3, $5, $2\n", if ($sd =~  /Specification: Oracle8\s(.*)\sSession ID:\s(.*)\sStatus:\s(.*)\sStart Time:\s(.*)\sDuration:\s(.*)/);
+        }
+    } 
+    
+    close($IPD);
+
+    
+
+    ##Sending logs to monserver
+    sendOmniLogs($user, $server, $password, $inProgressCleanData);
+
+    close($INPD)
+
+}
+
+
+sub sendOmniLogs {
+    my $user = shift;
+    my $server = shift;
+    my $password = shift;
+    my $file = shift;
+
+    ##Remove  Old Omni-logs from mon server
+    my $remove_logs = "ssh -l $user $server rm -rf $file";
+    my $copy_logs = "$rSync -az $file $user\@$server:/var/mon/docroot/omni-logs/";
+
+    my @removelogs;
+    my @copylogs;
+
+    unless ($debug) {
+        close(STDERR);
+        close(STDOUT);
+        open(STDERR, '>>', "/var/log/omni-logs-transfer.txt");
+        open(STDOUT, '>>', "/var/log/omni-logs-transfer.txt");
+    }
+
+    for (my $i = 1; $i < 4;$i++){
+        my $status = ariba::rc::Utils::executeRemoteCommand($remove_logs, $password, 0, undef, undef, \@removelogs );
+        last if $status;
+        print "REMOVE Failed for $i time \n";
+    }
+
+    for (my $i = 1; $i < 4;$i++){
+        my $status = ariba::rc::Utils::executeRemoteCommand($copy_logs, $password, 0, undef, undef, \@copylogs );
+        last if $status;
+        print "RSYNC Failed for $i time \n";
+    }
+}
+
+main();

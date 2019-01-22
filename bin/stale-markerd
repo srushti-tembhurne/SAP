@@ -1,0 +1,133 @@
+#!/usr/local/bin/perl -w
+#
+# background daemon for per-query staleness marker
+#
+
+my $vers = '$Id: //ariba/services/monitor/bin/stale-markerd#16 $';
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::StatusPage;
+use ariba::monitor::QueryManager;
+use ariba::monitor::TicketThrottler;
+
+my $debug = 0;
+my $sleepInterval = 1200; # 20 mins
+
+sub main {
+
+	if ( $ARGV[0] && $ARGV[0] =~ /^-d/ ){
+		$debug = 1;
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $launchTime = time();
+
+	my @productNames = ariba::monitor::StatusPage::monitoredProductNames($me->service());
+
+	my $throttler;
+	$throttler = ariba::monitor::TicketThrottler->new();
+
+	#
+	# start by marking all queries as not needing staleness check. Once
+	# we know the that the queries have had a chance to run, we will clear
+	# this flag.
+	#
+	my %skipStalenessCheck;
+	for my $productName ( @productNames ){
+		my @qms = ariba::monitor::QueryManager->instancesForProduct($productName);
+		for my $qm (@qms) {
+			my $key = $productName . "-" . $qm->name();
+
+			print "Recording $key in skip staleness check array\n" if ($debug);
+
+			$skipStalenessCheck{$key} = 1;
+		}
+	}
+
+	ariba::monitor::QueryManager->_removeAllObjectsFromCache();
+
+	# loop
+	while(1){
+		$throttler->expireTickets() if($throttler);
+		for my $productName ( @productNames ){
+			my @qms = ariba::monitor::QueryManager->instancesForProduct($productName);
+			for my $qm (@qms) {
+
+				my $currentTime = time();
+
+				# lock the QM here, before it has been faulted-in
+				unless ($qm->lock()) {
+					print "Couldn't grab lock for qm for $productName\n" if ($debug);
+					next;
+				}
+
+				my $key = $productName . "-" . $qm->name();
+
+				#
+				# If this program has been running longer than the frequency
+				# of run for this query manager, then check it for staleness
+				# else wait till it has had a chance to run.
+				#
+				if ($skipStalenessCheck{$key}) {
+					my $duration = $currentTime - $launchTime;
+					my $qmInterval = $qm->longestRunInterval();
+
+					#
+					# this block of code is designed so that if you have a mon
+					# downtime, queries don't get marked stale because they
+					# were stopped during the downtime.  Some backup related
+					# queries have very long intervals, which means that the
+					# QM they are in does not get checked for staleness ever.
+					#
+					# That behavior is bad.  Since this code is for mon
+					# downtimes, any longer than 6 hours is pretty safe to
+					# exclude.
+					#
+					$qmInterval = 21600 if($qmInterval > 21600);
+
+					if ($qmInterval > $duration) {
+						print "$key in skip [$qmInterval > $duration]\n" if ($debug);
+						$qm->unlock();
+						next;
+					} else {
+						print "Removed $key from skip [$qmInterval < $duration]\n" if ($debug);
+						delete($skipStalenessCheck{$key});
+					}
+				}
+
+				my $oldStale = $qm->attribute("isStale");
+				my $newStale = $qm->markStaleQueries($currentTime);
+
+				#
+				# check for queries in warn status and open tickets
+				#
+				$qm->openTicketsForWarnStatus($currentTime, $throttler, $me->service());
+
+				#
+				# If the QueryManager was not stale before and is not stale
+				# now, no need to save anything. If it was stale before or
+				# is stale now, make sure that queries get their stale flag
+				# set correctly.
+				#
+				if ($oldStale || $newStale) {
+
+					$qm->recursiveSave();
+					print "Updated stale flag for $key\n" if ($debug);
+				}
+
+				$qm->unlock();
+			}
+		}
+
+		ariba::monitor::QueryManager->_removeAllObjectsFromCache();
+		ariba::monitor::Query->_removeAllObjectsFromCache();
+
+		sleep($sleepInterval); # 1 hour
+	}
+}
+
+main();

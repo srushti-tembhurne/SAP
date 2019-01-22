@@ -1,0 +1,991 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/snmp/rebuild-queries#85 $
+#
+# rebuild-queries
+# rebuilds snmp queries using config file and machine db
+# writes a crontab to sample oids
+#
+
+use strict;
+
+use File::Path;
+use File::Basename;
+use CGI qw/:standard/;
+use URI::Escape;
+use Log::Log4perl qw (get_logger); # Not using predefined levels variables.
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Constants;
+use ariba::Ops::Utils;
+
+use ariba::util::Crontab;
+use ariba::util::Cronjob;
+
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::NetworkDeviceManager;
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::Query;
+use ariba::monitor::misc;
+
+use ariba::Ops::Machine;
+
+use ariba::SNMP::ConfigManager;
+use ariba::SNMP::Session;
+use dmail::LockLib;
+
+my $debug = 0;
+my %tierIndexCreated;
+my $snmpMonitorDir = ariba::monitor::misc::snmpDir();
+my $snmpDir = basename($snmpMonitorDir);
+
+my $powerGraphUrl = "/cgi-bin/powergraph";
+
+# These are made file global, so the getLogfileName method can simply retrieve them, and validate access.
+# They are set in 'main'.
+my $logfileName;
+my $logfileDir;
+
+# The Log::Log4perl module allows using a config file to define the logging setup.  I found Log::Log4perl
+# allows assigning a code ref as the "filename", where said code returns the string to be used as the
+# filename.  The code ref can access other functions in the main Perl code to get dynamic information.
+sub getLogfileName
+{
+    # Simply needs to return the input string as a string.  But testing can also be done here.
+    # Check the directory part only, the file will be created if needed.
+    -d $logfileDir || mkdir $logfileDir;
+    return "$logfileDir/$logfileName";
+}
+
+sub defaultDatacenter
+{
+        my $machine = ariba::Ops::Machine->new(ariba::Ops::NetworkUtils::hostname());
+        my $logger = Log::Log4perl->get_logger ();
+
+        my $datacenter = $machine->datacenter();
+
+        print "Defaulting datacenter to $datacenter\n" if $debug;
+
+        $logger->error ("Returning default datacenter:  $datacenter");
+        return $datacenter;
+}
+
+sub allDevicesInDatacenter
+{
+        my $datacenter = shift;
+        my $hostname   = shift;
+        my $restart    = shift;
+        my $logger     = Log::Log4perl->get_logger ();
+
+        my %matchDatacenter = (
+            'status' => 'inservice',
+            'datacenter' => $datacenter,
+            'monitoringDatacenter' => '',
+        );
+
+        my %matchMonitoringDatacenter = (
+                'status' => 'inservice',
+                'monitoringDatacenter' => $datacenter,
+        );
+
+        # VMs are marked as outofservice because they do not want cfengine to update them
+        my %matchVirtualMachinesInDatacenter = (
+                'status'                => 'outofservice',
+                'datacenter'    => $datacenter,
+                'hardwareType'  => 'VM',
+        );
+
+        # This will limit the machines found to 1 or 0.
+        if ($hostname) {
+                $matchDatacenter{hostname} = $hostname;
+                $matchMonitoringDatacenter{hostname} = $hostname;
+                $matchVirtualMachinesInDatacenter{hostname} = $hostname;
+        }
+
+        my @matchedDevices = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+
+        push(@matchedDevices, ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+        push(@matchedDevices, ariba::Ops::Machine->machinesWithProperties(%matchVirtualMachinesInDatacenter));
+
+        ### [AlexN] snmp query is hanging on proxy01/02.us1.ariba.com -- filter it out for now.
+        @matchedDevices = grep { $_->hostname ne 'proxy01.us1.ariba.com' } @matchedDevices;
+        @matchedDevices = grep { $_->hostname ne 'proxy02.us1.ariba.com' } @matchedDevices;
+
+        print "Found ", scalar(@matchedDevices), " devices in $datacenter\n" if $debug;
+
+        # Because we need to have a restart ability, we need to process the sorted list so we can skip up to and including the failed host.
+        my $foundHost;
+        for my $device (sort {$a->hostname() cmp $b->hostname()} @matchedDevices)
+        {
+                my $host = $device->hostname();
+                # If $restart has a value, we need to skip all hosts, through and including it, on the presumption the others are taken care
+                # of and we only need to process from the slot immediately after the one that failed.
+                if ($restart && ! $foundHost)
+                {
+                    $foundHost = TRUE if $host eq $restart;
+                    next;
+                }
+
+                my $tier = ariba::Ops::NetworkUtils::hostnameToNetname($host);
+
+                my $hardwareVendor = $device->hardwareVendor();
+
+                my $deviceType = $device->deviceType();
+
+                #
+                # Fill out some additional fields.
+                #
+                # we need to know which network tier it belongs to.
+                #
+                $device->setTier($tier);
+
+                print "  $deviceType $host (tier $tier)\n" if $debug;
+                $logger->error ("Device found:  $host (type:  $deviceType; tier:  $tier");
+                # Add write to pipe to parent here, when parent/child is done.  Only need to send the hostname.
+        }
+
+        return @matchedDevices;
+}
+
+sub createSnmpQueries
+{
+        my $cfgFilesRef = shift;
+        my $devicesRef = shift;
+        my $datacenter = shift;
+        my $generateDevicePage = shift;
+        my $rebuildQueryManager = shift;
+        my $monQueriesRef = shift;
+        my $logger = Log::Log4perl->get_logger ();
+        my $startTime = time();
+
+        my $me    = ariba::rc::InstalledProduct->new();
+
+        my $cipherStore    = ariba::rc::CipherStore->new($me->service());
+        my $accessPassword = $cipherStore->valueForName('networkAccess');
+
+        print "Configuring devices...\n" if $debug;
+
+        my @cfgMgrs;
+        for my $cfgFile (@$cfgFilesRef) {
+                $logger->error ("Configuring for $cfgFile");
+                push(@cfgMgrs, ariba::SNMP::ConfigManager->new($cfgFile));
+                $logger->error ("Finished configuring for $cfgFile");
+        }
+
+        my $year = 365 * 24 * 60;
+
+        my %snmpQueries;
+        for my $device (@$devicesRef) {
+
+                my $tier = $device->tier();
+                my $host = $device->hostname();
+
+                my $community = $device->snmpCommunity();
+                my $version   = $device->snmpVersion() || 2;
+                my %allDeviceOids;
+                my %descriptionForOid;
+
+                my $machinesOnSwitches;
+                my $portsSpeed = undef;
+                my $dataRouters;
+
+                print "  $host (tier $tier)\n" if $debug;
+
+                # The two methods called within this 'if' statement have had timeouts set, to prevent hanging.  They will 'die' on a
+                # SIGALRM, so they need to be trapped here, to prevent it killing the whole program.  Since this is done on a per
+                # device basis, we know the device which failed and can log it for future reference.
+                if ($device->provides('switch')) {
+
+                        eval {($machinesOnSwitches, $portsSpeed) = matchSwitchesToHosts ($device, $accessPassword);};
+                        $logger->fatal ("$host failed in 'matchSwitchesToHosts ()' method") if $@;
+                        $logger->error ("Provides 'switch':  $host (tier:  $tier)");
+                } elsif ($device->provides('router')) {
+
+                        eval {($dataRouters, $portsSpeed) = retrieveRoutersInfo ($device, $accessPassword);};
+                        $logger->fatal ("$host failed in 'retrieveRoutersInfo ()' method") if $@;
+                        $logger->error ("Provides 'router':  $host (tier:  $tier)");
+                        $logger->error ("Provides 'router':  $host (tier:  $tier)");
+                } elsif ($device->provides('firewall') || $device->provides('loadbalancer')) {
+
+                        my $nd = ariba::Ops::NetworkDeviceManager->newFromMachine($device);
+                        $portsSpeed = $nd->portSpeedTable() if $nd;
+                        $logger->error ("Provides 'firewall/loadbalancer':  $host (tier:  $tier)");
+                }
+
+                for my $cfgMgr (@cfgMgrs) {
+
+                        my %oids = $cfgMgr->oidsForMachine($device);
+                        my $name = $cfgMgr->name();
+                        my $freq = $cfgMgr->frequency();
+                        my $port = $cfgMgr->snmpPort();
+
+                        my $snmpQueriesName = $cfgMgr->name();
+
+                        $snmpQueriesName .= "-" . $datacenter if $datacenter;
+
+                        $logger->error ("SNMP queries:  name:  '$name'; frequency:  '$freq'; port:  '$port'; snmpQueriesName:  '$snmpQueriesName'");
+                        $cfgMgr->setQueryManagerName($snmpQueriesName);
+
+                        my $oneYearSamples = $year/$freq;
+
+                        for my $oid (sort(keys(%oids))) {
+
+                                my $type = ariba::SNMP::Session->oidType($oids{$oid});
+
+                                # rename interface names
+                                my ($prettyOid, $instanceName,$queryName) = fixupOIDNames($oids{$oid}, $oid, $host);
+
+                                # skip HP software interface
+                                next if $prettyOid =~ /^software if/;
+
+                                # skip filesystems we don't care about.
+                                if ($oid =~ /(Percent|Pct) Disk/io) {
+
+                                        # skip the .101 series - "Real Mem" and the like.
+                                        next if ($oid !~ /:/ && $oid !~ /aggr\d/);
+
+                                        #
+                                        next if $oid =~ /^:(proc|etc|var:run|var:lib)$/;
+                                }
+
+                                # clean these up a bit further
+                                $instanceName =~ s/\s/_/go;
+                                $instanceName =~ s#[^\w\d_:/\.-]#_#go;
+
+                                my $q = ariba::monitor::Query->new($instanceName);
+
+                                $q->setProductName($snmpDir);
+                                $q->setQueryName($queryName);
+                                $q->setUiHint($host);
+                                $q->setRecordMaxResults($oneYearSamples);
+                                $q->setRecordDataType($type);
+
+                                if ($device->provides('switch')) {
+
+                                        updateQueryDescriptionAndSpeedForSwitch ($q, $oid, $host, $machinesOnSwitches, $portsSpeed);
+
+                                } elsif ($device->provides('router')) {
+
+                                        updateQueryDescriptionAndSpeedForRouter ($q, $oid, $host,  $dataRouters, $portsSpeed);
+                                } elsif ($device->provides('firewall') || $device->provides('loadbalancer')) {
+                                        updateQueryWithSpeedInfo( $q, $oid, $host, $portsSpeed );
+                                }
+
+                                $descriptionForOid{$prettyOid} = $q->cdbDescription();
+
+                                my $units = ariba::monitor::CircularDB->defaultDataUnits();
+
+                                if ($oid =~ /(Percent|Pct)/io) {
+                                        $units = "percent";
+                                }
+
+                                # append to units correctly to calculate hpux cpu percent.
+                                if (defined $type && $type eq "counter") {
+                                        $units = "per sec";
+                                        if ($oid =~ /(Percent|Pct)/io) {
+                                                $units .= " percent";
+                                        }
+                                }
+
+                                $q->setRecordDataUnits($units);
+                                $q->setSnmp("$host, $oids{$oid}");
+                                $q->setSnmpArgs("$community, $version, $port");
+
+                                print " $prettyOid ($type)\n" if $debug && $type;
+
+                                push(@{$snmpQueries{$snmpQueriesName}}, $q);
+
+                                $allDeviceOids{$oid} = $oids{$oid} ;
+
+                                $logger->error ("Creating query object for '$host':  query '$queryName'; OID:  '$prettyOid'");
+                        }
+                }
+                $device->setDescriptionForOid(\%descriptionForOid);
+                generateDevicePage($device, \%allDeviceOids) if $generateDevicePage;
+        }
+
+        my $runTime = time() - $startTime;
+        for my $queriesName (keys(%snmpQueries)) {
+
+                my $queries     = ariba::monitor::QueryManager->new("$snmpDir/$queriesName");
+                my @allQueries = @{$snmpQueries{$queriesName}};
+
+                unless ($queries->lock()) {
+                        print "Warning: couldn't grab lock for $snmpDir/$queriesName\n" if $debug;
+                        next;
+                }
+
+                # if only processing one device in the datacenter, just replace it's
+                # query entries in the QM file, don't blow away the other machine's
+                # queries or run-queries will stop polling them
+                unless ($rebuildQueryManager) {
+                        my $host = (@$devicesRef)[0]->hostname();
+                        for my $existingQuery ($queries->queries()) {
+                                next if ($existingQuery->uiHint() eq $host);
+                                push(@allQueries, $existingQuery);
+                        }
+                }
+
+                $queries->setQueries(@allQueries);
+                $queries->setName($queriesName);
+
+                $queries->recursiveSave();
+                $queries->unlock();
+
+                print "Saved $queriesName with ", scalar(@allQueries), " snmp queries\n" if $debug;
+
+                $logger->error ("SNMP queries '$queriesName' has " . scalar (@allQueries) . " snmp queries in '$snmpDir/$queriesName'");
+
+                $monQueriesRef->{"$queriesName run time for rebuild"} = {
+                        info => 1,
+                        uiHint => $queriesName,
+                        perl => sub { return $runTime; },  # Can't split, so same time for all QMs.
+                        format => 'scaleTime(answer)',
+                        recordMaxResults => 110000,
+                        recordDataType => 'gauge',
+                };
+        }
+
+        return (@cfgMgrs);
+}
+
+sub findHostForSwitchPort {
+        my $switchName = lc(shift);
+        my $switchPort = shift;
+        my $machinesOnSwitches = shift;
+        my $logger = Log::Log4perl->get_logger ();
+
+        if ($machinesOnSwitches && exists $$machinesOnSwitches{$switchPort}) {
+
+                my $machineHostname = $$machinesOnSwitches{$switchPort};
+                print "Found : [$switchPort] -> [$machineHostname] \n" if ($debug);
+                $logger->error ("Found:  [$switchPort] -> [$machineHostname] <- returns hostname");
+                return $machineHostname;
+
+        }
+
+        my %searchHash = (
+                'networkSwitch' => $switchName,
+                'networkSwitchPort' => $switchPort
+        );
+
+        my ($machine) = ariba::Ops::Machine->machinesWithProperties(%searchHash);
+
+        unless ($machine)  {
+
+                %searchHash = (
+                        'networkSwitchSecondary' => $switchName,
+                        'networkSwitchPortSecondary' => $switchPort
+                );
+
+                ($machine) = ariba::Ops::Machine->machinesWithProperties(%searchHash);
+
+        }
+
+        if ($machine) {
+                print "Found : [",$machine->hostname(),"]\n" if ($debug);
+                $logger->error ("Found:  " . $machine->hostname() . "<- returns hostname");
+                return $machine->hostname();
+        };
+
+        return undef;
+}
+
+sub updateQueryWithSpeedInfo {
+        my $query = shift;
+        my $oid = shift;
+        my $host = shift;
+        my $portsSpeed = shift;
+
+        my $index = $query->queryName();
+        if($index =~ m|/([^\s]+)\s|) {
+                $index = $1;
+        }
+
+        if($portsSpeed->{$index}) {
+                $query->setPortSpeed( $portsSpeed->{$index} );
+        }
+}
+
+sub updateQueryDescriptionAndSpeedForSwitch {
+
+        my $query = shift;
+        my $oid = shift;
+        my $host = shift;
+        my $machinesOnSwitches = shift;
+        my $portsSpeed = shift;
+
+        if ($oid =~ /^if/i ){
+                my $port = $oid;
+                $port =~ m/^(\S+)(\s*)(\S+)/;
+                $port = $3;
+                $port =~  s#:#\/#g;
+
+                my $hostOnPort = findHostForSwitchPort ($host, $port, $machinesOnSwitches);
+
+                if ($hostOnPort) {
+
+                        $query->setCdbDescription(' connected to ' . $hostOnPort );
+                } else {
+                        $query->setCdbDescription('');
+                }
+
+                $query->setPortSpeed($portsSpeed->{$port}->{'ifHighSpeed'}) if( $portsSpeed and $portsSpeed->{$port} );
+
+        }
+}
+
+sub updateQueryDescriptionAndSpeedForRouter {
+
+        my ($query, $oid, $host, $dataRouters, $portsSpeed) = @_;
+
+        my $ifDescr = $oid;
+        $ifDescr =~ m/^(\S+)(\s*)(\S+)/;
+        $ifDescr = $3;
+        $ifDescr =~  s#:#\/#g;
+
+        print "  Router $host ($ifDescr)\n" if $debug;
+
+        for my $key (keys(%$dataRouters)) {
+                if (($dataRouters->{$key}->{'name'} eq $host)
+                        && ( $ifDescr eq $dataRouters->{$key}->{'ifDescr'}) ) {
+
+                        my $ifAlias = $dataRouters->{$key}->{'ifAlias'};
+                        my $ipAddr = $dataRouters->{$key}->{'ipAddress'};
+
+                        my $description = '';
+
+                        $description .= " $ifAlias" if ($ifAlias);
+                        $description .= " [$ipAddr]" if ($ipAddr);
+
+                        $query->setCdbDescription( $description );
+                        $query->setPortSpeed( $portsSpeed->{$key} );
+
+                        last;
+                }
+        }
+}
+
+
+sub fixupOIDNames {
+        my ($oidValue, $oid, $host) = @_;
+        my $logger = Log::Log4perl->get_logger ();
+
+        my ($instanceName, $queryName, $prettyOid);
+
+        $oid =~ s/\\ Label:.+ Serial Number .+$//;  # Remove label & serial number from Windows disk description as they are too long for cdb
+
+        $prettyOid = $oid;
+
+        # rename interface names
+        if ($oidValue =~ /^if/i || $oidValue =~ /\s+lan\d+\s+/i) {
+
+                $prettyOid      =~ s/^(\S+)(\s*)(\S+)/$3$2$1/;
+                $instanceName = "$snmpDir/$host/$prettyOid";
+                $queryName      = "$host/$prettyOid";
+
+        } else {
+
+                $instanceName = "$snmpDir/$host/$oid";
+                $queryName      = "$host/$oid";
+        }
+
+        $logger->error ("pretty oid:  $prettyOid; instance:  $instanceName; query name:  $queryName");
+        return ($prettyOid, $instanceName, $queryName);
+}
+
+sub installCronJobs
+{
+        my $datacenter = shift;
+        my @cfgMgrs = @_;
+        my $logger = Log::Log4perl->get_logger ();
+
+        my $crontab = ariba::util::Crontab->new();
+
+        print "Installing cronjobs...\n" if $debug;
+
+        my $binDir = $FindBin::Bin;
+        my $sampleScript = "$binDir/run-queries";
+        my $day = 3;
+
+        for my $cfgMgr (@cfgMgrs) {
+                my $queriesName = $cfgMgr->queryManagerName();
+                my $freq = $cfgMgr->frequency();
+                #
+                # remove old cron jobs
+                #
+                my $newCronjobNamePrefix = "snmp run for $datacenter";
+                foreach my $job ($crontab->jobNames()) {
+                        if ($job =~ /$newCronjobNamePrefix $queriesName/) {
+                                $crontab->removeJobWithName($job);
+                        }
+                }
+                $logger->error ("Removed old cronjobs");
+
+                #
+                # sampling and graphing cronjobs
+                #
+                $crontab->addEntryToCron(
+                        "$newCronjobNamePrefix $queriesName sample and daily graphs",
+                        "$sampleScript -e -p -r \"$queriesName\"",
+                        "$newCronjobNamePrefix $queriesName sample and daily graph",
+                        "*/$freq * * * *");
+
+                $crontab->addEntryToCron(
+                        "$newCronjobNamePrefix $queriesName daily graphs",
+                        "$sampleScript -e -p -g daily \"$queriesName\"",
+                        "$newCronjobNamePrefix $queriesName daily graphs",
+                        "*/60 9,20 * * *");
+
+                $crontab->addEntryToCron(
+                        "$newCronjobNamePrefix $queriesName weekly graphs",
+                        "$sampleScript -e -p -g weekly \"$queriesName\"",
+                        "$newCronjobNamePrefix $queriesName weekly graphs",
+                        "*/60 0 * * 6");
+
+                $crontab->addEntryToCron(
+                        "$newCronjobNamePrefix $queriesName monthly graphs",
+                        "$sampleScript -e -p -g monthly \"$queriesName\"",
+                        "$newCronjobNamePrefix $queriesName monthly graphs",
+                        "*/60 2 * * 0");
+
+                $crontab->addEntryToCron(
+                        "$newCronjobNamePrefix $queriesName quarterly graphs",
+                        "$sampleScript -e -p -g quarterly \"$queriesName\"",
+                        "$newCronjobNamePrefix $queriesName quarterly graphs",
+                        "*/60 3 1,15 * *");
+
+                $crontab->addEntryToCron(
+                        "$newCronjobNamePrefix $queriesName yearly graphs",
+                        "$sampleScript -e -p -g yearly \"$queriesName\"",
+                        "$newCronjobNamePrefix $queriesName yearly graphs",
+                        "0 5 $day * *");
+                $day++;
+
+                $logger->error ("Finished adding '$queriesName' jobs for '$freq' mins, daily, weekly, monthly, quarterly and yearly graphs");
+                print "  $queriesName with every $freq mins\n" if $debug;
+        }
+        $crontab->commit();
+}
+
+sub generateMainPage
+{
+        my $datacenter = shift;
+        my $devicesRef = shift;
+        my $logger = Log::Log4perl->get_logger ();
+
+        my $docRoot = ariba::monitor::misc::autoGeneratedDocsDir();
+        my $indexFile = "$docRoot/$snmpDir/$datacenter-index.html";
+        my $formAction = "/cgi-bin/show-page";
+
+        print "Generating main page $indexFile...\n" if $debug;
+        $logger->error ("Generating main page index file '$indexFile'");
+
+        mkpath($snmpMonitorDir);
+
+        open(IND, "> $indexFile") || die("Could not open $indexFile, $!\n");
+
+        my $cgi = CGI->new();
+
+        print IND $cgi->start_html(
+                        -title   => 'Ariba Network Device Summary',
+                        -bgcolor => '#ffffff',
+                        );
+
+        print IND $cgi->h2("Ariba Network Device Utilization");
+        print IND $cgi->h3("$datacenter Datacenter");
+
+        my $sortedBuckets;
+        for my $device(@$devicesRef) {
+                my $host = $device->hostname();
+                my $tier = $device->tier();
+                my $type = $device->deviceType();
+
+                push(@{$sortedBuckets->{$tier}->{$type}}, $host);
+        }
+
+        print IND "\n<p><b>";
+        print IND "<a href=\"$powerGraphUrl\">Use PowerGraph</a></b><p>\n";
+
+        print IND $cgi->start_table({-border => 0,
+                                 -cellpadding => 2,
+                                 -cellspacing => 10,
+                                 });
+
+        for my $tier (sort(keys(%$sortedBuckets))) {
+
+                print IND "<tr>";
+                print IND "\n";
+
+                # indent n3x1 and n3x2 a level
+                if ($tier =~ /n\d+x\d+/) {
+                        print IND "<td>&nbsp;</td>\n";
+                }
+
+                for my $type ( ariba::Ops::Machine->allDeviceTypes() ) {
+
+                        unless ($sortedBuckets->{$tier}->{$type}) {
+                                print IND "<td>". "&nbsp;" . "</td>\n";
+                                print IND "<td>" . "&nbsp;" . "</td>\n";
+                                next;
+                        }
+
+                        my @allDevices = sort(@{$sortedBuckets->{$tier}->{$type}});
+
+                        my $form = "form$tier$type";
+                        my $name = $type eq "net" ? "devices" : "hosts";
+                        my $allMachinesOfType = join(',', @allDevices);
+
+                        # add a comma at the end. in case of one machine the
+                        # labels in the ui get hosed otherwise
+                        unshift(@allDevices, "$allMachinesOfType,");
+                        unshift(@allDevices, "Select from list of $name");
+
+                        print IND $cgi->start_form(
+                                        -name => $form,
+                                        -method => 'GET',
+                                        -action => $formAction,
+                                                -onLoad => "document.forms['$form'].reset();",
+                                        );
+                        print IND $cgi->hidden(
+                                        -name => 'tier',
+                                        -default => $tier,
+                                        );
+                        print IND "\n";
+                        print IND "<td align='right'>";
+                        print IND "<a name=\"$tier\">$name on $tier</a>\n";
+                        print IND "</td>\n";
+                        print IND "<td align='left'>";
+                        print IND $cgi->popup_menu(
+                                        -name    => 'sysnameOrDeviceType',
+                                        -values   => [ @allDevices ],
+                                        -labels   => { "$allMachinesOfType," =>
+                                                                "all of $tier $name"},
+                                        -onChange => "document.forms['$form'].submit();",
+                                        );
+                        print IND "</td>\n";
+                        print IND $cgi->end_form();
+                        print IND "\n";
+                }
+
+        }
+        print IND $cgi->end_table();
+
+        print IND "\n<p>\n";
+        my $time = localtime(time);
+        print IND $cgi->i("Page created on $time\n");
+
+        print IND $cgi->end_html();
+        print IND "\n";
+        close(IND);
+        $logger->error ("Finished generating main page index file '$indexFile'");
+}
+
+sub generateDevicePage
+{
+        my $device  = shift;
+        my $oidsRef = shift;
+        my $logger = Log::Log4perl->get_logger ();
+
+        return unless keys %$oidsRef;
+
+        print " writing html wrapper...\n" if $debug;
+
+        my $cgi         = CGI->new();
+        my $tier           = $device->tier();
+        my $host           = $device->hostname();
+        my $deviceType = $device->deviceType();
+        my $name           = $deviceType eq "net" ? "devices" : "hosts";
+        my      $descriptionForOidRef = $device->descriptionForOid() || ();
+
+        my $hostHtmlFile = ariba::monitor::misc::htmlWrapperForPregeneratedGraphsForHost($host);
+
+        $logger->error ("Generating device page 'host html' file '$hostHtmlFile'");
+        mkpath(dirname($hostHtmlFile));
+
+        open(HOST, ">$hostHtmlFile") || die("Could not open $hostHtmlFile, $!\n");
+
+        print HOST $cgi->start_html(
+        -title   => "Ariba Network $host $tier",
+        -bgcolor => '#ffffff',
+        );
+
+        print HOST $cgi->h2("Ariba Network $host $tier");
+
+        print HOST "\n<p><b>";
+        print HOST "<a href=\"$powerGraphUrl\">Use PowerGraph</a></b><p>\n";
+
+        my %cacheOfOidsToFixedUpOids;
+        my @oidNames = sort {
+
+                        my $A = $cacheOfOidsToFixedUpOids{$a} || (fixupOIDNames($oidsRef->{$a}, $a, $host))[0];
+                        my $B = $cacheOfOidsToFixedUpOids{$b} || (fixupOIDNames($oidsRef->{$b}, $b, $host))[0];
+
+                        $cacheOfOidsToFixedUpOids{$a} = $A;
+                        $cacheOfOidsToFixedUpOids{$b} = $B;
+
+                        if ($A =~ /^Percent/ && $B =~ /^Percent/ ) {
+                                return $A cmp $B;
+                        }
+                        if ($A =~ /^Percent/ ) {
+                                return -1;
+                        }
+                        if ($B =~ /^Percent/ ) {
+                                return 1;
+                        }
+                        return $A cmp $B;
+                } keys(%$oidsRef);
+
+        for my $oidName ( @oidNames ) {
+
+                $oidName                = $cacheOfOidsToFixedUpOids{$oidName};
+
+                my $oidHtmlFile = ariba::monitor::misc::htmlWrapperForPregeneratedGraphsForHost($host,$oidName);
+
+                open(OID, ">$oidHtmlFile") || die("Could not open $oidHtmlFile, $!\n");
+
+                print OID $cgi->start_html(
+                        -title   => "Ariba Network $host $tier",
+                        -bgcolor => '#ffffff',
+                        );
+
+                print OID $cgi->h2("$oidName for $host" . $$descriptionForOidRef{$oidName});
+
+                print OID "\n<p><b><a href=\"$powerGraphUrl\">Use PowerGraph</a></b><p>\n";
+
+                for my $type (qw(daily weekly monthly quarterly yearly)) {
+
+                        my $imageFileName = URI::Escape::uri_escape(basename(
+                        ariba::monitor::misc::imageFileForQueryNameAndFrequency(
+                                $snmpDir,
+                                "$host/$oidName",
+                                $type
+                        )
+                        ));
+
+                        print OID "<p>\n<b>$type graph</b>\n<p>\n";
+
+                        print OID $cgi->img({ 'src' => $imageFileName });
+
+                        if ($type eq "daily") {
+
+                        my $oidHtmlHref = URI::Escape::uri_escape(basename($oidHtmlFile));
+
+                        print HOST "\n<p>\n";
+                        print HOST $cgi->a({ 'href' => $oidHtmlHref}, "$oidName for $host" . $$descriptionForOidRef{$oidName});
+                        print HOST "\n<p>\n";
+                        print HOST $cgi->a({ 'href' => $oidHtmlHref}, $cgi->img({ 'src' => $imageFileName}));
+
+                        }
+                }
+
+                print OID $cgi->end_html();
+                print OID "\n";
+                close(OID);
+        }
+
+        my $time = localtime(time);
+        print HOST "\n<p>\n";
+        print HOST $cgi->i("Page created on $time\n");
+        print HOST $cgi->end_html();
+        print HOST "\n";
+        close(HOST);
+        $logger->error ("Finished generating device page 'host html' file '$hostHtmlFile'");
+}
+
+sub usage
+{
+        print "Error: $_[0]\n" if $_[0];
+        print "usage: $0 [-h|-d] [-host <host>] [-t <tier>] [-l <datacenter>] <cfgfile>...\n";
+        print "           -h: this help\n";
+        print "           -d: turn on debugging\n";
+        print "           -host <host>: generate mrtg config for a given host\n";
+        print "           -l <datacenter>: datacenter (snv, bou, fgc, devlab)\n";
+        print "           -c install cron jobs\n";
+        print "           -i rebuild datacenter index html page\n";
+
+        exit(1);
+}
+
+# Assume that the script network-switch-port has set the name correctly.
+sub matchSwitchesToHosts {
+
+        my $switch = shift;
+        my $accessPassword = shift;
+        my %listPortToHost = {};
+        my $logger = Log::Log4perl->get_logger ();
+
+
+        my $switchName    = $switch->hostname();
+        print "Switch : [$switchName]\n" if ($debug);
+
+        my $snmp          = ariba::SNMP::Session->newFromMachine($switch);
+        $snmp->setTimeout(30);
+
+        my @oids   = qw(ifDescr ifAlias);
+        $logger->error ("Switch:  $switchName bulk walking '@oids'\n");
+        # Set alarm here, to break hung processing.
+        ariba::Ops::Utils::timeoutOn (20); # 20 because I really have no idea how long to set it.
+        my $walked = $snmp->bulkWalkOids(@oids);
+        ariba::Ops::Utils::timeoutOff ();
+        $logger->error ("Switch:  $switchName finished walking '@oids'\n");
+
+        while (my ($iid, $vars) = each %$walked) {
+                # If an Alias is not found, this mean that no description has been set
+                # for the interface and move to next interface.
+
+                my $ifAlias = $vars->{'ifAlias'} || next;
+                my $ifDescr = $vars->{'ifDescr'};
+
+                $listPortToHost{$ifDescr} = $ifAlias;
+        }
+
+        my $networkDevice = ariba::Ops::NetworkDeviceManager->newFromMachine($switch);
+        my $portsSpeed;
+        if ( $networkDevice ) {
+                $networkDevice->setAccessPassword($accessPassword);
+                $portsSpeed = $networkDevice->portsSpeedTable();
+        }
+
+        return \%listPortToHost, $portsSpeed;
+}
+
+
+sub retrieveRoutersInfo {
+
+        my $router = shift;
+        my $accessPassword = shift;
+        my $logger = Log::Log4perl->get_logger ();
+
+        my %result = ();
+        my %queries  = ();
+        my %portsSpeed = {};
+
+        my $routerName    = $router->hostname();
+
+        my $networkDevice = ariba::Ops::NetworkDeviceManager->newFromMachine($router);
+        my $snmp          = ariba::SNMP::Session->newFromMachine($router);
+        $snmp->setTimeout(30);
+        my $hostname;
+
+        $networkDevice->setAccessPassword($accessPassword) if $networkDevice;
+
+        my @errors        = ();
+        my @oids   = qw(ifAlias ifDescr ipAdEntIfIndex ifHighSpeed);
+        $logger->error ("Router:  $routerName bulk walking '@oids'\n");
+        ariba::Ops::Utils::timeoutOn (40); # 40 to match, plus, the SNMP timeout set above.
+        my $walked = $snmp->bulkWalkOids(@oids);
+        ariba::Ops::Utils::timeoutOff ();
+        $logger->error ("Router:  $routerName finished walking '@oids'\n");
+
+        while (my ($iid, $vars) = each %$walked) {
+
+                my $index = $vars->{'ipAdEntIfIndex'} || next;
+
+                if ( $walked->{$index}->{'ipAddress'}) {
+
+                        $walked->{$index}->{'ipAddress'} .= ", $iid";
+
+                } else {
+                        $walked->{$index}->{'ipAddress'} = $iid;
+                }
+
+                $walked->{$index}->{'name'} = $routerName;
+
+                $result{$index} = $walked->{$index};
+                $portsSpeed{$index} = $walked->{$index}->{'ifHighSpeed'};
+
+        }
+
+        return \%result, \%portsSpeed;
+}
+
+sub main
+{
+        # We need to be able to restart processing at some arbitrary point, determined at run time by the parent process.
+        # The $restart variable will contain the name of the device on which failure happened, as returned by the child.
+        # This is implemented in two stages, first setting up the restart option and logging, followed by parent/child
+        # forking and writing the current host name to a pipe to the parent.  In the first step, will write to logger
+        # only, in the second to both logger and pipe.
+        my ($datacenter, $tier, $hostname, @cfgFiles, $rebuildIndex, $addCronJobs, $restart);
+        my $sendEmail = 0;
+        my $sendPage = 0;
+        my $runMonQueries = 0;
+
+        $rebuildIndex = 0;
+        $addCronJobs = 0;
+
+        while (my $arg = shift(@ARGV)) {
+                if ($arg =~ /^-host$/)    {$hostname = shift(@ARGV); next;}
+                if ($arg =~ /^-h$/)       {usage();}
+                if ($arg =~ /^-d$/)       {$debug++; next;}
+                if ($arg =~ /^-l$/)       {$datacenter = shift(@ARGV); next;}
+                if ($arg =~ /^-i$/)       {$rebuildIndex = 1;}
+                if ($arg =~ /^-c$/)       {$addCronJobs = 1;}
+                if ($arg =~ /^-e$/)       {$sendEmail = 1; next;}
+                if ($arg =~ /^-p$/)       {$sendPage = 1; next;}
+                if ($arg =~ /^-r$/)       {$runMonQueries = 1; next;}
+                if ($arg =~ /^-restart$/) {$restart = shift (@ARGV);}
+                if ($arg !~ /^-/)        {push(@cfgFiles, $arg); next;}
+        }
+
+        unless (@cfgFiles) {
+                usage("Need to specify a configuration file.");
+        }
+
+        $datacenter ||= defaultDatacenter();
+        my $lockFile = "/tmp/" . basename($0) . ".$datacenter";
+        die "can't grab lock\n" unless dmail::LockLib::requestlock($lockFile, 5);
+
+        # We need the runtime bin directory to find and read the Log::Log4perl configuration file.  This will work to find the
+        # *deployed* config file in <mon home>/etc, for both testing and deployed code.
+        my $logConfigFile = "$FindBin::Bin/../../etc/rebuild-queries-log.conf";
+
+        # set up logging here.  First, define what the logfile name should be:
+        # <timestamp>_<datacenter>.log  -- the timestamp is the year-mon-day_hour:minutes
+        my ($minutes, $hour, $day, $month, $year) = (localtime)[1,2,3,4,5];
+        $logfileDir  = '/var/tmp/rebuild-queries';
+        $logfileName = sprintf ("%4d-%02d-%02d_%02d:%02d_%s.log", $year + 1900, $month + 1, $day, $hour, $minutes, $datacenter);
+
+        # initialize with our parameters and get a logger object:
+        Log::Log4perl->init($logConfigFile);
+        my $logger = Log::Log4perl->get_logger ();
+
+        my %monQueries;
+        $logger->error ("Calling allDevicesInDatacenter()");
+        my @allDevices = allDevicesInDatacenter($datacenter, $hostname, $restart);
+        $logger->error ("Call allDevicesInDatacenter() completed");
+
+        my $shouldRebuildQueryManager = !defined($hostname);
+        $logger->error ("Calling createSnmpQueries()");
+        my @cfgMgrs = createSnmpQueries(\@cfgFiles, \@allDevices, $datacenter, $rebuildIndex, $shouldRebuildQueryManager, \%monQueries);
+        $logger->error ("Call createSnmpQueries() completed");
+
+        $logger->error ("Calling installCronJobs()");
+        installCronJobs($datacenter, @cfgMgrs) if ($addCronJobs);
+        $logger->error ("Call installCronJobs() completed");
+        $logger->error ("Calling generateMainPage()");
+        generateMainPage($datacenter, \@allDevices) if ($rebuildIndex && defined($datacenter));
+        $logger->error ("Call generateMainPage() completed");
+
+        if ($runMonQueries) {
+                $logger->error ("Running monitoring queries");
+                my $me = ariba::rc::InstalledProduct->new();
+                my $email = $me->default('notify.email');
+                my $qm = ariba::monitor::QueryManager->newWithDetails("snmp", $me->name(), $me->service(), undef, \%monQueries);
+                $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+                $logger->error ("Finished running monitoring queries");
+        }
+        dmail::LockLib::releaselock($lockFile);
+}
+
+main();
+
+
+__END__
+
+Ran:  rebuild-queries -d -l snv /home/monprod/Cookies-793/etc/system.cfg
+Appears to hang on:  Switch : [c2960-n3x2-sv5-102.snv.ariba.com]

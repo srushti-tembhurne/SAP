@@ -1,0 +1,584 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use DateTime;
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DBConnection;
+use ariba::Ops::HanaClient;
+use ariba::Ops::OracleClient;
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-h]
+
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub parseSchemas {
+    my $prod = shift;
+    my $path = shift;
+    my $userNames = shift;
+
+    my @users = split( /\,/, $userNames );
+    my $userSize    = scalar @users;
+    my $userIndex = 0;
+
+    my %schemas;
+
+    foreach my $keyPath ( $prod->defaultKeysForPrefix($path) ) {
+        foreach my $key ( getKeys( $prod, $keyPath ) ) {
+            my $keyEnd = ( split( /\./, $key ) )[-1];
+            if ( $keyEnd eq "AribaDBUsername" ) {
+                my $val = $prod->default("$key");
+                if ( index( $val, "HANA" ) != -1 ) {
+                    my @fields     = split( /\./, $key );
+                    my $index      = 0;
+                    my $arrSize    = scalar @fields;
+                    my $schemaName = "";
+                    while ( $index < $arrSize ) {
+                        my $curField = $fields[$index];
+                        if (   ( index( $curField, "Schema" ) != -1 )
+                            && ( index( $curField, "SchemaSet" ) == -1 ) )
+                        {
+                            $schemaName = $curField;
+                        }
+                        $index = $index + 1;
+                    }
+
+                    if ( length($schemaName) > 0 ) {
+                        if ( index( $key, "Dedicated" ) != -1 ) {
+                            $schemaName = "Star.Dedicated." . $schemaName;
+                        }
+                        elsif ( index( $key, "Shared" ) != -1 ) {
+                            $schemaName = "Star.Shared." . $schemaName;
+                        }
+                        $schemas{$schemaName} = $val;
+                    }
+                }
+            }
+        }
+    }
+
+    my ($dbc) =
+      ariba::Ops::DBConnection->connectionsForProductOfDBType( $prod,
+        ariba::Ops::DBConnection->typeMain() );
+    my $dbh = ariba::Ops::OracleClient->newFromDBConnection($dbc);
+    if ( !$dbh->connect() ) {
+        print "Could not connect to database: " . $dbh->error() . "\n";
+        exit(1);
+    }
+    my $hanaSchemas = "";
+
+    while ( my ( $key2, $value2 ) = each(%schemas) ) {
+        if ( length($hanaSchemas) > 0 ) {
+            $hanaSchemas .= ",";
+        }
+        $hanaSchemas .= "'";
+        $hanaSchemas .= $key2;
+        $hanaSchemas .= "'";
+    }
+
+    my @results;
+    my $realmQuery =
+"SELECT DISTINCT databaseschema FROM schematypemaptab WHERE isprimary=1 AND databaseschema in ("
+      . $hanaSchemas
+      . ") ORDER BY databaseschema";
+    if ( $dbh->connect() ) {
+        $dbh->executeSqlWithTimeout( $realmQuery, 120, \@results );
+    }
+    $dbh->disconnect();
+
+    my @schema_names;
+    foreach my $result (@results) {
+        push @schema_names, $schemas{$result};
+    }
+
+    my %schemaNameHash;
+    @schemaNameHash{@schema_names} = ();
+
+    my @dedicatedConn =
+      ariba::Ops::DBConnection->connectionsForProductOfDBType( $prod,
+        ariba::Ops::DBConnection->typeMainStarDedicated() );
+    my @sharedConn =
+      ariba::Ops::DBConnection->connectionsForProductOfDBType( $prod,
+        ariba::Ops::DBConnection->typeMainStarShared() );
+
+    foreach my $conn (@dedicatedConn) {
+        my $sid = $conn->sid();
+        if ( index( $sid, "hana" ) != -1 ) {
+            my $schemaId            = $conn->schemaId();
+            my $dedicatedSchemaName = "Star.Dedicated.Schema" . $schemaId;
+            if ( exists $schemas{$dedicatedSchemaName} ) {
+                my $physicalSchemaName = $schemas{$dedicatedSchemaName};
+                if ( exists $schemaNameHash{$physicalSchemaName} ) {
+                    my $hc = ariba::Ops::HanaClient->newFromDBConnection($conn);
+                    if ( !$hc->connect() ) {
+                        print(  "Connection to "
+                              . $conn->user() . "\@"
+                              . $conn->sid()
+                              . " failed: ["
+                              . $hc->error()
+                              . "]." );
+                        exit(0);
+                    }
+
+                    my $sql =
+                        "GRANT SELECT ON SCHEMA "
+                      . $physicalSchemaName
+                      . " TO SYSTEM WITH GRANT OPTION";
+                    if (  !$hc->executeSqlWithTimeout( $sql, 60 * 60 )
+                        || $hc->error() )
+                    {
+                        print "You got an error: " . $hc->error() . "\n";
+                        exit(0);
+                    }
+
+                    $sql =
+                        "GRANT SELECT ON SCHEMA "
+                      . $physicalSchemaName
+                      . " TO _SYS_REPO WITH GRANT OPTION";
+                    if (  !$hc->executeSqlWithTimeout( $sql, 60 * 60 )
+                        || $hc->error() )
+                    {
+                        print "You got an error: " . $hc->error() . "\n";
+                        exit(0);
+                    }
+
+                    $userIndex = 0;
+                    while ($userIndex < $userSize) {
+                        my $curUser = $users[$userIndex];
+                        $sql =
+                            "GRANT SELECT ON SCHEMA "
+                          . $physicalSchemaName
+                          . " TO " . $curUser;
+                        if (  !$hc->executeSqlWithTimeout( $sql, 60 * 60 )
+                            || $hc->error() )
+                        {
+                            print "You got an error: " . $hc->error() . "\n";
+                            exit(0);
+                        }
+                        $userIndex = $userIndex + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    foreach my $conn (@sharedConn) {
+        my $sid = $conn->sid();
+        if ( index( $sid, "hana" ) != -1 ) {
+            my $schemaId         = $conn->schemaId();
+            my $sharedSchemaName = "Star.Shared.Schema" . $schemaId;
+            if ( exists $schemas{$sharedSchemaName} ) {
+                my $physicalSchemaName = $schemas{$sharedSchemaName};
+                if ( exists $schemaNameHash{$physicalSchemaName} ) {
+                    my $hc = ariba::Ops::HanaClient->newFromDBConnection($conn);
+                    if ( !$hc->connect() ) {
+                        print(  "Connection to "
+                              . $conn->user() . "\@"
+                              . $conn->sid()
+                              . " failed: ["
+                              . $hc->error()
+                              . "]." );
+                        exit(0);
+                    }
+
+                    my $sql =
+                        "GRANT SELECT ON SCHEMA "
+                      . $physicalSchemaName
+                      . " TO SYSTEM WITH GRANT OPTION";
+                    if (  !$hc->executeSqlWithTimeout( $sql, 60 * 60 )
+                        || $hc->error() )
+                    {
+                        print "You got an error: " . $hc->error() . "\n";
+                        exit(0);
+                    }
+
+                    $sql =
+                        "GRANT SELECT ON SCHEMA "
+                      . $physicalSchemaName
+                      . " TO _SYS_REPO WITH GRANT OPTION";
+                    if (  !$hc->executeSqlWithTimeout( $sql, 60 * 60 )
+                        || $hc->error() )
+                    {
+                        print "You got an error: " . $hc->error() . "\n";
+                        exit(0);
+                    }
+                    $userIndex = 0;
+                    while ($userIndex < $userSize) {
+                        my $curUser = $users[$userIndex];
+                        $sql =
+                            "GRANT CREATE ANY, EXECUTE, INDEX, SELECT ON SCHEMA "
+                          . $physicalSchemaName
+                          . " TO " . $curUser;
+                        if (  !$hc->executeSqlWithTimeout( $sql, 60 * 60 )
+                            || $hc->error() )
+                        {
+                            print "You got an error: " . $hc->error() . "\n";
+                            exit(0);
+                        }
+                        $userIndex = $userIndex + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    return @schema_names;
+}
+
+sub getKeys {
+    my $product   = shift;
+    my $keyPrefix = shift;
+    my @results;
+
+    my @keys = $product->{'parameters'}->listKeys();
+    foreach my $key (@keys) {
+        if ( $key =~ m/$keyPrefix\./ ) {
+            push( @results, $key );
+        }
+    }
+
+    return @results;
+}
+
+sub main {
+    my ( $arg, $userNames, $outputDir );
+    while ( $arg = shift(@ARGV) ) {
+        if ( $arg =~ /^-outputDir/ ) { $outputDir   = shift(@ARGV); }
+        if ( $arg =~ /^-users/ )    { $userNames    = shift(@ARGV); }
+    }
+
+    my $me = ariba::rc::InstalledProduct->new('mon');
+    my @products =
+      ariba::rc::InstalledProduct->installedProductsList( $me->service() );
+
+    my $dbuser = $me->default("dbainfo.hana.system.username");
+    my $dbpass = $me->default("dbainfo.hana.system.password");
+
+    foreach my $product2 (@products) {
+        my $productname = $product2->name();
+        if ( $productname eq "s4" ) {
+            my @connections =
+              ariba::Ops::DBConnection->connectionsFromProducts($product2);
+            my @connectionsByHostAndSid =
+              ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(
+                @connections);
+
+            for my $dbc (@connectionsByHostAndSid) {
+                next
+                  unless ( $dbc->dbServerType() eq
+                    ariba::Ops::DBConnection->hanaDBServerType() );
+
+                my $product     = $dbc->product();
+                my $productName = $product->name();
+                my $service     = $product->service();
+                my $instance    = uc( $dbc->sid() );
+
+                my $host = $dbc->host();
+                print "Host is " . $host . "\n";
+                print
+    "Generating calculationviews.   This can take several minutes..."
+                . "\n";
+                my $dbsid                  = $dbc->sid();
+                my $type                   = $dbc->type();
+                my $port                   = $dbc->port();
+                my $hanaHosts              = $dbc->hanaHosts();
+                my $hanaFailoverHosts      = $dbc->hanaFailoverHosts();
+                my @dedicated_schema_names = parseSchemas( $product,
+                    "System.DatabaseSchemas.Star.Dedicated.Schema", $userNames );
+                my @shared_schema_names = parseSchemas( $product,
+                    "System.DatabaseSchemas.Star.Shared.Schema", $userNames );
+                my @schema_names;
+                push( @schema_names, @dedicated_schema_names );
+                push( @schema_names, @shared_schema_names );
+
+                my $hanaClient =
+                  ariba::Ops::HanaClient->new( $dbuser, $dbpass, $dbsid, $port,
+                    $hanaHosts, $hanaFailoverHosts );
+                unless ( $hanaClient->connect( 60, 2 ) ) {
+                    print
+"Hana connection issue while connecting $dbuser to $dbsid on $port for $hanaHosts and $hanaFailoverHosts \n";
+                }
+
+                my $numSchemas = scalar @schema_names;
+                my $numTables  = 0;
+                my $tablesSql;
+                my @table_names;
+                my $referenceSchema = "";
+                my $schemaNum       = 0;
+                my %tableToColumnArray;
+                while ( ( $numTables eq 0 ) && ( $schemaNum < $numSchemas ) ) {
+                    $referenceSchema = $schema_names[$schemaNum];
+                    $tablesSql =
+"SELECT DISTINCT TABLE_NAME FROM M_CS_TABLES WHERE SCHEMA_NAME = '"
+                      . $referenceSchema . "' "
+                      . "AND TABLE_NAME LIKE 'FACT_%' or TABLE_NAME LIKE 'DIM_%' OR TABLE_NAME LIKE 'JOIN_%' or TABLE_NAME LIKE 'VECT_%'";
+                    @table_names = $hanaClient->executeSql($tablesSql);
+                    $numTables   = scalar @table_names;
+                    $schemaNum++;
+                }
+
+                if ( $numTables > 0 ) {
+                    my $columnSql =
+"SELECT COLUMN_NAME, TABLE_NAME FROM M_CS_COLUMNS WHERE SCHEMA_NAME = '"
+                      . $referenceSchema
+                      . "' AND TABLE_NAME IN (";
+                    my $tableNum = 0;
+                    my @column_to_table_names;
+                    my $row;
+                    while ( $tableNum < $numTables ) {
+                        my $tableName = $table_names[$tableNum];
+                        $columnSql .= "'" . $tableName . "'";
+                        if ( ( $tableNum + 1 ) eq $numTables ) {
+                            $columnSql .= "";
+                        }
+                        else {
+                            $columnSql .= ",";
+                        }
+                        $tableNum++;
+                    }
+                    $columnSql .= ") ";
+                    $columnSql .= "ORDER BY TABLE_NAME";
+                    @column_to_table_names =
+                      $hanaClient->executeSql($columnSql);
+                    my $column_names = [];
+                    my $curTableName = "";
+                    foreach $row (@column_to_table_names) {
+                        my ( $columnName, $columnTableName ) = split /\t/, $row;
+                        if ( $curTableName eq $columnTableName ) {
+                            push( @$column_names, $columnName );
+                        }
+                        else {
+                            if ( length($curTableName) > 0 ) {
+                                $tableToColumnArray{$curTableName} =
+                                  $column_names;
+                            }
+                            $column_names = [];
+                            $curTableName = $columnTableName;
+                            push( @$column_names, $columnName );
+                        }
+                    }
+                    if ( scalar @$column_names > 0 ) {
+                        $tableToColumnArray{$curTableName} = $column_names;
+                    }
+
+#at this point, we have enough information for the generated calculated view files
+                    my $dt = DateTime->now;
+                    my $calculatedViewDir =
+                      "/tmp/calculated_views_" . $dt->ymd . $dt->hms;
+                    my $outputTable;
+                    mkdir $calculatedViewDir
+                      or die "Error creating directory: $calculatedViewDir";
+                    
+                    my @dirs     = split( /\//, $outputDir );
+                    my $index      = 0;
+                    my $dirSize    = scalar @dirs;
+                    while ( $index < $dirSize ) {
+                        my $curDir = $dirs[$index];
+                        $calculatedViewDir .= "/" . $curDir;
+                        mkdir $calculatedViewDir
+                          or die "Error creating directory: $calculatedViewDir";
+                        $index = $index + 1;
+                    }
+
+                    foreach $outputTable (@table_names) {
+                        my $file =
+                            $calculatedViewDir . "/"
+                          . $outputTable
+                          . "_CV.calculationview";
+                        unless ( open FILE, '>' . $file ) {
+
+                            # Die with error message
+                            # if we can't open it.
+                            die "\nUnable to create $file\n";
+                        }
+                        print FILE '<?xml version="1.0" encoding="UTF-8"?>'
+                          . "\n";
+                        print FILE
+'<Calculation:scenario xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:Calculation="http://www.sap.com/ndb/BiModelCalculation.ecore" schemaVersion="2.3" id="'
+                          . $outputTable . '_CV" '
+                          . 'applyPrivilegeType="ANALYTIC_PRIVILEGE" checkAnalyticPrivileges="true" defaultClient="$$client$$" defaultLanguage="$$language$$" hierarchiesSQLEnabled="false" translationRelevant="true" visibility="internal" calculationScenarioType="TREE_BASED" dataCategory="DIMENSION" enforceSqlExecution="false" executionSemantic="UNDEFINED" outputViewType="Aggregation">'
+                          . "\n";
+                        print FILE '  <origin/>' . "\n";
+                        print FILE '  <descriptions defaultDescription="'
+                          . $outputTable . "_CV" . '"/>' . "\n";
+                        print FILE
+'  <metadata activatedAt="2016-05-18 07:22:37.0" changedAt="2016-05-18 10:17:56.473"/>'
+                          . "\n";
+                        print FILE '  <localVariables/>' . "\n";
+                        print FILE '  <variableMappings/>' . "\n";
+                        print FILE '  <dataSources>' . "\n";
+                        $schemaNum = 0;
+
+                        foreach (@schema_names) {
+                            if ( $schemaNum == 0 ) {
+                                print FILE '    <DataSource id="'
+                                  . $outputTable
+                                  . '" type="DATA_BASE_TABLE">' . "\n";
+                                print FILE
+'      <viewAttributes allViewAttributes="true"/>'
+                                  . "\n";
+                                print FILE '      <columnObject schemaName="'
+                                  . "$_"
+                                  . '" columnObjectName="'
+                                  . $outputTable . '"/>' . "\n";
+                                print FILE '    </DataSource>' . "\n";
+                            }
+                            else {
+                                print FILE '    <DataSource id="'
+                                  . $outputTable . "_"
+                                  . $schemaNum
+                                  . '" type="DATA_BASE_TABLE">' . "\n";
+                                print FILE
+'      <viewAttributes allViewAttributes="true"/>'
+                                  . "\n";
+                                print FILE '      <columnObject schemaName="'
+                                  . "$_"
+                                  . '" columnObjectName="'
+                                  . $outputTable
+                                  . '" alias="'
+                                  . $outputTable . "_"
+                                  . $schemaNum . '"/>' . "\n";
+                                print FILE '    </DataSource>' . "\n";
+                            }
+                            $schemaNum = $schemaNum + 1;
+                        }
+                        print FILE '  </dataSources>' . "\n";
+                        print FILE '  <calculationViews>', "\n";
+                        print FILE
+'    <calculationView xsi:type="Calculation:UnionView" id="Union_1">'
+                          . "\n";
+                        print FILE '      <descriptions/>' . "\n";
+                        print FILE '      <viewAttributes>' . "\n";
+                        $column_names = $tableToColumnArray{$outputTable};
+                        foreach (@$column_names) {
+                            print FILE '        <viewAttribute id="' . "$_"
+                              . '"/>' . "\n";
+                        }
+                        print FILE '      </viewAttributes>' . "\n";
+                        print FILE '      <calculatedViewAttributes/>' . "\n";
+                        my $schemaProcessing = 0;
+
+                        while ( $schemaProcessing < $schemaNum ) {
+                            if ( $schemaProcessing == 0 ) {
+                                print FILE
+'      <input emptyUnionBehavior="NO_ROW" node="#'
+                                  . $outputTable . '">' . "\n";
+                            }
+                            else {
+                                print FILE
+'      <input emptyUnionBehavior="NO_ROW" node="#'
+                                  . $outputTable . "_"
+                                  . $schemaProcessing . '">' . "\n";
+                            }
+                            foreach (@$column_names) {
+                                print FILE
+'        <mapping xsi:type="Calculation:AttributeMapping" target="'
+                                  . "$_"
+                                  . '" source="' . "$_" . '"/>' . "\n";
+                            }
+                            print FILE '      </input>' . "\n";
+                            $schemaProcessing = $schemaProcessing + 1;
+                        }
+
+                        print FILE '    </calculationView>' . "\n";
+                        print FILE '  </calculationViews>' . "\n";
+                        print FILE '  <logicalModel id="Union_1">' . "\n";
+                        print FILE '    <descriptions defaultDescription="'
+                          . $outputTable . "_CV" . '"/>' . "\n";
+                        print FILE '    <attributes>' . "\n";
+                        my $columnNum = 1;
+
+                        foreach (@$column_names) {
+                            print FILE '      <attribute id="' . "$_"
+                              . '" order="'
+                              . $columnNum
+                              . '" attributeHierarchyActive="false" displayAttribute="false">'
+                              . "\n";
+                            print FILE
+                              '        <descriptions defaultDescription="'
+                              . "$_" . '"/>' . "\n";
+                            print FILE
+'        <keyMapping columnObjectName="Union_1" columnName="'
+                              . "$_" . '"/>' . "\n";
+                            print FILE '      </attribute>' . "\n";
+                            $columnNum = $columnNum + 1;
+                        }
+
+                        print FILE '    </attributes>' . "\n";
+                        print FILE '    <calculatedAttributes>' . "\n";
+                        my $tableRecordCountStr =
+                          $outputTable . "_Record_Count";
+                        print FILE '     <calculatedAttribute id="'
+                          . $tableRecordCountStr
+                          . '" hidden="false" order="31" attributeHierarchyActive="false" displayAttribute="false">'
+                          . "\n";
+                        print FILE '        <descriptions defaultDescription="'
+                          . $tableRecordCountStr . '"/>' . "\n";
+                        print FILE
+'        <keyCalculation datatype="INTEGER" expressionLanguage="COLUMN_ENGINE">'
+                          . "\n";
+                        print FILE '          <formula>1</formula>' . "\n";
+                        print FILE '        </keyCalculation>' . "\n";
+                        print FILE '      </calculatedAttribute>' . "\n";
+                        print FILE '    </calculatedAttributes>' . "\n";
+                        print FILE '    <privateDataFoundation>' . "\n";
+                        print FILE '      <tableProxies/>' . "\n";
+                        print FILE '      <joins/>' . "\n";
+                        print FILE '      <layout>' . "\n";
+                        print FILE '        <shapes/>' . "\n";
+                        print FILE '      </layout>' . "\n";
+                        print FILE '    </privateDataFoundation>' . "\n";
+                        print FILE '    <baseMeasures/>' . "\n";
+                        print FILE '    <calculatedMeasures/>' . "\n";
+                        print FILE '    <restrictedMeasures/>' . "\n";
+                        print FILE '    <localDimensions/>' . "\n";
+                        print FILE '  </logicalModel>' . "\n";
+                        print FILE '  <layout>' . "\n";
+                        print FILE '    <shapes>' . "\n";
+                        print FILE
+'      <shape expanded="true" modelObjectName="Output" modelObjectNameSpace="MeasureGroup">'
+                          . "\n";
+                        print FILE '        <upperLeftCorner x="40" y="85"/>'
+                          . "\n";
+                        print FILE
+                          '        <rectangleSize height="0" width="0"/>'
+                          . "\n";
+                        print FILE '      </shape>' . "\n";
+                        print FILE
+'      <shape expanded="true" modelObjectName="Union_1" modelObjectNameSpace="CalculationView">'
+                          . "\n";
+                        print FILE '        <upperLeftCorner x="40" y="200"/>'
+                          . "\n";
+                        print FILE
+                          '        <rectangleSize height="-1" width="-1"/>'
+                          . "\n";
+                        print FILE '      </shape>' . "\n";
+                        print FILE '    </shapes>' . "\n";
+                        print FILE '  </layout>' . "\n";
+                        print FILE '</Calculation:scenario>' . "\n";
+                    }
+                    print "Finished generating calculationviews in "
+                      . $calculatedViewDir . "\n";
+                }
+                $hanaClient->disconnect();
+            }
+        }
+    }
+}
+
+main(@ARGV);
+
+__END__

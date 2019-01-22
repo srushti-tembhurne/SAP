@@ -1,0 +1,70 @@
+#!/usr/local/bin/perl -w
+#
+# Sample driver for page system
+# $Id:$
+#
+
+use strict;
+
+use FindBin;
+use lib ("$FindBin::Bin/../../lib");
+
+use ariba::Ops::NotificationRequest;
+use ariba::Ops::PageUtils;
+use ariba::rc::InstalledProduct;
+
+sub main {
+    my $server = ariba::Ops::PageUtils::pageServer();
+    my $debug = 1;
+
+    my $message;
+    my $body = "this should be acked";
+    my $subject = "PageTest" . time();
+
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-h/) { usage();}
+        if ($arg =~ /^-d/) { $debug = 1; next;}
+        if ($arg =~ /^-s/) { $server = shift(@ARGV); next;}
+        if ($arg !~ /^-/) { $message .= " " . $arg; next;}
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $product = $me->name();
+    my $service = $me->service();
+    my $cluster = $me->currentCluster();
+    my $notify = $me->default("notify.email");
+    my $customer = "";
+
+    if ( $message ) {
+        $body = "";
+        $subject = $message;
+    }
+
+    my $notificationRequest = ariba::Ops::NotificationRequest->newMessage(
+        "crit", 
+        $0, 
+        $product, 
+        $service, 
+        $customer,
+        $cluster,
+        $subject, 
+        $body,
+        $notify
+    );
+
+    $notificationRequest->setDebug($debug);
+    $notificationRequest->send($server);
+}
+
+sub usage {
+    print "usage: sendpage [-help] [-debug] [-server server] [message]\n";
+    print "\n";
+    print "   Send a test page from the current service to the current on call people.\n";
+    print "\n";
+    print "   Sends a default message unless message if defined.\n";
+    print "\n";
+    print "   By default server is computed using product API\n";
+    exit(1);
+}
+
+main();

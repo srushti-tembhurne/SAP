@@ -1,0 +1,111 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: $
+#
+# Ported to MySQL from alert-log for Oracle by Hide Inada.
+# 
+# This script parses the mysql error log file. It will page people if
+# it sees something bad in the error log.
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::monitor::misc;
+use ariba::monitor::StatusPage;
+use ariba::Ops::LogParser::MySQLAlertLogParser;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::DBConnection;
+
+use Date::Calc;
+
+my $debug = 0;
+
+my $SCANRANGE = 3600 * 2; # 2 hours in seconds
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; };
+		if ($arg =~ /^-d/o) { $debug = 1; };
+	}
+
+	my $me          = ariba::rc::InstalledProduct->new();
+	my $service     = $me->service();
+	my $customer    = $me->customer();
+
+	my @products    = ariba::rc::InstalledProduct->installedProductsList($service);
+	my $hostname    = ariba::Ops::NetworkUtils::hostname();
+	my $cluster     = $me->currentCluster();
+
+	my $machine     = ariba::Ops::Machine->new($hostname);
+	my $datacenter  = $machine->datacenter();
+	my $tab         = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+	my $currentHour = (localtime)[2];
+
+	my @connections = ariba::Ops::DBConnection->connectionsToMySQLFromProducts(@products);
+
+	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndPort(@connections)) {
+
+		my $type        = $dbc->type();
+		my $virtualHost = $dbc->host();
+
+		my $port        = uc($dbc->port());
+		my $product     = $dbc->product();
+		my $activeHost  = $product->activeHostForVirtualHostInCluster($virtualHost, $cluster);
+
+		if (!$activeHost || $activeHost ne $hostname) {
+			next;
+		}
+
+		my %queries = ();
+
+		my $alertLogParser = ariba::Ops::LogParser::MySQLAlertLogParser->newFromDBConnection($dbc, $hostname);
+
+        $alertLogParser->parseFile(
+                     time() - $SCANRANGE, # start range
+                     time() # end range
+					  );
+
+		my ($errors, $warnings) = ($alertLogParser->errors(), $alertLogParser->warnings());
+#		my $results = join("\n", @$errors, @$warnings);
+
+		my $results;
+
+		if(scalar(@$errors) > 100) {
+			$results = "Too many errors reported to display.";
+		} else {
+			$results = join("\n", @$errors);  # Do not show warnings for now per discussion with JC [TMID:73124]
+		}
+
+		$queries{"Error log for DB running on port [$port] on $hostname"} = {
+			info    => "numrows > -1",
+			crit    => scalar(@$errors) > 0,
+			warn    => scalar(@$warnings) > 0,
+			timeout => 60,
+			perl    => sub { return $results; },
+			uiHint  => 'mysql-error-log',
+		};
+
+		my $email = $me->default('notify.email');
+
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			'dba', $tab, $service, $customer, \%queries
+		);
+
+		$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+main();
+
+__END__

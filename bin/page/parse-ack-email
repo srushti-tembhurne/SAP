@@ -1,0 +1,236 @@
+#!/usr/local/bin/perl -w
+#
+# Simple client to ack a page
+# and to turn email from operationsPagerAddress into a pageRequest
+#
+#
+# $Id: //ariba/services/monitor/bin/page/parse-ack-email#26 $
+#
+
+use strict;
+use FindBin;
+use lib ("$FindBin::Bin/../../lib");
+
+use ariba::Ops::NotificationRequest;
+use ariba::Ops::PageRequest;
+use ariba::Ops::PageAck;
+use ariba::Ops::PageUtils;
+use ariba::Ops::Utils;
+use ariba::Ops::Constants;
+use ariba::Ops::MIMEHelper;
+
+
+use MIME::Parser;
+use MIME::Head;
+use File::Basename;
+use File::Path;
+
+my $server;
+my $debug;
+my $pageid;
+my $from;
+
+sub main {
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-help/) { usage();}
+        if ($arg =~ /^-d/) { $debug = 1; next;}
+        if ($arg =~ /^-s/) { $server = shift(@ARGV); next;}
+    }
+
+    my $to;
+    my $cc;
+    my $subject;
+    my $from;
+    my $pageid;
+
+    my $pagerEmailAddress = (split("@", ariba::Ops::Constants::operationsPagerAddress()))[0];
+
+    print "pagerEmailAddress == $pagerEmailAddress\n" if $debug;
+
+    my $pageidPattern = '\d+[a-zA-Z][1-2]?[0-9]';
+
+    MIME::Tools->debugging($debug);
+    my $parser  = MIME::Parser->new();
+
+    $parser->output_under('/tmp');
+
+    # according to http://cpan.uwinnipeg.ca/htdocs/MIME-tools/MIME/Parser.html
+    # these settings result in speed gains:
+    #
+    #   File I/O is much faster than in-core I/O. Although it seems like slurping a
+    #   message into core and processing it in-core should be faster... it isn't.
+    #   Reason: Perl's filehandle-based I/O translates directly into native
+    #   operating-system calls, whereas the in-core I/O is implemented in Perl.
+
+    #   Inner files are slower than real tmpfiles, but faster than in-core ones. If
+    #   speed is your concern, that's why you should set use_inner_files(true) if you
+    #   set tmp_to_core(true): so that we can bypass the slow in-core tmpfiles if the
+    #   input stream permits.
+
+    $parser->use_inner_files(0);
+    $parser->tmp_to_core(0);
+    $parser->output_to_core(0);
+
+    my $entity = eval { $parser->parse(\*STDIN) };
+    die "Error parsing mail: $@" if $@;
+
+    my $topLevelHeader = $entity->head();
+
+    my $bodyString;
+    my $bodyMimeType;
+
+    if ( $entity->is_multipart() ) {
+        # find the most suitable (read: easily-readable) part
+        my @display = ();
+
+        my $mimeHelper = ariba::Ops::MIMEHelper->new({ 'text/plain' => 171, 'text/html' => 170 });
+        $mimeHelper->parseMultipart($parser, $entity, \@display);
+        # ariba::Ops::MIMEHelper->parseMultipart($parser, $entity, \@display);
+
+        my $mostReadableEntity = pop(@display);
+        $bodyString = $mostReadableEntity->bodyhandle()->as_string();
+        $bodyMimeType = $mostReadableEntity->head()->mime_type();
+    } else {
+        $bodyString = $entity->bodyhandle()->as_string();
+        $bodyMimeType = $entity->head()->mime_type();
+    }
+
+    $from = $topLevelHeader->get("From");
+    $to = $topLevelHeader->get("To");
+    $cc = $topLevelHeader->get("Cc");
+    $subject = $topLevelHeader->get("Subject");
+
+    if ($bodyMimeType eq 'text/html') {
+        $bodyString = ariba::Ops::Utils::stripHTML($bodyString);
+    }
+
+    # first look in subject for our pageid, then body
+    if ( $subject && $subject =~ /\b($pageidPattern)\b/ ) {
+        $pageid = $1;
+    }
+    elsif ( $bodyString =~ /\b($pageidPattern)\b/ ) {
+        $pageid  = $1;
+    }
+
+
+    if ( $from && $pageid ) {
+        $server = ariba::Ops::PageUtils::pageServer() unless ( $server );
+
+        print "acking page $pageid as $from, connecting to server $server\n" if $debug;
+
+        my $ack = ariba::Ops::PageAck->newWithPageId($pageid, $from, ariba::Ops::PageAck->viaEmail());
+
+        if ( $ack->sendToServer($server) ) {
+            print "sent ack\n" if $debug;
+        } else {
+            print "failed to send ack\n" if $debug;
+            if ($debug) {
+                $to = "dept_an_ops_arch\@ariba.com";
+            }
+            else {
+                $to = $from;
+            }
+
+            unless ( $debug ) {
+                # a fake user, insuring we don't get bounces
+                $from = "parse-ack-email";  
+                $subject = "failed to send ack $pageid to paged on $server";    
+                $bodyString = "is paged running?";
+                    
+                ariba::Ops::Utils::email($to, $subject, $bodyString, undef, $from);
+            }
+        }
+    } elsif ( $from && $from =~ /$pagerEmailAddress/i ) { 
+        print "Received spam from $from with body:\n$bodyString\n" if $debug;
+    } elsif ( whiteListDomain($from) && (($to && $to =~ /$pagerEmailAddress/i ) || ($cc && $cc =~ /$pagerEmailAddress/i )) ) {
+        # create a notification request
+
+        if(($from =~ /datadoghq.com/ || $from =~ /dtdg.com/ || $from =~ /dtdg.co/) && ($subject =~ /\[Monitor\s+Alert\]\s+Recovered/ || $subject =~ /\[Monitor\s+Alert\]\s+No\s+data/ ) ){
+                my $time;
+                open(LOG,">>/tmp/datadog.csv") or warn "Unable to open file /tmp/datadog.csv\n";
+                $time = localtime();
+                $from =~ s/\n/ /g;
+                $subject =~ s/\n/ /g;
+                print LOG "$time,$from,$subject\n";
+                close(LOG);
+
+        }else{
+
+        print "creating NotificationRequest from $from with body:\n$bodyString\n" if $debug;
+
+        my $me = ariba::rc::InstalledProduct->new("mon");
+
+        my $notify = $me->default("notify.email");
+
+        my $notificationRequest = ariba::Ops::NotificationRequest->newMessage(
+                "crit",
+                "$from via $0",
+                $me->name(),
+                $me->service(),
+                $me->customer(),
+                $me->currentCluster(),
+                $subject,
+                $from . "\n" . $bodyString,
+                $notify
+                );
+
+        $notificationRequest->setDebug($debug);
+        if ($debug) {
+            print "called notificationRequest->send()\n";
+        }
+        else {
+            $notificationRequest->send($server);
+        }
+	}
+    } else {
+        print "stdin does not look like an emailed page ack!\n" if $debug;
+
+        $to = "an_auto\@ariba.com";
+
+        if ( $debug ) {
+            print "from = $from\n" if $from;
+            print "to = $to\n" if $to;
+            print "cc = $cc\n" if $cc;
+        }
+
+        # forward this email on acting as if we were really just
+        # a .forward to $to
+
+        open(SENDMAIL, "| /usr/lib/sendmail -v $to");
+        $entity->print(\*SENDMAIL);
+        print SENDMAIL "\nForwarded by $0\n";
+        close(SENDMAIL);
+    }
+
+    # remove temporary files
+    $parser->filer()->purge();
+    rmdir($parser->filer()->output_dir());
+
+    exit(0);
+}
+
+sub whiteListDomain {
+    my $address = shift;
+
+    my $found = 0;
+    my @whiteList = qw( sap.com gomez.com ariba.com dtdg.com dtdg.co datadoghq.com pingdom.com site24x7.com );
+
+    foreach my $domain (@whiteList) {
+        if ( $address =~ /\@$domain/ ) {
+            $found = 1;
+            last;
+        }
+    }
+    return $found;
+}
+
+sub usage {
+    print "usage: parse-ack-email [-server server]\n";
+    print "\n";
+    print "Parse an email in stdin to acknowledge receipt of a page\n";
+    print "By default server is computed using product API\n";
+    exit(1);
+}
+
+main();
+

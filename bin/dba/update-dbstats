@@ -1,0 +1,162 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/dba/update-dbstats#7 $
+#
+# This script can be used to update oracle 10g stats for a given
+# product. It can be installed as a cronjob to update stats on 
+# a regular basis.
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+
+my $debug = 0;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	my ($array, @productNames);
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-prod/o) { $array = \@productNames; next; };
+		if ($arg =~ /^-e/o) { $sendEmail = 1; next; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; next; };
+		if ($arg =~ /^-d/o) { $debug = 1; next; };
+		if ($arg !~ /^-/o ) { push(@$array, $arg); next; };
+	}
+
+	my $me	          = ariba::rc::InstalledProduct->new();
+	my $hostname      = ariba::Ops::NetworkUtils::hostname();
+	my $cluster       = $me->currentCluster();
+	my $email         = $me->default('notify.dba');
+	my $user          = "system";
+	my $pass          = $me->default("dbainfo.$user.password");
+
+	#return 0 if ($me->service() eq "mach");
+
+	my @products      = ();
+
+	if (@productNames) {
+
+		for my $productName (@productNames) {
+			push(@products, ariba::rc::InstalledProduct->installedProductsList($me->service(), $productName));
+		}
+
+	} else {
+		push(@products, ariba::rc::InstalledProduct->installedProductsList($me->service()));
+	}
+
+	for my $product (@products) {
+
+		my @dbconnections = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndForStarSchema($product, ariba::Ops::DBConnection::typeMain());
+
+		my %queries;
+		my $instance;
+		my $virtualHost;
+
+		for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbconnections)) {
+
+			$virtualHost = $dbc->host();
+			$instance    = uc($dbc->sid());
+
+			my $schema   = $dbc->user();
+
+			runAndSpoolStaleStatsInformation($user, $pass, $instance, $schema, $virtualHost);
+
+			$queries{"Update DB Stats for schema [$schema] and sid [$instance]"} = {
+				info => "numrows > -1",
+				warn => "numrows >= 1",
+				timeout => 20*60,
+				hasErraticSchedule => 1,
+				sql => "exec dbms_stats.gather_schema_stats(ownname=>'$schema', options=>'GATHER STALE', cascade=>true)",
+			};
+
+		}
+
+		next unless(keys(%queries));
+
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			"dba", $product->name(), $me->service(), $me->customer(), \%queries
+		);
+
+		$qm->setSQLConnectInfo($user, $pass, $instance, $virtualHost);
+
+		$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+sub runAndSpoolStaleStatsInformation {
+	my $user = shift;
+	my $pass = shift;
+	my $sid = shift;
+	my $schema = shift;
+	my $host = shift;
+	my $timeout = shift;
+
+	my @sqls = (
+		"exec dbms_stats.FLUSH_DATABASE_MONITORING_INFO()",
+		"select table_name from dba_tab_statistics where owner='$schema' and stale_stats='YES'",
+		"select index_name from dba_ind_statistics where owner='$schema' and stale_stats='YES'",
+		);
+
+	my $file = "/var/tmp/$sid-$schema-stale-stats.txt";
+
+	my $oc = ariba::Ops::OracleClient->new($user, $pass, $sid, $host);
+	$oc->connect() || die "Error: Could not connect to $user\@$sid\n";
+
+	my $timeoutOccured = 0;
+	my @results = ();
+
+	open(STALESTATS, ">>$file") || return 0;
+	print STALESTATS "----------------------------------------------\n";
+	print STALESTATS "Stale tables and index at: ", scalar(localtime(time())), "\n";
+	print STALESTATS "----------------------------------------------\n";
+
+	for my $sql (@sqls) {
+		print "running sql $sql\n" if ($debug);
+
+		# optionally run with a timeout.
+		if (defined $timeout) {
+			if ($oc->executeSqlWithTimeout($sql, $timeout, \@results)) {
+				$timeoutOccured = 0;
+			} else {
+				$timeoutOccured = 1;
+			}
+		} else {
+			@results = $oc->executeSql($sql);
+		}
+
+		if ($oc->error()) {
+			push(@results, "$sql had error: " . $oc->error());
+		}
+
+		if ($timeoutOccured) {
+			push(@results, "$sql timed out");
+		}
+
+		print STALESTATS join("\n", @results);
+		print STALESTATS "\n";
+		print STALESTATS "***********************************************\n";
+	}
+
+	close(STALESTATS);
+
+	$oc->disconnect();
+
+	return 1;
+}
+
+main();
+
+__END__
+

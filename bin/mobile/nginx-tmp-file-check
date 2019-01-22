@@ -1,0 +1,120 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/mobile/nginx-tmp-file-check#1 $
+#
+# nginx-tmp-file-check created by Greg Rogers, I835876, greg.rogers@sap.com
+#
+# Nginx requies a clear text password in a file to start up.  Verify this file
+# has been deleted on all nginx hosts after startup.
+#
+
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use Data::Dumper;
+use Getopt::Long qw(:config bundling no_ignore_case_always no_getopt_compat require_order);
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::Ops::NetworkUtils;
+use ariba::rc::Utils;
+use ariba::rc::CipherStore;
+
+sub main
+{
+    my $debug;
+    my $sendEmail;
+    my $sendPage;
+
+    GetOptions (
+        'debug|d'      => \$debug,
+        'sendemail|e'  => \$sendEmail,
+        'sendpage|p'   => \$sendPage,
+    );
+
+    $main::quiet = 1 unless $debug;
+
+    my $mobile      = ariba::rc::InstalledProduct->new( 'mobile' );
+    my $file        = $mobile->default( "Nginx.Mobile.TempSSLFilePath" );
+    return unless $file;
+
+    my $mon         = ariba::rc::InstalledProduct->new();
+    my $cluster     = $mon->currentCluster() || 'primary';
+    my @instances   = $mobile->appInstancesWithNameInCluster( 'Nginx', $cluster );
+    my $cipherStore = ariba::rc::CipherStore->new( $mon->service() );
+    my $monUser     = ariba::rc::Globals::deploymentUser( $mon->name(), $mon->service() );
+    my $password    = $cipherStore->valueForName( $monUser );
+
+    my $email        = $mobile->default( 'notify.email' );
+    my $success      = "Tmp file deleted";
+    my $badConnect   = "Could not connect to host";
+
+    # We may ping when nginx is restarting and catch that brief moment where the tmp file exists.
+    # Thus we crit only when we see it in two consecutive runs.
+    my $crit = "answer ne '$success' && previousAnswer ne '$success' && answer ne '$badConnect'";
+    my $warn = "answer ne '$success' || answer eq '$badConnect'";
+    my $info = "answer eq '$success'";
+
+    my %queries;
+    my %processedHosts;
+    foreach my $instance ( @instances ) {
+        my $host = $instance->host();
+        next if $processedHosts{ $host };
+        $processedHosts{ $host } = 1;
+
+        my $text;
+        my @output;
+
+        # ls on each nginx host and try to find the tmp file.
+        # the executeRemoteCommand return code is based on the result of the command,
+        # not whether the command could execute.  Thus we need to check for both success
+        # and failure text and then assume any other result is some sort of connection issue.
+        my $status = ariba::rc::Utils::executeRemoteCommand (
+            "ssh $monUser\@$host \"ls -l $file\"",
+            $password,
+            0,
+            undef,
+            undef,
+            \@output
+        );
+        foreach my $line (@output) {
+            # eg "ls: /tmp/nginx-cert.txt: No such file or directory"
+            if ( $line =~ /No such file/ ) {
+                $text = $success;
+                last;
+            }
+            # eg "-rw-r--r-- 1 svcprod ariba 0 Aug  9 09:18 /tmp/nginx-cert.txt"
+            elsif ( $line =~ /prod ariba/ ) {
+                $text = "Tmp file found: $file.  Log in and delete it!  Ask TOOLS to investigate why it was not deleted.";
+                last;
+            }
+        }
+        $text = $badConnect unless $text;
+
+        $queries{ "Ngnix host: $host" } = {
+            crit        => $crit,
+            warn        => $warn,
+            info        => $info,
+            perl        => sub { return $text; },
+            description => "Verify tmp password file required to start Nginx is deleted.",
+            inf_field   => "status",
+            inf_tags    => qq(host="$host"),
+            group_by    => $host,
+        };
+    }
+    $queries{influx_details} = {measurement => "nginx-tmp-file-deletion"};
+
+    my $q = ariba::monitor::QueryManager->newWithDetails (
+        "nginx-tmp-file-deletion", $mobile->name(), $mobile->service(), undef, $cluster, \%queries
+    );
+
+    $q->processQueries( $debug, $email, $sendEmail, $sendPage );
+}
+
+main();
+
+__END__

@@ -1,0 +1,321 @@
+#!/usr/local/bin/perl -w
+#
+# $Id$
+#
+# This script is run as root cronjob on all db servers.
+# It cleans up old (already applied) archive logs for database sids
+# that are the target of physical replication
+#
+#
+
+use warnings;
+use strict;
+use lib qw(/usr/local/ariba/lib);
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../lib/perl";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+
+use ariba::DBA::SampleSQLQueries;
+
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::Machine;
+use ariba::Ops::FileSystemUtils;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::DBConnection;
+use ariba::Ops::Constants;
+use ariba::Ops::ServiceController;
+use ariba::rc::CipherStore;
+use ariba::rc::Utils;
+use ariba::rc::Passwords;
+use ariba::Ops::Utils;
+
+use File::Basename;
+use File::Copy;
+use File::Path;
+
+my $debug = 0;
+my $hostname = ariba::Ops::NetworkUtils::hostname();
+my $machine = ariba::Ops::Machine->new($hostname);
+my $datacenter = $machine->datacenter();
+my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+my $service;
+
+my $TYPE_STRING_DR      = "DR";
+my $TYPE_STRING_PRIMARY = "primary";
+
+sub usage {
+    my $errmsg = shift;
+
+    print "ERROR: $errmsg\n" if ($errmsg);
+    print "Usage: $0 [-h|-d|-e|-p\n";
+    print "    -h: this help message\n";
+    print "    -d: turn on debug\n";
+    print "    -e: send email notification\n";
+    print "    -p: send pager notification\n";
+    print "    -service: specify service to run for\n";
+    print "\n";
+
+    exit(1);
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my ($sid, $suspend);
+
+    while(my $arg=shift(@ARGV)){
+        if( $arg =~ /^-e$/i ){ $sendEmail = 1; next; }
+        if( $arg =~ /^-h$/i ){ usage(); }
+        if( $arg =~ /^-p$/i ){ $sendPage = 1; next; }
+        if( $arg =~ /^-d$/i ){ $debug++; next; }
+        if( $arg =~ /^-service$/i ) { $service = shift(@ARGV); next; }
+        if( $arg =~ /^-sid$/o ) { $sid = shift(@ARGV); next; }
+        if( $arg =~ /^-suspend$/o ) { $suspend = 1; next; }
+        if( $arg =~ /^-resume$/o ) { $suspend = 2; next; }
+        usage("Unknown arg: $arg");
+    }
+
+    # to disable prints from sshCover
+    $main::quiet = 1 unless $debug;
+
+    my $mon = ariba::rc::InstalledProduct->new('mon', $service);
+    $service = $mon->service();
+
+    my $sysUser       = "sys";
+    my $sysPass       = $mon->default("dbainfo.$sysUser.password");
+
+    if($suspend) {
+        my $file = ariba::Ops::Constants::archiveLogSuspendFile($sid);
+        if($suspend == 1) {
+            open(my $fh, "> $file");
+            print $fh scalar(localtime(time())), "\n";
+            close($fh);
+            print "Touched $file to suspend archive log deletion.\n";
+        } else {
+            my $user = (getpwuid($<))[0];
+            if($user ne "mon$service") {
+                usage("This script must be run as mon$service for service $service.");
+            }
+            my $cipher = ariba::rc::CipherStore->new( $service );
+            my $passwd = $cipher->valueForName( $user );
+            my $sudo = ariba::rc::Utils::sudoCmd();
+            my $cmd = "$sudo /bin/rm -f $file";
+            my @output;
+            unless( ariba::rc::Utils::executeLocalCommand($cmd, undef, \@output, undef, 1, undef, $passwd) ) {
+                print "Removing $file failed:\n", join("\n", @output), "\n";
+                exit(1);
+            }
+            print "Removed $file to resume archive log deletion.\n";
+        }
+        exit(0);
+    }
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList($mon->service());
+    usage("could not find any products installed") unless scalar(@products);
+
+    my @connections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+    my @uniqueDbcs = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections);
+
+    print $mon->service(), " has ", scalar(@uniqueDbcs), " unique host+sid combinations\n" if ($debug);
+
+    my $primaryOrDR;
+
+    for my $dbc (@uniqueDbcs) {
+
+        my $type       = $dbc->type();
+        my $host       = $dbc->host();
+        my $instance   = uc($dbc->sid());
+        my $product    = $dbc->product();
+        my $pname      = $product->name();
+        my $customer   = $product->customer();
+        my $service    = $product->service();
+
+        my $cluster    = $product->currentCluster();
+
+        my $activeHost = $product->activeHostForVirtualHostInCluster($host, $cluster);
+
+        if (!$activeHost || $activeHost ne $hostname) {
+            next;
+        }
+
+        print "Checking ", $dbc->host(), " for physical replication\n" if $debug >= 2;
+
+        next unless $dbc->isPhysicalReplication();
+
+        my @primaryLogLocations;
+
+        if ($dbc->isDR()) {
+            $primaryOrDR = $TYPE_STRING_DR;
+
+            # rman deletes the archive logs for DR db in prod service
+            # or maybe not, turning this off now first for sdb to test
+            # now turning off s4, but s2 is still enabled
+            next if (ariba::Ops::ServiceController::isProductionServicesOnly($service) and $pname ne "sdb" and $pname ne "s4");
+        } else {
+            $primaryOrDR = $TYPE_STRING_PRIMARY;
+            my ($drDbc) = $dbc->peers();
+
+            # some products don't have DR
+            next unless defined ($drDbc);
+
+            # rman deletes the archive logs from the primary db in the prod service
+            next if (ariba::Ops::ServiceController::isProductionServicesOnly($service));
+
+            eval {
+                @primaryLogLocations = ariba::DBA::SampleSQLQueries::executeSQLQuery($mon, "archiveLogDestinations", $dbc);
+            };
+
+
+            $dbc = $drDbc;
+        }
+
+        print "\t$pname $instance on $host is type ". $dbc->type() . " $primaryOrDR\n" if $debug;
+
+        my %queries    = ();
+
+        $queries{"Physical log cleanup for $primaryOrDR [$instance] on $hostname"} = {
+            crit => "answer =~ /^error/i",
+            warn => "answer =~ /suspended/",
+            timeout => 30*60,
+            sql => q`select name from V$ARCHIVED_LOG where REGISTRAR='RFS' and APPLIED='YES'`,
+            processAnswer => sub { main::removeAppliedLogs($mon, $primaryOrDR, \@primaryLogLocations, $pname, $debug,$instance,$hostname); },
+            uiHint => 'log cleanup',
+        };
+
+        my $email = $mon->default('notify.email');
+        my $qm = ariba::monitor::QueryManager->newWithDetails(
+                'dba', $pname, $mon->service(), undef, \%queries
+                );
+
+        $qm->setSQLConnectInfo($sysUser, $sysPass, $dbc->sid(), $dbc->host());
+        $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub removeAppliedLogs {
+    my $self  = $ariba::monitor::Query::_ourGlobalQuerySelf;
+    my $mon = shift;
+    my $primaryOrDR = shift;
+    my $primaryLogLocationsRef = shift;
+    my $productName = shift;
+    my $debug = shift;
+    my $instance = shift;
+    my $hostname = shift;
+
+    my $is_suspended = 0;
+
+    my $error = $self->error();
+    my @results = ();
+
+    my $bcvBackupStartTime;
+    unless ($error) {
+        $bcvBackupStartTime = bcvBackupStartTimeForHostAndSid($hostname, $self->oracleClient()->sid());
+        $error = "Failed to obtain start time of bcv backup." if (!$bcvBackupStartTime && ariba::Ops::ServiceController::isProductionServicesOnly($service) && $productName ne 'sdb'); # Make exception for sdb as bcv backup for dr side isn't setup yet.
+    }
+
+    if ($error) {
+        @results = ("Error: " . $error);
+    } elsif( ariba::Ops::Constants::archiveLogIsSuspended($self->oracleClient()->sid()) ) {
+        @results = ("Log cleanup suspended");
+        $is_suspended = 1;
+    } else {
+        my @logs = $self->results();
+
+        $bcvBackupStartTime -= 3600 if ($bcvBackupStartTime); # -1 hour for safety measure
+
+        if ($debug) {
+            print "Considering ".scalar(@logs)." log files to delete\n";
+            print "Adjusted BCV backup start time is ", scalar(localtime($bcvBackupStartTime)), "\n" if ($bcvBackupStartTime);
+        }
+
+        if ($primaryOrDR eq $TYPE_STRING_DR) {
+            for my $logFile (@logs) {
+                if ($debug) {
+                    if (-e $logFile && 
+                        (!$bcvBackupStartTime || (stat($logFile))[9] < $bcvBackupStartTime)) {
+                        print "*** [$primaryOrDR] Would delete $logFile\n";
+                    }
+                } else {
+                    if (-e $logFile && 
+                        (!$bcvBackupStartTime || (stat($logFile))[9] < $bcvBackupStartTime)) {
+                        if (unlink $logFile) {
+                            push(@results, $logFile);
+                        } else {
+                            push(@results, "Error: unlink $logFile failed: $!");
+                        }
+                    }
+                }
+            }
+
+        } elsif ( $primaryOrDR eq $TYPE_STRING_PRIMARY ) {
+
+            # do this only for devlab services
+            my $service = $mon->service();
+            if ( ariba::rc::Globals::serviceUsesSharedFileSystem($service) || ariba::Ops::ServiceController::isLabServiceOnly($service)) {
+
+                for my $file (@logs) {
+
+                    my $logFileFilename = basename($file);
+
+                    for my $logLocation (@$primaryLogLocationsRef) {
+
+                        my $logFile = $logLocation . $logFileFilename;
+                        print "Checking archive log: $logFile\n" if $debug;
+                        if (-f $logFile && 
+                            (!$bcvBackupStartTime || (stat($logFile))[9] < $bcvBackupStartTime)) {
+                            if ($debug >= 2) {
+                                print "*** [$primaryOrDR] Would delete $logFile\n";
+                            } elsif (unlink($logFile)) {
+                                print "*** [$primaryOrDR] deleted $logFile\n" if $debug;
+                                push (@results, "$logFile");
+                            } else {
+                                push(@results, "Error: unlink $logFile failed: $!");
+                            }
+                        }
+                    }
+                }
+            }
+        } else { 
+            push(@results, "ERROR: Unknown type '$primaryOrDR'");
+        }
+    }
+
+    my %influx_data = (measurement => 'dba_log_cleanup', tags => {sid => $instance, hostname => $hostname, product => $productName, service => $service, dc_type => $primaryOrDR});
+    $influx_data{data} = {
+        error_count => scalar(grep {$_ =~ /^error/i} @results) || 0,
+        is_suspended => $is_suspended, 
+        file_cleaned => scalar( grep {$_ !~ /^error/i } @results) || 0,
+    };
+    eval {
+        my $statsd_line = ariba::Ops::Utils::generateStatsDLine( \%influx_data );
+        print "$statsd_line\n" if ($debug); 
+        ariba::Ops::Utils::sendToStatsD( $statsd_line )  if ( $statsd_line );
+    };
+    
+
+    return join("\n", @results);
+}
+
+sub bcvBackupStartTimeForHostAndSid {
+    my $host = shift;
+    my $sid = uc(shift);
+    my $backupStartTime;
+
+    my $queryName = "backup of $sid on $host to bcv 2";
+    my $queryId = ariba::monitor::Query->generateInstanceName($queryName, $tab);
+
+    if (ariba::monitor::Query->objectWithNameExists($queryId)) {
+        my $query = ariba::monitor::Query->new($queryId);
+        $backupStartTime = $query->backupStartTime();
+    }
+
+    return $backupStartTime;	
+}
+
+main();
+

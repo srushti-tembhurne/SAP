@@ -1,0 +1,683 @@
+#!/usr/local/bin/perl -w
+#
+# Summarize Snort or PIX logs and optionally mail them out
+#
+use strict; 
+use File::Path;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use File::Basename;
+use IO::Zlib;
+use MIME::Lite;
+use DateTime;
+use ariba::Oncall::Person;
+use ariba::Oncall::Schedule;
+use ariba::Ops::Constants;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Utils;
+use ariba::Ops::DatacenterController;
+
+my $debug = 0;    
+my $email = 0;
+
+#
+# cache for PIX log parsing
+#
+my %dnsCache = ();      # map ip => hostname
+my %tierCache = ();     # map ip => tier 
+
+
+#
+# hash ref with info about the various logs we parse and summarize
+#
+my $logs = {
+
+    'pix'   =>  {
+        'description'       =>  'pix',
+        'sourceDir'     =>  '/var/log/cisco',
+        'summaryDir'        =>  '/var/mon/logs/pix-summaries',
+        'sourceFileRegex'   =>  'pix-n\d-\d\.1(?:\.gz)?$',
+        'mailTo'        =>  'oncall',
+        'mailCc'        =>  'ask_network@ariba.com, hoa-alert@sap.com',
+    },
+
+    'snort' =>  {
+        'description'       =>  'snort',
+        'sourceDir'     =>  '/var/log',
+        'summaryDir'        =>  '/var/mon/logs/snort-summaries',
+        'sourceFileRegex'   =>  '^snort\.alert\.1(?:\.gz)?$',
+        'ignoreFile'        =>  '/usr/local/ariba/snort/signatureIgnoreFile',
+        'mailTo'        =>  'oncall',
+        'mailCc'        =>  'ticketmaster@ariba.com, hoa-alert@sap.com',
+    },
+};
+
+sub usage {
+    print "usage: $0 [-deh] <pix|snort>\n\n",
+          "Generate summaries of PIX or Snort log files.\n",
+          "-d   turn on debugging\n",
+          "-e   e-mail the summary\n",
+          "-h   this help message\n\n";
+
+    exit 1;
+}
+
+sub main {
+
+    usage() unless (@ARGV);
+
+    my @logTypes = ();
+
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-h$/) { usage(); }
+        if ($arg =~ /^-d$/) { $debug++; next; }
+        if ($arg =~ /^-e$/) { $email = 1; next; }
+        if ($arg =~ /^pix$|^snort$/) { push(@logTypes,$arg); next; }
+        usage();
+    }       
+
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    
+    (my $domain = $hostname ) =~ s/\w+\.(\w+)\.ariba\.com/$1/;
+
+    # If this job fires for all data centers at the same time then some of the Snort reports are not received.
+    # There is some bug where the multiple reports generated are clobbering each other.  The root problem was never 
+    # found.  The work around was to stagger the report runs for each data center.  See details in HOA-10798.
+    if ( $domain ) {
+        my $sleepMultiplier = 7 * 60;
+        my @datacenters = ariba::Ops::DatacenterController::prodDatacenters();
+        my ($index) = grep { $datacenters[$_] eq $domain } 0..@datacenters-1;
+        sleep ($index * $sleepMultiplier);
+    }
+
+    for my $logType ( @logTypes ) {
+
+        # Read through the source log directory and pick out the ones we want to summarize.
+        my $sourceFiles = sourceFilesForLogType($logType);
+
+        # Figure out where our summary file will be written to. 
+        my $summaryFile = summaryFileForLogType($logType, $domain);
+
+        # Parse our source files and write them out to a summary file.
+        parseFiles($logType, $sourceFiles, $summaryFile);
+
+        # Mail the summarized log file
+        mailSummary($logType, $summaryFile, $domain) if $email;
+    }
+}
+
+sub mailSummary {
+    my $logType = shift;
+    my $file = shift;
+    my $domain = shift;
+
+    my ($sec,$min,$hour,$mday,$month,$year,$wday,$yday,$isdst) = localtime(time);
+    $month++;
+    $year+=1900;
+    my $date = sprintf("%d-%02d-%02d", $year, $month, $mday);
+    my $tmOwner = 'unassigned-sysadmin';
+    my $username;
+    my $notice;
+
+    # default To and CC
+    my $to = ariba::Ops::Constants->operationsSecurityAddress();
+    my @cc = ();
+
+    # specific log type To and CC which override the defaults
+    my $mailTo = $logs->{$logType}->{'mailTo'};
+    my $mailCc = $logs->{$logType}->{'mailCc'};
+
+    if ( defined($mailTo) ) {
+
+        if ($mailTo eq 'oncall') {
+            my $sched = ariba::Oncall::Schedule->new($month,$year);
+            if ($sched) {
+                my $contactPerson;
+                if ( $logType eq 'pix' ) {
+                    $contactPerson = ariba::Oncall::Person->new($sched->netadminForDay($mday));
+                    }
+                    elsif ( $logType eq 'snort' ) {
+                    $contactPerson = ariba::Oncall::Person->new($sched->sysadminForDay($mday));
+                }
+
+                if ($contactPerson) {
+                    $username = $contactPerson->attribute('username');
+                    $to = "$username\@ariba.com";
+                }
+            }
+
+            unless ($username) {
+                $to = ariba::Ops::Constants->operationsSysadminEmailAddress();
+                $username = 'unassigned-sysadmin';
+                $notice = 'NO SYSADMIN ON OPS CALENDAR';
+            }
+        } else {
+            $to = $mailTo;
+        }
+
+        # CC operationsSecurityAddress since it was removed as the to address
+        push @cc, ariba::Ops::Constants->operationsSecurityAddress();
+    }
+
+    if ( defined($mailCc) ) {
+        push @cc, $mailCc;
+    }
+
+    if ( defined($username) ) {
+        $tmOwner = $username;
+    }
+
+    my $body = "Please review the " . ucfirst(lc($logType)) . " log summary for $date.\n\n";
+    $body = "$notice\n\n$body" if ($notice);
+    my $ccString = join(',', @cc);
+    
+    if ($ccString =~ /ticketmaster|ask_network/) {
+        $body .= "tm-owner: $tmOwner\n" .
+                     "tm-priority: high\n" .
+                     "tm-category: security\n" .
+                     "tm-duedate: $date\n\n";
+    }
+    
+    # reading the file back in for the email
+    open(F, $file) or die $!;
+    
+    # avoiding the perl "read file in" new line makes a new element in an
+    # array deal - putting it all in one string
+    local $/ = undef;
+    
+    $body .= <F>;
+    close(F);
+
+    my $subject = "$date " . ucfirst(lc($logType)) . " Log Summary " . uc($domain);
+    $subject = "$notice: $subject" if ($notice);
+    my $from = ariba::Ops::Constants->nullReplyTo();
+    my $replyTo = ariba::Ops::Constants->nullReplyTo();
+
+        ariba::Ops::Utils::email(
+                $to,
+        $subject,
+                $body,
+        $ccString,
+        $from,
+        $replyTo,
+        );
+}
+
+sub summaryFileForLogType {
+    my $logType = shift;
+    my $domain = shift;
+
+    my $lastday = DateTime->today;
+    $lastday = $lastday->subtract( days => 1 );
+    
+    my $year = $lastday->year();
+    my $month = $lastday->month();
+    my $day = $lastday->day();
+
+    # Our directory structure where we'll store the summarized logs
+    # e.g. 2008/4/2008-04-23-snv-pix-log-summary.txt
+    #
+    my $summaryDir  = $logs->{$logType}->{'summaryDir'} . "/$year/$month";
+    my $summaryFile = sprintf("%d-%02d-%02d-%s-%s-log-summary.txt",
+        $year,
+        $month,
+        $day,
+        $domain,
+        $logs->{$logType}->{'description'},
+    );
+
+    unless ( -d $summaryDir ) {
+        print "\tCreating directory: [$summaryDir]\n" if $debug;
+        File::Path::mkpath($summaryDir) or die "Can't create directory: [$summaryDir]: $!";
+    }
+
+    return "$summaryDir/$summaryFile";
+}
+
+sub parseFiles {
+    my $logType = shift;
+    my $sourceFiles = shift;
+    my $summaryFile = shift;
+
+    if ( $logType eq 'pix' ) {
+        parsePIXLogs($sourceFiles, $summaryFile);
+    }
+    elsif ( $logType eq 'snort' ) {
+        parseSnortLogs($sourceFiles, $summaryFile);
+    }
+    else {
+        die "Unable to parse unknown log type [$logType]\n";
+    }
+}
+
+sub parsePIXLogs {
+    my $sourceFiles = shift;
+    my $summaryFile = shift;
+
+    # Open our summary file for writing
+    open(SUMMARY, ">>$summaryFile") or die "Unable to open [$summaryFile] for writing: $!";
+    print SUMMARY '-' x 72, "\n";
+    print SUMMARY "\t\t", basename($summaryFile), "\n";
+    print SUMMARY '-' x 72, "\n\n";
+
+    foreach my $file ( @$sourceFiles ) {
+
+            # these are for accumulating summary data
+            my %sorted = ();
+            my %icmp   = ();
+
+        my $pixTier = 0;
+
+        if ($file =~ /^pix-(n\d)-\d/) {
+                        $pixTier = $1;
+        }
+
+        my $pixfh = IO::Zlib->new($file, 'rb') or die "Unable to open $file: $!";
+
+        while (my $line = <$pixfh>) {
+
+            # strip out message higher than level 3
+            #
+            # Firewall logs message with the following format 
+            # ASA-<servity level>- , e.g. ASA-5-
+            #
+            #    Emergency (severity 0)—The system is unusable
+            #    Alert (severity 1)—Immediate action is needed
+            #    Critical (severity 2)—Critical condition
+            #    Error (severity 3)—Error condition
+            #    Warning (severity 4)—Warning condition
+            #    Notification (severity 5)—Normal but significant condition
+            #    Informational (severity 6)—Informational message
+            #    Debugging (severity 7)—Debugging message
+            #
+            if ($line =~ /ASA-[4567]-/) {
+                next;
+            }
+    
+            # strip out "last message repeated" lines
+            if ($line =~ /last message repeated/) {
+                next;
+            }
+
+            # strip out the following user generate output
+            #
+            # PIX-5-111008: User 'enable_1' executed the 'no pager' command.
+            # PIX-5-111008: User 'enable_1' executed the 'enable' command.
+            # PIX-5-502103: User priv level changed: Uname: enable_1 From: 1 To: 15
+            # PIX-5-611103: User logged out: Uname: enable_15
+            #
+            if ($line =~ /PIX-5-111008/ || $line =~ /PIX-5-502103/ || $line =~ /PIX-5-611103/) {
+                next;
+            }
+
+            # strip out dates
+            $line =~ s/^.*: %//g;
+            
+            # grep for icmp
+            if ($line =~ /icmp src/) {
+            
+                # strip the dest and increment the %icmp hash count.
+                $line =~ s/ dst.*//g;
+                $icmp{$line}++;
+            
+                next;
+            }
+
+            # Received ARP response collision from 216.109.110.253/0013.21e9.c861 on interface inside
+            if ($line =~ /collision from (\d+\.\d+\.\d+\.\d+)/) {
+                my $ip = $1;
+
+                if (defined( tierForIp($ip) )) {
+                    my $hostname = hostnameForIp($ip);
+                    $line =~ s/$ip/$hostname/;
+                }
+            }
+
+            # group source addresses by the following going from generic to specific:
+            # (external ip) - for any source address in the n1 pix log
+            # ip address    - an ip address if not resolvable
+            # hostname      - hostname if resolvable
+            # roles         - roles if the host is in machinedb
+            #
+            # Deny tcp src outside:216.109.110.101/8443 dst inside:216.109.111.180/51921 by access-group "N1-N2"
+            # Deny inbound (No xlate) udp src outside:216.109.110.5/1354 dst outside:205.180.14.3/53
+            # Dropped UDP DNS reply from outside:207.241.224.5/53 to inside:216.109.110.77/53; packet length 1615 bytes exceeds configured limit of 1500 bytes
+            #
+            if ($line =~ /(?:from|src) outside:(\d+\.\d+\.\d+\.\d+)/) {
+                my $ip = $1;
+                my $servicesProvided = '[external ip]';
+
+                # If we're parsing the n1 pix log assume all src addresses are external
+                unless ($pixTier eq 'n1') {
+
+                    if (defined( tierForIp($ip) )) {
+                        my $hostname = hostnameForIp($ip);
+                        $servicesProvided = servicesForHostname($hostname);
+                    }
+                }
+
+                $line =~ s/(?:from|src) outside:$ip/$servicesProvided/;
+            }
+
+            # Summarize drop rate exceeded messages
+            # ASA-4-733100: [ Scanning] drop rate-1 exceeded. Current burst rate is 10 per second, max configured rate is 10; 
+            # Current average rate is 7 per second, max configured rate is 5; Cumulative total count is 4778
+            #
+
+            if ($line =~ /drop rate/) {
+                $line = substr ($line, 0, index($line, 'Current average rate is')) . "\n";
+            }
+
+            # group destination addresses by the following going from generic to specific:
+            # ip address    - an ip address if not resolvable
+            # hostname      - hostname if resolvable
+            # services      - if the host is in machinedb group by its services provided
+            #
+            # Deny tcp src outside:216.109.110.101/8443 dst inside:216.109.111.180/51921 by access-group "N1-N2"
+            # Deny inbound (No xlate) udp src outside:216.109.110.5/1354 dst outside:205.180.14.3/53
+            # Dropped UDP DNS reply from outside:207.241.224.5/53 to inside:216.109.110.77/53; packet length 1615 bytes exceeds configured limit of 1500 bytes
+            #
+            if ($line =~ /(?:dst|to) (?:outside|inside):(\d+\.\d+\.\d+\.\d+)/) {
+                my $ip = $1;
+
+                if (defined( tierForIp($ip) )) {
+                    my $hostname = hostnameForIp($ip);
+                    my $servicesProvided = servicesForHostname($hostname);
+                    $line =~ s/(?:dst|to) (outside|inside):$ip/\-> $servicesProvided/;
+                } else {
+                    $line =~ s/(?:dst|to) (outside|inside):$ip/\-> $ip/;
+                }
+            }
+
+            # remove byte count from summarization
+            #
+            # Dropped UDP DNS reply [external ip]/53 -> [bootsvr|dns|ntp|smtp server]/53; packet length 1615 bytes exceeds configured limit of 1500 bytes
+            $line =~ s/packet length \d+ bytes exceeds/packet length exceeds/;
+
+            # summarize high destination ports
+            if ($line =~ m|/([0-9]+) by access| and $1 >= 1024) {
+                $line =~ s|/$1|/\[high port\]|;
+            }
+
+            # summarize high source ports
+            if ($line =~ m|/([0-9]+) \->| and $1 >= 1024) {
+                $line =~ s|/$1|/\[high port\]|;
+            }
+
+            # strip out syslog code
+            # PIX-4-410001:
+            $line =~ s/PIX\-\d+\-\d+: //;
+
+            # strip out access-group information as it corresponds to the pix log it's in
+            # by access-group "N0-N1"
+            $line =~ s/ by access\-group.*$//;
+
+            # add each line to a hash and increment it's value: ie: 1, 2, 3
+            $sorted{$line}++;
+        }
+
+        ################################################################
+        # sort and print out the summaries.
+    
+        $file = basename $file;
+    
+        $file =~ s/(pix\-n\d+\-\d+)\.\d+\.gz/$1/;
+        print SUMMARY "\n", '-' x 72, "\n";
+        print(SUMMARY "\t\t\t $file\n");
+        print SUMMARY '-' x 72, "\n";
+    
+        # create a mapping with the following:
+        #   keys = number of occurences of a line
+        #   values = an anonymous array of lines that have occurred 'key' times
+        my %reverseSortedKeysAndValues = ();
+    
+        while (my ($line, $count) = each %sorted) {
+            push @{ $reverseSortedKeysAndValues{$count} }, $line;
+        }
+    
+        # sort by overall count
+        foreach my $count (sort { $b <=> $a } keys %reverseSortedKeysAndValues) {
+        
+            # sort alpha numerically by lines having the same number of occurances
+            foreach my $line ( sort { $a cmp $b } @{ $reverseSortedKeysAndValues{$count} } ) {
+                next if $line =~ /^\s*$/;
+                printf(SUMMARY "%5.d %s", $count, $line);
+            }
+        }
+    
+        print SUMMARY "\n", '-' x 72, "\n";
+        print(SUMMARY "\t\t\t $file ICMP Summary\n");
+        print SUMMARY '-' x 72, "\n";
+    
+        if (scalar keys %icmp) {
+            for my $line (sort { $icmp{$b} <=> $icmp{$a} } keys %icmp) {
+                # skip empty lines
+                next if $line =~ /^\s*$/;
+                printf(SUMMARY "%5.d %s", $icmp{$line}, $line);
+            }
+        }
+        else {
+            print SUMMARY "\tnothing to report\n";
+        }
+    }
+
+    close(SUMMARY);
+}
+
+sub sourceFilesForLogType {
+    my $logType = shift;
+
+    my @files = ();
+    my $sourceDir       = $logs->{$logType}->{'sourceDir'};
+    my $sourceFileRegex = qr/$logs->{$logType}->{'sourceFileRegex'}/;
+
+    chdir($sourceDir) or die "Unable to cd into [$sourceDir]: $!";
+    opendir(DIR, $sourceDir) or die "Can't open [$sourceDir]: $!";
+
+    foreach my $file ( sort readdir(DIR) ) {
+
+        next unless ( -f $file );
+        next if ( -z $file );
+        push( @files, "$sourceDir/$file" ) if ( $file =~ /$sourceFileRegex/ );
+    }
+
+    closedir(DIR);
+
+    return \@files;
+}
+
+sub parseSnortLogs {
+    my $sourceFiles = shift;
+    my $summaryFile = shift;
+
+    my %alerts = ();
+    my @signatures = signaturesToIgnore();
+    my %ignore = map { $_ => 1 } @signatures;
+
+    # Open our summary file for writing
+    open(SUMMARY, ">>$summaryFile") or die "Unable to open [$summaryFile] for writing: $!";
+    print SUMMARY '-' x 72, "\n";
+    print SUMMARY "\t\t", basename($summaryFile), "\n";
+    print SUMMARY '-' x 72, "\n\n";
+
+    foreach my $file ( @$sourceFiles ) {
+
+        my $snortFh = IO::Zlib->new($file, 'rb') or die "generate-snortlog-summaries: $!";
+        while (my $line = <$snortFh>) {
+    
+            chomp $line;
+            
+            # strip out "last message repeated" lines
+            if ($line =~ /last message repeated/) {
+                next;
+            }
+            
+            # strip out dates and snort pid
+            $line =~ s/^.*snort\[\d+\]: //g;
+            
+            my ($signature, $description, $class, $priority, $protocol, $pair);
+            
+            ##-----------------------------------------------------------HOA-26418---------------------------------------------------------------------------------------------------------
+              # Logs in EU does not have ": <eth1>" so in regex making optional this pattern by replacing ":\s*<\w+>" by ".*" to resolve HOA-26418
+              # [1:485:5] ICMP Destination Unreachable Communication Administratively Prohibited [Classification: Misc activity] [Priority: 3] {ICMP} 172.22.1.254 -> 172.22.2.193 ]
+              # [1:11687:5] WEB-MISC Apache SSI error page cross-site scripting [Classification: Web Application Attack] [Priority: 1] {TCP} 202.131.112.18:4074 -> 216.109.104.16:80
+            ##-----------------------------------------------------------HOA-26418---------------------------------------------------------------------------------------------------------
+
+            # [1:485:5] ICMP Destination Unreachable Communication Administratively Prohibited [Classification: Misc activity] [Priority: 3]: <eth1> {ICMP} 172.22.1.254 -> 172.22.2.193 ]
+            # [1:11687:5] WEB-MISC Apache SSI error page cross-site scripting [Classification: Web Application Attack] [Priority: 1]: <eth1> {TCP} 202.131.112.18:4074 -> 216.109.104.16:80
+
+            if ($line =~ /^\[(.+?)\]\s*([^\[]+)\s+\[Classification:\s*(.+?)\]\s*\[Priority:\s*(\d+)\].*\s*\{(\w+)\}\s*(\d+\.\d+\.\d+\.\d+.*\->\s*\d+\.\d+\.\d+\.\d+\S*)/) {
+                $signature   = $1;
+                $description = $2;
+                $class       = $3;
+                $priority    = $4;
+                $protocol    = $5;
+                $pair        = $6;
+            
+                if ( $ignore{$signature} ) {
+                    print "Ignoring signature [$signature]\n" if $debug;
+                    next;
+                }
+            
+                # make our key a combination of priority and signature
+                my $key = "$priority:$signature";
+            
+                # if we know about a key increment its hit counter
+                if (exists( $alerts{$key} )) {
+                    $alerts{$key}->{'pairHits'}->{$pair}++;
+                }
+            
+                # otherwise add new alert
+                else {
+                    $alerts{$key} = {
+                        'signature'     => $signature,
+                        'description'   => $description,
+                        'class'         => $class,
+                        'priority'      => $priority,
+                        'protocol'      => $protocol,
+                        'pairHits'      => {
+                            "$pair" => 1,
+                        },
+                    };
+                }
+            }
+        }
+
+        $snortFh->close;
+
+        # Sort and write out the summary.
+        foreach my $key (sort keys %alerts) {
+            my $signature   = $alerts{$key}->{'signature'};
+            my $description = $alerts{$key}->{'description'};
+            my $priority    = $alerts{$key}->{'priority'};
+            my $class       = $alerts{$key}->{'class'};
+            my $protocol    = $alerts{$key}->{'protocol'};
+
+            print SUMMARY "$description\n" .
+                "   Priority: $priority\n" .
+                "   Class: $class\n" .
+                "   Protocol: $protocol\n" .
+                "   Signature: $signature\n" .
+                "   Source -> Destination (hits):\n";
+
+            my %pairHits = %{ $alerts{$key}->{'pairHits'} };
+            foreach my $pair ( sort { $pairHits{$b} <=> $pairHits{$a} } keys %pairHits ) {
+                my $hits = $pairHits{$pair};
+                print SUMMARY "      $pair ($hits)\n";
+            }
+        
+            print SUMMARY "\n";
+        }
+
+    }
+
+    close(SUMMARY);
+}
+
+sub signaturesToIgnore {
+    my @signatures = ();
+
+    my $signatureIgnoreFile = $logs->{'snort'}->{'ignoreFile'};
+    open(IN, $signatureIgnoreFile) or warn "Unable to open file for reading: $!";
+    while (my $line = <IN>) {
+        chomp $line;
+
+        # ignore empty line or lines starting with a comment
+        next if $line =~ /^$/;
+        next if $line =~ /^#/;
+
+        push @signatures, $line;
+    }
+    close(IN);
+
+    return @signatures;
+}
+
+sub tierForIp {
+    my $ip = shift;
+    my $tier;
+
+    if (exists( $tierCache{$ip} )) {
+        $tier = $tierCache{$ip};
+    } else {
+        my $mask;
+        my $hostname = ariba::Ops::NetworkUtils::hostname();
+        my $domain = ariba::Ops::NetworkUtils::domainForHost($hostname);
+
+        $tier = ariba::Ops::NetworkUtils::hostnameToTier($ip, $mask, $domain);
+        $tierCache{$ip} = $tier;
+    }
+
+    return $tier;
+}
+
+sub hostnameForIp {
+    my $ip = shift;
+    my $hostname;
+
+    if (exists( $dnsCache{$ip} )) {
+        $hostname = $dnsCache{$ip};
+    } else {
+        $hostname = ariba::Ops::NetworkUtils::addrToHost($ip);
+
+        # check if we weren't able to resolve a hostname
+        if ( ariba::Ops::NetworkUtils::isIPAddr($hostname) ) {
+            my $tier = tierForIp($ip);
+            $hostname = "[unresolvable n${tier} ip]";
+        }
+
+        $dnsCache{$ip} = $hostname;
+    }
+
+    return $hostname;
+}
+    
+sub servicesForHostname {
+    my $hostname = shift;
+    my $servicesProvided = $hostname;
+
+    if ($hostname and not ariba::Ops::NetworkUtils::isIPAddr($hostname) and $hostname !~ /unresolvable/) {
+
+        my $machine = ariba::Ops::Machine->new($hostname);
+
+        if ($machine->ipAddr()) {
+
+            my @servicesProvided = sort $machine->providesServices();
+
+            if (@servicesProvided) {
+                $servicesProvided = '[' . join('|', @servicesProvided) . ' server]';
+            } else {
+                $servicesProvided = "[$hostname]";
+            }
+
+        } else {
+            $servicesProvided = '[host in DNS but not MDB]';
+        }
+    }
+
+    return $servicesProvided;
+}
+
+main();

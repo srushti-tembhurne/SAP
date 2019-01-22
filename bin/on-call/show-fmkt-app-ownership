@@ -1,0 +1,143 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/on-call/show-fmkt-app-ownership#2 $
+# List all contact info in the db as a cgi program or command line
+# This is based on //ariba/services/monitor/bin/on-call/show-schedule#7
+# delete when we stop doing per-product FMKT assignments
+#
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Constants;
+use ariba::Oncall::Display;
+use ariba::Oncall::FMKTProductAssignments;
+use ariba::Oncall::Person;
+
+sub main {
+	my $display = ariba::Oncall::Display->new();
+	$display->printHeaders();
+
+	if ($display->isHTML()) {
+		print "<font size=5 face=Helvetica>Ariba Network Operations FMKT Application Ownership</font><br>";
+		print "<font size=3 face=Helvetica><a href=",$display->contactLink(),">See Staff Contact Information</a></font><hr>";
+		print "<font size=2 face=Helvetica>Send all long emails to <a href=\"mailto:" . ariba::Ops::Constants->operationsEmailAddress() . "\">" . ariba::Ops::Constants->operationsEmailAddress() . "</a>.<br>";
+		print "Send all pages to <a href=\"mailto:" . ariba::Ops::Constants->operationsPagerAddress() . "\">" . ariba::Ops::Constants->operationsPagerAddress() . "</a>.<br></font>";
+	}
+
+	my $sched = ariba::Oncall::FMKTProductAssignments->new();
+
+	printHeader(
+		$display,
+		"Schedule for FMKT Assignments",
+		"listed people are always on-call for these products"
+	);
+
+	if ($display->isHTML()) {
+		print "<table border=1 cellspacing=0 cellpadding=3>\n";
+		print "<tr bgcolor=#CCCCCC align=center>";
+		print "<td><b><font size=2 face=Helvetica>Product</font></b></td>\n";
+		print "<td><b><font size=2 face=Helvetica>Primary</font></b></td>\n";
+		print "<td><b><font size=2 face=Helvetica>Backup</font></b></td>\n";
+		print "<td><b><font size=2 face=Helvetica>DBA</font></b></td>\n";
+		print "<td><b><font size=2 face=Helvetica>Comments</font></b></td>\n";
+		print "</tr>";
+
+		my $bgcolor1 = '#FFFFFF';
+		my $bgcolor2 = '#DDDDDD';
+		
+		my $bgcolor = $bgcolor2;
+
+		for my $pn ( $sched->productNames() ) {
+
+			my $primary = ariba::Oncall::Person->new($sched->primaryForProductName($pn));
+			my $backup  = ariba::Oncall::Person->new($sched->backupForProductName($pn));
+			my $dba  = ariba::Oncall::Person->new($sched->dbaForProductName($pn));
+
+			if ( $bgcolor eq $bgcolor1 ) {
+				$bgcolor = $bgcolor2;
+			} else {
+				$bgcolor = $bgcolor1;
+			}
+			
+			print "<tr bgcolor=$bgcolor>\n";
+			print "<td align=center><b><font face=Helvetica size=2>$pn</font></b></td>\n";
+
+			for my $person ( $primary, $backup, $dba ) {
+				print "<td>\n";
+				if ( $person->instance() ) {
+					print "<a href=", $display->contactLink($person->instance()), ">";
+					print "<b><font size=2 face=Helvetica>",fullName($person),"</font></b></a>";
+				} else {
+					print '&nbsp;';
+				}
+
+				print "</td>";
+			}
+
+			print "<td>\n";
+			if ( my $comment = $sched->commentForProductName($pn) ) {
+				$comment =~ s/,/<br>/og;
+				print '<font size=1 face=Helvetica>',$comment,'</font>';
+			} else {
+				print '&nbsp;';
+			}
+			print "</td>\n";
+
+			print "</tr>\n";
+		}
+	
+		print "</table>\n";	
+
+	} else {
+		for my $pn ( $sched->productNames() ) {
+			next unless $sched->primaryForProductName($pn);
+
+			my $primary = ariba::Oncall::Person->new($sched->primaryForProductName($pn));
+			my $backup  = ariba::Oncall::Person->new($sched->backupForProductName($pn));
+			my $dba  = ariba::Oncall::Person->new($sched->dbaForProductName($pn));
+
+			printf("%18s:  %s", $pn, fullName($primary));
+	
+			if ( $backup && $backup->instance() ) {
+				print ' (p) ', fullName($backup), ' (b)';
+			}
+
+			if ( $dba && $dba->instance() ) {
+				print ' ', fullName($dba), ' (dba)';
+			}
+
+			if ( $sched->commentForProductName($pn) ) {
+				print ' # '.$sched->commentForProductName($pn);
+			}
+			print "\n"
+		}
+	}
+}
+
+sub fullName {
+	my $person = shift;
+
+	return $person->fullname() || $person->instance() . ' [not in on-call db]'
+}
+
+sub printHeader {
+	my ($display,$header,$subheader) = @_;
+
+	if ($display->isHTML()) {
+		print '<br>';
+		print "<b><font size=5 face=Helvetica>$header</font></b>";
+		print "<br>\n";	
+		print "$subheader<br><br>\n";	
+	} else { 
+		print "\n$header\n";
+		print "$subheader\n\n";
+	}
+}
+
+main();
+
+__END__

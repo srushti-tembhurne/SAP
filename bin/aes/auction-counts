@@ -1,0 +1,107 @@
+#!/usr/local/bin/perl -w
+#
+# record auction counts for aes customers for past day
+#
+# $Id: //ariba/services/monitor/bin/aes/auction-counts#4 $
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::RealBin/../../lib";
+
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+
+sub main {
+	my $debug = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $product = "aes";
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-d/o) { $debug = 1; next }
+		if ($arg =~ /^-e/o) { $sendEmail = 1; next }
+		if ($arg =~ /^-p/o) { $sendPage = 1; next }
+		if ($arg =~ /^-product/o) { $product = shift(@ARGV); next }
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $service = $me->service();
+	my $email = $me->default('notify.email');
+	my @products = ariba::rc::InstalledProduct->installedProductsList($service, $product);
+
+	foreach my $product (@products) {
+		my $customer = $product->customer();
+
+		print "processing customer $customer...\n" if $debug;
+
+		my %queries;
+		$queries{"$customer auction counts"} = {
+			format			=> "%d created within last day",
+			recordMaxResults	=> "20000",
+			recordItem		=> "answer",
+			recordDataType		=> "gauge",
+			info			=> "defined(answer)",
+			warn			=> "!defined(answer)",
+			customer		=> $customer,
+			sql			=> qq`
+				select count(distinct auctionid) from auctions
+					where tdatimecreated > sysdate - 1;
+			`,
+		};
+		#
+		#auction status are:
+		#
+		#1 - open *
+		#2 - suspended
+		#3 - closed
+		#4 - terminated
+		#5 - failed recovery
+		#6 - killed
+		#7 - pending clear 
+		#8 - scheduled
+		#9 - migrated
+		#10- preview *
+		#11- pending launch
+		#12- pending open *
+		#13- pending review *
+		#14- paused
+		#15- obsolete
+		#
+		#things marked with '*' are good candidates for 'active auctions' query
+		#
+		$queries{"$customer active (open, preview, pending open, pending preview) auctions"} = {
+			format			=> "%d",
+			recordMaxResults	=> "20000",
+			recordItem		=> "answer",
+			recordDataType		=> "gauge",
+			info			=> "defined(answer)",
+			warn			=> "!defined(answer)",
+			customer		=> $customer,
+			sql			=> qq`
+				select count(distinct auctionid) from auctions
+					where status in
+				(1, 10, 12, 13);
+			`,
+		};
+
+
+		my $q = ariba::monitor::QueryManager->newWithDetails(
+			"auction-counts", $product->name(), $service, $customer, \%queries
+		);
+
+		$q->setSQLConnectInfo($product->connectInfoForOracleClient());
+		$q->setUiHint("ignore");
+
+		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+
+
+	exit 0;
+}
+
+main();
+

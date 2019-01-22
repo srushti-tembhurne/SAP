@@ -1,0 +1,303 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+use ariba::rc::InstalledProduct;
+use dmail::LockLib;
+
+my $LOCKFILE = '/tmp/oracle-memory-status';
+
+# Query objects, key on dbsid-dbhost-dbtype
+my %queryCache = ();
+
+# query hashes (for creating Query objects), key on dbsid-dbhost-dbtype
+my %queryHashCache = ();
+my %rateHashCache = ();
+
+# OracleClient objects, key on dbsid-dbhost-dbuser
+my %oracleClientCache = ();
+
+
+sub main {
+
+    my $debug = 0;
+    my $quiet = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift(@ARGV)) {
+        print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+        if ($arg =~ /^-d/o) { $debug=1; }
+        if ($arg =~ /^-e/o) { $sendEmail=1; };
+        if ($arg =~ /^-p/o) { $sendPage=1; };
+    }
+
+    $| = 1;
+    my $me      = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $email = $me->default('notify.email');
+
+    my $systemuser  = "system";
+    my $systempass  = $me->default("dbainfo.$systemuser.password");
+
+    my $sysuser = "sys";
+    my $syspass  = $me->default("dbainfo.$sysuser.password");
+
+    my ($dbuser, $dbpass);
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList( $me->service() );
+
+    foreach my $product (@products) {
+
+        my $isSSProduct = !$product->isASPProduct();
+
+        my $productLock = "$LOCKFILE-".$product->name();
+        unless (dmail::LockLib::requestlock($productLock,5)) {
+            warn "can't grab lock\n";
+            next;
+        }
+
+        my @connections = ariba::Ops::DBConnection->connectionsFromProducts($product);
+
+        for my $dbc ( ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections)) {
+
+            my $product     = $dbc->product();
+            my $productName = $product->name();
+
+            my $host  = $dbc->host();
+            my $dbsid = $dbc->sid();
+            my $type  = $dbc->type();
+
+            my $oracleClient;
+            if ($dbc->dbServerType() ne ariba::Ops::DBConnection->oracleDBServerType()) {
+                next;
+            }
+            if ($dbc->isDR() && $dbc->isPhysicalReplication()) {
+                # Don't run any unnecessary oracle status queries for physical standby.
+                # Oracle connetions prevent the db from being closed by bcv-backup.
+                # TMID: 88177
+                next;
+                $dbuser = $sysuser;
+                $dbpass = $syspass;
+            } else {
+                $dbuser = $systemuser;
+                $dbpass = $systempass;
+            }
+
+            my $queryCacheKey = join('-', $dbsid, $host, $type);
+
+            my $ocCacheKey = join("", $dbuser, $dbsid, $host);
+            if ($oracleClientCache{$ocCacheKey}) {
+                $oracleClient = $oracleClientCache{$ocCacheKey};
+            }
+            else {
+                $oracleClient = ariba::Ops::OracleClient->new($dbuser, $dbpass, $dbsid, $host);
+                # on connect timeout, just keep going; this will cause
+                # queries to fail with a connect error, which is what
+                # we want.
+                $oracleClientCache{$ocCacheKey} = $oracleClient;
+                unless ($oracleClient->connect(20,4)) {
+                    # continue on even if there is an error, this way
+                    # the error shows up once in the query and not
+                    # man times in email
+                }
+            }
+
+            my ($expando, $tab, $dbname);
+
+            $tab = $productName;
+            my $severity;
+            if ($dbc->isDR()) {
+                $expando = "oracle-status-for-dr-db";
+            }
+ 	    elsif ($dbc->isReplicated()) {
+            	$expando = "oracle-status-for-replicated-db";
+    	    }
+	    else {
+                $expando = "oracle-status-for-main-db";
+                $severity = 0;
+            }
+
+            $dbname = "$type-db";
+            $dbname =~ s/-/ /g;
+
+            my $critString = "answer > .75 * varproclimit";
+
+            if  (! $queryHashCache{$queryCacheKey}) {
+                my $queryName = "$dbsid current number of processes on $dbname";
+                my %sidQueries = (
+                        "$queryName" => {
+                            recordMaxResults => 110000,
+                                                        recordDataType => "gauge",
+                                                        info => "answer",
+                                        warn => "answer > .6 * varproclimit",
+                            crit => $critString,
+
+                                                        proclimit => q`select to_number(value) from v$parameter where name='processes'`,
+
+                                                        sql => q`select count(*) from v$process`,
+                                                        severity => $severity,
+
+                                                        details => {
+                                                                "current processes " =>{
+                                                                        noRowCount => 1,
+                                                                        sql => q`
+                                                                                select count(*), machine, program from v$session
+                                                                                group by machine, program
+                                                                                order by count(*) desc;
+                                                                        `,
+                                                                }
+                                                        }
+                        },
+                        "$dbsid ORA-04031 errors on $dbname" => {
+                            recordMaxResults => 110000,
+                            recordDataType => "counter",
+                            #crit => "previousAnswer && answer > previousAnswer",
+                            sql => q`select REQUEST_FAILURES from v$shared_pool_reserved`,
+                        },
+                        "$dbsid shared pool reloads on $dbname" => {
+                            recordMaxResults => 110000,
+                            recordDataType => "counter",
+                            sql => q`select RELOADS from v$librarycache where namespace = 'SQL AREA'`,
+                        },
+                        "$dbsid shared pool invalidations on $dbname" => {
+                            recordMaxResults => 110000,
+                            recordDataType => "counter",
+                            sql => q`select INVALIDATIONS from v$librarycache where namespace = 'SQL AREA'`,
+                        },
+                        "$dbsid shared pool cache hit ratio on $dbname" => {
+                            recordMaxResults => 110000,
+                            recordDataType => "gauge",
+                            format => "%.1f%%",
+                            sql => q`select PINHITS/PINS*100 from v$librarycache where namespace = 'SQL AREA'`,
+                        },
+
+                        "$dbsid Percent of Active Sessions in Blocked State" => {
+                            recordMaxResults => 60000,
+                            recordDataType => "gauge",
+                            format => "%.1f%%\n",
+                            sql => q`select round((blocked/active)*100,2) percent_blocked from (select count(*) active from v$session where status = 'ACTIVE'), (select count(*) blocked from v$session where status = 'ACTIVE' and blocking_session is not null)`,
+                        },
+
+                    );
+                my %rateQueries = (
+                        "$dbsid percent change in processes on $dbname" => {
+                            recordMaxResults => 110000,
+                            recordDataType => "gauge",
+                            warn => "answer > 20",
+                            format => "%.1f%%",
+                            extractRecorded => "percentChange($tab/$queryName, 2)",
+                        }
+                    );
+
+                $queryHashCache{$queryCacheKey} = \%sidQueries;
+                $rateHashCache{$queryCacheKey} = \%rateQueries;
+
+            }
+
+            my $sidLock = "$LOCKFILE-$queryCacheKey";
+            unless (dmail::LockLib::requestlock($sidLock,5)) {
+                warn "can't grab lock\n";
+                next;
+            }
+
+            my $sidQM = ariba::monitor::QueryManager->newWithDetails(
+                        $expando,
+                        $tab,
+                        $product->service(),
+                        $product->customer(),
+                        $queryHashCache{$queryCacheKey},
+            );
+
+            my $rateQM = ariba::monitor::QueryManager->newWithDetails(
+                        "$expando-rate",
+                        $tab,
+                        $product->service(),
+                        $product->customer(),
+                        $rateHashCache{$queryCacheKey},
+            );
+            $rateQM->setUIManager($expando);
+
+            $sidQM->setSQLConnectInfoFromOracleClient($oracleClient);
+            if ( ! $queryCache{$queryCacheKey} ) {
+
+                $sidQM->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+                $rateQM->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+                $queryCache{$queryCacheKey} = [ $sidQM->queries(), $rateQM->queries() ];
+            } else {
+                # pull out all queries from the cached QM
+                my %queriesHash = map { $_->queryName() => $_ } @{$queryCache{$queryCacheKey}};
+
+                # for each query in the sid-wide QM, match any queries
+                # that have already been run and stuff the previous values
+                for my $query ($sidQM->queries()) {
+                    my $cachedQuery = $queriesHash{$query->queryName()};
+                    unless ($cachedQuery) {
+                        print ">>>NOT FOUND ", $query->queryName() . " for $queryCacheKey\n";
+                        next;
+                    }
+                    # Stuff the data from the previous query here.
+                    for my $attribute ($cachedQuery->attributes()) {
+                        $query->setAttribute($attribute, $cachedQuery->attribute($attribute));
+                    }
+
+                    $query->setParentQueryManager($sidQM);
+                    $query->setCustomer($sidQM->customer());
+                }
+
+                for my $query ($rateQM->queries()) {
+                    my $cachedQuery = $queriesHash{$query->queryName()};
+                    unless ($cachedQuery) {
+                        print ">>>NOT FOUND ", $query->queryName() . " for $queryCacheKey\n";
+                        next;
+                    }
+                    # Stuff the data from the previous query here.
+                    for my $attribute ($cachedQuery->attributes()) {
+                        $query->setAttribute($attribute, $cachedQuery->attribute($attribute));
+                    }
+
+                    $query->setParentQueryManager($rateQM);
+                    $query->setCustomer($rateQM->customer());
+                }
+
+                # Don't notify here - notification has already been sent for
+                # these sid-wide queries
+                if ($debug) {
+                    $sidQM->displayToStdout();
+                    $rateQM->displayToStdout();
+                } else {
+                    my $monserver = ariba::Ops::PageUtils::monitorServer();
+                    unless (defined $monserver) {
+                        warn "oracle-connection-number-status: ariba::Ops::PageUtils::monitorServer() couldn't find a monitor server.\n";
+                    } else {
+                        $sidQM->checkStatus();
+                        $rateQM->checkStatus();
+                        if ((my $ret = $sidQM->appendToServer($monserver)) != 0) {
+                            warn "oracle-connection-number-status: appending to server failed with ret $ret";
+                        } else {
+                            $sidQM->archiveResultsOnServer();
+                        }
+                        if ((my $ret = $rateQM->appendToServer($monserver)) != 0) {
+                            warn "oracle-connection-number-status: appending to server failed with ret $ret";
+                        } else {
+                            $rateQM->archiveResultsOnServer();
+                        }
+                    }
+                }
+
+            }
+
+            dmail::LockLib::releaselock($sidLock);
+        }
+
+        dmail::LockLib::releaselock($productLock);
+    }
+}
+
+main();

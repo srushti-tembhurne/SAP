@@ -1,0 +1,118 @@
+#!/usr/local/bin/perl
+
+#
+# $Id: //ariba/services/monitor/bin/piwik/piwik-status#5 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::monitor::OutageSchedule;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::Url;
+use ariba::Ops::MySQLClient;
+
+sub main {
+	my $debug = 0;
+	my $quiet = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while(my $arg=shift){
+		if($arg =~ /^-d/o){ $debug=1; }
+		if($arg =~ /^-e/o){ $sendEmail=1; };
+		if($arg =~ /^-p$/o){ $sendPage=1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $email = $me->default('notify.email');
+	my $cluster = $me->currentCluster();
+	my $service = $me->service();
+
+	my $piwik = ariba::rc::InstalledProduct->new('piwik', $service);
+	my %q;
+
+	foreach my $host ($piwik->hostsForRoleInCluster('piwikwebserver',$cluster))
+	{
+		my $url = "https://" . $host . ":" . $piwik->default('webserver_port') . 
+			$piwik->default('monitor.uri');
+		$url =~ s/AND/\&/g;
+		my $monUrl = ariba::Ops::Url->new($url);
+		my @results = $monUrl->request();
+		my $xml = join("\n", @results);
+		$xml =~ s/></>\n</g;
+		@results = split("\n",$xml);
+
+		my %tags;
+		foreach my $line (@results) {
+			if($line =~ /<([^>]+)>([^<]+)<\//) {
+				$tags{$1} = $2;
+			}
+		}
+
+		$q{"$host total memory"} = {
+			info => 1,
+			perl => sub { return $tags{'CurrentTotalMemory'} },
+			recordDataType => 'gauge',
+			recordItem => 'answer',
+			recordMaxResults => 500,
+		};
+
+		$q{"$host peak memory"} = {
+			info => 1,
+			perl => sub { return $tags{'CurrentPeakMemory'} },
+			recordDataType => 'gauge',
+			recordItem => 'answer',
+			recordMaxResults => 500,
+		};
+
+		$q{"$host average response time in milliseconds"} = {
+			info => 1,
+			perl => sub { return $tags{'AvgResponseTimeMS'} },
+			recordDataType => 'gauge',
+			recordItem => 'answer',
+			recordMaxResults => 500,
+		};
+	}
+
+	my $dbuser = $piwik->default('MySQLDBConnections.piwik.user');
+	my $dbpass = $piwik->default('MySQLDBConnections.piwik.password');
+	my $host = $piwik->default('MySQLDBConnections.piwik.host');
+	my $port = $piwik->default('MySQLDBConnections.piwik.port');
+	my $database = $piwik->default('MySQLDBConnections.piwik.database');
+
+	my $dbc = ariba::Ops::MySQLClient->new(
+			$dbuser,
+			$dbpass,
+			$host,
+			$port,
+			$database
+	);
+	$dbc->connect(20,4); # 20 seconds, 4 retries
+
+	$q{"Failed Piwik Tasks"} = {
+		info => "numrows == 0",
+		warn => "numrows > 0",
+		sql => 'select * from piwik_ariba_tasks
+					where
+						((STATUS = 0 AND ts_finished IS NULL AND
+							ts_timeout_at < SYSDATE())
+					OR
+						(STATUS = 2))
+					AND
+						(ts_timeout_at > (SYSDATE() - INTERVAL 24 HOUR))',
+		format => "  %s %s %s %s %s %s %s %s %s %s",
+	};
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails('piwik-status', 'piwik', $service, undef, \%q);
+	$qm->setSQLConnectInfoFromMySQLClient($dbc);
+	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+		
+}
+
+main(@ARGV);

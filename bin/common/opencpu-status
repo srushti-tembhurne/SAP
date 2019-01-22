@@ -1,0 +1,107 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/opencpu-status#1 $
+
+$quiet = 1;
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+
+my $debug = 0;
+
+sub usage {
+	my $error = shift; 
+
+	print <<USAGE;
+Usage: $0 [-e|-p|-d|-h] -product  <<product name>>
+
+This script uses a curl command to ping each opencpu instance.
+
+	-e    Enables sending of email for monitor query.
+	-p    Enables sending of pages for monitor query.
+	-d    Turns on debug mode. 
+	-h    Shows this help.
+
+USAGE
+
+	print "(error) $error\n" if ($error);
+
+	exit();
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+    my $role = 'opencpu';
+
+	while (my $arg = shift) {
+		if ($arg =~ m/^-h$/o) { usage();		next; }
+		if ($arg =~ m/^-d$/o) { $debug++; 		next; }
+		if ($arg =~ m/^-e$/o) { $sendEmail = 1;	next; }
+		if ($arg =~ m/^-p$/o) { $sendPage = 1; 	next; }
+
+		usage("Invalid argument: $arg");
+	}
+	
+	my $mon = ariba::rc::InstalledProduct->new();
+    my $service = $mon->service();
+    my $cluster = $mon->currentCluster();
+
+    my @products = ariba::rc::InstalledProduct->installedProductsListInCluster( $service, undef, undef, $cluster );
+
+    foreach my $product (@products) {
+
+        # The config generator is a componenet used by redis embedded with an app.  Key on its existence
+        # to see if we should proceed
+        my @hosts = $product->hostsForRoleInCluster( $role, $cluster );
+        next unless @hosts;
+
+	    my %queries = ();
+        my @instances = $product->appInstancesLaunchedByRoleInCluster( $role, $cluster );
+
+	    foreach my $instance (@instances) {
+
+            my $instanceName = $instance->instanceName();
+            $queries{"$instanceName opencpu isup"} = {
+                info   => 'answer eq "ok"',
+                warn   => 'answer ne "ok"',
+                crit   => 'answer ne "ok" && previousAnswer ne "ok"',
+                perl   => sub { openCpuPing( $instance ); },
+                uiHint => "default community/$role",
+            };
+        }
+
+        my $q = ariba::monitor::QueryManager->newWithDetails(
+            "opencpu-status", $product->name(), $service, $product->customer(), \%queries
+        );
+        $q->setUiManager('http-urls-status');
+
+        my $ret = $q->processQueriesUsingServer($debug, $product->default('notify.email'), $sendEmail, $sendPage);
+    }
+
+}
+
+sub openCpuPing {
+    my $instance = shift;
+
+    my $ret;
+    my ($return, @output) = $instance->checkIsUp();
+
+    # success when $return = 1;
+    if ($return) {
+        $ret = 'ok';
+    } else {
+        $ret = join("\n", @output);
+    }
+
+    return $ret;
+}
+
+main(@ARGV);
+
+__END__

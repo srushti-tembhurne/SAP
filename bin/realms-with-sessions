@@ -1,0 +1,47 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Time::Local;
+
+use ariba::monitor::CircularDB;
+
+sub main
+{
+	my($product, $starttime, $endtime);
+
+	while(my $arg = shift(@ARGV)) {
+		if($arg =~ m/^-product$/o) { $product = shift(@ARGV); next; }
+		if($arg =~ m/^-starttime$/o) { $starttime = shift(@ARGV); next; }
+		if($arg =~ m/^-endtime$/o) { $endtime = shift(@ARGV); next; }
+	}
+
+	# 2010-07-27:15:59:00
+	my @start = $starttime =~ m/(\d+)-(\d+)-(\d+):(\d+):(\d+):(\d+)/;
+	my @end = $endtime =~ m/(\d+)-(\d+)-(\d+):(\d+):(\d+):(\d+)/;
+	$start[1]--;
+	$end[1]--;
+
+	my $start = timelocal(reverse @start);
+	my $end = timelocal(reverse @end);
+
+	my @cdbs = ariba::monitor::CircularDB->listDBs($product, "active");
+
+	foreach my $cdb (@cdbs) {
+		my $name = $cdb->name();
+		next if $name !~ m/id/;
+		next if $name =~ m/-T/i;
+		my @recs = $cdb->readRecords($start, $end);
+		foreach my $rec (@recs) {
+			if($rec->[1] != 0) {
+				print "$name\n";
+				last;
+			}
+		}
+	}
+}
+
+main();
+	

@@ -1,0 +1,143 @@
+#!/usr/local/bin/perl
+
+use warnings;
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use DateTime;
+use IO::File;
+use File::Path;
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+
+my $debug = 0;
+
+sub main {
+	my ($productName);
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-prod/i) { $productName = shift(@ARGV); next; }
+		if ($arg =~ /^-d/i) { ++$debug; next; }
+	}
+
+	my $today = DateTime->now( time_zone => 'local' );
+
+	my $mon = ariba::rc::InstalledProduct->new("mon");
+	die "$0: Can't load mon product" unless ($mon);
+
+	my $product = ariba::rc::InstalledProduct->new($productName, $mon->service());
+	die "$0: Can't load $productName product" unless ($product);
+
+	my @connections = ariba::Ops::DBConnection->connectionsFromProducts($product);
+	for my $dbc ( ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections)) {
+
+		# skip dr connections
+		next if $dbc->isDR();
+
+		my $sid = $dbc->sid();
+		my $host = $dbc->host();
+
+		if ($debug) {
+			print "working on $sid $host\n";
+		}
+
+		my $sysOc = ariba::Ops::OracleClient->new("system", $mon->default("dbainfo.system.password"), $dbc->sid(), $dbc->host());
+		$sysOc->connect() or die "Could not connect to schema as system: $!";
+
+		my $path = join("/", ariba::Ops::Constants::monitorDir(),
+							"docroot/full-tablescan-reports",
+							"$productName");
+
+		mkpath($path);
+		my $reportFileName = "$path/full-tablescan-report-$productName-$sid-$host-" . $today->ymd("-") . ".txt";
+
+		my $reportFh = IO::File->new(">$reportFileName") or die "Can't open report file $reportFileName: $!"; 
+		$reportFh->autoflush(1);
+
+		# 1. list SQL IDs for all SQL doing full table scans within
+		#     the last 24 hours.
+		my @fullTablescanIds = $sysOc->executeSql(q`
+			select distinct p.sql_id
+			from
+			dba_hist_sql_plan p,
+			dba_hist_sqlstat   s,
+			dba_hist_snapshot sn
+			where p.options='FULL'
+			and
+			p.sql_id = s.sql_id
+			and
+			s.snap_id = sn.snap_id
+			and sn.BEGIN_INTERVAL_TIME > sysdate - 1
+		`);
+
+		if ($debug) {
+			print "got ".scalar(@fullTablescanIds)." IDs for full table scan SQLs:\n";
+			print join(",", @fullTablescanIds), "\n";
+		}
+		
+		# this is to limit the number of times we re-use the db
+		# connection, to avoid problems with temp space
+		my $max = scalar(@fullTablescanIds);
+		my $index = 0;
+		my $maxTimesConnectionReuse = 29;  # since we start at 0, this is actualy +1 times
+
+		while ($index < $max) {
+
+			my $last = $index + $maxTimesConnectionReuse;
+			if ($last >= $max) {
+				$last = $max - 1;
+			}
+
+			my @idsSlice = @fullTablescanIds[$index .. $last];
+
+			$sysOc = ariba::Ops::OracleClient->new("system", $mon->default("dbainfo.system.password"), $dbc->sid(), $dbc->host());
+			$sysOc->connect() or die "Could not connect to schema as system: $!";
+
+			for my $sqlId (@idsSlice) {
+
+				print $reportFh "=============================================================\n";
+				print $reportFh "### SQL ID $sqlId\n";
+				print $reportFh "=============================================================\n";
+
+				# 2. grab SQL txt
+				my @sqls = $sysOc->executeSql(q`
+						select sql_text from dba_hist_sqltext where sql_id='`.$sqlId.q`'
+						`);
+
+				if ($sysOc->error()) {
+					print $reportFh "### ERROR: fetch SQLtext for id $sqlId failed: ".$sysOc->error()."\n";
+					next;
+				}
+
+				print $reportFh "\n### sql text for $sqlId ###\n";
+				print $reportFh join("\n", @sqls), "\n";
+
+				# 3. grab Query plan
+				my @queryPlans = $sysOc->executeSql(q`
+						SELECT * FROM TABLE(dbms_xplan.display_awr('`.$sqlId.q`'))
+						`);
+				if ($sysOc->error()) {
+					print $reportFh "### ERROR: fetch SQL plan for id $sqlId failed: ".$sysOc->error()."\n";
+					next;
+				}
+
+				print $reportFh "\n### plan for $sqlId ###\n\n";
+				print( $reportFh join("\n", @queryPlans), "\n" );
+
+			}
+
+			$sysOc->disconnect();
+			$index = $last+1;
+		}
+
+		$reportFh->close();
+
+	}
+}
+
+main();
+

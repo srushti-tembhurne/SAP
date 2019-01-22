@@ -1,0 +1,253 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/dba/check-log-volumes#17 $
+#
+# A script to make sure that the multiple log destinations are on different
+# set of spindles
+# 
+# 
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::Passwords;
+use ariba::DBA::SampleSQLQueries;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::FileSystemUtils;
+use ariba::Ops::NetworkDeviceManager;
+use ariba::monitor::StatusPage;
+
+use File::Basename;
+
+my $debug = 0;
+
+## We assume one inserv device/database.
+my $nm;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	my ($instance, $user, $pass, $array, @productNames);
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; next; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; next; };
+		if ($arg =~ /^-d/o) { $debug++ ; next; };
+	}
+
+	my $me	          = ariba::rc::InstalledProduct->new();
+	my $hostname      = ariba::Ops::NetworkUtils::hostname();
+	my $cluster       = $me->currentCluster();
+	my $email         = $me->default('notify.dba');
+
+	
+	print "DEBUG: debug level is $debug\n" if $debug >= 1;
+
+	my @products      = ();
+
+	#
+	# Get all the products running on this machine
+	#
+	push(@products, ariba::rc::InstalledProduct->installedProductsList($me->service()));
+
+	unless(@products) {
+		print "no running products found running on this machine\n" if $debug;
+		exit (0) 
+	}
+
+	#
+	# get a handle to inserv device for this datacenter
+	#
+	my $machine     = ariba::Ops::Machine->new();
+	my $datacenter  = $machine->datacenter();
+	my $tab         = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+	my @inservs = ariba::Ops::NetworkDeviceManager->newFromDatacenter($datacenter, 'inserv');
+
+	my @dbconnections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+
+	#
+	# loop over all sids on this host
+	#
+	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbconnections)) {
+		my $type        = $dbc->type();
+		my $virtualHost = $dbc->host();
+		my $instance    = uc($dbc->sid());
+
+		my $product     = $dbc->product();
+		my $productName = $product->name();
+
+		my $activeHost  = $product->activeHostForVirtualHostInCluster($virtualHost, $cluster);
+
+		if (!$activeHost || $activeHost ne $hostname) {
+			next;
+		}
+
+		my ($logVolumesTo3ParVirtualVolumesHashRef, $inservHostRef);
+		($logVolumesTo3ParVirtualVolumesHashRef, $inservHostRef) = multipleVirtualVolumesForOracleLogs($me, $dbc, @inservs);
+
+		next if ($@ || !defined $logVolumesTo3ParVirtualVolumesHashRef || !keys(%$logVolumesTo3ParVirtualVolumesHashRef));
+
+		my $crit;
+
+		while(my ($key, $value) = each(%$inservHostRef)) {
+			# CRIT only if there is no failed disk 
+			# 0: no failed disk, 1: failed disk
+			if($value == 0) {
+				$crit = "!answer || answer =~ /^Error/";
+				last;
+			}
+		}
+
+		my %queries;
+
+		$queries{"Shared disk spindles for log volumes for $instance"} = {
+			noRowCount => 1,
+			uiHint  => 'shared-spindles-for-log-volumes',
+			info => "answer eq 'ok'",
+			warn => "answer =~ /^Warn/",
+			crit => $crit,
+			timeout => 4 * 60,
+			perl => sub { main::checkDistinctSpindles($logVolumesTo3ParVirtualVolumesHashRef); },
+		};
+
+		my $email = $me->default('notify') || $me->default('notify.email');
+
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			'dba', $tab, $me->service(), $me->customer(), \%queries
+		);
+
+		$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+sub multipleVirtualVolumesForOracleLogs {
+	my $me = shift;
+	my $dbc = shift;
+	my (@inservs) = (@_);
+
+	# Hash for volume->VV mapping
+	my %volumeToVirtualVolumes;
+	# Hash for inserv hosts->failed disk status mapping
+	my %inservHosts;
+
+	#
+	# find log file location for the sid we are working on
+	#
+	my @logLocations;
+        eval {  
+		@logLocations = ariba::DBA::SampleSQLQueries::executeSQLQuery($me, "logLocations", $dbc);
+        };
+	my @logVolumes = ariba::Ops::FileSystemUtils::uniqueMountPointsForPathList(\@logLocations);
+
+	#
+	# If there is no logging to more than one location, there
+	# is nothing to do here. Move on
+	#
+	return (\%volumeToVirtualVolumes, \%inservHosts) if (@logVolumes <= 1);
+
+	#
+	# if volumes are not completely on 3par, there is nothing to
+	# to do, move on
+	#
+	my $allDevicesOn3Par = 1;
+	for my $volume (@logVolumes) {
+		my @deviceDetails = ariba::Ops::FileSystemUtils::devicesForMountPoint($volume);
+
+		for my $device (@deviceDetails) {
+			if (!$device->is3Par()) {
+				$allDevicesOn3Par = 0;
+				last;
+			}
+
+			# Assign the network manager object for the database
+			$nm = $device->inservForDevice(\@inservs) unless $nm;
+		
+			unless(exists $inservHosts{$nm->instance()}) {
+			my $failedDiskStatus = $nm->failedDisk();
+				if ($failedDiskStatus) {
+					$inservHosts{$nm->instance()} = 1;
+				} else {
+					$inservHosts{$nm->instance()} = 0;
+				}
+			}
+		}
+		last unless($allDevicesOn3Par);
+	}
+
+	return (\%volumeToVirtualVolumes, \%inservHosts) unless($allDevicesOn3Par);
+
+	$nm->setDebug($debug) if $debug > 1;
+	ariba::Ops::FileSystemUtils::setDebug($debug) if $debug > 1;
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+
+	#
+	# get 3par vv for volumes on host
+	#
+
+	for my $volume (@logVolumes) {
+		my @deviceDetails = ariba::Ops::FileSystemUtils::devicesForMountPoint($volume);
+
+		my @luns;
+		for my $device (@deviceDetails) {
+			push(@luns,  $device->lun());
+		}
+		my @virtualVols = $nm->virtualVolumesForLunsOnHost(\@luns, $hostname);
+
+		push(@{$volumeToVirtualVolumes{$volume}}, @virtualVols);
+		if ($debug) {
+			print "virtual vols for $volume on $hostname:\n";
+			for my $vv (@virtualVols) {
+				print "  ", $vv->name(), "\n";
+			}
+		}
+	}
+	return (\%volumeToVirtualVolumes, \%inservHosts);
+}
+
+sub checkDistinctSpindles {
+	my $logVolumesTo3ParVirtualVolumesHashRef = shift;
+
+	my @vols = keys(%$logVolumesTo3ParVirtualVolumesHashRef);
+	my $numVols = scalar(@vols);
+
+	if ($numVols != 2) {
+		return("Warn: Found $numVols log volumes expecting 2");
+	}
+
+	# get virutal volumes that make up each log volume
+	my @vv1;
+	my @vv2;
+
+	for my $vv (@{$logVolumesTo3ParVirtualVolumesHashRef->{$vols[0]}}) {
+		push(@vv1, $vv->name());
+	}
+	for my $vv (@{$logVolumesTo3ParVirtualVolumesHashRef->{$vols[1]}}) {
+		push(@vv2, $vv->name());
+	}
+
+	my @sharedPds = $nm->virtualVolumesSharedPhysicalDisks(\@vv1, \@vv2);
+	#
+	# If there are no shared physical disks we are ok.
+	#
+	unless(@sharedPds) {
+		return ("ok");
+	}
+
+	my @results;
+	push(@results, "Error: Following virtual volumes share physical disk(s)");
+	for my $sharedPd (@sharedPds) {
+		my $sharedBetween = $sharedPd->virtualVolume1() . " " .  $sharedPd->virtualVolume2() . " (" . $sharedPd->physicalPosition() . ")";
+		push(@results, $sharedBetween);
+	}
+
+	return(join("\n", @results));
+}
+
+main();

@@ -1,0 +1,89 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use Data::Dumper;
+use Getopt::Long qw(:config no_ignore_case_always no_getopt_compat require_order);
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Url;
+use ariba::monitor::QueryManager;
+use XML::Simple;
+
+sub main {
+	my ($debug, $sendEmail, $sendPage, $productName);
+	GetOptions  (
+			'debug|d'         => \$debug,
+			'sendemail|e'     => \$sendEmail,
+			'sendpage|p'      => \$sendPage,
+			'product|prod=s'  => \$productName,
+		    );
+
+	my $monProduct = ariba::rc::InstalledProduct->new();
+	my $product = ariba::rc::InstalledProduct->new($productName, $monProduct->service());
+
+    unless($product) {
+        print "product [ $productName ] is invalid \n";
+        exit(0);
+    }
+	my $cluster = $product->currentCluster() || 'primary';
+
+	my $adminurl = $product->default("VendedUrls.AdminFrontDoorTopURL");
+	my $prodname = $product->name();
+	my $service = $product->service();
+	my $customer = $product->customer() || undef;
+	my $email = $product->default('notify.email');
+	my @pq_da = qw( areNewMessagesExistInQueueForLongTime arePendingMessagesExistInQueueForLongTime areDoneMessagesExistInQueueForLongTime SchedulerStatusMonitorAction);
+
+	my %queries;
+
+	foreach my $queue(@pq_da) {
+
+		$prodname =~s/s4/Sourcing/si;
+
+		my $uri;
+		if($queue eq "SchedulerStatusMonitorAction" ) {
+			$uri = $adminurl.'/'.ucfirst($prodname).'/Main/ad/'.'getStatus/SchedulerStatusMonitorAction';
+		}
+		else {
+			$uri = $adminurl.'/'.ucfirst($prodname).'/Main/ad/'.$queue.'/MessageStatusMonitorAction';
+		}
+		my $url = ariba::monitor::Url->new( $uri ); 
+		my $response = $url->request();
+		print "$url \t $response \n" if($debug);
+
+		my $xml_href;
+		eval {
+			$xml_href = XMLin($response);
+		};
+
+		if ($@ || ref($xml_href) !~ /hash/i){
+			print " Error in parsing url [ $url ] : $response \n error : $@ \n" if($debug);
+			$xml_href->{'Status'} = "ERROR in $url ";
+		}
+		print Dumper($xml_href) if($debug);	    
+		$queries{"$queue"} =  {
+			description => "$queue",
+			crit => "answer !~/No|Success/i",
+			severity => 1,
+			perl => sub { return $xml_href->{'Status'} },   
+			correctiveActions => [
+                                          Ops => '1) Please refer this wiki -> https://wiki-ariba.sjc.sap.corp/display/ENGDPTS/Corrective+Action+for+Pq-message-status+monitoring'
+                                    ],
+		};
+
+
+	}
+
+
+	my $queryObject = ariba::monitor::QueryManager->newWithDetails('PQ-Message-Status', $productName, $service, $customer, undef, \%queries);
+	$queryObject->processQueries($debug, $email, $sendEmail, $sendPage);
+
+
+}
+
+&main();
+

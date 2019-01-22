@@ -1,0 +1,217 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::MySQLClient;
+use ariba::Ops::DBConnection;
+use ariba::rc::InstalledProduct;
+use dmail::LockLib;
+
+my $LOCKFILE = '/tmp/mysql-status';
+
+my %queryCache = ();
+my %queryHashCache = ();
+my %mySQLClientCache = ();
+
+sub main {
+	# Set default command line options
+	my $debug = 0;
+	my $quiet = 0; # set to 1 to hide arg parsing message
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	# Check command line options
+	while (my $arg = shift(@ARGV)) {
+		print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+		if ($arg =~ /^-d/o) { $debug=1; }
+		if ($arg =~ /^-e/o) { $sendEmail=1; };
+		if ($arg =~ /^-p/o) { $sendPage=1; };
+	}
+
+	$| = 1; # Do not line buffer. This is carried over from oracle-connection-number-status.
+
+	my $me	  = ariba::rc::InstalledProduct->new();
+	my $cluster = $me->currentCluster();
+	my $email = $me->default('notify.email');
+
+	my $service = $me->service();
+
+	my $dbuser  = "system";  # Always use "system" for monitoring per discussion with JC, Jarek & Hide
+	my $dbpass  = $me->default("dbainfo.mysqlsystem.password");
+
+	# Get the list products for the service
+	my @products = ariba::rc::InstalledProduct->installedProductsList( $service );
+
+	foreach my $product (@products) { # loop start for each product installed in the service
+
+		my $productLock = "$LOCKFILE-".$product->name(); # e.g. /tmp/lockfile-mysql-status-ut
+		if ($product->customer()) {
+			$productLock .= $product->customer();
+		}
+
+		# Get connection information for the product from product config files
+		my $mysqlType = ariba::Ops::DBConnection->mysqlDBServerType();
+		my @connections = ariba::Ops::DBConnection->connectionsToMySQLFromProducts($product);
+
+		next unless scalar(@connections);
+
+		unless (dmail::LockLib::requestlock($productLock,5)) {
+			warn "can't grab lock\n"; # if you can't grab a lock for the product, skip to the next prod.
+			next;
+		}
+
+		for my $dbc ( ariba::Ops::DBConnection->uniqueConnectionsByHostAndPort(@connections) ) {
+			# For each product, loop for unique host and port combinations
+
+			my $tab; # on monitoring page
+			my $expando; # on monitoring page
+
+			my $product	 = $dbc->product();
+			my $productName = $product->name();
+
+			my $host  = $dbc->host();
+
+			# "sid" contains port number and database name if MySQL
+			my $dbsid = $dbc->sid();
+			my $port = $dbc->port(); 
+			my $database = $dbc->database(); 
+
+			my $type  = $dbc->type();
+
+			my $mySQLClient;
+
+			# Instantiate a MySQLClient object and connect to the DB if not created and cached
+			my $mySQLClientCacheKey = join("", $dbuser, $host, $port, $database);
+
+			if ($mySQLClientCache{$mySQLClientCacheKey}) {
+				$mySQLClient = $mySQLClientCache{$mySQLClientCacheKey};
+			} else {
+				$mySQLClient = ariba::Ops::MySQLClient->new($dbuser, $dbpass, $host, $port, $database);
+				$mySQLClientCache{$mySQLClientCacheKey} = $mySQLClient;
+
+								# on connect timeout, just keep going; this will cause
+								# queries to fail with a connect error, which is what
+								# we want.
+
+				unless (
+						$mySQLClient->connect(
+											  20, # timeout
+											  4   # retries
+											  )
+						) {
+										# continue on even if there is an error, this way
+										# the error shows up once in the query and not
+										# man times in email
+				}
+			} # end of getting a valid reference to a MySQLClient instance
+
+			if ($dbc->isDR()) {
+				$tab = ariba::monitor::StatusPage::disasterRecoveryProduct();
+				$expando = "mysql-status-for-$productName-dr-db";
+			} else {
+				$tab = $productName;
+				$expando = "mysql-status-for-main-db";
+			}
+
+			my $queryCacheKey = join('-', $host, $port, $database, $type); 
+
+			if (! $queryHashCache{$queryCacheKey} ) {
+				# if queryHashCache does NOT have the cached value for the specific query key.
+
+				my %sidQueries = (
+								  "Current number of threads connected on $host port $port" => {
+									  recordMaxResults => 12000,
+									  recordDataType => "gauge",
+									  info => "answer",
+									  warn => "answer > .8 * varproclimit",
+									  crit => "answer > .9 * varproclimit",
+									  proclimit => q`select @@max_connections`,
+									  sql =>
+										  q`select VARIABLE_VALUE from information_schema.global_status where VARIABLE_NAME = 'THREADS_CONNECTED'`,
+									  },
+								  );
+
+				$queryHashCache{$queryCacheKey} = \%sidQueries;
+
+			} # end if the value for the key does not exist in cache.
+
+			my $sidLock = "$LOCKFILE-$queryCacheKey";
+			unless (dmail::LockLib::requestlock($sidLock,5)) {
+				warn "can't grab sid lock: $sidLock\n";
+				next; # move on to next mysqld running on a different port database combination on the host
+			}
+
+			my $sidQM = ariba::monitor::QueryManager->newWithDetails(
+																	 $expando,
+																	 $tab, # product name
+																	 $product->service(),
+																	 $product->customer(),
+																	 $queryHashCache{$queryCacheKey}, 
+																	   #  Ref to a hash table containing queries
+																	 );
+
+
+			#  set mySQLClient to QueryManager and each Query instance.
+			$sidQM->setSQLConnectInfoFromMySQLClient($mySQLClient); 
+
+			if ( ! $queryCache{$queryCacheKey} ) {
+				# queryCache for the specific set of queries is empty. Processing the query
+
+				$sidQM->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+				$queryCache{$queryCacheKey} = [ $sidQM->queries() ];
+
+			} else {
+               # pull out all queries from the cached QM
+				my %queriesHash = map { $_->queryName() => $_ } @{$queryCache{$queryCacheKey}};
+
+                # for each query in the sid-wide QM, match any queries
+                # that have already been run and stuff the previous values
+				for my $query ($sidQM->queries()) {
+					my $cachedQuery = $queriesHash{$query->queryName()};
+					unless ($cachedQuery) {
+						print ">>>NOT FOUND ", $query->queryName() . " for $queryCacheKey\n";
+						next;
+					}
+                    # Stuff the data from the previous query here.
+					for my $attribute ($cachedQuery->attributes()) {
+						$query->setAttribute($attribute, $cachedQuery->attribute($attribute));
+					}
+
+					$query->setParentQueryManager($sidQM);
+					$query->setCustomer($sidQM->customer());
+				}
+
+                # Don't notify here - notification has already been sent for
+                # these sid-wide queries
+				if ($debug) {
+					$sidQM->displayToStdout();
+				} else {
+					my $monserver = ariba::Ops::PageUtils::monitorServer();
+					unless (defined $monserver) {
+						warn "mysql-status: ariba::Ops::PageUtils::monitorServer() couldn't find a monitor server.\n";
+					} else {
+						$sidQM->checkStatus();
+						if ((my $ret = $sidQM->appendToServer($monserver)) != 0) {
+							warn "mysql-status: appending to server failed with ret $ret";
+						} else { 
+							$sidQM->archiveResultsOnServer();
+						}
+					}
+				} # end if debug
+			} # end if queryCache
+
+			dmail::LockLib::releaselock($sidLock);
+		} # end for-loop of unique instance of mySQL server running on a specific port
+
+		dmail::LockLib::releaselock($productLock);
+	} # end loop for product
+
+	exit(0);
+}
+
+main();

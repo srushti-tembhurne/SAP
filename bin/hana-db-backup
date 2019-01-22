@@ -1,0 +1,286 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+use Data::Dumper;
+use File::Basename;
+use POSIX qw(strftime);
+use Getopt::Long        qw(GetOptions);
+use Pod::Usage          qw(pod2usage);
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DBConnection;
+use ariba::Ops::HanaClient;
+use dmail::LockLib;
+
+=head1 SYNOPSIS
+
+    hana-db-backup [ -h ] [ -d ] [ -v ] [ -c ] [ -t <backup type> ]
+
+    Options:
+        --help|-h         Show this help.
+        --debug|-d        Debug.
+        --verbose|-v      Verbose.
+        --type|-t         Type of backup (full|incr|diff) (default: full)
+        --cleanup|-c      Cleanup. Run the cleanup script for each hana cluster immediately
+                          upon completion of its backup. (NOTE: this is only relevant for FULL
+                          backups of MDC clusters. That is: if specified with type = 'incr',
+                          it's silently ignored. It's also silently ignored, unconditionally,
+                          for single-container clusters, because single-container backups
+                          are submitted in the background and return to us (the caller) immediately.
+
+=cut
+
+my $debug = 0;
+my $verbose = 0;
+my $type = "full";
+
+my $do_cleanup;
+my $cleanup_prog = 'bin/clean-archivelogs-hana'; # relative to $mon->installDir
+
+# HOA-186139: it was noticed that cleanups did not happen immediately after the 10/10/2018 full backups completed.
+# Theory is that invoking cleanup immediately after backup may not give enough time for hana to finalize its
+# book-keeping. DBAs suggest inserting a 5-minute delay.
+my $cleanup_delay = 5 * 60;
+
+my $prog = basename($0);
+my $LOCKFILE = "/tmp/$prog";
+
+my $backup_pfx_single;
+my $backup_pfx_mdc;
+
+# define any special path overrides (by service) here.
+# (make sure to include trailing "/" if appropriate!)
+my %path_overrides = (
+    load6 => '/hana/log/A01/mnt00002/BACKUP/',
+);
+
+# hana has 3 backup types: FULL, INCR, DIFF
+
+# PFS-13688: on MDC deployments, when you run hana backup using the "async" opt, it submits backup for sysdb + all
+# tenants concurrently. on clusters with more than one tenant, this stresses i/o. so we need to backup MDC instances
+# serially. but without the "async" opt, the backup runs in the foreground -- the script only exits once the backup
+# completes. this means we need to run the backup for each hana cluster in a child process. that way, clusters can
+# still be backed up concurrently, but within any single cluster, DB instances get backed up serially.
+#
+# another caveat is that the v2.02 hdbc client doesn't like when you fork a process that contains an active hdbc
+# connection. (the 1.00.60 client and 2.03 client don't complain.) so we must restructure to open the connection
+# inside the child, after forking.
+
+sub get_hana_dbcs {
+    my $service = shift;
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList($service);
+
+    my @all_dbcs;
+    foreach my $product (@products) {
+        # ebs does not use an oracle db. It does read AN's db configs into it's own. Thus we skip ebs.
+        # Disable HANA backup for MDS product as of now,(temporary changes)
+        next if (lc($product->name) eq 'ebs' || lc($product->name) eq 'mds');
+        push @all_dbcs, ariba::Ops::DBConnection->connectionsFromProducts([$product]);
+    }
+
+    my @dbcs = grep { $_->isHana && ! $_->isDR } @all_dbcs;
+    @dbcs = ariba::Ops::DBConnection->uniqueConnectionsByHostAndPort(@dbcs);
+
+    unless(@dbcs) {
+        # if no hana dbcs found, might as well exit right here and now.
+        dbg("no hana dbcs found for service=$service.");
+        dmail::LockLib::releaselock($LOCKFILE);
+        exit(0);
+    }
+
+    return \@dbcs;
+}
+
+sub parse_dbc {
+    my $dbc = shift;
+
+    my $product   = $dbc->product->name;
+    my $host      = $dbc->host();
+    $host         =~ s/:\d+//; # strip port
+    my $dbsid     = uc($dbc->sid());
+    $dbsid        =~ s/^([^.]+).*/$1/;
+    my $dbname    = $dbc->dbname() || $dbsid;
+    $dbname       = uc($dbname);
+    my $port      = $dbc->port();
+    my $hanaHosts = [ sort(@{$dbc->hanaHosts()}) ]; # sort to minimize frivolous standby connect errors
+
+    return ($product, $host, $dbsid, $dbname, $port, $hanaHosts);
+}
+
+sub get_file_pfx {
+    my $service = shift;
+    my $mon_name = shift;
+
+    $mon_name = uc($mon_name);
+    my $bkp_type     = uc($type);
+
+    my @localtime = localtime;
+    my $file_pfx = "$mon_name.SCHEDULED_${bkp_type}_";
+    $file_pfx .= sprintf("%4d-%02d-%02d_%02d%02d",
+        $localtime[5]+1900, $localtime[4]+1, $localtime[3], $localtime[2], $localtime[1]);
+
+    # tack on path override
+    $file_pfx = $path_overrides{$service} . $file_pfx if $path_overrides{$service};
+
+    return $file_pfx;
+}
+
+sub main
+{
+    my $help;
+
+    GetOptions(
+               'help|h'      => sub {pod2usage(1)},
+               'debug|d'     => sub { $debug++ },
+               'verbose|v'   => sub { $verbose++ },
+               'cleanup|c'   => sub { $do_cleanup++ },
+               'type|t=s'    => \$type,
+    );
+
+    unless(dmail::LockLib::requestlock($LOCKFILE, 5)) {
+         warn "can't grab lock\n";
+         exit(-1);
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $service = $mon->service();
+    my $dbuser = $mon->default ("dbainfo.hana.system.username");
+    my $dbpass = $mon->default ("dbainfo.hana.system.password");
+    $cleanup_prog = $mon->installDir . "/$cleanup_prog" unless $cleanup_prog =~ m|^/|;
+
+    unless ( $type =~ /^(full|incr|diff)$/i ) { 
+        warn "backup type: '$type' not supported. Accepted types: full, incr\n";
+        exit(-1);
+    }
+
+    my $incr_or_diff = (lc($type) eq 'incr') ? "incremental" : 
+                       (lc($type) eq 'diff') ? "differential" : "";
+    $do_cleanup = 0 if $incr_or_diff; # only meaningful for full backups
+
+    $backup_pfx_single = "backup data $incr_or_diff using file";
+    $backup_pfx_mdc    = "backup data $incr_or_diff for full system using file";
+
+    my $dbcs = get_hana_dbcs($service);
+
+    my %seen;
+    for my $dbc (@$dbcs) {
+        my ($product, $host, $sid, $dbname, $port, $hanaHosts) = parse_dbc($dbc);
+        if ( $host =~ /^hanacvip11/i ) {
+            print "Skipping the backup for hana db on $host\n";
+            next;
+        }
+
+        my $dbinfo = "sid=$sid dbname=$dbname host=$host port=$port hosts=@$hanaHosts";
+        dbg("(product=$product) connecting to: $dbinfo");
+
+        my $hanaClient = ariba::Ops::HanaClient->new($dbuser, $dbpass, $host, $port, $hanaHosts);
+        $hanaClient->setDebug($debug > 1);
+
+        # alerting on failed backups is handled via hana-connection-number-status,
+        # so here we'll ignore errors so we can move onto the next one.
+
+        $hanaClient->connect(30, 2); 
+        if((my $err = $hanaClient->error())) {
+            print "ERROR: db connect failed for $dbinfo: $err";
+            $hanaClient->disconnect; 
+            next;
+        }
+
+        if((my $sysdb_host = $hanaClient->sysdb_host)) {
+            my $sysdb_port = $hanaClient->sysdb_port;
+            $hanaClient->disconnect;
+            unless($seen{"$sysdb_host:$sysdb_port"}) {
+                submit_mdc_backup($service, $mon->name, $sid, $dbuser, $dbpass, $sysdb_host, $sysdb_port, $host);
+                $seen{"$sysdb_host:$sysdb_port"} = 1;
+            }
+            next;
+        }
+
+        # if we're here, it must be a single-container backup
+        my $file_pfx = get_file_pfx($service, $mon->name);
+        my $backup_sql = "$backup_pfx_single ('$file_pfx') asynchronous";
+
+        if($debug) {
+            dbg("would back up: $dbinfo with sql: $backup_sql");
+            next;
+        }
+        dbg("backing up: $dbinfo with sql: $backup_sql");
+        $hanaClient->executeSql($backup_sql);
+        $hanaClient->disconnect;
+    }
+
+    # wait for MDC backups (running via child pids) to finish
+    while((my $pid = wait) != -1) {
+        dbg("child $pid exited");
+    }
+
+    dmail::LockLib::releaselock($LOCKFILE);
+}
+
+sub submit_mdc_backup {
+    my $service = shift;
+    my $mon_name = shift;
+    my $sid = shift;
+    my ($dbuser, $dbpass, $sysdb_host, $sysdb_port, $tenant_host) = (shift, shift, shift, shift, shift); # I SAID SHIFT, DAMMIT!
+
+    my $dbname = "SYSTEMDB";
+    my $dbinfo = "sid=$sid dbname=$dbname host=$sysdb_host port=$sysdb_port hosts=(undef)";
+
+    my $file_pfx = get_file_pfx($service, $mon_name);
+    my $backup_sql = "$backup_pfx_mdc ('$file_pfx')";
+
+    # we need to pass the tenant host to the cleanup script as the include pattern,
+    # because the filtering happens at product config parse time, during which time
+    # we don't know the sysdb host.
+    my $cleanup_cmd = "$cleanup_prog -include $tenant_host >/dev/null 2>&1";
+
+    if($debug) {
+        dbg("would back up: $dbinfo with sql: $backup_sql");
+        dbg("would run cleanup command: '$cleanup_cmd' after $cleanup_delay secs") if $do_cleanup;
+        return;
+    }
+
+    my $hc = ariba::Ops::HanaClient->new($dbuser, $dbpass, $sysdb_host, $sysdb_port, undef);
+    $hc->setDebug($debug > 1);
+
+    my $pid = fork;
+    print "ERROR: fork failed: $!\n" unless defined $pid;
+
+    return if $pid; # parent
+
+    if($pid == 0) { # child
+        dbg("connecting to MDC master: $dbinfo");
+        $hc->connect(30, 2);
+        if((my $err = $hc->error())) {
+            print "ERROR: db connect failed for $dbinfo: $err";
+            $hc->disconnect;
+            exit(1);
+        }
+
+        dbg("backing up: $dbinfo with sql: $backup_sql");
+        $hc->executeSql($backup_sql);
+
+        if($do_cleanup && $tenant_host) { # safeguard against undefined tenant host
+            dbg("sleeping $cleanup_delay secs before running cleanup command...");
+            sleep($cleanup_delay);
+            dbg("running cleanup command: '$cleanup_cmd'");
+            system($cleanup_cmd);
+        }
+
+        exit(0);
+    }
+}
+
+sub dbg {
+    my $txt = shift;
+    return unless $debug || $verbose;
+    my $d = strftime("%d-%b-%Y %H:%M:%S", localtime);
+    print "[$d] [$$] [DEBUG] $txt\n";
+}
+
+main();

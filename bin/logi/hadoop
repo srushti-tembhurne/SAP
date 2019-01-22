@@ -1,0 +1,155 @@
+#!/usr/local/bin/perl -w
+
+# $Id: $
+
+use strict;
+use FindBin;
+use XML::Simple;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+use ariba::rc::InstalledProduct;
+use ariba::util::Misc;
+use ariba::Ops::DateTime;
+
+my $debug = 0;
+my $GB = 1024 * 1024 * 1024;
+
+sub usage {
+	my $error = shift; 
+
+	print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+	-e    Enables sending of email for monitor query.
+	-p    Enables sending of pages for monitor query.
+	-d    Turns on debug mode. 
+	-h    Shows this help.
+
+USAGE
+
+	print "(error) $error\n" if ($error);
+
+	exit();
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while (my $arg = shift) {
+		if ($arg =~ /^-h$/o) { usage(); 			next; }
+		if ($arg =~ /^-d$/o) { $debug++; 		next; }
+		if ($arg =~ /^-e$/o) { $sendEmail = 1; 	next; }
+		if ($arg =~ /^-p$/o) { $sendPage = 1; 	next; }
+
+		usage("Invalid argument: $arg");
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	exit unless (ariba::rc::InstalledProduct->isInstalled('logi', $me->service()));
+
+	my $logi = ariba::rc::InstalledProduct->new('logi', $me->service());
+
+	my $monitorUrl = $logi->default('Logi.MonitorUrl') . '?type=hdfsHealth';
+	my $monitor = ariba::monitor::Url->new($monitorUrl);
+	my $statsXml = $monitor->request(60);	
+	my $error = $monitor->error(); 
+	my $stats; 
+
+	# Validate response
+	$error = "Response is empty" unless ($error || $statsXml);
+	$error = "Response does not contain 'monitorStats' element: $statsXml" unless ($error || $statsXml =~ /monitorStats/);
+
+	unless ($error) {
+		eval { 
+			$stats = XMLin($statsXml);
+		}; 
+		$error = "Malformed XML: $@" if ($@);
+	}
+	$error = "Failed to parse XML: $statsXml" unless ($stats);
+
+	my %queries = (
+		'Hadoop monitor stats url' => {
+			warn	=> 0,
+			error	=> $error, 
+			perl	=> sub { return $error || 'ok'; },
+			url		=> $monitorUrl,
+		}
+	);
+
+	unless ($error) {	
+		populateQueriesForStatsWithNamePrefix(\%queries, $stats, 'DFS');
+	}
+
+	my $email = $me->default('notify.email');
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails('hadoop', $logi->name(), $me->service(), $me->customer(), \%queries);
+	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+sub populateQueriesForStatsWithNamePrefix {
+	my $queries = shift;
+	my $stats = shift; 
+	my $queryNamePrefix = shift; 
+	my $uiHint = shift || $queryNamePrefix;
+
+	return unless ($queries && $stats && $queryNamePrefix);
+
+	foreach my $name (keys %$stats) {
+		my $value = $stats->{$name};
+		my $warn;
+		my $format;
+                my $crit;
+		my $recordMaxResults = 35000;
+
+		if ($name eq 'node') {
+			foreach my $node (keys %$value) {
+				my $nodeStats = $value->{$node};
+				populateQueriesForStatsWithNamePrefix($queries, $nodeStats, $node, "$uiHint/$node");
+			}
+			next;
+		} elsif ($name =~ /^(?:configuredCapacity|presentCapacity|dfsRemaining|dfsUsed|nonDfsUsed)$/) {
+			$value = $value / $GB if ($value);
+			$warn = 'answer < 1' unless ($name =~ /Used$/); 
+			$format = '%.2f GB';
+		} elsif ($name =~ /dfsUsedPercent/) {
+			$warn = 'answer > 90';
+			$format = '%.2f %%';
+		} elsif ($name =~ /dfsRemainingPercent/) {
+			$warn = 'answer <= 10';
+			$format = '%.2f %%';
+		} elsif ($name =~ /^(?:blocksWithCorruptReplicas|missingBlocks)$/) {
+			$warn = 'answer > 0';
+                } elsif ($name =~ /datanodesDead/) {
+                        $crit = 'answer > 0';
+		} elsif ($name eq 'datanodesAvailable') {
+			$warn = 'answer < 1'; 
+		} elsif ($name eq 'lastContact') {
+			$value = time() - $value if ($value); 
+			$format = 'scaleTime(answer) ago';
+		} elsif ($name eq 'safeMode') {
+			$warn = 'answer eq "ON"';
+			undef($recordMaxResults);
+		} else {
+			undef($recordMaxResults) unless ($name eq 'underReplicatedBlocks');
+		}
+
+		my $queryName = ariba::util::Misc::textForXmlName($name);
+		$queryName =~ s/\bdfs\b/storage/g;
+
+		$queries->{"$queryNamePrefix $queryName"} = {
+			format	=> $format,
+			uiHint	=> $uiHint,
+                        crit    => $crit,
+			warn	=> $warn,
+			perl	=> sub { return $value },
+			recordMaxResults => $recordMaxResults,
+		};
+	}
+}
+
+main(@ARGV);
+
+__END__

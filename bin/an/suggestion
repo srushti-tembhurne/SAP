@@ -1,0 +1,469 @@
+#!/usr/local/bin/perl -w
+
+# $Id$
+# $DateTime$
+# $Author$
+
+## See: http://development.ariba.com/ASM_Suite/versions/Discovery/AD10/DesignSpecs/SuggestionMonitoring.doc
+
+#the comments that start with apr are to be reverted before May.
+#the service owner wanted all of the checks to run as WARN for the first
+#month.
+
+use strict;
+use FindBin;
+use Data::Dumper;
+use POSIX;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::OracleClient;
+
+my $debug = 0;
+my $force_every_time = 0;
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode.
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+my $me = ariba::rc::InstalledProduct->new();
+my $service = $me->service();
+my $product = ariba::rc::InstalledProduct->new('an', $service);
+
+my $oracleQueryCount = 0;
+my $startTime = time;
+
+#begin support for section 2
+#The idea here is that we can call doOracleQuery at will, and, because of
+#the closure across $oc, we will only create a single connection to the
+#database.  It frees the calling code from having to remember a two-step
+#open + then use process.
+{   my $oc;
+    sub doOracleQuery {
+        my %args = @_;
+        $oracleQueryCount++;
+        $args{timeout} = $args{timeout} || 60;
+        if(not $oc) {
+            my $dbc = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndSchemaId ( $product, ariba::Ops::DBConnection->typeMain);
+            $oc = ariba::Ops::OracleClient->new($dbc->user(), $dbc->password(), $dbc->sid(), $dbc->host(), @_);;
+            $oc->connect();
+        }
+        my @ret;
+        my $resultExec = $oc->executeSqlWithTimeout($args{sql}, $args{timeout}, \@ret);
+        $args{results} = \@ret;
+        $args{resultExec} = $resultExec;
+        return \%args;
+    }
+}
+
+my $dirToTableMap = {
+    ADS4DataLoadTask => 's4_activity_data',
+    ADTeamLoadTask => 's4_buyer_team_data',
+};
+
+#called from with getRealmInfo() below
+sub detailedInfo {
+    my $realmDir = shift;
+    my $type = shift;
+    my $realmId = $realmDir;
+    $realmId =~ s/.*?_(\d+)$/$1/; #there's an integer in there somewheres
+    my $ret = {
+        highestCtime => 0,
+        lowestCtime => 9999999999,  #Where's http://www.haskell.org/ when you need it?
+        isEmpty => 1,
+        fileCount => 0,
+        realm_id => $realmId,
+        realmDir => $realmDir,
+        hasZeroCt => 0,
+    };
+
+    #This could have been another iterator, but I wasn't able to imagine
+    #any early exit conditionals
+    opendir my $dh, $realmDir or die "failed to opendir $realmDir: $!";
+    foreach (grep { not /^\./ and -f "$realmDir/$_" } readdir($dh)) {
+        my $ctime = (stat("$realmDir/$_"))[10];
+        $ret->{isEmpty} = 0;
+        $ret->{fileCount}++;
+        $ret->{highestCtime} = $ctime if $ctime > $ret->{highestCtime};
+        $ret->{lowestCtime} = $ctime if $ctime < $ret->{lowestCtime};
+    }
+
+    {   my $cmpTime = POSIX::strftime "%e-%b-%Y\n", localtime($ret->{lowestCtime});
+        my $results = doOracleQuery(
+            sql => "select count(1) from $dirToTableMap->{$type} where realm_id = $ret->{realm_id} and updated_time > '$cmpTime'"
+        );
+        if(defined $results->{results}->[0] and $results->{results}->[0] == 0) {
+            $ret->{hasZeroCt} = 1;
+        }
+    }
+    return $ret;
+}
+
+#friendly little iterator
+#http://en.wikipedia.org/wiki/Iterator
+#basically, the caller hits getRealmInfo with the $type over and over again
+#until it returns undef.
+#as seen below:
+#        while(my $realmInfo = getRealmInfo($type)) {
+#to accomplish this, you need a closure over the relevant internal variables
+#to preserve them between calls.
+{   my ($dh, $dir, $type);
+    sub getRealmInfo {
+        if(not $dh) {
+            $type = shift;
+            $dir = $product->default("$type.ReportDir");
+            opendir $dh, $dir or die "failed to opendir $dir: $!";
+        }
+        while(my $f = readdir $dh) {
+            next if $f =~ /^\./;
+            next unless -d "$dir/$f";
+            return detailedInfo("$dir/$f", $type);
+        }
+        undef $dh;
+        return undef;
+    }
+}
+#end support for section 2
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $overall_check_status = '';
+    eval { #first find out if we are in a service with this feature
+        my $ret = doOracleQuery(sql => "select * from user_tables where table_name='SUGGESTION'") or die 'feature not installed';
+        die 'feature not installed' unless $ret->{results};
+        die 'feature not installed' unless scalar @{$ret->{results}};
+    };
+    if($@) {    #feature not installed
+        print "feature not installed. not running any queries\n" if -t STDOUT;
+        exit 0;
+    }
+
+    my %queries;
+    eval {
+        #section 2
+        #run daily
+        my $currentMonth = (localtime(time))[4];
+        my $info = {};
+        foreach my $type (qw(ADS4DataLoadTask ADTeamLoadTask)) {
+            my $reportDir = $product->default("$type.ReportDir")
+                or die "\$product->default(\"\$type.ReportDir\") returned false";
+            die "\$product->default(\"\$type.ReportDir\") returned $reportDir which does not exist"
+                unless -d $reportDir;
+            $info->{$type} = {
+                reportDir => $reportDir,
+                withoutLatestFile => 0,
+                withLatestFile => 0,
+                realmsWithZeroCt => 0,
+                realmsWithZero => [],
+                realmsWithoutLatestFile => [],
+            };
+            while(my $realmInfo = getRealmInfo($type)) {
+                my $highestMon = (localtime($realmInfo->{highestCtime}))[4];
+                if($highestMon != $currentMonth) {
+                    $info->{$type}->{withoutLatestFile}++;
+                    push @{$info->{$type}->{realmsWithoutLatestFile}}, $realmInfo->{realm_id};
+                } else {
+                    $info->{$type}->{withLatestFile}++;
+                }
+                if($realmInfo->{hasZeroCt}) {
+                    $info->{$type}->{realmsWithZeroCt}++;
+                    push @{$info->{$type}->{realmsWithZero}}, $realmInfo->{realm_id};
+                }
+            }
+        }
+
+        #section 2a
+        #Run daily, but force to 'info' all runs before the 5th
+        {   my $dayOfMonth = (localtime(time))[3];
+            my $elements = [
+                ['ADS4DataLoadTask','No new file available : ADS4DataLoadTask'],
+                ['ADTeamLoadTask','No new file available: ADTeamLoadTask'],
+            ];
+            foreach my $element (@$elements) {
+                my ($tableName, $queryName) = @$element;
+                my @realmsWithZero = @{$info->{$tableName}->{realmsWithZero}};
+                unshift @realmsWithZero, 'Realm ID';
+                if($dayOfMonth > 4) {   #only really run after the 4th
+                    $queries{$queryName} = {
+#apr                        crit    => 'numrows > 300',
+                        warn    => 'numrows > 100',
+                        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+                        perl => sub { return join("\n", sort {$a <=> $b} @realmsWithZero); },
+                    };
+                } else {    #before the 5th, force 'info'
+                    $queries{$queryName} = {
+                        perl => sub { return 'forced to "info": results not valid before the 5th of the month'; },
+                    };
+                }
+            }
+        }
+
+        #section 2b
+        #run once per day
+        {   my $elements = [
+                ['ADS4DataLoadTask','No new data loaded: ADS4DataLoadTask'],
+                ['ADTeamLoadTask','No new data loaded: ADTeamLoadTask'],
+            ];
+            foreach my $element (@$elements) {
+                my ($tableName, $queryName) = @$element;
+                my @realmsWithoutLatestFile = @{$info->{$tableName}->{realmsWithoutLatestFile}};
+                unshift @realmsWithoutLatestFile, 'Realm ID';
+                $queries{$queryName} = {
+#apr                    crit    => 'numrows > 300',
+                    warn    => 'numrows > 100',
+                    ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+                    perl => sub { return join("\n", sort {$a <=> $b} @realmsWithoutLatestFile); },
+                };
+            }
+        }
+    }; #eval around files-based checks
+    if($@) {
+        $overall_check_status .= "section 2 had an exception: $@ ";
+    }
+    #section 1b
+    #run once per day
+    $queries{'Suggestions not refreshed for more than 40 days'} = {
+#apr        crit    => 'buyer_user_id_count > 20',
+        warn    => 'buyer_user_id_count > 10',
+        uiHint  => 'Suggestion Task',
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql => 'select count(distinct buyer_user_id) buyer_user_id_count from suggestion where created_on <=trunc(sysdate-40)',
+    };
+
+
+    #section 1c
+    #run once per day
+#TODO: see about removing the first column (count) from output as it adds
+#no value, only used for logic
+#also look at adding column headers
+    $queries{'No recommendations for users in 14 days'} = {
+#apr        crit    => 'numrows > 0',
+        warn    => 'numrows > 0',
+        uiHint  => 'Suggestion Task',
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql => 'Select count(s.id), r.buyer_id, r.realm_id from suggestion s
+, realm_buyerinfo r where s.realm_id(+)=r.realm_id
+and s.BUYER_USER_ID(+)=r.buyer_id and r.updated_time <= trunc(sysdate-14)
+group by r.buyer_id, r.realm_id
+having count(s.id)=0',
+    };
+    #section 3c
+    #run once per week at the beginning of the week
+    #per slakshman@ariba.com 'beginning of the week' is Monday
+   # if(1) {
+    if((localtime(time))[6] == 1) {
+        my $elements = [
+            ['s4_seller_industry_profile','s4_seller_industry_profile'],
+            ['seller_profile_score','seller_profile_score'],
+            ['ad_seller_ratings','ad_seller_ratings'],
+            ['clickstream_seller','clickstream_seller'],
+            ['clickstream_buyer','clickstream_buyer'],
+            ['clickstream_model','clickstream_model'],
+        ];
+        foreach my $element (@$elements) {
+            my ($tableName, $queryName) = @$element;
+            $queries{$queryName} = {
+                warn    => 'tot_not_processed > 0',
+#apr                crit    => 'tot_not_processed > 0.5',
+                uiHint  => 'Processing tasks/With processed_time',
+                ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+                sql => "Select b.not_processed/decode(a.total_new,0,1,a.total_new) tot_not_processed from 
+(Select count(*) total_new from $tableName where updated_time > trunc(sysdate-7) and updated_time <   trunc(sysdate)) a,
+(Select count(*) not_processed from $tableName where updated_time > trunc(sysdate-7) and updated_time <   trunc(sysdate) and processed_time<updated_time) b",
+            };
+        }
+    }
+
+    #section 3d
+    #run once per week at the beginning of the week
+    #per slakshman@ariba.com 'beginning of the week' is Monday
+    #if(1) {
+    if((localtime(time))[6] == 1) {
+        my $elements = [
+            ['s4_activity_data', 's4_activity_data'],
+            ['s4_buyer_team_data', 's4_buyer_team_data'],
+            ['buyer_activity_profile', 'buyer_activity_profile'],
+            ['s4_seller_comm_profile','s4_seller_comm_profile'],
+        ];
+        foreach my $element (@$elements) {
+            my ($tableName, $queryName) = @$element;
+            $queries{$queryName} = {
+                warn    => 'tot_not_processed > 0',
+#apr                crit    => 'tot_not_processed > 0.5',
+                uiHint  => 'Processing tasks/With is_processed flag',
+                ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+                sql => "Select b.not_processed/decode(a.total_new,0,1,a.total_new) tot_not_processed from 
+(Select count(*) total_new from $tableName where updated_time > trunc(sysdate-7) and updated_time <   trunc(sysdate)) a,
+(Select count(*) not_processed from $tableName where updated_time > trunc(sysdate-7) and updated_time <   trunc(sysdate) and is_processed=0) b"
+            };
+        }
+    }
+
+    #section 4c
+    #run once a week on the 7th day of the week
+    #per slakshman@ariba.com '7th day of the week' is Sunday
+    #if(1) {
+    if((localtime(time))[6] == 0) {
+        $queries{'Profile Score'} = {
+            warn    => 'numrows == 0',
+            uiHint  => 'Metrics Task',
+            ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+            sql => q`Select count (*) week_record from SELLER_PROFILE_SCORE where updated_time > trunc(sysdate-7) and updated_time < sysdate`,
+        };
+        $queries{'Seller metric AN'} = {
+#apr            crit    => 'numrows == 0',
+            warn    => 'numrows == 0',
+            uiHint  => 'Metrics Task',
+            ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+            sql => q`Select count(*) month_an_record
+from seller_metrics 
+where an_updated_time >= trunc(sysdate,'month')`,
+        };
+        $queries{'Seller metric AD'} = {
+            warn    => 'numrows == 0',
+            uiHint  => 'Metrics Task',
+            ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+            sql => q`Select count(*) week_ad_record
+from seller_metrics where ad_updated_time >= trunc(sysdate-7)`,
+        };
+        $queries{'Seller metric S4'} = {
+#apr            crit    => 'numrows == 0',
+            warn    => 'numrows == 0',
+            uiHint  => 'Metrics Task',
+            ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+            sql => q`Select count(*) month_s4_record
+from seller_metrics 
+where s4_updated_time >= trunc(sysdate,'month')`,
+        };
+        $queries{'Discovery score'} = {
+            warn    => 'disc_score == 0',
+            uiHint  => 'Metrics Task',
+            ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+            sql => q`Select count(*) disc_score
+From seller_activity_scores
+Where activity_score_type='Discovery'
+And updated_time>=trunc(sysdate-7)`,
+        };
+    }
+
+    #section 4d
+    #run once per month
+    #assuming the first day of the month
+    #this is correct per slakshman@ariba.com
+    #if(1) {
+    if((localtime(time))[3] == 1) {
+        $queries{'Seller Metrics stale record not updated'} = {
+#apr            crit    => 'numrows > 0',
+            warn    => 'numrows > 0',
+            uiHint  => 'Metrics Task',
+            ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+            sql => q`Select count(*) not_updated from seller_metrics where
+tr_updated_time < trunc(sysdate-40) or 
+an_updated_time < trunc(sysdate-40) or 
+ad_updated_time < trunc(sysdate-40) or
+s4_updated_time < trunc(sysdate-40)`,
+        };
+    }
+
+    #section 5
+    #run daily
+    {   my $elements = [
+            ['clickstream_seller','ClickStream Seller'],
+            ['clickstream_buyer','ClickStream Buyer'],
+            ['clickstream_model','ClickStream Model'],
+            ['clickstream_buyer_supplier','ClickStream Buyer Supplier'],
+        ];
+        foreach my $element (@$elements) {
+            my ($tableName, $queryName) = @$element;
+            $queries{$queryName} = {
+#apr                crit    => 'numrows == 0',
+                warn    => 'numrows == 0',
+                uiHint  => 'Clickstream Task',
+                ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+                sql => "Select count(*) not_updated from $tableName where updated_time > trunc(sysdate-1) and updated_time<trunc(sysdate)",
+            };
+        }
+    }
+
+    #section 6
+    #run daily
+    {   my $elements = [
+            ['seller_activity_scores','Seller Activity Scores'],
+            ['seller_industry_scores','Seller Industry Scores'],
+            ['buyer_activity_scores','Buyer Activity Scores'],
+        ];
+        foreach my $element (@$elements) {
+            my ($tableName, $queryName) = @$element;
+            $queries{$queryName} = {
+#apr                crit    => 'numrows == 0',
+                warn    => 'numrows == 0',
+                uiHint  => 'Final Score tasks',
+                ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+                sql => "select count(*) from $tableName where 
+(updated_time > processed_time or processed_time is null) 
+and updated_time >=trunc(sysdate-1) and updated_time < trunc(sysdate)
+and activity_score_type!='Final'",
+            };
+        }
+    }
+
+    #monitoring performance data
+    ###We're not going to actually run this though, since we're super-sensitive
+    ###about performance right now
+    #actually we are, because we have a requirement to record if the check
+    #itself failed.  So since we're doing that, we may as well put some of
+    #this info in there
+    {   my $runTime = time - $startTime;
+        #see how much CPU time this thing took
+        #http://man7.org/linux/man-pages/man5/proc.5.html
+        open my $fh, '<', "/proc/$$/stat";
+        read $fh, my $line, 1024;
+        close $fh;
+        my @stuff = split /\s+/, $line;
+
+        my $userJiffies = $stuff[13];
+        my $kernelJiffies = $stuff[14];
+        my $checkRunInfo = "$overall_check_status oracleQueryCount=$oracleQueryCount  runTime=$runTime  userJiffies=$userJiffies  kernelJiffies=$kernelJiffies";
+        $queries{'Check Run Info'} = {
+            uiHint  => 'Monitoring',
+            perl => sub { return $checkRunInfo; },
+        };
+    }
+
+    my $email = $me->default('notify.email');
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('suggestion', 'an', $service, undef, \%queries);
+    my $dbc = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndSchemaId ( $product, ariba::Ops::DBConnection->typeMain);
+    $qm->setSQLConnectInfoFromDBConnection($dbc);
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($product, $qm);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);
+

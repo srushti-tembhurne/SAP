@@ -1,0 +1,166 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/everywhere/ramdisk-usage#8 $
+#
+# Monitor arches ramdisk usage
+#
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use ariba::Ops::Utils;
+use ariba::rc::Globals;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 <Service> [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+my $sendEmail = 0;
+my $sendPage = 0;
+my $service     = undef;
+
+sub main {
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg !~ /^-/o)   { $service = $arg; next; }
+    }
+
+    usage("Need a service") unless ($service);
+
+    my @aProdNames = ariba::rc::Globals::archesProducts();
+    foreach my $ap ( @aProdNames ) {
+        setupForProd($ap);
+    }
+}
+
+sub setupForProd {
+    my $prodname = shift;
+
+    return unless (ariba::rc::InstalledProduct->isInstalled($prodname, $service));
+    my $arches = ariba::rc::InstalledProduct->new($prodname, $service);
+    my @hostsForRamdisk;
+
+    push(@hostsForRamdisk, $arches->hostsForRoleInCluster('shardwriterosgi', $arches->currentCluster()));
+    push(@hostsForRamdisk, $arches->hostsForRoleInCluster('searchcore', $arches->currentCluster()));
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+
+    return unless (grep { /^$hostname$/ } @hostsForRamdisk);
+    return unless ($arches->default('Arches.useRamdisk'));
+    my %queries;
+
+    my $ramDir = $arches->default('Arches.ramDir');
+    my @ramDirs = split(',', $ramDir);
+
+    for my $dir (@ramDirs) {
+        #
+        # Sample data run on hdp111.lab1 in LOAD100 service: 
+        # -bash-3.2$ df /var/ramdisk/arches/ | grep -v "Filesystem"
+        # ramdisk              134217728         0 134217728   0% /var/ramdisk/arches
+        # 
+        my $result;
+        my $warnRes;
+        my $critRes;
+        my $res = 0;
+
+        if (-d $dir) {
+            my $cmd = "df $dir | grep -v \"Filesystem\"";
+            $result = `$cmd`;
+
+            $warnRes = `find $dir/* -maxdepth 0 -type d -mmin +360`;
+            $critRes = `find $dir/* -maxdepth 0 -type d -mmin +720`;
+
+            my ($fs, $used) = (split(/\s+/, $result))[0,4]; 
+            if ($fs =~/ramdisk/) {
+                $used =~ s/\%//;
+                $result = $used;
+
+                if($critRes) {
+                   $res = 12; #'Content in Ramdisk is more than 12 hours';
+                }
+                elsif($warnRes) {
+                   $res = 6; #'Content in Ramdisk is more than 6 hours';
+                }
+
+            } else {
+                $result = "ERROR: $dir is not mounted";
+            }
+        } else {
+            $result = "ERROR: $dir does not exist";
+        }
+
+        my %influx_data;
+        $influx_data{measurement} = 'arches_ramdisk_usage';
+        $influx_data{tags} = { product => $arches->name(), service => $arches->service(), hostname => "$hostname", dir => "$dir"};
+        $influx_data{data} = { old_content => $res, current => ( $result =~ m/ERROR/ ? -1 : $result ) };
+
+        eval {
+            my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+            ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line);
+        };
+
+        $queries{"$hostname $dir"} = {
+            warn    => "answer > 75",
+            crit    => "answer =~ /ERROR/ || answer > 85",
+            perl    => sub { return $result; },
+            recordDataType => 'gauge',
+            recordMaxResults => 110000,
+            format => "%.1f%%\n",
+            severity    => 2,
+            description => 'Ram Disk usage', 
+            correctiveActions => [
+                Ops => 'Investigate for any issues in the cleanup job or ramdisk usage growth', 
+            ],
+        };
+
+        $queries{"Old content (in Hours) in $hostname $dir"} = {
+            hasErraticSchedule => 1,
+            warn    => "answer =~ /6/",
+            crit    => "answer =~ /12/",
+            perl    => sub { return $res; },
+            recordDataType => 'gauge',
+            recordMaxResults => 110000,
+            severity    => 2,
+            description => 'Ram Disk content',
+            correctiveActions => [
+                Ops => 'Investigate for any issues in the cleanup job or old ramdisk content',
+            ],
+        };
+
+    }
+
+    my $email = $arches->default('notify.email');
+    my $monserver = ($arches->hostsForRoleInCluster('monitor', $arches->currentCluster()))[0];
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('ramdisk-usage', $arches->name(), $arches->service(), undef, \%queries);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monserver);
+}
+
+
+main(@ARGV);
+
+__END__

@@ -1,0 +1,291 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/process-heap-dumps#16 $
+
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../bin";
+
+use Archive::Zip qw (:ERROR_CODES :CONSTANTS);
+use ariba::rc::InstalledProduct;
+use File::Basename;
+use File::Copy;
+use File::Path;
+use dmail::LockLib;
+
+use Data::Dumper;
+require "heaptool";
+
+my $PROCESSING = "processing";
+my $ERROR      = "error";
+my $PROCESSED  = "clean";
+my $TMP        = "tmp";
+my $LOG        = "logs";
+
+my $debug = 0;
+my $product = undef;
+
+sub usage
+{
+    print "Usage: $0\n";
+    print "    Clean and process product heap dumps\n";
+    print "    -p[roduct] \$product -- specify a product name.\n";
+    print "    [-h]          this message\n";
+    print "    [-d[ebug]]    debug\n";
+    exit;
+}
+
+sub main {
+    my $productName = undef;
+        
+    while ( my $arg = shift(@ARGV) ) {
+        if ( $arg =~ /^-h/ ) { usage(); }
+        if ( $arg =~ /^-d(ebug)?/i ) { ++$debug; next; }
+    if ( $arg =~ /^-p(roduct)?/i ) { $productName = shift(@ARGV); next; }
+    }
+    
+    my $qmName = 'process-heap-dumps';
+    my $me = ariba::rc::InstalledProduct->new();
+    if ( $productName && ariba::rc::InstalledProduct->isInstalled($productName, $me->service)) {
+        $product = ariba::rc::InstalledProduct->new( $productName, $me->service());
+    } else {
+    print STDERR "Invalid product name or product is not installed.\n";
+    usage;
+    return;
+    }
+
+    setJavaVersionEnv($productName);
+    print "DEBUG JavaHome ", $ENV{'JAVA64_HOME'}, "\n", if ($debug);
+    my %incomingDumps = ();
+    my $lockFile = "/tmp/$qmName";
+    $lockFile .= "-" . $product->name();
+    
+    if (!dmail::LockLib::requestlock($lockFile,1) ) {
+        print STDERR "can't grab lock $lockFile\n" if -T STDOUT;
+        next;
+    }
+
+    if (defined($product->default('Ops.HeapDumpRoot'))) {
+        queueDumps(\%incomingDumps);
+    }
+    else {
+        print "Product: " . $product->name() . " has no dump root.  Skipping\n" if $debug;
+    }
+    print "Content of incomingDumps \n ", Dumper(\%incomingDumps), "\n", if $debug;
+    processDumps(\%incomingDumps);
+    dmail::LockLib::releaselock($lockFile);
+}
+
+sub prepareDirectories
+{
+    my $basedir = shift;
+    my $incoming = shift;
+
+    my @dirs = (
+    "$basedir/$PROCESSING",
+    "$basedir/$TMP",
+    "$basedir/$ERROR",
+    "$basedir/$PROCESSED",
+    "$basedir/$LOG"
+    );
+
+    for my $dir (@dirs) {
+        if (!-d $dir) {
+            mkpath($dir);
+        }
+    }
+}
+
+sub queueDumps
+{
+    my $incomingDumps = shift;
+
+    my $basedir = $product->default('Ops.HeapDumpRoot');
+    my $incoming = $product->default('Ops.HeapDumpDir') || 'incoming';
+
+    my $incomingDir = "$basedir/$incoming";
+    my $processingDir = "$basedir/$PROCESSING";
+
+
+    if (!-d $incomingDir) {
+    return;
+    }
+    
+    prepareDirectories($basedir, $incoming);
+
+    print "Queueing dumps for  " . $product->name() . " from $incomingDir\n" if $debug;
+
+
+    my $filename;
+    my $mtime;
+
+    if (opendir(DIR, $incomingDir)) {
+        while ($filename = readdir(DIR)) {
+            if ($filename eq '.' || $filename eq '..') {
+                next;
+            }
+            $mtime = (stat("$incomingDir/$filename"))[9];
+            if (time() - $mtime > 90) {
+                move("$incomingDir/$filename","$processingDir") || die "Could not move $incomingDir/$filename to $processingDir";
+            }
+        }
+    }
+    closedir(DIR);
+
+    opendir (DIR, $processingDir);
+    while ($filename = readdir(DIR)) {
+        if ($filename eq '.' || $filename eq '..') {
+            next;
+        }
+        $mtime = (stat("$processingDir/$filename"))[9]; 
+        $$incomingDumps{"$processingDir/$filename"} = $mtime;
+    }
+    closedir(DIR);
+}
+
+sub processDumps
+{
+    my $queued = shift;
+    my @files = sort { $$queued{$a} <=> $$queued{$b} } keys %$queued;
+
+    for my $fileNameOriginalWithFullPath (@files) {
+    my ($baseDir, $fileNameBaseWithTime, $fileNameWithTimeAndExt) = getFileNameVariables($fileNameOriginalWithFullPath);
+    my $logFile = "$baseDir/$LOG/$fileNameBaseWithTime.log";
+
+        if (-e $logFile) {
+        print "Log file for $fileNameBaseWithTime already exists.  Skipping.\n";
+        } else {
+            if (open(FH, ">$logFile")) {
+                print FH "Processing dump $fileNameOriginalWithFullPath\n";
+                cleanHeap($fileNameOriginalWithFullPath, $baseDir, $fileNameBaseWithTime, $fileNameWithTimeAndExt, \*FH);
+                close(FH);
+            } else {
+                print FH "Can not create $logFile.  Skipping.";
+        next;
+            }
+        }
+    }
+}
+
+sub setJavaVersionEnv
+{
+    my $javaVersionFile = $product->installDir()."/config/JavaVersion.cfg";
+    my $javaHome = "/usr/j2sdk1.6.0_13";
+   
+    if (-f $javaVersionFile) {
+        open(JAVAVER, $javaVersionFile) || return $javaHome;
+        my $javaVer = <JAVAVER>;
+        close(JAVAVER);
+
+        chomp($javaVer);
+        $javaVer =~ s|\r$||;
+
+        if (-d "/usr/j2sdk$javaVer") {
+            $javaHome = "/usr/j2sdk$javaVer";
+        }
+    }
+    else {
+        print "Cound not find JavaVersion.cfg in config directory.\n";
+    }
+    $ENV{'JAVA64_HOME'} = $javaHome;
+}
+
+sub cleanHeap
+{
+    my $fileNameOriginalWithFullPath = shift;
+    my $baseDir = shift;
+    my $fileNameBaseWithTime = shift;
+    my $fileNameWithTimeAndExt = shift;
+    my $fh = shift;
+
+    my $productName = $product->name();
+
+
+    # clean the heap dump of sensitive data. 
+    ## if heapTool returns 0 means it's sucessfully clean the file
+    ## if heapTool returns 1 means it's not sucessfully clean the file & got the error while running heapTool
+    print $fh "Running heapTool on $fileNameOriginalWithFullPath, $baseDir/$TMP/CLEAN-$fileNameWithTimeAndExt\n";
+    print "Running heapTool on $fileNameOriginalWithFullPath, $baseDir/$TMP/CLEAN-$fileNameWithTimeAndExt\n", if $debug;
+    if (heapTool($fileNameOriginalWithFullPath, "$baseDir/$TMP/CLEAN-$fileNameWithTimeAndExt")) {
+        print $fh "Could not clean $fileNameOriginalWithFullPath.\n";
+        print "Could not clean $fileNameOriginalWithFullPath.\n", if $debug;
+        move ("$baseDir/$PROCESSING/$fileNameWithTimeAndExt", "$baseDir/$ERROR/$fileNameWithTimeAndExt");
+        return;
+    }
+    my $cleanZipFile = "CLEAN-$fileNameBaseWithTime.zip";
+    print $fh "zipping cleansed heap file $cleanZipFile\n";   
+    print "zipping cleansed heap file $cleanZipFile\n", if $debug;   
+
+    chdir("$baseDir/$TMP");
+    my $heapZip = Archive::Zip->new();
+    $heapZip->addFile("CLEAN-$fileNameWithTimeAndExt");
+
+    if (!$heapZip->writeToFileNamed("$cleanZipFile") == AZ_OK) {
+        print $fh "Could not create file $baseDir/$TMP/$cleanZipFile\n";
+        print "Could not create file $baseDir/$TMP/$cleanZipFile\n", if $debug;
+        return;
+    }
+
+    ##Removing clean file from the tmp direcotry after ziping the file.
+
+    print $fh "Removing... file CLEAN-$fileNameWithTimeAndExt\n";
+    print "Removing... file CLEAN-$fileNameWithTimeAndExt\n", if $debug;
+
+    if (! unlink("CLEAN-$fileNameWithTimeAndExt") ){
+        print $fh "Unable to Remove CLEAN-$fileNameWithTimeAndExt\n";
+        print "Unable to Remove CLEAN-$fileNameWithTimeAndExt\n", if $debug;
+    } 
+
+    my $destinationDir = "$baseDir/$PROCESSED";
+    print $fh "Moving files to $destinationDir \n";
+    print "Moving files to $destinationDir \n", if $debug;
+
+    print $fh "Moving $baseDir/$TMP/$cleanZipFile, $destinationDir/$cleanZipFile\n";
+    print "Moving $baseDir/$TMP/$cleanZipFile, $destinationDir/$cleanZipFile\n", if $debug;
+
+    if (!move("$baseDir/$TMP/$cleanZipFile", "$destinationDir/$cleanZipFile")){
+        print $fh "Could not move file $baseDir/$TMP/$cleanZipFile to destination dir $destinationDir\n";
+        print  "Could not move file $baseDir/$TMP/$cleanZipFile to destination dir $destinationDir\n", if $debug;
+        return;
+    }
+
+    ## Remove File from the processing direcotry 
+    print $fh "Removing... $baseDir/$PROCESSING/$fileNameWithTimeAndExt\n";
+    print "Removing... $baseDir/$PROCESSING/$fileNameWithTimeAndExt\n", if $debug;
+
+    if (! unlink($fileNameOriginalWithFullPath) ) {
+        print $fh "Unable to Remove $fileNameOriginalWithFullPath\n";
+        print "Unable to Remove $fileNameOriginalWithFullPath\n", if $debug;
+    }
+
+}
+
+sub getFormattedFileTimeStamp {
+        my $file = shift;
+
+        my $time = (stat($file))[9];
+        my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($time);
+        $year -= 100 if $year > 99;
+        sprintf("%04d%02d%02d-%02d%02d",$year+2000,$mon+1,$mday, $hour,$min);
+}
+
+sub getFileNameVariables {
+    my $fileNameOriginalWithFullPath = shift;
+
+        my $formattedTime = getFormattedFileTimeStamp($fileNameOriginalWithFullPath);
+
+        $fileNameOriginalWithFullPath =~ /(.*)\/$PROCESSING\/(.*)\.hprof/;
+        my $baseDir = $1;
+        my $fileNameOriginalBase = $2;
+
+        # add -clean to the cleansed dump's filename so it's obvious it's safe
+    my $fileNameCleanBaseWithTime = "${fileNameOriginalBase}_$formattedTime";
+    my $fileNameWithTime = "${fileNameCleanBaseWithTime}.hprof";
+
+    return ($baseDir, $fileNameCleanBaseWithTime, $fileNameWithTime);
+}
+
+main();

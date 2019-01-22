@@ -1,0 +1,67 @@
+#!/usr/local/bin/perl -w
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::NetworkDeviceManager;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Startup::Common;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::FileSystemUtilsRPC;
+use ariba::Ops::DatacenterController;
+
+
+sub main {
+
+        my $debug=0;
+        my $sendEmail=0;
+        my $sendPage=0;
+
+        while(my $arg=shift(@ARGV)){
+                if($arg =~ /^-d/o){ $debug++; }
+                if($arg =~ /^-e/o){ $sendEmail=1; };
+                if($arg =~ /^-p/o){ $sendPage=1; };
+        }
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $service = $me->service();
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $machine = ariba::Ops::Machine->new($hostname);
+	my $datacenter = $machine->datacenter();
+
+	my %queries;
+	my %match = (
+			'datacenter' => $datacenter,
+                        'os' => 'enginuity',
+                );
+
+	my @machines = ariba::Ops::Machine->machinesWithProperties(%match);
+	foreach my $m (@machines) {
+		my $emcDevices = ariba::Ops::NetworkDeviceManager->newFromMachine($m);
+		my $config = $emcDevices->symcfg();
+		my $result;
+
+		if($config) {
+			foreach my $key (sort(keys(%$config))) {
+				my $value = $config->{$key};
+				$result .= "'$key' => '$value'\n";
+			}
+		}
+
+               $queries{"EMC Query"} = {
+			perl => sub { return $result},
+		};
+	}
+
+	my $email = $me->default('notify.email');
+        my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+        my $q = ariba::monitor::QueryManager->newWithDetails("emc-stat", $tab, $me->service(), undef, \%queries);
+        $q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+}
+main ()

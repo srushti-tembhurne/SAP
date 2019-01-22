@@ -1,0 +1,418 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/network/device-config#10 $
+#
+# Grab the running config from network devices, and compare to what we have in
+# perforce - send out diffs if required.
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::NetworkDeviceManager;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Constants;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::CipherStore;
+use ariba::rc::Utils;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::CSS::Config;
+use Term::ReadKey;
+
+use Digest::MD5 qw(md5_hex);
+use MIME::Lite;
+
+my $CONFIG_BASE = '/usr/local/network-config';
+
+my $ignoreRegex = '-I ' . join('-I ', (
+    '"Cryptochecksum:" ',
+    '"set spantree portcost" ',
+    '"set spantree portvlancost" ',
+    '"set port name" ',
+    '"description" ',
+    '"time:" ',
+    '"Time:" ',
+    '"ntp clock-period" ',
+    '"Last configuration change at" ',
+    '"NVRAM config last updated at" ',
+    '"!Active version:" ',
+    '"configure" ',
+    '"Use \'show config all\'" ',
+    '"Uptime is" ',
+    '"No configuration change" ',
+    '"show run" ',
+    '"!Generated on" ',
+    '"monitor session" ',
+        '": end" ',
+));
+
+my $isOosRegex = "oos\$|is\$";
+
+sub main {
+
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $debug     = 0;
+    my $force     = 0;
+
+    while (my $arg = shift @ARGV) {
+        if ($arg =~ /^-e/o) { $sendEmail = 1 };
+        if ($arg =~ /^-p/o) { $sendPage  = 1 };
+        if ($arg =~ /^-d/o) { $debug++ };
+        if ($arg =~ /^-f/o) { $force++ };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+
+    my $cipherStore    = ariba::rc::CipherStore->new($me->service());
+    my $accessPasswordFromCS = $cipherStore->valueForName('networkAccess');
+    my $enablePasswordFromCS = $cipherStore->valueForName('networkEnable');
+
+    if (!$accessPasswordFromCS) {
+        $accessPasswordFromCS = getPasswordFromStdin('Network Access');
+    }
+
+    if (!$enablePasswordFromCS) {
+        $enablePasswordFromCS = getPasswordFromStdin('Network Enable');
+    }
+
+    my $email          = $me->default('notify.email');
+    my @attachedFiles  = ();
+    my $date       = localtime(time());
+
+    for my $datacenter (ariba::Ops::ProductAPIExtensions::datacentersForProducts($me)) {
+
+        my %queries = ();
+        my @diffs   = ();
+        my $sendDiffEmail = 0;
+
+        my %matchDatacenter = (
+            'datacenter' => $datacenter,
+            'status'           => 'inservice',
+            'monitoringDatacenter' => '',
+        );
+
+        my %matchMonitoringDatacenter = (
+            'status'           => 'inservice',
+            'monitoringDatacenter' => $datacenter,
+        );
+
+        
+        my @machines = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+        @machines = (@machines , ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+        
+        #Testing change for #tmid 154259
+        my @to = ();
+        push @to, ariba::Ops::Constants->networkEmailNotificationAddress();
+        push @to, "jmcminn\@ariba.com";
+        my $senderList = join(',', @to);
+    
+        # Send out email with all the diffs.
+        my $msg = MIME::Lite->new(
+            'To'       => $senderList,
+            'From'     => ariba::Ops::Constants->nullReplyTo(),
+            'Cc'       => 'ask_network@ariba.com',
+            'Subject'  => "Network config diffs vs perforce for $datacenter on $date",
+            'Reply-To' => ariba::Ops::Constants->nullReplyTo(),
+            'Type'     => 'multipart/mixed',
+        );
+        
+        $msg->attach(
+            'Type'        => 'text/plain',
+            'Disposition' => 'inline',
+            'Data'        => join("\n", (
+                'Diffs are attached to this message.',
+                '',
+                'tm-owner: unassigned-network',
+                'tm-priority: high',
+                'tm-category: network',
+                '',
+                '',
+            )),
+        );
+
+        for my $machine (@machines) {
+
+            next unless $machine->deviceType() eq 'net';
+            next if $machine->hardwareVendor() eq 'netscreen';
+
+            my $networkDevice = ariba::Ops::NetworkDeviceManager->newFromMachine($machine) || next;
+            my $hostname      = $machine->hostname();
+
+            # Can't login to the failover device.
+            next if $hostname =~ /(?:ldir|pix|asa)\S+?\-2\./;
+
+            my $accessPassword = $accessPasswordFromCS;
+            my $enablePassword = $enablePasswordFromCS;
+
+            # local directors use lower-cased passwords
+            if ($machine->os() eq 'ldir') {
+                $accessPassword = lc($accessPassword);
+                $enablePassword = lc($enablePassword);
+            }
+ 
+            # These devices only have one password
+            if ($machine->os() eq 'css' || 
+                $machine->os() eq 'bigip' ||
+                $machine->os() eq 'cyclades') {
+
+                $networkDevice->setAccessPassword($enablePassword);
+
+            } else {
+
+                $networkDevice->setAccessPassword($accessPassword);
+            }
+
+            $networkDevice->setEnablePassword($enablePassword);
+            $networkDevice->setDebug($debug) if $debug > 1;
+
+            # login and grab the config
+            $networkDevice->connect() || do {
+                print "Failed to log in to host $hostname, check password\n";
+                next;
+            };
+
+            my $runningConfig = "/tmp/$hostname.running-config";
+            my $checkedInConfig = "/tmp/$hostname.checkedin-config";
+
+            # increase timeout to 60 seconds from the default of 30
+            my $runningNetworkConfigString = $networkDevice->getConfig(60);
+
+            # if result doesn't have some non-whitespace in it
+            # then reconnect and try again with longer timeout
+            if($runningNetworkConfigString !~ m/\S/) {
+                $networkDevice->disconnect();
+                $networkDevice->connect();
+                $runningNetworkConfigString = $networkDevice->getConfig(120);
+            }
+
+            # Don't hold open a telnet or ssh handle.
+            my $cmdPrompt = $networkDevice->actualCommandPrompt();
+            if($cmdPrompt) {
+                $cmdPrompt =~ s/\s+$//;
+                $cmdPrompt = "-I \"$cmdPrompt\"";
+            }
+            $networkDevice->disconnect();
+
+            # remove in-service / out-of-service notifications
+            $runningNetworkConfigString =~ s/$isOosRegex//mg;
+            
+            open (RUNNINGCONFIG, ">$runningConfig") or die $!;
+            print RUNNINGCONFIG $runningNetworkConfigString  . "\n";
+            close RUNNINGCONFIG;
+
+            # Routers can now provide 2 service. We only want to check for configs
+            # in the router path.
+
+            my $checkedInConfigOriginal;
+                        my @device_types = ('consoleserver' , 'firewall' , 'loadbalancer' , 'router', 'switch');
+                        foreach my $device_type (@device_types) {
+                                foreach my $service ($machine->providesServices()){
+                                        next unless $service eq $device_type;
+                                        $checkedInConfigOriginal = sprintf('%s/%s/%s/%s',
+                                                $CONFIG_BASE,
+                                                $machine->datacenter(),
+                                                $service,
+                                                $networkDevice->shortName(),
+                                        );
+                                }
+                        }
+
+            unless ( -r $checkedInConfigOriginal ) {
+                my $error = "\nERROR: the file $checkedInConfigOriginal does not exist on disk.\n"  .  
+                    "This is either a cfengine problem or a brand-new device.\n\n";
+
+                unlink $runningConfig or warn "Couldn't removing temp copy of running config: [$runningConfig]: $!";
+
+                $msg->attach(
+                    'Type'        => 'text/plain',
+                    'Data'        => $error,
+                    'Disposition' => 'inline',
+                );
+                next;
+            }
+
+            open (CHECKEDINCONFIG, ">$checkedInConfig") or die $!;
+            open (CHECKEDINCONFIGORIGINAL, "<$checkedInConfigOriginal") or die $!;
+            while (<CHECKEDINCONFIGORIGINAL>) {
+                s/$isOosRegex//go;
+                print CHECKEDINCONFIG;
+            }
+            close (CHECKEDINCONFIG);
+            close (CHECKEDINCONFIGORIGINAL);
+
+
+            my ($diffVP4Count, $md5DiffVP4) = countAndAttachDiffs(
+                $checkedInConfig,
+                $runningConfig,
+                "$hostname.diff",
+                $msg,
+                $cmdPrompt
+            );
+
+            $queries{"$hostname running configuration differences vs perforce"} = {
+                noRowCount => 1,
+                info => "answer == 0",
+                warn => "answer != 0",
+                crit => "answer != 0 && answer == previousAnswer",
+                perl => "return $diffVP4Count",
+                perforceMD5Diff => $md5DiffVP4,
+                processAnswer => sub { main::processAnswerForFingerprintChange(\$sendDiffEmail) },
+            };
+
+            if($machine->os() eq 'css' && $hostname =~ /-1\./) {
+                my $secondaryConfig = $checkedInConfigOriginal;
+                $secondaryConfig =~ s/-1/-2/;
+                next unless(-r $secondaryConfig);
+                my $primary = ariba::monitor::CSS::Config->newFromConfig($checkedInConfigOriginal);
+                my $secondary = ariba::monitor::CSS::Config->newFromConfig($secondaryConfig);
+
+                $primary->ignore('virtual-router');
+                $primary->ignore('global-portmap');
+                $secondary->ignore('virtual-router');
+                $secondary->ignore('global-portmap');
+
+                my $primaryParsed = "/tmp/$hostname.config";
+                my $secondaryParsed = "/tmp/$hostname.config";
+                $secondaryParsed =~ s/-1/-2/;
+                open(A, "> $primaryParsed");
+                print A $primary->configAsString();
+                close(A);
+                open(A, "> $secondaryParsed");
+                print A $secondary->configAsString();
+                close(A);
+
+                my ( $diffVSecondaryCount, $md5DiffVSecondary ) =
+                    countAndAttachDiffs(
+                        $primaryParsed,
+                        $secondaryParsed,
+                        "${hostname}_v_secondary.diff",
+                        $msg
+                    );
+
+                $queries{"$hostname running configuration differences vs secondary"} = {
+                    noRowCount => 1,
+                    info => "answer == 0",
+                    warn => "answer != 0",
+                    crit => "answer != 0 && answer == previousAnswer",
+                    perl => "return $diffVSecondaryCount",
+                    perforceMD5Diff => $md5DiffVSecondary,
+                    processAnswer => sub { main::processAnswerForFingerprintChange(\$sendDiffEmail) },
+                };
+            }
+        }
+
+        my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+        my $qm = ariba::monitor::QueryManager->newWithDetails(
+            'network-device-config', $pn, $me->service(), $me->customer(), \%queries
+        );
+
+        $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+        if ($debug) {
+            print "Would send the following email:\n";
+            print $msg->as_string(), "\n";
+        }
+        else {
+            # This calls sendmail.
+            $msg->send() if $sendDiffEmail || $force;
+        }
+    }
+}
+
+sub processAnswerForFingerprintChange {
+    my $sendDiffEmail = shift;
+
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+    my $currentMD5  = $query->perforceMD5Diff();
+    my $previousMD5 = $query->previousPerforceMD5Diff();
+
+    # First run for this query? or different MD5
+    if ((!$previousMD5 || ($currentMD5 ne $previousMD5)) && $query->results()) {
+
+        $query->setPreviousPerforceMD5Diff($currentMD5);
+
+        $$sendDiffEmail = 1;
+    }
+
+    return $query->results();
+}
+
+sub countAndAttachDiffs {
+    my $file1 = shift;
+    my $file2 = shift;
+    my $attachFileName = shift;
+    my $msg = shift;
+    my $cmdPrompt = shift;
+
+    my $diffProg = diffCmd();
+
+    # Ignore whitespace on diffs
+    open(DIFF, "$diffProg -uBbwEN -U 2 $ignoreRegex $cmdPrompt $file1 $file2 |") or do {
+        warn "Can't run $diffProg -uBbwE $file1 $file2!\n";
+        next;
+    };
+
+    my @diff = ();
+    my $diffCount = 0;
+
+    while (my $line = <DIFF>) {
+
+        if ($line =~ /^\@\@/) {
+
+            $diffCount++;
+        }
+
+        push @diff, $line;
+    }
+
+    close(DIFF);
+
+    # We don't want to continually append to ticketmaster
+    # so get the hash of the diff - minus the first two
+    # lines (files), and stuff it in the query.
+    my @diffForMD5 = @diff;
+    my $md5Diff    = md5_hex( join('', splice(@diffForMD5, 2)) );
+
+    # Start attaching the diffs
+    if ($diffCount > 0) {
+        $msg->attach(
+            'Type'        => 'text/plain',
+            'Data'        => \@diff,
+            'Filename'    => $attachFileName,
+            'Disposition' => 'attachment',
+        );
+    }
+
+    unlink $file1 or warn "Couldn't removing temp copy of running config: [$file1]: $!";
+    unlink $file2 or warn "Couldn't removing temp copy of running config: [$file2]: $!";
+
+    return($diffCount, $md5Diff);
+}
+
+
+main();
+
+sub getPasswordFromStdin {
+    my $passwordType = shift;
+
+    return unless -t STDIN;
+
+    my $password;
+
+    ReadMode('noecho');
+
+    print "\nEnter $passwordType password:";
+    chomp($password = ReadLine(0));
+
+    ReadMode('normal');
+    print "\n";
+
+    return $password;
+}
+
+__END__

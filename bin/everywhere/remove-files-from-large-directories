@@ -1,0 +1,119 @@
+#!/usr/local/bin/perl
+
+use strict;
+
+my $debug = 0;
+
+sub usage {
+
+	print "usage: $0 [-d|-h|-m <max files to remove>|-s <sleep>] -r <full path to directory to remove>\n\n",
+	      "This utility provides throttling mechanisms for removing files within a large filesystem on our Netapp.\n",
+	      "The goal is to remove files while consuming as few resources on the filer as possible; simply running\n",
+	      "rm -rf on sufficiently large directories will have a negative CPU/memory impact on filer performance.\n\n",
+	      "-h	: Optional: This help message\n",
+	      "-d	: Optional: Enable debugging.  Use this to dry-run a command, nothing will be deleted\n",
+	      "-m	: Optional: Max number of files to remove before exiting.  Throttling mechanism, defaults to 1024\n",
+	      "-s	: Optional: Number of seconds to sleep between file removal.  Throttling mechanism, defaults to 1\n",
+	      "-r	: Required: Files in this directory will be removed, subdirectories will not be\n",
+	      "           traversed.  Files will be removed inline until all files are removed or the max\n",
+	      "           number of files to remove are reached.\n\n";
+
+	exit 0;
+}
+
+sub main {
+	my $directory;
+	my $maxFileCount = 1024;  # max number of entries returned by a single call to getdents()
+	my $sleep = 1;  # sleep in seconds
+	my $confirmRemoval = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		chomp $arg;
+
+		if ($arg =~ /^-r/) { $directory = shift @ARGV; next; }
+		if ($arg =~ /^-m/) { $maxFileCount = shift @ARGV; next; }
+		if ($arg =~ /^-s/) { $sleep = shift @ARGV; next; }
+		if ($arg =~ /^-d/) { $debug++; next; }
+		if ($arg =~ /^-h/) { usage(); next; }
+
+		usage();
+	}
+
+	unless ( -d $directory ) {
+		die "Unable to find directory [$directory]";
+	}
+
+	unless ( $directory =~ m|^/| ) {
+		die "Directory must be an absolute path";
+	}
+
+	if ($maxFileCount < 0) {
+		die "File count must be greater than zero";
+	}
+
+	if ($sleep < 0) {
+		die "Sleep must be greater than or equal to zero";
+	}
+
+	#
+	# Do some paranoid verification before we remove files
+	#
+	if ( $directory eq '/' ) {
+		die "Removal of files in '/' is not allowed";
+	}
+
+	my ($device, $inode, $mode, $nlink, $uid, $gid, $rdev, $size, $atime, $mtime, $ctime, $blksize, $blocks) = stat($directory);
+
+	if ( ($uid < 100) or ($gid < 100) ) {
+		die "Directory owned by root or system account.  Removal of files not allowed";
+	}
+
+	#
+	# Prompt user for confirmation of the directory whose files will be removed
+	#
+	print "Are you sure you want to remove files in [$directory] (yes/[no])? ";
+	my $answer = <STDIN>;
+	chomp $answer;
+	print "answer [$answer]\n" if $debug;
+
+	unless ($answer =~ /^yes$/i) {
+		print "Exiting, no action taken\n";
+		exit 1;
+	}
+
+	#
+	# Remove files from directory
+	#
+	chdir($directory) or die "Unable to cd to [$directory]: $!";
+
+	my $filesRemoved = 0;
+	opendir(my $dir, '.') or die "Unable to open directory [$directory]: $!";
+	while ( my $entry = readdir($dir) ) {
+
+		my $absoluteEntry = "${directory}/${entry}";
+		if ( -f $absoluteEntry ) {
+			if ($debug) {
+				print "DRY-RUN: removing [$absoluteEntry]\n";
+			} else {
+				print "removing [$absoluteEntry]\n";
+				unlink $absoluteEntry or warn "Unable to unlink [$absoluteEntry]: $!";
+			}
+
+			$filesRemoved++;
+			if ($maxFileCount and ($filesRemoved >= $maxFileCount)) {
+				print "Removed $maxFileCount files, exiting\n";
+				last;
+			}
+
+			if ($sleep) {
+				print "sleeping for $sleep seconds...\n" if $debug;
+				sleep($sleep);
+			}
+		}
+	}
+	closedir($dir);
+
+	print "Done.\n";
+}
+
+main();

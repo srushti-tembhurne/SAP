@@ -1,0 +1,144 @@
+#!/usr/local/bin/perl -w
+#
+# Adds and checks the route to the dummynet host
+#
+# Id: $
+
+use strict;
+use FindBin;
+use Net::Ping;
+
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Machine;
+use ariba::Ops::DBConnection;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+
+my $debug = 0;
+
+sub debug {
+	my $msg = shift; 
+
+	print "[debug] $msg\n" if ($debug);
+}
+
+sub routeToDummynetForService {
+	my $action = shift;
+	my $host = shift;
+	my $dummynetHost = shift;
+	my $service = shift;
+
+	my @installedProducts = ariba::rc::InstalledProduct->installedProductsList($service);
+	my @dbConnections = ariba::Ops::DBConnection->connectionsFromProducts(@installedProducts);
+
+	my %uniquePeerHosts;
+	foreach my $db (@dbConnections) {
+		next unless ($db->host() eq $host);
+
+		# Skip non-DR
+		my @peerConnections = $db->peers(); 
+		next unless (@peerConnections); 
+
+		foreach my $peerDb (@peerConnections) {
+			my $peerHost = $peerDb->host();
+
+			next if ($peerHost eq $host);
+			next if ($uniquePeerHosts{$peerHost});
+
+			my $cmd = "/sbin/route $action -host $peerHost gw $dummynetHost 2>&1";
+			if ($debug >= 2) {
+				debug("Will run $cmd");
+			} else {
+				debug("Running $cmd");
+				my $output = `$cmd`; 
+				debug($output) if ($output);
+			} 
+			$uniquePeerHosts{$peerDb->host()} = 1;	
+		}
+	}
+
+	return keys(%uniquePeerHosts);
+}
+
+sub pingToHost {
+	my $host = shift;
+	my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+	my $p = Net::Ping->new();
+	$p->hires(1);
+	my ($success, $duration, $ip) = $p->ping($host);
+	$p->close();
+
+	return ($duration * 1000) if ($success); 
+
+	$query->setError('Ping failed. Host is unreachable.');
+	return -1;
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $action = 'add';
+
+	while (my $arg = shift){
+		if ($arg =~ /^-d/o) { $debug++; 			next; };
+		if ($arg =~ /^-e/o) { $sendEmail = 1; 		next; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; 		next; };
+		if ($arg =~ /^-remove/o) { $action = 'del';	next; };
+	}
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $machine = ariba::Ops::Machine->new($hostname);
+	my $datacenter = $machine->datacenter();
+	my $productName = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+	my $me = ariba::rc::InstalledProduct->new();
+	my %queries;
+
+	unless ($datacenter =~ /devlab/) {
+		debug('This should only be run in devlab service');
+		exit();
+	}
+
+	my %dummynetProperties = (
+		datacenter 			=> $datacenter,
+		providesServices	=> 'dummynet',
+		status				=> 'inservice',
+	);
+
+	my @dummynetMachines = ariba::Ops::Machine->machinesWithProperties(%dummynetProperties);
+	
+	unless (@dummynetMachines) {
+		debug('No dummynet host is found in machine db');
+		exit();
+	}
+	my $dummynetMachine = $dummynetMachines[0];
+	my $dummynetHostname = $dummynetMachine->hostname();
+
+	my @peerHosts = routeToDummynetForService($action, $hostname, $dummynetHostname, $me->service());
+	unless (@peerHosts) {
+		debug('This host is not applicable for dummynet routing based on db config (no dr). No route added');
+		exit();
+	}
+
+	my $minReplyTime = $action eq 'add' ? 70 : 0;
+	foreach my $peerHostname (@peerHosts) {
+		$queries{"$hostname ping to $peerHostname"} = {
+			uiHint	=> 'dummynet',
+			info	=> "answer >= $minReplyTime",
+			crit	=> "answer < $minReplyTime",
+			perl	=> sub { main::pingToHost($peerHostname) },
+			format	=> '%.2f ms',
+		};
+	}
+
+	my $email = $me->default('notify.email');
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails("dba", $productName, $me->service(), $me->customer(), \%queries);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);

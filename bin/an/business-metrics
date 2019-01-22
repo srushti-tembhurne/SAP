@@ -1,0 +1,1087 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/an/business-metrics#44 $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DateTime;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::OracleClient;
+use ariba::monitor::ReportingConstants;
+use ariba::monitor::QueryManager;
+
+sub usage {
+	my $error = shift;
+
+	if ($error) {
+		print "Error: $error\n";
+	}
+
+	print "$0 [-h|-d|-a] -s yyyy-mm-dd -e yyyy-mm-dd\n";
+	print "    -h : this help messsage\n";
+	print "    -d : debug mode\n";
+	print "    -a : archive results, record some numbers in cdb\n";
+	print "    -s : start of date range for which to generate the report, ex. 2005-01-01\n";
+	print "    -e : end of date range for which to generate the report, ex. 2005-02-01\n";
+
+	exit(1);
+}
+
+sub main {
+
+	my $debug = 0;
+	my $archiveResults = 0;
+	my $sDate;
+	my $eDate;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ m/^-h/o) { usage(); }
+		if ($arg =~ m/^-d/o) { $debug = 1; }
+		if ($arg =~ m/^-a/o) { $archiveResults = 1; }
+		if ($arg =~ m/^-s/o) { $sDate = shift(@ARGV); }
+		if ($arg =~ m/^-e/o) { $eDate = shift(@ARGV); }
+	}
+	
+	if( $ENV{'REQUEST_METHOD'} ){
+		print "Content-Type: text/plain\n\n";
+	}
+
+	if ($sDate && !$eDate) {
+		usage("If you sepecify start date, you need to specify end date too");
+	}
+
+	if (!$sDate && $eDate) {
+		usage("If you sepecify end date, you need to specify start date too");
+	}
+
+	if (!$sDate && !$eDate) {
+		($sDate, $eDate) = ariba::Ops::DateTime::computeStartAndEndDate(time());
+	}
+
+	if ($sDate && $sDate !~ m|\d\d\d\d-\d\d-\d\d|) {
+		usage("Bad date format for start date");
+	}
+
+	if ($eDate && $eDate !~ m|\d\d\d\d-\d\d-\d\d|) {
+		usage("Bad date format for end date");
+	}
+
+	my $date = scalar localtime(time());
+
+	# this should really be inside of OracleClient, not sure
+	# what that will break
+	$ENV{'NLS_LANG'}="American_america.utf8";
+
+	unless ($archiveResults) {
+
+		print '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">';
+		print "\n<pre>\n";
+		print "*** ARIBA CONFIDENTIAL INFORMATION: DO NOT DISTRIBUTE ***\n";
+		print "All queries as of $date unless otherwise noted\n\n";
+		
+		# so the browser doesn't timeout?
+		$| = 1;
+		print "";
+		$| = 0;
+	}
+
+	my $me       = ariba::rc::InstalledProduct->new();
+	my $product  = ariba::rc::InstalledProduct->new("an", $me->service());
+
+	my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($product);
+	my $communitiesList = join(", ", @communityIds);
+
+	# These are reusable
+	my %sqlParts = (
+		'orderRoutingMethods' => q`
+			from cxml_document p, org_join o
+			where p.from_org = o.id
+				and o.deployment='Production'
+				and p.source_partition = schema_community
+				and p.operation_type != 'delete'
+				and p.document_type = 'PurchaseOrder'
+				and p.status not in ('Failed','Duplicated')
+				and p.document_status not in ('Obsoleted','Deleted','Rejected','Supplier Cancelled')
+				and p.created between
+					to_date('`. $sDate . q`','YYYY-MM-DD') and
+					to_date('`. $eDate . q`','YYYY-MM-DD')
+		`,
+
+		'invoicesSuccessfullVolume' => q`
+			from  cxml_document p, org_join o
+			where p.created between to_date('`. $sDate  . q`','YYYY-MM-DD')
+					and to_date('`.  $eDate . q`','YYYY-MM-DD')
+			      and p.document_type = 'InvoiceDetailRequest'
+			      and p.source_partition = schema_community
+			      and p.status ! = 'Failed'
+			      and o.id = p.from_org
+			      and o.deployment = 'Production'
+		`,
+
+		'invoicesSuccessfullSpend' => q`
+			select /*+ index(p IND_B398011A_2B45162B) */ sum(i.amount_approx) from
+			org_join bo, org_join so, invoice i, cxml_document p
+			where p.created between to_date('`. $sDate  . q`','YYYY-MM-DD') and
+				to_date('`.  $eDate . q`','YYYY-MM-DD')
+				and i.generic_document = p.id
+				and p.status != 'Failed'
+				and (document_status not in 
+					('Obsoleted','Deleted','Rejected','rejected', 'invalid')
+					 or document_status is null
+				)
+				and p.operation_type != 'delete'
+				and p.source_partition = schema_community
+				and p.document_type = 'InvoiceDetailRequest'
+				and p.from_org = so.id
+				and p.to_org = bo.id
+				and so.deployment = 'Production'
+				and bo.deployment = 'Production'
+		`,
+	);
+
+	###############
+	my %queries = ();
+
+	unless ($archiveResults) {
+
+		%queries = (
+			"Definitions - EMEA Countries" =>
+			{
+				perl => "join(', ',sort keys(%ariba::monitor::ReportingConstants::EMEACountries))",
+			},
+
+			"Definitions - AP Countries" =>
+			{
+				perl => "join(', ',sort keys(%ariba::monitor::ReportingConstants::APCountries))",
+			},
+
+			"Buyer-Supplier/Could-Transact - # of pairs who could transact" =>
+			{
+					timeout => 2 * 60 * 60,
+					sql => q`
+				select count(*) from (
+					select bo.name, so.name 
+					from relationship_type rt, 
+						 relationship bs, 
+						 org so, org bo, 
+						 relationship_status st
+					where
+						st.name='Enabled' and
+						rt.name='Trading' and
+						bs.status = st.id and
+						bs.type = rt.id
+						and bs.party0= bo.id and bs.party1 = so.id
+						and so.deployment = 'Production'
+						and exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = so.id)
+						and bo.deployment = 'Production'
+						and exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = bo.id)
+						group by bo.name, so.name
+				)
+					`,
+			},
+
+			"Buyer-Supplier/Have-Transacted - # of pairs who have transacted" =>
+			{
+			runForCommunities => $communitiesList,
+			aggregationMethod => "counts",
+			timeout => 2 * 60 * 60,
+			sql => q`
+			select count(*) from (
+			  select * from relationship_join r, 
+							relationship_type_join t, 
+							org_join o1, org_join o2 
+						where
+						 t.name = 'Trading' and 
+						 r.type = t.id and exists ( 
+						 select /*+ index(cxml_document IND_B398011A_741BFDD) */ id
+							 from cxml_document 
+							 where
+								from_org = r.party0 and 
+								to_org = r.party1 and 
+								document_type = 'PurchaseOrder' and 
+								rownum=1) and
+						 r.party0 = o1.id and 
+						 o1.deployment = 'Production' and 
+						 r.party1 = o2.id and 
+						 o2.deployment = 'Production'
+				)
+			`,
+
+			},
+			"Buyers/AP - # of AP buyers who have added at least one supplier" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select count(distinct o.id)
+					from org o, relationship bs, relationship_type rt,
+						 relationship_status st, address a
+					where 
+						o.deployment='Production' and
+						exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = o.id) and
+						rt.name = 'Trading' and 
+						st.name = 'Enabled' and 
+						bs.type = rt.id and 
+						bs.status = st.id and 
+						bs.party0 = o.id and 
+						o.address=a.id and a.country in ` .
+						ariba::monitor::ReportingConstants::sqlList(\%ariba::monitor::ReportingConstants::APCountries),
+			},
+
+			"Buyers/EMEA - # of EMEA buyers who have added at least one supplier" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select count(distinct o.id)
+					from org o, relationship bs, relationship_type rt,
+						 relationship_status st, address a
+					where 
+						o.deployment='Production' and 
+						exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = o.id) and
+						rt.name = 'Trading' and 
+						st.name = 'Enabled' and 
+						bs.type = rt.id and 
+						bs.status = st.id and 
+						bs.party0 = o.id and 
+						o.address=a.id and a.country in ` .
+						ariba::monitor::ReportingConstants::sqlList(\%ariba::monitor::ReportingConstants::EMEACountries),
+			},
+
+			"Buyers/Total - # of buyers who have added at least one supplier" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select count(distinct o.id)
+					from org o, relationship bs, relationship_type rt,
+						 relationship_status st
+					where 
+						o.deployment='Production' and 
+						exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = o.id) and
+						rt.name = 'Trading' and 
+						st.name = 'Enabled' and 
+						bs.type = rt.id and 
+						bs. status = st.id and 
+						bs.party0 = o.id
+			`,
+			},
+
+			"Catalogs/All - # catalogs from production suppliers" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select count(c.id) from 
+						catalog c, catalog_content cc, person p, org o
+					where c.creator = p.id
+						and p.org = o.id
+						and o.deployment = 'Production'
+						and exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = o.id)
+						and c.content = cc.id
+						and cc.status = 'Published'
+			`,
+			},
+
+			"Catalogs/All/Lines - # of lines in catalogs from production suppliers" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select sum(c.item_count)
+					from catalog c, catalog_content cc, person p, org o
+					where c.creator = p.id
+						and p.org = o.id
+						and o.deployment = 'Production'
+						and exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = o.id)
+						and c.content = cc.id
+						and cc.status = 'Published'
+			`,
+			},
+
+			"Catalogs/Public - # catalogs from production suppliers" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select count(c.id) from 
+						catalog c, catalog_content cc, person p, org o
+					where c.creator = p.id
+						and p.org = o.id
+						and o.deployment = 'Production'
+						and exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = o.id)
+						and c.content = cc.id
+						and cc.status = 'Published'
+						and c.visibility = 'Public'
+			`,
+			},
+
+			"Catalogs/Public/Lines - # of lines in catalogs from production suppliers" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select sum(c.item_count) from 
+						catalog c, catalog_content cc, person p, org o
+					where c.creator=p.id
+						and p.org=o.id
+						and o.deployment='Production'
+						and exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = o.id)
+						and c.content = cc.id
+						and cc.status = 'Published'
+						and c.visibility = 'Public'
+			`,
+			},
+
+			"Documents/POs/All/Successful/Monthly - # successfully transacted $sDate - $eDate" =>
+			{
+			runForCommunities => $communitiesList,
+			aggregationMethod => "counts",
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select /*+ index(p IND_B398011A_2B45162B) */ count(p.id) from
+						cxml_document p
+						where
+						p.created between
+							to_date('`. $sDate  . q`','YYYY-MM-DD')
+								and to_date('`.  $eDate . q`','YYYY-MM-DD')
+						and p.source_partition = schema_community
+						and p.status != 'Failed'
+						and p.document_type = 'PurchaseOrder'
+			`,
+			},
+
+			"Documents/POs/All/Total/Monthly - # transacted $sDate - $eDate" =>
+			{
+			runForCommunities => $communitiesList,
+			aggregationMethod => "counts",
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select /*+ index(p IND_B398011A_2B45162B) */ count(p.id)
+					from cxml_document p
+							where
+						p.created between
+							to_date('`. $sDate  . q`','YYYY-MM-DD')
+								and to_date('`.  $eDate . q`','YYYY-MM-DD')
+						and p.source_partition = schema_community
+						and p.document_type = 'PurchaseOrder'
+			`,
+			},
+
+			"Documents/POs/Production/Line-Items/Monthly - # items transacted $sDate - $eDate" =>
+			{
+			runForCommunities => $communitiesList,
+			aggregationMethod => "counts",
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select /*+ index(d IND_B398011A_2B45162B) use_nl(d p pi o) */
+					count(pi.id) from
+						po_item pi, po p, cxml_document d, org_join o
+					where
+						d.created between
+							to_date('`. $sDate  . q`', 'YYYY-MM-DD')
+								and to_date('`.  $eDate . q`', 'YYYY-MM-DD')
+						and d.source_partition = schema_community
+						and d.document_type='PurchaseOrder'
+						and p.generic_document = d.id
+						and pi.po=p.id
+						and d.from_org=o.id
+						and o.deployment='Production'
+			`,
+			},
+
+			"Documents/POs/Production/Successful/Monthly - # successfully transacted $sDate - $eDate" =>
+			{
+			runForCommunities => $communitiesList,
+			aggregationMethod => "counts",
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select /*+ index(p IND_B398011A_2B45162B) */ count(p.id) from
+						cxml_document p, org_join o
+					where
+						p.created between
+						to_date('`. $sDate  . q`','YYYY-MM-DD')
+							and to_date('`.  $eDate . q`','YYYY-MM-DD')
+						and p.source_partition = schema_community
+						and p.document_type = 'PurchaseOrder'
+						and p.status != 'Failed' 
+						and o.id = p.from_org
+						and o.deployment = 'Production'
+			`,
+			},
+
+			"Documents/POs/Production/Total/Monthly - # transacted $sDate - $eDate" =>
+			{
+			runForCommunities => $communitiesList,
+			aggregationMethod => "counts",
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select /*+ index(p IND_B398011A_2B45162B) use_nl(p o) */ count(p.id)
+					from cxml_document p, org_join o
+					where
+						p.created between
+							to_date('`. $sDate  . q`','YYYY-MM-DD')
+								and to_date('`.  $eDate . q`','YYYY-MM-DD')
+						and p.source_partition = schema_community
+						and p.document_type = 'PurchaseOrder' 
+						and o.id = p.from_org
+						and o.deployment = 'Production'
+			`,
+			},
+
+			# MChang: Add Invoice Data
+			
+			# --- begin
+
+			"Documents/Invoice/All/Successful/Monthly - # successfully transacted $sDate - $eDate" =>
+			{
+			runForCommunities => $communitiesList,
+			aggregationMethod => "counts",
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select /*+ index(p IND_B398011A_2B45162B) */ count(p.id) 
+				from cxml_document p
+				where p.created between to_date('`. $sDate  . q`','YYYY-MM-DD')
+								and to_date('`.  $eDate . q`','YYYY-MM-DD')
+					  and p.status != 'Failed'
+					  and p.source_partition = schema_community
+					  and  p.document_type = 'InvoiceDetailRequest'
+			`,
+			},
+
+			"Documents/Invoice/All/Total/Monthly - # transacted $sDate - $eDate" =>
+			{
+			runForCommunities => $communitiesList,
+			aggregationMethod => "counts",
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select /*+ index(p IND_B398011A_2B45162B) */ count(p.id)
+				from cxml_document p
+				where p.created between 
+					to_date('`. $sDate  . q`','YYYY-MM-DD') and to_date('`.  $eDate . q`','YYYY-MM-DD')
+					  and p.source_partition = schema_community
+					  and p.document_type = 'InvoiceDetailRequest'
+			`,
+			},
+
+			"Documents/Invoice/Production/Successful/Monthly - # successfully transacted $sDate - $eDate" =>
+			{
+			runForCommunities => $communitiesList,
+			aggregationMethod => "counts",
+			timeout => 2 * 60 * 60,
+			sql => q`select /*+ index(p IND_B398011A_2B45162B) */ count(p.id) ` .
+				$sqlParts{'invoicesSuccessfullVolume'},
+			},
+
+			"Documents/Invoice/Production/Successful/Monthly - # by recieving method $sDate - $eDate" =>
+			{
+			runForCommunities => $communitiesList,
+			format => "%-20.20s %10d\n",
+			timeout => 2 * 60 * 60,
+			sql => q`select /*+ index(p IND_B398011A_2B45162B) */ nvl(p.receiving_method, 'Unknown'), count(p.id) ` .
+				$sqlParts{'invoicesSuccessfullVolume'} . q` group by p.receiving_method`,
+			},
+
+			"Documents/Invoice/Production/Total/Monthly - # transacted $sDate - $eDate" =>
+			{
+			runForCommunities => $communitiesList,
+			aggregationMethod => "counts",
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select /*+ index(p IND_B398011A_2B45162B) use_nl(p o) */ count(p.id)
+				from cxml_document p, org_join o
+				where p.created between 
+					to_date('`. $sDate  . q`','YYYY-MM-DD') and to_date('`.  $eDate . q`','YYYY-MM-DD')
+					  and p.source_partition = schema_community
+					  and p.document_type = 'InvoiceDetailRequest'
+					  and o.id = p.from_org
+					  and o.deployment = 'Production'
+			`,
+			},
+
+			# --- end
+
+			"Order Routing/Buyer-Supplier/Could-Transact --  pairs who could transact" =>
+			{
+			format => "    %s: %d\n",
+			noRowCount => 1,
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select distinct s.service_id, count(s.service_id) 
+					from org bo, org so, relationship r, routing_profile rp, 
+							routing_method rm, service s
+					where r.party0=bo.id and 
+						r.party1=so.id and 
+						r.status=100 and
+						bo.deployment='Production' and 
+						exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = bo.id) and
+						so.deployment='Production' and
+						exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = so.id) and
+						rp.org=so.id and 
+						rm.routingprofile=rp.id and 
+						rm.service=s.id 
+					group by s.service_id
+			`,
+			},
+
+			"Order Routing/Spend/Monthly - Total spend per routing method $sDate - $eDate (method production po)" =>
+			{
+			header => "    Order Routing Method                     No. of POs          Amount\n    --------------------                     ----------         -------\n",
+			format => "    %-40.40s %10d %15.2f\n",
+			runForCommunities => $communitiesList,
+			noRowCount => 1,
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select /*+ index(p IND_B398011A_2B45162B) use_nl(p o) */
+					p.routing_method, count(p.id), sum(p.amount_approx) ` .
+					$sqlParts{'orderRoutingMethods'} .  q` group by p.routing_method`,
+			},
+
+			"Order Routing/Suppliers/Summary --  summary for enabled production suppliers" =>
+			{
+			format => "    %s: %d\n",
+			noRowCount => 1,
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select distinct s.service_id, count(distinct so.id)
+					from org so, relationship r, routing_profile rp,
+					routing_method rm, service s
+				where so.id=r.party1 and
+					r.status=100 and
+					so.deployment='Production' and
+					exists (select 1 from person where status in
+					('Enabled', 'LimitedAccess')
+					and person.org = so.id) and
+					rp.org=so.id and
+						rm.routingprofile=rp.id and
+						rm.service=s.id and
+						rm.type=1
+					group by s.service_id;
+			`,
+			},
+
+			" Spend/Monthly - Total spend $sDate - $eDate (method production po)" =>
+			{
+			runForCommunities => $communitiesList,
+			aggregationMethod => "counts",
+			format => "%0.2f\n",
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select /*+ index(p IND_B398011A_2B45162B) use_nl(p o) */
+						sum(p.amount_approx) 
+					from cxml_document p, org_join o
+					where
+						p.document_type = 'PurchaseOrder'
+						and p.source_partition = schema_community
+						and p.created between to_date('`. $sDate  .  q`','YYYY-MM-DD')
+								and to_date('`.  $eDate . q`','YYYY-MM-DD')
+						and p.status != 'Failed'
+						and p.document_status not in ('Obsoleted','Deleted','Rejected')
+						and p.from_org=o.id
+						and o.deployment='Production'
+			`,
+			},
+
+			" Invoice Spend/Monthly - Total spend $sDate - $eDate (method production invoice)" =>
+                        {
+                        runForCommunities => $communitiesList,
+                        aggregationMethod => "counts",
+                        format => "%0.2f\n",
+						timeout => 2 * 60 * 60,
+                        sql => $sqlParts{'invoicesSuccessfullSpend'},
+                        },
+
+			"Suppliers/Active Punchout/AP - # of production punchout suppliers active in the past 30 days" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select count(distinct o.id)
+				from org o, address a
+				where o.address = a.id
+					  and a.country in ` . 
+					  ariba::monitor::ReportingConstants::sqlList(\%ariba::monitor::ReportingConstants::APCountries)
+					  . q` and o.id in (select distinct to_org_id from 
+						  (select to_org_id from cxml_log_an1
+						   where created > (sysdate - 30) and message_type = 'PunchOutSetupRequest')
+						   UNION
+						  (select to_org_id from cxml_log_an2
+						   where created > (sysdate - 30) and message_type = 'PunchOutSetupRequest'))
+					and o.deployment = 'Production'
+				`,
+			},
+
+			"Suppliers/Active Punchout/EMEA - # of production punchout suppliers active in the past 30 days" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select count(distinct o.id)
+				from org o, address a
+				where o.address = a.id
+					  and a.country in ` . 
+					  ariba::monitor::ReportingConstants::sqlList(\%ariba::monitor::ReportingConstants::EMEACountries)
+					  . q` and o.id in (select distinct to_org_id from 
+						  (select to_org_id from cxml_log_an1
+						   where created > (sysdate - 30) and message_type = 'PunchOutSetupRequest')
+						   UNION
+						  (select to_org_id from cxml_log_an2
+						   where created > (sysdate - 30) and message_type = 'PunchOutSetupRequest'))
+					and o.deployment = 'Production'
+				`,
+			},
+
+			"Suppliers/Active Punchout/Total - # of production punchout suppliers active in the past 30 days" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select count(distinct o.id)
+				from org o where o.id in (select distinct to_org_id from 
+					  (select to_org_id from cxml_log_an1
+					   where created > (sysdate - 30) and message_type = 'PunchOutSetupRequest')
+					   UNION
+					  (select to_org_id from cxml_log_an2
+					   where created > (sysdate - 30) and message_type = 'PunchOutSetupRequest'))
+					and o.deployment = 'Production'
+				`,
+			},
+			"Suppliers - # of production suppliers enabled in this month -- $sDate - $eDate" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select count(o.id)
+				from  org o
+				where o.type=107
+				and o.VISIBILITY != 'Private'
+				and o.deployment = 'Production'
+				and o.dbcreated between to_date('`. $sDate  . q`','YYYY-MM-DD') and to_date('`.  $eDate . q`','YYYY-MM-DD')
+				and exists (
+					select 1 from person p, person_role pr, role r 
+					where pr.org = o.id and pr.person = p.id and pr.role = r.id and r.name = 'SUPPLIER_MASTERACCOUNT'
+					and p.org = o.id and p.status in ('Enabled', 'LimitedAccess')
+				)
+				`,
+			},
+
+			"Suppliers/AP - # of AP suppliers added by at least one buyer" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select count(distinct o.id)
+					from org o, relationship bs, relationship_type rt,
+						 relationship_status st, address a
+					where 
+						o.deployment='Production' and 
+						exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = o.id) and
+						rt.name = 'Trading' and 
+						st.name = 'Enabled' and 
+						bs.type = rt.id and 
+						bs.status = st.id and 
+						bs.party1 = o.id and 
+						o.address=a.id and a.country in ` .
+						ariba::monitor::ReportingConstants::sqlList(\%ariba::monitor::ReportingConstants::APCountries),
+			},
+
+			"Suppliers/EMEA - # of EMEA suppliers added by at least one buyer" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select count(distinct o.id)
+					from org o, relationship bs, relationship_type rt,
+						 relationship_status st, address a
+					where 
+						o.deployment='Production' and 
+						exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = o.id) and
+						rt.name = 'Trading' and 
+						st.name = 'Enabled' and 
+						bs.type = rt.id and 
+						bs.status = st.id and 
+						bs.party1 = o.id and 
+						o.address=a.id and a.country in ` .
+						ariba::monitor::ReportingConstants::sqlList(\%ariba::monitor::ReportingConstants::EMEACountries),
+			},
+
+			"Suppliers/By-Country - # of production suppliers by country" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select c.countryname, count(o.id)
+				from country c, org o, address a
+				where c.isoa3 = a.country
+				and o.address = a.id
+				and o.type=107
+				and o.VISIBILITY != 'Private'
+				and o.deployment = 'Production'
+				and exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = o.id)
+				group by c.countryname`,
+			},
+
+			"Suppliers/By-Category - # of production suppliers by category (top two levels of UNSPSC )" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select c.name, count(o.id)
+				from commodity c, org o, org_commodity oc
+				where
+				(c.parent is null
+				or c.parent in (select id from commodity where parent is null))
+				and c.id=oc.commodity
+				and oc.org=o.id
+				and o.type=107
+				and o.VISIBILITY != 'Private'
+				and o.deployment = 'Production'
+				and exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = o.id)
+				group by c.name`,
+			},
+
+			"Suppliers/Public-Catalogs - # of production suppliers with public published catalogs" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select count(distinct(o.name)) from 
+				catalog c, catalog_content cc, person p, org o
+				where c.creator = p.id
+					and p.org = o.id
+					and o.deployment = 'Production'
+					and exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = o.id)
+					and c.content = cc.id
+					and cc.status = 'Published'
+					and c.visibility = 'Public'
+			`,
+			},
+
+			"Suppliers/Commodities - # of suppliers with at least one commodity" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select count(*) from org o where exists
+					(select 1 from  org_commodity where org = o.id)
+					and deployment = 'Production' and type= 107
+					and exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = o.id)
+			`,
+			},
+
+			"Suppliers/Total - # of suppliers added by at least one buyer" =>
+			{
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select count(distinct o.id)
+					from org o, relationship bs, relationship_type rt,
+						 relationship_status st
+					where 
+						o.deployment='Production' and 
+						exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = o.id) and
+						rt.name = 'Trading' and 
+						st.name = 'Enabled' and 
+						bs.type = rt.id and 
+						bs. status = st.id and 
+						bs.party1 = o.id
+			`,
+			},
+
+			"[buyers who have added at least one supplier]" =>
+			{
+			format => "    %s; %s\n",
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select company.name, address.country 
+					from  org, company, address 
+					where
+						company.id = org.company
+						and org.deployment = 'Production'
+						and exists (select 1 from person where status in ('Enabled', 'LimitedAccess') and person.org = org.id)
+						and org.address = address.id 
+						and exists (select /*+ ordered */ * 
+								from relationship r, relationship_type t,
+									relationship_status s 
+								where
+									r.status = s.id and 
+									r.type = t.id and 
+									t.name = 'Trading' and 
+									s.name = 'Enabled' and
+									r.party0 = org.id)
+			`,
+			},
+
+			"[pairs of Buyer -> Suppliers who have transacted during $sDate - $eDate, ordered by spend]" =>
+			{
+			skip => 1,
+			runForCommunities => $communitiesList,
+			format => "%11.2f (%5d po) %25.25s -> %-22s\n",
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select a.psm, a.cnt, b.name, s.name from
+					(select /*+ index(p IND_B398011A_2B45162B) */
+						p.from_org, p.to_org, count(p.id) cnt,
+						sum(p.amount_approx) psm
+						from cxml_document p
+						where
+							p.document_type = 'PurchaseOrder'
+							and p.source_partition = schema_community
+							and p.status != 'Failed'
+							and p.document_status not in ('Deleted','Rejected', 'Obsoleted')
+							and p.created between 
+								to_date('`. $sDate  . q`','YYYY-MM-DD') and
+								to_date('`.  $eDate . q`','YYYY-MM-DD')
+						group by p.from_org, p.to_org) a,
+					org_join b,
+					org_join s
+					where
+						a.from_org = b.id and
+						b.deployment = 'Production' and
+						a.to_org = s.id and
+						s.deployment = 'Production'
+						order by a.psm desc
+			`,
+			},
+	  
+			# MChang: Add invoice transacting pair
+			"[pairs of Buyers <- Supplier who have transacted during $sDate - $eDate, ordered by spend]" =>
+			{
+			skip => 1,
+			runForCommunities => $communitiesList,
+			format => "%11.2f (%5d invoice) %25.25s <- %-22s\n",
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select a.psm,
+					   a.cnt,
+					   b.name,
+					   s.name
+					   from (select /*+ index(p IND_B398011A_2B45162B) */
+							p.from_org,
+							p.to_org,
+							count(p.id) cnt,
+							sum(i.amount_approx) psm
+					 from invoice i, 
+						  cxml_document p
+					 where p.document_type = 'InvoiceDetailRequest'
+						   and p.status != 'Failed'
+						   and p.source_partition = schema_community
+						   and (p.document_status not in ('Deleted','Rejected', 'Obsoleted') or p.document_status is null)
+						   and p.created between to_date('`. $sDate  . q`','YYYY-MM-DD') and to_date('`.  $eDate . q`','YYYY-MM-DD')
+						   and i.generic_document = p.id
+					 group by p.from_org, p.to_org) a,
+					 org_join b,
+					 org_join s
+				where a.from_org = s.id
+					  and s.deployment = 'Production'
+					  and a.to_org = b.id
+					  and b.deployment = 'Production'
+				order by a.psm desc
+			`, #` - syntax highlighting
+			},
+			# James Chiang added for Alva's request.
+			"Total number of transacted suppliers in this month" =>
+			{
+			runForCommunities => $communitiesList,
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select
+				count(distinct to_org)
+				from cxml_document c,
+				org_join oj
+				where
+				c.to_org=oj.id
+				and c.document_type='PurchaseOrder'
+				and c.created between
+                                              to_date('`. $sDate  . q`','YYYY-MM-DD') and
+                                              to_date('`.  $eDate . q`','YYYY-MM-DD')
+				and source_partition=schema_community
+				and oj.deployment='Production'
+			`,
+			},
+			"Number of suppliers transacted with 1, 2, 3, 4 or 5, and 6 or more buyers" =>
+			{
+			runForCommunities => $communitiesList,
+			format => "    %d buyer: %d\n",
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select a.cnt, count(a.id)
+				from
+				(
+				  select to_org id , count(distinct from_org) cnt
+				  from cxml_document c,
+				  org_join oj
+				  where
+				  c.document_type='PurchaseOrder'
+				  and c.to_org=oj.id
+				  and oj.deployment='Production'
+				  and c.created between
+                                              to_date('`. $sDate  . q`','YYYY-MM-DD') and
+                                              to_date('`.  $eDate . q`','YYYY-MM-DD')
+				  and source_partition=schema_community
+				  group by to_org
+				) a
+				group by a.cnt
+			`,
+			},
+			"Number of transacted suppliers by order routing method" =>
+			{
+			runForCommunities => $communitiesList,
+			format => "    %s: %d\n",
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select s.service_id, count(distinct to_org)
+				from
+				anlive.routing_method m,
+				anlive.service s,
+				anlive.routing_profile p,
+				cxml_document c,
+				org_join oj
+				where
+				m.type=1
+				and m.routingprofile=p.id
+				and m.service=s.id
+				and c.to_org=p.org
+				and c.to_org=oj.id
+				and c.document_type='PurchaseOrder'
+				and c.created between
+                                              to_date('`. $sDate  . q`','YYYY-MM-DD') and
+                                              to_date('`.  $eDate . q`','YYYY-MM-DD')
+				and source_partition=schema_community
+				and oj.deployment='Production'
+				group by s.service_id
+			`,
+			},
+			"Number of transacted suppliers by order routing who signed up for SPS" =>
+			{
+			runForCommunities => $communitiesList,
+			format => "    %s: %d\n",
+			timeout => 2 * 60 * 60,
+			sql => q`
+				select /*+ index(c IND_B398011A_2B45162B) */ s.service_id, count(distinct to_org)
+				from
+				anlive.routing_method m,
+				anlive.service s,
+				anlive.routing_profile p,
+				anlive.supplier sp,
+				anlive.org o,
+				anlive.smi_service_account sa,
+				anlive.smi_service ss,
+				cxml_document c
+				where
+				sp.org = o.id
+				and sa.org = o.id
+				and sa.service = ss.id
+				and ss.service_name = 'PREMIUMTSS'
+				and sa.current_subscription is not null
+				and m.type=1
+				and m.routingprofile=p.id
+				and m.service=s.id
+				and p.org=o.id
+				and c.to_org=p.org
+				and c.to_org=o.id
+				and c.document_type='PurchaseOrder'
+				and c.created between
+                                              to_date('`. $sDate  . q`','YYYY-MM-DD') and
+                                              to_date('`.  $eDate . q`','YYYY-MM-DD')
+				and source_partition=schema_community
+				and o.deployment='Production'
+				group by s.service_id
+			`,
+			},
+		);
+	}
+
+	# things that we use in excel spreadsheet and should be recorded in cdb
+	if ($archiveResults) {
+
+		my $baseDir = 'an/business-metrics/documents';
+
+		my $oracleClient = ariba::Ops::OracleClient->new($product->connectInfoForOracleClient());
+		   $oracleClient->connect();
+
+		my @routingMethods = $oracleClient->executeSql("select service_id from service where id in 
+			(select distinct service from routing_method where type=1)");
+		   $oracleClient->disconnect();
+
+		$queries{"$baseDir/invoices/volume"} = {
+
+			recordMaxResults => 500,
+			recordDataType => "gauge",
+			recordAggregateDBFileName => "$baseDir/invoices/volume",
+
+			runForCommunities => $communitiesList,
+			aggregationMethod => "counts",
+
+			timeout => 2 * 60 * 60,
+			sql => q`select /*+ index(p IND_B398011A_2B45162B) */ count(p.id) ` .
+				$sqlParts{'invoicesSuccessfullVolume'},
+                };
+
+		$queries{"$baseDir/invoices/spend"} = {
+
+			recordMaxResults => 500,
+			recordDataType => "gauge",
+			recordAggregateDBFileName => "$baseDir/invoices/spend",
+
+			runForCommunities => $communitiesList,
+			aggregationMethod => "counts",
+
+			timeout => 2 * 60 * 60,
+			sql => $sqlParts{'invoicesSuccessfullSpend'},
+		};
+
+		# stats for each routing method we handle.
+		for my $routingMethod (@routingMethods) {
+
+			my $routingMethodName = $routingMethod;
+			   $routingMethodName =~ s|^ariba\.||i;
+
+			$queries{"$baseDir/pos/volume/$routingMethodName"} = {
+
+				recordMaxResults => 500,
+				recordDataType => "gauge",
+				recordAggregateDBFileName => "$baseDir/pos/volume/$routingMethodName",
+
+				runForCommunities => $communitiesList,
+				aggregationMethod => "counts",
+
+				timeout => 2 * 60 * 60,
+				sql => q`
+					select /*+ index(p IND_B398011A_2B45162B) use_nl(p o) */
+						count(p.id) ` . 
+						$sqlParts{'orderRoutingMethods'} .
+						q` and p.routing_method like '%` . $routingMethodName . q`%'
+				`,
+			};
+
+			$queries{"$baseDir/pos/spend/$routingMethodName"} = {
+				recordMaxResults => 500,
+				recordDataType => "gauge",
+				recordAggregateDBFileName => "$baseDir/pos/spend/$routingMethodName",
+
+				runForCommunities => $communitiesList,
+				aggregationMethod => "counts",
+
+				timeout => 2 * 60 * 60,
+				sql => q`
+					select /*+ index(p IND_B398011A_2B45162B) use_nl(p o) */
+						sum(p.amount_approx) ` . 
+						$sqlParts{'orderRoutingMethods'} .
+						q` and p.routing_method like '%` . $routingMethodName . q`%'
+				`,
+			};
+		}
+	}
+
+	my $q = ariba::monitor::QueryManager->newWithDetails(
+		'business-metrics', 'an', $product->service(), 'business-metrics', \%queries
+	);
+
+	$q->setSQLConnectInfo($product->connectInfoForOracleClient());
+	$product->setCommunitiesSQLConnectInfoOnQueryManager($q);
+
+	$q->run();
+
+	#
+	# save these queries to disk so that we can see which one is slow based
+	# on run time
+	#
+	foreach my $qry ($q->queries()) {
+		$qry->save();
+	}
+
+	if ($archiveResults) {
+		$q->archiveResults();
+	} else {
+		$q->displayToStdout();
+	}
+}
+
+main();

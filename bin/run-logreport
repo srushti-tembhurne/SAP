@@ -1,0 +1,115 @@
+#!/usr/local/bin/perl
+
+use FindBin;
+use lib (
+	"$FindBin::Bin/../lib",
+);
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DateTime;
+use ariba::rc::Utils;
+use ariba::monitor::ANLogReport;
+use IPC::Open3;
+
+sub main {
+	my $me = ariba::rc::InstalledProduct->new();
+
+	my $service = $me->service();
+
+	my $logReportDir = $me->default('LogReportDir');
+	exit unless($logReportDir);
+
+	my $date = ariba::Ops::DateTime::prettyTime(time());
+	$date =~ s/\s+.*$//;
+
+	my $logFile = "$ENV{'HOME'}/logs/logreport";
+	ariba::rc::Utils::mkdirRecursively($logFile);
+	$logFile .= "/$date.log";
+	open(LOG, ">$logFile");
+
+	my $save = select(LOG);
+	$|=1;
+	select($save);
+
+	foreach my $product ( 's4', 'buyer', 'an' ) {
+		my ($in, $out);
+		my ($pid);
+
+		my $command = $me->installDir() . "/bin/process-logs -service $service -product $product -save -logRoot /home/mon$service/krlogs -lastModified 24 -gz";
+
+		print LOG "Running $command\n";
+		$pid = open3($in, $out, $out, "$command");
+		close($in);
+		while (my $line = <$out>) {
+			print LOG $line;
+		}
+		close($out);
+		waitpid($pid, 0);
+
+		print LOG "MAKING dir: $logReportDir/$product/$date\n";
+		ariba::rc::Utils::mkdirRecursively("$logReportDir/$product/$date");
+
+        if ( $product eq "an" ) {
+            #$command = $me->installDir() . "/bin/logreporterrors.pl --for 3-Tertiary -output $logReportDir/$product/$date /home/mon$service/krlogs";
+            my $dateNoHyphen = $date;
+            $dateNoHyphen =~ s/-//g;
+
+            my $params = {
+                logdir => "/home/mon$service/krlogs/$product/$dateNoHyphen",
+                apps => [ qw/Authenticator Register ProfileManagement Supplier Buyer Discovery/ ],
+                loglevels => [ qw/error/ ],
+                error_patterns  => [
+                    'java.lang.IllegalStateException: Attempt to pop past initial state of Security Context.',
+                    'ariba.util.core.FatalAssertionException: Mismatch in tokens.',
+                    'IOException caught javax.imageio.IIOException',
+                    'isNameFieldOverridden',
+                    'ACOptimisticLockingException',
+                    'ADManageProfile',
+                    'SDirectAction.homeAction',
+                    'cXML.Request.InvoiceDetailRequest.*.InvoiceDetailOrderInfo.OrderReference.DocumentReference.payloadID',
+                    'Error while punching to Buyer portal',
+                    'Failed generating response for autosuggest search',
+                    'isTestMode',
+               ],
+                htmldir => "$logReportDir/$product/$date",
+                docroot => "/logreports/$product/$date",
+                template_dir    => "/home/mon$service/etc",
+            };
+
+            eval {
+                my $obj = ariba::monitor::ANLogReport->new( $params );
+                $obj->gen_html( $params->{ htmldir }, $params->{ docroot }, $params->{ template_dir } );
+            };
+
+            if ( $@ ) {
+                print LOG "something happened while processing AN logs: $@\n";
+            }
+        }
+        else {
+            $command = $me->installDir() . "/bin/logreporterrors.pl -output $logReportDir/$product/$date /home/mon$service/krlogs";
+            print LOG "Running $command\n";
+            $pid = open3($in, $out, $out, "$command");
+            close($in);
+            while (my $line = <$out>) {
+                print LOG $line;
+            }
+            close($out);
+            waitpid($pid, 0);
+        }
+
+		print LOG "Removing work dir /home/mon$service/krlogs/$product\n";
+		system("/bin/rm -rf /home/mon$service/krlogs/$product");
+
+		opendir(DIR,"$logReportDir/$product");
+		while(my $f = readdir(DIR)) {
+			next if($f =~ /^\.+$/);
+			my $ts = (stat("$logReportDir/$product/$f"))[9];
+			if($ts < (time() - (14*24*60*60)) ) {
+				print LOG "Removing old report $logReportDir/$product/$f\n";
+				system("/bin/rm -rf $logReportDir/$product/$f");
+			}
+		}
+	}
+}
+
+main(@ARGV);

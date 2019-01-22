@@ -1,0 +1,213 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/everywhere/sqlLogSize-moniotring#7 $
+
+use strict;
+use FindBin;
+
+use lib qw(/usr/local/ariba/lib);
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Constants;
+use ariba::Ops::Utils;
+
+use Data::Dumper;
+use POSIX qw(strftime);
+
+my $debug = 0;
+my $WARN_RATE = 1416; ## N MB per Running frequency of the script
+my $CRIT_RATE = 1666; ## N MB per Running frequency of the script 
+
+my $FILE_WARN_SIZE = 4000; # 4 GB
+my $FILE_CRIT_SIZE = 5000; # 5 GB
+
+my $DIR_WARN_SIZE = 65000; # 40 GB
+my $DIR_CRIT_SIZE = 85000; # 50 GB
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h|-s <SERVICE NAME>|-product <PRODUCT NAME>]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+    -s <SERVICE NAME>  Mandatory argument 
+    -prod <PRODUCT NAME>  Mandatory argument 
+
+    $0 -s prod -prod s4
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $service;
+    my $productName;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-s$/o) { $service = shift;   next; }
+        if ($arg =~ /^-prod$/o) { $productName = shift;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    usage(),  unless (defined ($productName) && defined ($service));
+
+    ### Condition only for S4 hanasim
+    if (lc($productName) eq "s4"){
+        $FILE_WARN_SIZE = 8000;  ## 8GB
+        $FILE_CRIT_SIZE = 15000;  ## 15GB
+    }
+
+    my $product = ariba::rc::InstalledProduct->new($productName, $service);
+    my $cluster = $product->currentCluster(); 
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my @monhosts = $product->hostsForRoleInCluster( 'monitor', $cluster );
+    die "Error reading mon host for $service ...\n" unless ( scalar @monhosts );
+    my $monhost = $monhosts[0];
+    my %queries;
+
+    my $SqlLogDir = $product->default("System.Logging.SQLCollectorFile.DirectoryName") ;#ariba::Ops::Constants->sqlLogsDir("s4");
+    print "SQL Log directory for $productName: ", $SqlLogDir, "\n", if $debug;
+
+    my @overSizedFiles;
+    my $dirSizeMB;
+    my $dirSizeGB;
+    my %influx_data;
+
+    if (-d $SqlLogDir){
+        my $size = `du -s $SqlLogDir`;
+        my @splitline = split/\s+/, $size;
+        $size = $splitline[0];
+        $size =~ s/^\s+|\s+$//g;
+        print "The size of the SQL log Dir $SqlLogDir ", $size, "\n";
+        $dirSizeGB = sprintf("%.2f",($size/ (1024 * 1024)) ); 
+        $dirSizeMB = sprintf("%.2f",($size/1024) ); 
+        print "Size of ", $SqlLogDir , " = ", $dirSizeGB, " GB\n", if ($debug);
+        print "Cheking size of each file inside $SqlLogDir\n", if $debug ;
+        @overSizedFiles = checkLogFilesize($SqlLogDir);
+    }
+
+    $influx_data{'measurement'} = 'buyer_sql_logsize_monitoring';
+    $influx_data{'tags'} = { 'product' => $productName , 'service' => $service, hostname => "$hostname"};
+    $influx_data{'tags'}->{oversized_files} = substr(join(';', @overSizedFiles), 0, 1024)  if ( scalar(@overSizedFiles));
+    $influx_data{'data'} = { 'growth_rate_in_mb' => $dirSizeMB, 'size_in_gb' => $dirSizeGB, 'oversized_file_cnt' => scalar @overSizedFiles};
+
+    eval {
+        my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+        ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line);
+    };
+
+    $queries{"Oversized Files-$hostname"} = {
+        warn    => 'answer =~ /warn/',
+        crit    => 'answer =~ /crit/' ,
+        perl    =>  sub { scalar @overSizedFiles  > 0 ? return join ( "\n", @overSizedFiles)  : "None"; },
+        uiHint  => $hostname,
+        ticketOnWarnOpenAfterMinutes    => 1,
+        ticketOwner => 'unassigned-sysadmin',
+        severity    => 1,
+        description => '', 
+        correctiveActions => [
+            Ops => '', 
+            Engr => '', 
+            Tools => '', 
+        ],
+    };
+
+    $queries{"SQL Log Directory Size-$hostname"} = {
+        crit    => "answer > $DIR_CRIT_SIZE", 
+        warn    => "answer > $DIR_WARN_SIZE",
+        recordMaxResults => 43800,  ##Svaving Powergraph Record for 1 year, provided frequency is 5 times/hour 
+        perl    =>  $dirSizeGB,
+        format  => "%0.2f GB\n",
+        uiHint  => $hostname,
+        ticketOnWarnOpenAfterMinutes    => 1,
+        ticketOwner => 'unassigned-sysadmin',
+        severity    => 1,
+        description => '', 
+        correctiveActions => [
+            Ops => '', 
+            Engr => '', 
+            Tools => '', 
+        ],
+    };
+
+    $queries{"SQL Log Directory Growth Rate-$hostname"} = {
+        crit    => "answer  >  (previousanswer + $CRIT_RATE)",
+        warn    => "answer  >  (previousanswer + $WARN_RATE)",
+        recordMaxResults => 43800,  ##Svaving Powergraph Record for 1 year, provided frequency is 5 times/hour 
+        #processAnswer  => sub { return main::calculateGrowthRate(); },
+        perl    =>  $dirSizeMB ,
+        format  => "%0.2f MB\n",
+        uiHint  => $hostname,
+        ticketOnWarnOpenAfterMinutes    => 1,
+        ticketOwner => 'unassigned-sysadmin',
+        severity    => 1,
+        description => 'Running this script 5 times in hour, i.e. every 12 minute', 
+        correctiveActions => [
+            Ops => '', 
+            Engr => '', 
+            Tools => '', 
+        ],
+    };
+    my $email = $product->default('notify.email');
+    my $qm = ariba::monitor::QueryManager->newWithDetails('SQL-LogSize-Moniotring', $productName, $service, $product->customer(), \%queries);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monhost);
+}
+
+
+sub checkLogFilesize {
+    my $path = shift;
+    my $warnSize =  $FILE_WARN_SIZE;
+    my $critSize =  $FILE_CRIT_SIZE;
+    my @bigFiles = ();
+    chomp($path);
+    print "Cheking File size for ", $path, "\n", if ($debug);
+    opendir DH, $path or die "Unable to Open dir at $path\n";
+
+    while (my $file = readdir(DH)) {
+        next if $file eq "." or $file eq "..";
+        my $fileName = "$path/$file";
+        my $size = ( (stat($fileName))[7]/(1024 * 1024) ); # # Converting size to Mega byte
+        my $time = strftime "%b %e %H:%M %Y", localtime((stat($fileName))[9]);
+
+        if ($size > $warnSize){
+            my $flag = $size > $critSize ? "crit" : "warn";
+            my $roundedMB = sprintf( "%.2f", $size );
+            my $overSizedFile  = "$flag: $file \t $roundedMB MB \t $time" ;
+            print "OVersize File: ", $overSizedFile, "\n", if $debug;
+            push (@bigFiles, $overSizedFile);
+        }
+    }
+   
+   return sort @bigFiles;
+}
+
+sub calculateGrowthRate{
+
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+    my $result =  $query->results() ;
+    print Dumper($query);
+    my $previousResult =  $query->previousResults() ;
+    my $growthRate = sprintf("%d", $result - $previousResult);
+    print "Result: $result\nPrevious Result: $previousResult\nGrowth Rate which difference between Result and Previous Result: $growthRate\n", if $debug > 1;
+
+    return $growthRate;
+}
+
+main(@ARGV); 
+
+__END__

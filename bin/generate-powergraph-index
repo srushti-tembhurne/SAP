@@ -1,0 +1,390 @@
+#!/usr/local/bin/perl -w
+
+# $Id$
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::Globals;
+use ariba::monitor::misc;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::monitor::DowntimeEntry;
+use CGI;
+
+my $DEBUG = 0;
+my $index = '/var/tmp/powergraph.mainpage.html';
+
+$| = 1;
+
+sub main {
+    my $cgi = CGI->new();
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my @page = ();
+
+    push @page, '<html><head><title>Select Queries</title></head><body>';
+    push @page, ariba::monitor::misc::expandoJavaScriptHeader();
+    push @page, displayLogo($cgi);
+    push @page, $cgi->h3("Select items to graph");
+    push @page, $cgi->start_form(
+        -method => 'post',
+        -action => 'powergraph',
+         ) .
+    $cgi->hidden(-name => 'deviceSelection', -value => 1);
+
+    my @products = ariba::monitor::StatusPage::monitoredProductNames($me->service());
+
+    push (@products, 'snmp');
+
+    for my $product (@products) {
+        my $productName = ref($product) ? $product->name() : $product;
+        my $itemIdPrefix = lc($productName) . $me->service();
+        my $itemIdSuffix = '00';
+        my $printedProduct = 0;
+
+        my @customerQueries;
+        my $lastCustomer;
+
+        # this is one of many *ugly* hacks
+        # we need to re-think out UI system
+        # See Grillo for his ideas.  We need
+        # an expando object that can have sub expandos
+        # and/or queries.  QMs are not UI objects!
+            
+
+        my @qms = ariba::monitor::QueryManager->instancesForProduct($productName);
+        my $isActiveActiveProduct = ariba::rc::Globals::isActiveActiveProduct($productName);
+
+        my %uiManager = ();
+        for my $qm (@qms) {
+            my $uiName = $qm->uiManager() || $qm->name();
+            my $qmCustomer = $qm->customer();
+            my $qmCluster = $isActiveActiveProduct ? $qm->cluster() : undef;
+            my @queries = $qm->graphableQueries();
+            next unless @queries;
+            if($qmCustomer || $qmCluster) {
+                for my $q (@queries) {
+                    if($q->uiHint()) {
+                        $q->setUiHint($uiName . "/" . $q->uiHint());
+                    } else {
+                        $q->setUiHint($uiName);
+                    }
+                    push(@{$uiManager{$qmCustomer || $qmCluster}}, $q);
+                }
+            } else {
+                push(@{$uiManager{$uiName}}, @queries);
+            }
+        }
+
+        for my $uiName (sort keys %uiManager) {
+            my @queries = @{$uiManager{$uiName}};
+            my %expandos = listExpandos($uiName, @queries);
+            my @expandos = sort { ariba::monitor::QueryManager::expandoCmp($a,$b) } (keys(%expandos));
+
+            next unless scalar @expandos > 0;
+
+            unless ($printedProduct) {
+                push @page, "<h3>$productName</h3>\n";
+                $printedProduct = 1;
+            }
+
+            my $openFirstLevelExpandos = $isActiveActiveProduct;
+            $itemIdSuffix = displayQueryManager(\%expandos, $itemIdPrefix, $itemIdSuffix, \@page, $openFirstLevelExpandos, undef, @expandos );
+
+        }
+    }
+
+    
+    eval {
+        generateUptimeItems($me, \@page) ;
+    };
+
+
+
+    push @page, '<br>' . $cgi->submit(-name => 'Select items and proceed') . 
+        '&nbsp;' . $cgi->reset() .  $cgi->end_form() . $cgi->end_html() . "\n";
+
+    open (INDEX, ">$index") or die "Can't write to $index: $!";
+    print INDEX join('', @page);
+    close(INDEX);
+}
+
+sub listExpandos {
+    my $uiName = shift;
+    my @queries = @_;
+
+    my %expandos = ();
+
+    for my $query (@queries) {
+        my $qUiHint = $query->uiHint();
+        my $uiHint = $uiName;
+
+        $uiHint .= "/$qUiHint" if $qUiHint;
+        push(@{$expandos{$uiHint}}, $query);
+    }
+
+    return %expandos;
+}
+
+sub generateUptimeItems {
+    my $me = shift;
+    my $htmlRef = shift;
+
+    ariba::monitor::DowntimeEntry->connectToDatabase($me);
+
+    my @productList =  ariba::monitor::DowntimeEntry->productList();
+    my $service = $me->service();
+
+    my %productCustomers;
+
+    map {my ($productName, $customer) = @$_ ; push (@{$productCustomers{$productName}}, $customer) } @productList;
+
+    push @$htmlRef, "<h3>Uptime</h3>\n";
+
+    foreach my $productName (sort keys %productCustomers) {
+
+
+        push @$htmlRef, "<table border=0 width=\"100%\" cellspacing=0>\n";
+        push @$htmlRef, "<tr>\n";
+        push @$htmlRef, "<td nowrap width=\"2%\"></td>\n";
+        push @$htmlRef, "<td width=\"40%\"><b><a href=\"javascript://\" onClick=\"openClose('uptime$productName'); return false\">$productName</a></b></td>\n";
+        push @$htmlRef, "</tr>\n";
+        push @$htmlRef, "</table>\n";
+
+        push @$htmlRef, "<div class=\"block\" id=\"uptime$productName\">\n";
+
+        foreach my $customer (@{$productCustomers{$productName}}) {
+    
+            my $customerRef = "";
+            $customerRef = "/$customer" if ($customer);
+
+            my $openCloseRef = $productName;
+
+            my $margin = 4;
+
+            if ($customer) {
+                $openCloseRef .= $customer;
+
+                push @$htmlRef, "<table border=0 width=\"100%\" cellspacing=0>\n";
+                push @$htmlRef, "<tr>\n";
+                push @$htmlRef, "<td nowrap width=\"4%\"></td>\n";
+                push @$htmlRef, "<td width=\"40%\"><b><a href=\"javascript://\" onClick=\"openClose('uptime$openCloseRef'); return false\">$customer</a></b></td>\n";
+                push @$htmlRef, "</tr>\n";
+                push @$htmlRef, "</table>\n";
+
+                $margin = 6;
+            }
+
+            push @$htmlRef, "<div class=\"block\" id=\"uptime$openCloseRef\">\n" if ($customer);
+            push @$htmlRef, "<table border=0 width=\"100%\" cellspacing=0>\n";
+            push @$htmlRef, "<tr><td width=\"$margin%\"></td>\n";
+            push @$htmlRef, "<td><table width=\"97%\" align=right><tr><td width=\"2%\"></td>\n";
+            push @$htmlRef, "<td><input type=\"checkbox\" name=\"devices\" value=\"outage://$productName/$service$customerRef/uptimesla\">&nbsp; SLA uptime</td></tr>\n";
+            push @$htmlRef, "<tr><td width=\"2%\"></td>\n";
+            push @$htmlRef, "<td><input type=\"checkbox\" name=\"devices\" value=\"outage://$productName/$service$customerRef/uptime\">&nbsp; uptime</td></tr>\n";
+            push @$htmlRef, "<tr><td width=\"2%\"></td>\n";
+            push @$htmlRef, "<td><input type=\"checkbox\" name=\"devices\" value=\"outage://$productName/$service$customerRef/unplanneddowntime\">&nbsp; Unplanned downtime</td></tr>\n";
+            push @$htmlRef, "</table></td></tr>\n";
+            push @$htmlRef, "<tr bgcolor=\"#000000\">\n";
+            push @$htmlRef, "<td bgcolor=\"white\"></td>\n";
+            push @$htmlRef, "<tr><td><br></td></tr>\n";
+            push @$htmlRef, "</table>\n";
+            push @$htmlRef, "</div>\n" if ($customer);
+
+        }
+        push @$htmlRef, "</div>\n";
+    }
+}
+
+sub displayLogo {
+    my $cgi      = shift;
+
+    my @logo = ();
+
+    push @logo, "<table cellspacing=6>\n",
+        "<tr>\n",
+        "<td>\n",
+        "<center>\n",
+        "<img src=\"http://ops.ariba.com/images/logo-med-TM.gif\" width=\"122\" height=\"70\" alt=\"\">",
+        "<br><br>",
+        "<font size=\"3\"><a href=\"mailto:an_ops\@ariba.com\">Network Operations</a></font>\n",
+        "</center>\n",
+        "</td>\n",
+        "<td valign=middle>\n",
+        "<b><font size=\"6\">PowerGraph</font></b><br>\n",
+        "</td>\n",
+        "</tr>\n",
+        "</table>\n",
+        "<hr>\n";
+
+    wantarray ? return @logo : print @logo;
+}
+
+sub displayQueryManager {
+    my $expandosRef = shift;
+    my $itemIdPrefix = shift;
+    my $itemIdSuffix = shift;
+    my $htmlRef = shift;
+    my $openFirstLevelExpandos = shift;
+    my $curExpando = shift;
+    my @expandos = @_;
+
+    local $^W = 0;   #HACK HACK.  This code is *gross*, and is recursive when it shouldn't be
+
+
+    my $expando = shift(@expandos);
+
+    $itemIdSuffix = openCloseExpandoHeirarchy($curExpando, $expando, $itemIdPrefix, $itemIdSuffix, $htmlRef, $openFirstLevelExpandos, @expandos);
+
+    push(@$htmlRef, "<table border=0 width=\"100%\" cellspacing=0>\n");
+    displayQueriesForExpando($expando, $htmlRef, @{$expandosRef->{$expando}});
+
+    if (@expandos) {
+        push(@$htmlRef, "<tr><td></td></tr>\n");
+    } else {
+        push(@$htmlRef, "<tr><td><br></td></tr>\n");
+    }
+
+    push(@$htmlRef, "</table>\n");
+
+    if (@expandos) {
+        $itemIdSuffix = displayQueryManager($expandosRef, $itemIdPrefix, $itemIdSuffix, $htmlRef, 0, $expando, @expandos);
+    } else {
+        $itemIdSuffix = openCloseExpandoHeirarchy($expando, undef, $itemIdPrefix, $itemIdSuffix, $htmlRef, 0, @expandos);
+    }
+
+    return $itemIdSuffix;
+}
+
+sub displayQueriesForExpando {
+    my $expando = shift;
+    my $htmlRef = shift;
+    my @queries = @_;
+
+    my @levels = split(/\//, $expando);
+    my $depth = scalar(@levels);
+
+    @queries = sort { $a->instance() cmp $b->instance() } @queries;
+
+    displayCheckboxesForQueries($htmlRef, \@queries, $depth);
+
+    push(@$htmlRef, "<tr bgcolor=\"#000000\">\n");
+    for (my $i = 0; $i < $depth; $i++) {
+        push(@$htmlRef, "<td bgcolor=\"white\"></td>\n");
+    }
+}
+
+sub displayCheckboxesForQueries {
+    my $htmlRef = shift;
+    my $queries = shift;
+    my $indent  = shift || 0;
+    
+    my $tr = sprintf("<tr><td width=\"%d%%\"></td>\n", $indent * 2);
+
+    push(@$htmlRef, "$tr<td><table width=\"97%\" align=right>");
+
+    for (my $i = 0; $i < @$queries; $i++) {
+
+        my $query = $queries->[$i];
+
+        my $instance = $query->instance() . '.cdb';
+        my $queryName = $query->queryName() || next;
+
+        if ( $query->cdbDescription() ) {
+            $queryName .= ' ' . $query->cdbDescription();
+        }
+
+
+        my $uiHint = $query->uiHint() || '';
+
+        $queryName =~ s/$uiHint\/?//g;
+
+        if ($queryName =~ /percent disk usage/i || $queryName =~ /^\S+\s+if.+bits/i) {
+            $queryName =~ s|:|/|g;
+        }
+
+        push(@$htmlRef, qq!$tr<td><input type="checkbox" name="devices" value="file://$instance">&nbsp; $queryName</td></tr>\n!);
+    }
+
+    push(@$htmlRef, "</table></td></tr>\n");
+}
+
+sub openCloseExpandoHeirarchy {
+    my $curExpando = shift;
+    my $newExpando = shift;
+    my $itemIdPrefix = shift;
+    my $itemIdSuffix = shift;
+    my $htmlRef = shift;
+    my $openFirstLevelExpandos = shift;
+    my @expandos = @_;
+
+    my @newExpandoElements;
+
+    if ($newExpando) {
+        @newExpandoElements = split(/\//, $newExpando);
+    }
+
+    my $match = 0 ;
+    if ($curExpando) {
+        my @curExpandoElements = split(/\//, $curExpando);
+
+        for (my $i = 0; $i < @curExpandoElements; $i++) {
+            if ($newExpando && $newExpandoElements[$i] && 
+                $curExpandoElements[$i] eq $newExpandoElements[$i]) {
+                $match++;
+            } else {
+                last;
+            }
+        }
+
+        unless ($match == @curExpandoElements) {
+            for (my $i = @curExpandoElements-1;  $i >= $match; $i--) {
+                push(@$htmlRef, "</div>\n");
+            }
+        }
+    }
+
+    return $itemIdSuffix unless($newExpando);
+
+    my $depth = $match-1;
+
+    my @allExpandos = ($newExpando, @expandos);
+
+    for (my $i = $match; $i < @newExpandoElements; $i++) {
+        $depth++;
+
+        my $openExpando = $newExpandoElements[$i];
+        $openExpando =~ s|\-| |g;
+
+        my $expando = join("/", @newExpandoElements[0..$i]);
+
+        my $divName = $itemIdPrefix . $itemIdSuffix++;
+
+        push(@$htmlRef, "<table border=0 width=\"100%\" cellspacing=0>\n<tr>\n");
+
+        my $width = 40;
+
+        if ($depth) {
+            $width -= 2 * $depth;
+            push(@$htmlRef, sprintf("<td cellpadding=$depth nowrap width=\"%d%%\"></td>\n", $depth * 2));
+        }
+
+        my $expandoClass = ( ( $depth == 0 ) && $openFirstLevelExpandos ) ? 'none' : 'block';
+
+        push(@$htmlRef, 
+            "<td nowrap width=\"2%\"></td>\n",
+            "<td width=\"$width%\"><b><a href=\"javascript://\" onClick=\"openClose(\'$divName\'); return false\">",
+            $openExpando . "</a></b></td>\n",
+            "</tr>\n",
+            "</table>\n",
+            "<div class=\"$expandoClass\" id=\"$divName\">\n"
+        );
+    }
+
+    return $itemIdSuffix;
+}
+
+main();

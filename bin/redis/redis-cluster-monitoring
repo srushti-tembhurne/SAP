@@ -1,0 +1,171 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/redis/redis-cluster-monitoring#3 $
+#
+#
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use JSON;
+use ariba::monitor::Url;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use ariba::rc::Passwords;
+use Data::Dumper;
+use ariba::rc::CipherStore;
+
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-prod|-e|-p|-d|-h]
+
+    -prod     Gets redis cluster monitoring for mentioned product.
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode.
+    -h        Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $debug = 0;
+    my $product;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();             next; }
+        if ($arg =~ /^-d$/o) { $debug++;            next; }
+        if ($arg =~ /^-e$/o) { $sendEmail++;        next; }
+        if ($arg =~ /^-p$/o) { $sendPage++;         next; }
+        if ($arg =~ /^-prod$/o) { $product = shift; next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    usage("Product name is not specified") unless $product;
+    
+    my $me = ariba::rc::InstalledProduct->new();
+    my $service = $me->service();
+    exit unless (ariba::rc::InstalledProduct->isInstalled($product, $service));
+    my $prodObj = ariba::rc::InstalledProduct->new($product,$service);
+    my $cluster = $prodObj->currentCluster();
+    
+    my @springbootAppHost = $prodObj->hostsForRolePrefixInCluster('springboot', $cluster);
+
+    my %queries;
+    
+    my $configDir = $prodObj->configDir();
+    my $installDir = $prodObj->installDir();
+    my $user = $prodObj->deploymentUser();
+
+    my $cipherStore = ariba::rc::CipherStore->new( $service );
+    my $password = $cipherStore->valueForName($user);
+
+    my $cmd = "ls $configDir \| egrep \'*ariba.com_Redis*\'";
+    my $remoteCmd = "ssh $user\@$springbootAppHost[0] $cmd";
+    my @list;
+    my $result = ariba::rc::Utils::executeRemoteCommand($remoteCmd, $password, 0, undef, undef, \@list);
+    return 0 unless ($result);
+    
+    my $sucess;
+    my ($clusterStatus, $clusterSize, $clusterKnownNodes);
+    my $numberOfMasters=0;
+    my $numberOfSlaves=0;
+    my ($host, $port);
+    foreach my $str (@list) {
+
+        if ($str =~ /(\w+\.\w+\.ariba\.com)_Redis-\d+\@\w+\.\w+_(\d+)_(slave|master)\.conf/) {
+            $host = $1;
+            $port = $2;
+            
+            # Run redis-cli command with the host-port pair that we just got. 
+            # If host is shut down & we dont get expected o/p, check with the next host-port pair 
+            
+            my $redisCmd = "$installDir/bin/redis-cli -c -h $host -p $port cluster info";
+            my $clusterOp = `$redisCmd`;
+            
+            my @output = split("\n", $clusterOp);
+            
+            foreach my $line (@output){
+                chomp $line;
+                
+                if ($line =~ /cluster_state:(\w+)/){
+                    $clusterStatus = $1; 
+                } elsif ($line =~ /cluster_size:(\w+)/){
+                    $clusterSize = $1;
+                } elsif ($line =~ /cluster_known_nodes:(\w+)/){
+                    $clusterKnownNodes = $1;
+                }
+            }
+            
+            my $nodeCmd = "$installDir/bin/redis-cli -c -h $host -p $port cluster nodes|awk \'{print \$3}\'";
+            my $nodeOp = `$nodeCmd`;
+            
+            my @result = split("\n", $nodeOp);
+            
+            foreach my $line (@result){
+                chomp $line;
+                
+                $numberOfMasters++ if ($line =~ /master/);
+                $numberOfSlaves++ if ($line =~ /slave/);
+            }
+            
+            # Got all the required info? If yes, exit the loop
+            last if($clusterStatus && $clusterSize && $clusterKnownNodes && $numberOfMasters && $numberOfSlaves);
+        }
+    }
+     
+    unless ($clusterStatus && $clusterSize && $clusterKnownNodes){
+        print "Error in getting redis-cluster info. Exiting...\n";
+        exit;
+    }
+    
+    unless ($numberOfMasters && $numberOfSlaves){
+        print "Error in getting redis-cluster nodes infor. Exitting...\n";
+        exit;
+    }
+     
+    $queries{"Redis cluster status"} = {
+        'info'               => "answer eq 'ok'",
+        'crit'               => "answer ne 'ok'",
+        'severity'           => 0,
+        'perl'               => sub { return $clusterStatus},
+    };
+    
+    $queries{"Redis cluster_size to cluster_known_nodes ratio"} = {
+        'info'               => "$clusterKnownNodes == (2* $clusterSize)",
+        'warn'               => "$clusterKnownNodes != (2* $clusterSize)",
+        'severity'           => 0,
+        'perl'               => sub { return "$clusterSize:$clusterKnownNodes" },
+    };
+    
+    $queries{"Redis cluster count_of_MasterNodes to count_of_SlaveNodes ratio"} = {
+        'info'               => "$numberOfMasters == $numberOfSlaves",
+        'crit'               => "$numberOfMasters != $numberOfSlaves",
+        'severity'           => 0,
+        'perl'               => sub { return "$numberOfMasters:$numberOfSlaves" },
+    };
+                                
+    my $email = $me->default('notify.email');
+    my $qm = ariba::monitor::QueryManager->newWithDetails('redis-cluster', $prodObj->name(), $service, undef, $cluster, \%queries);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+}
+
+main(@ARGV);
+
+__END__

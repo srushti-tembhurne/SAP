@@ -1,0 +1,214 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/dba/rman-resync#43 $
+#
+# This script will launch rman for oracle backup.
+#
+# This script has to be run as 'oracle' unix user
+# It needs to know backup and rman passwords.
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::util::OraInfo;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::DBConnection;
+use ariba::rc::Utils;
+
+my $debug = 0;
+
+$main::quiet = 1;
+
+#
+# Mapping of dbsid and their corresponding rman backup sid.
+#
+my $sidToRmanSid = {
+	'ANPRO2'  => { 'snv' => 'RMANPRO1', 'bou' => 'RMANPRO1' },
+	'MONPRO1' => { 'snv' => 'RMANPRO1', 'bou' => 'RMANPRO1' },
+	'EDIPRO1' => { 'snv' => 'RMANPRO1', 'bou' => 'RMANPRO1' },
+	'SSSPRO0' => { 'snv' => 'RMANPRO1', 'bou' => 'RMANPRO1' },
+	'SSSPRO1' => { 'snv' => 'RMANPRO1', 'bou' => 'RMANPRO1' },
+	'SSSPRO2' => { 'snv' => 'RMANPRO2', 'bou' => '' },
+	'SSSPRO3' => { 'snv' => 'RMANPRO1', 'bou' => 'RMANPRO1' },
+	'SSSPRO4' => { 'snv' => 'RMANPRO2', 'bou' => '' },
+	'SSSPRO5' => { 'snv' => 'RMANPRO1', 'bou' => 'RMANPRO1' },
+	'SSSPRO6' => { 'snv' => 'RMANPRO2', 'bou' => '' },
+	'BYRPRO0' => { 'snv' => 'RMANPRO1', 'bou' => 'RMANPRO1' },
+	'BYRPRO1' => { 'snv' => 'RMANPRO1', 'bou' => 'RMANPRO1' },
+	'BYRPRO2' => { 'snv' => 'RMANPRO2', 'bou' => 'RMANPRO1' },
+	'ASPRO1' => { 'snv' => 'RMANPRO1', 'bou' => '' },
+	'ALPRO1' => { 'snv' => 'RMANPRO1', 'bou' => '' },
+	'ACPRO1' => { 'snv' => 'RMANPRO1', 'bou' => '' },
+	'S2PRO1' => { 'snv' => 'RMANPRO1', 'bou' => 'RMANPRO1' },
+	'S2PRO2' => { 'snv' => 'RMANPRO2', 'bou' => '' },
+	'PERFPRO1' => { 'snv' => 'RMANPRO1', 'bou' => '' },
+	'SDBPRO1'  => { 'snv' => 'RMANPRO2', 'bou' => '' },
+	'ESPRO1'  => { 'snv' => 'RMANPRO1', 'bou' => 'RMANPRO1' },
+};
+
+sub main {
+	my $sendEmail  = 0;
+	my $sendPage   = 0;
+	my $tapeBackup = 0;
+	my @productNames;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; next; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; next; };
+		if ($arg =~ /^-d/o) { $debug = 1; next; };
+		if ($arg =~ /^-tapebackup/oi) { $tapeBackup = 1; next; };
+		if ($arg !~ /^-/o) { push(@productNames, $arg); next; };
+	}
+
+	my $me          = ariba::rc::InstalledProduct->new();
+	my $email       = $me->default('notify.email');
+	my $cluster     = $me->currentCluster();
+
+	my $hostname    = ariba::Ops::NetworkUtils::hostname();
+	my $machine     = ariba::Ops::Machine->new($hostname);
+	my $datacenter  = $machine->datacenter();
+	my $tab         = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+	# Only check products that have a database.
+        my @products      = ();
+
+	if (@productNames) {
+
+		for my $productName (@productNames) {
+			push(@products, ariba::rc::InstalledProduct->installedProductsList($me->service(), $productName));
+		}                                                                                                                       
+															
+	} else {
+
+		push(@products, ariba::rc::InstalledProduct->installedProductsList($me->service()));
+	}
+
+	my %queries     = ();
+	my @connections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+
+	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections)) {
+
+		my $type        = $dbc->type();
+		my $virtualHost = $dbc->host();
+		my $instance    = uc($dbc->sid());
+
+		my $product     = $dbc->product();
+		my $productName = $product->name();
+		my $activeHost  = $product->activeHostForVirtualHostInCluster($virtualHost, $cluster);
+
+		if (!$activeHost || $activeHost ne $hostname) {
+			next;
+		}
+
+		my $backupInstance = uc($instance) || next;
+		my $oraHome        = ariba::util::OraInfo::sidToOracleHome($backupInstance) || next;
+
+		my $backupPass   = $me->default('dbainfo.backup.password') || die "Empty dbainfo.backup.password! Start monitoring?";
+		my $rmanPass     = $me->default('dbainfo.rman.password')   || die "Empty dbainfo.rman.password! Start monitoring?";
+		my $rmanInstance = $sidToRmanSid->{$backupInstance}{$datacenter} || next;
+
+		$queries{"RMAN rsync status for $productName on $hostname"} = {
+			'warn'   => "numrows > 1 && previousNumrows > 1",
+			'info'   => 1,
+			'perl'   => sub { resync($me, $oraHome, $backupPass, $backupInstance, $rmanPass, $rmanInstance, $tapeBackup) },
+			'timeout' => 60 * 30,
+			'uiHint' => 'rman-resync',
+		};
+	}
+
+	# Don't update monitoring if we're being run from Omniback.
+	$debug = 1 if $tapeBackup;
+
+	return unless(keys(%queries));
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails(
+		'dba', $tab, $me->service(), $me->customer(), \%queries
+	);
+
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+sub resync {
+	my $me             = shift;
+	my $oraHome        = shift;
+	my $backuppass     = shift;
+	my $backupInstance = shift;
+	my $rmanpass       = shift;
+	my $rmanInstance   = shift;
+	my $tapeBackup     = shift;
+
+
+	my $SUDO = ariba::rc::Utils::sudoCmd();
+	my $cmd = "$oraHome/bin/rman"; 
+
+	$ENV{'ORACLE_HOME'} = $oraHome;
+	$ENV{'PATH'}        = "$oraHome/bin:$ENV{'PATH'}";
+	$ENV{'NLS_LANG'}    = "American_America.UTF8";
+	$ENV{'ORACLE_SID'}  = $backupInstance;
+
+	my $log = "/tmp/rmanout.$$.log";
+
+	my $user        = ariba::rc::Globals::deploymentUser($me->name(), $me->service());
+	my $cipherStore = ariba::rc::CipherStore->new($me->service());
+	my $pass        = $cipherStore->valueForName($user);
+
+	ariba::rc::Utils::refreshSudoPromptWithPassword($user, $pass, 1);
+
+	if ($tapeBackup) {
+		open(RMAN, "| $SUDO -u oracle sh -c \"$cmd\"") || return undef;
+	} else {
+		open(RMAN, "| $SUDO -u oracle sh -c \"$cmd > $log 2>&1\"") || return undef;
+	}
+
+	print RMAN "connect target backup/$backuppass\@$backupInstance\n"; 
+	print RMAN "connect rcvcat rman/$rmanpass\@$rmanInstance\n"; 
+	print RMAN "resync catalog;\n";
+
+	# If we're being run from omniback
+	if ($tapeBackup) {
+		print RMAN "sql 'alter system archive log current';\n";
+		print RMAN "sql 'alter database backup controlfile to trace';\n";
+	}
+
+	print RMAN "exit\n";
+	close(RMAN);
+
+	my @errors = ();
+	open(LOG, $log);
+
+	while(<LOG>) {
+		chomp;
+		push(@errors, $_);
+
+		if (/full resync complete/io) {
+			@errors = ($_);
+			last;
+		}
+	}
+
+	close(LOG);
+
+	my $rm = rmCmd();
+	$cmd = "$SUDO $rm $log";
+	my @output;
+	unless ( ariba::rc::Utils::executeLocalCommand($cmd, undef, \@output, undef, 1, undef, $pass) ) {
+		my $error = sprintf "Removing $log failed:\n", join("\n", @output), "\n";
+		push (@errors, $error);
+		exit(1);
+	}
+
+	return(join("\n", @errors));
+}
+
+main();
+
+__END__
+

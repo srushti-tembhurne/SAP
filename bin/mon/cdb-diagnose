@@ -1,0 +1,281 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/mon/cdb-diagnose#4 $
+#
+# A debugging app to look at contents of a circular db, validate it,
+# and plot it.
+#
+# Can also be use to validate snmp config file for a host.
+#
+
+use strict;
+
+use File::Basename;
+use Term::ReadLine;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::CircularDB;
+use ariba::monitor::CircularDBGraph;
+
+use ariba::Ops::Machine;
+use ariba::SNMP::ConfigManager;
+
+my $program = basename($0);
+my $term = Term::ReadLine->new($program);
+
+#
+# get user input
+#
+sub prompt
+{
+	my $prompt = shift;
+	my $blankAllowed = shift;
+
+	my $ans = $term->readline($prompt);
+
+	while (!$blankAllowed && !$ans) {
+		$ans = $term->readline($prompt);
+	}
+
+	return undef unless($ans);
+
+	$ans =~ s/^\s*//g;
+	$ans =~ s/\s*$//g;
+
+	return $ans;
+}
+
+#
+# plot graph for cdb
+#
+sub graphResults
+{
+	my $cdb = shift;
+
+	my $prompt = "Enter the filename for graph output: ";
+	my $file = prompt($prompt);
+
+	my $graph = ariba::monitor::CircularDBGraph->new($file, undef, undef, $cdb);
+	return $graph->graph();
+}
+
+#
+# fix bad data in cdb
+#
+sub updateRecord
+{
+	my $cdb = shift;
+
+	my $prompt = "Timestamp for the record you want to update: ";
+	my $date = prompt($prompt);
+
+	$prompt = "Value for the record you want to update: ";
+	my $value = prompt($prompt, 1);
+
+	my $return = $cdb->updateRecord($date, $value);
+
+	if ( $return ) {
+		print "Updated record $date with $value.\n";
+	} else {
+		print "Failed to update record, \$cdb->updateRecord($date, $value) returned 0.\n";
+	}
+
+	return $return;
+}
+
+#
+# add data to cdb
+#
+sub writeRecord
+{
+	my $cdb = shift;
+
+	my $prompt = "Timestamp for the record you want to write: ";
+	my $date = prompt($prompt);
+
+	$prompt = "Value for the record you want to write: ";
+	my $value = prompt($prompt, 1);
+
+	my $return = $cdb->writeRecord($date, $value);
+
+	if ( $return ) {
+		print "Wrote record $date with $value.\n";
+	} else {
+		print "Failed to write record, \$cdb->writeRecord($date, $value) returned 0.\n";
+	}
+
+	return $return;
+}
+
+#
+# fix bad data in cdb
+#
+sub discardRecordsInTimeRange
+{
+	my $cdb = shift;
+
+	my $prompt = "Timestamp of the first record you want to discard: ";
+	my $date1 = prompt($prompt);
+
+	$prompt = "Timestamp of the last record you want to discard: ";
+	my $date2 = prompt($prompt);
+
+	return $cdb->discardRecordsInTimeRange($date1, $date2);
+}
+
+#
+# allow user to manipulate data in cdb
+#
+sub debugCDB
+{
+	my $cdb = shift;
+
+	my $menu = "(p)rint (c)ooked data (v)alidate (u)pdate (w)rite (g)raph CDB (q)uit\n> ";
+	my $ans = prompt($menu);
+
+	if ($ans =~ /^p/i) {
+		$menu = "Enter Output Filename: ";
+		my $outputFilename = prompt($menu, 1);
+		while ($outputFilename && -e $outputFilename) {
+			print "Error: Can not write to existing file $outputFilename\n"; 
+			$outputFilename = prompt($menu, 1);
+		}
+		my $fh;
+		if($outputFilename) {
+			open(FL, "> $outputFilename");
+			$fh = *FL;
+		} else {
+			$fh = *STDOUT;
+		}
+		$cdb->print($fh);
+		close($fh) if ($outputFilename);
+		return 1;
+
+	} elsif ($ans =~ /^c/i) {
+		$menu = "Enter Output Filename: ";
+		my $outputFilename = prompt($menu, 1);
+		while ($outputFilename && -e $outputFilename) {
+			print "Error: Can not write to existing file $outputFilename\n"; 
+			$outputFilename = prompt($menu, 1);
+		}
+		my $fh;
+		if($outputFilename) {
+			open(FL, "> $outputFilename");
+			$fh = *FL;
+		} else {
+			$fh = *STDOUT;
+		}
+		$cdb->printHeader($fh);
+		$cdb->printRecords(undef, undef, undef, $fh, undef, 1);
+		close($fh) if ($outputFilename);
+		return 1;
+
+	} elsif ($ans =~ /^v/i) {
+		$cdb->validateContents();
+		return 1;
+
+	} elsif ($ans =~ /^u/i) {
+		updateRecord($cdb);
+		return 1;
+
+	} elsif ($ans =~ /^w/i) {
+		writeRecord($cdb);
+		return 1;
+
+	} elsif ($ans =~ /^g/i) {
+		graphResults($cdb);
+		return 1;
+
+	} elsif ($ans =~ /^q/i) {
+		return 0;
+
+	}
+
+	return 0;
+}
+
+#
+# load a circular db
+#
+sub loadCDB
+{
+	my $ans = shift;
+
+	unless ($ans) {
+		$ans = prompt('Select a CDB to load: ');
+	}
+
+	my $cdb = ariba::monitor::CircularDB->new($ans);
+
+	$cdb->printHeader();
+
+	my $again = 1;
+
+	while($again) {
+		$again = debugCDB($cdb);
+	}
+
+	return 0;
+}
+
+#
+# load snmp config file
+#
+sub checkSnmpConfig
+{
+	my $prompt = "Select SNMP config file: ";
+
+	my $cfgFile = prompt($prompt);
+	my $cm = ariba::SNMP::ConfigManager->new($cfgFile);
+
+	$prompt = "Select Machine Name: ";
+	my $host = prompt($prompt);
+
+	my $mc = ariba::Ops::Machine->new($host);
+	my %oids = $cm->oidsForMachine($mc);
+
+	print $cm->name(), " to run every ", $cm->frequency(), " mins\n";
+	print "oids for $host:\n";
+	for my $oid (sort(keys(%oids))) {
+		my $type = ariba::SNMP::Session->oidType($oids{$oid});
+		print "  $oid = $oids{$oid} ($type)\n";
+	}
+
+	return 0;
+}
+
+#
+# top level menu
+#
+sub mainMenu
+{
+	my $prompt = "(c)heck snmp config file (l)oad cdb (q)uit: ";
+
+	my $ans = prompt($prompt);
+	if ($ans =~ /^c/i) {
+		return checkSnmpConfig();
+	} elsif ($ans =~ /^l/i) {
+		return loadCDB();
+	} elsif ($ans =~ /^q/i) {
+		exit(0);
+	}
+
+	return 0;
+}
+
+sub main
+{
+
+	if ($ARGV[0] && $ARGV[0] =~ /\.cdb$/) {
+		loadCDB($ARGV[0]);
+		exit;
+	}
+
+	while(1) {
+		mainMenu();
+	}
+}
+
+main();

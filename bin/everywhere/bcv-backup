@@ -1,0 +1,1756 @@
+#!/usr/local/bin/perl 
+use strict;
+use warnings;
+
+#
+# $Id: //ariba/services/monitor/bin/everywhere/bcv-backup#109 $
+#
+
+=head1 NAME
+
+bcv-backup
+
+=head1 SYNOPSIS
+
+ bcv-backup [-h|-d|-log|-e|-p | -timeout <int> | -suspend <until> | [-snap|-physical|-incrementalPhysical]] <-bcv bcvid>|<-jira jira_id> [<-tmid tmid>] <product>|-vol <volume1>... <service>
+
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-bcv <bcvid>>
+
+specify the bcvid (1, 2 etc.) to backup the current vol to
+
+=item B<-snap>
+
+3Par Only: do a snap copy (Read Only, COW).
+
+=item B<-physical>
+
+3Par Only: do a physical copy.
+
+=item B<-incrementalPhysical>
+
+3Par Only: do an incremental physical copy.
+
+=item B<-removeSnapCopy>
+
+after the physical copy is made, remove the temporary snap copies it makes
+
+=item B<-timeout <integer>>
+
+override the timeout explictly in seconds
+
+=item B<product>
+
+product name to run backup for
+
+=item B<-vol <volume>>
+
+volume to backup (cold backup with mounted filesystem)
+
+=item B<-vvlist <file>>
+=item B<-vvListForVolume <vol>>
+
+backup list of virtual volumes
+in file which correspond to vol that needs to be backed up
+(cold backup without a mounted filesystem)
+
+
+=item B<service>
+
+service to run backup for
+
+=item B<-suspend <until>>
+
+Suspend backups to this bcv until the specified time.
+'until' is in touch format YYYYMMDDhhmm
+
+=item B<-tx>
+
+Backup only TX SIDs
+
+=item B<-sv>
+
+Backup only SV SIDs
+
+=item B<-log>
+
+turn on 3Par logging
+
+=item B<-e>
+
+send email notification
+
+=item B<-p>
+
+send pager notification
+
+=item B<-debug>
+
+Turn on debugging. Don't update monitoring
+
+=item B<-help|?>
+
+This excellent help message.
+
+
+=back
+
+=head1 DESCRIPTION
+
+This script is run as root cronjob on all db servers.
+It creates backups of database using 3par virtual or physical copy
+
+=cut
+
+use lib qw(/usr/local/ariba/lib);
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../lib/perl";
+use lib "$FindBin::Bin/../../../tools/lib/perl";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::NetworkDeviceManager;
+#Hana boxes do not have oracle DBD drivers. These will be loaded dynamically for non-Hana boxes
+#use ariba::DBA::SampleSQLQueries;
+use ariba::DBA::HanaSampleSQLQueries;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::Machine;
+use ariba::Ops::FileSystemUtils;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::DBConnection;
+use ariba::Ops::Utils;
+use ariba::Ops::MySQLClient;
+use ariba::Ops::MySQLHelper;
+use ariba::Ops::InservUtils;
+
+use File::Basename;
+use File::Copy;
+use File::Path;
+use Getopt::Long;    # GetOptions()
+use Pod::Usage;      # pod2usage()
+use POSIX qw(strftime);
+use Data::Dumper;
+
+my $debug = 0;
+my $updateMon = 1;
+my $SUSPEND_FILE = '/var/tmp/suspend-bcv-backup';
+
+my ($pcCopyStatus, $pcCopyMetrics) = ("",  {}); 
+my $sleepDuration = 120;
+my $splunk_logger;
+
+# default timeout for putting the db into hotbackup mode is 2 hours.
+my $DEFAULT_TIMEOUT = 60 * 60 * 2;
+
+
+sub findVolAndFileForSid {
+    my $sid = shift;
+    my $pat = shift;
+    my @files;
+
+    my $D;
+    opendir($D, "/var/tmp");
+    while(my $file = readdir($D)) {
+        next unless($file =~ /${sid}-virtual-volumes.txt/);
+        next if($pat && $file !~ /$pat/);
+        push(@files, $file);
+    }
+    closedir($D);
+
+    if(scalar(@files) != 1) {
+        die("Did not find unique virtual-volumes.txt for $sid");
+    }
+
+    my $file = shift(@files);
+    $file = "/var/tmp/$file";
+
+    my $vol;
+    open($D, "< $file");
+    while(my $line = <$D>) {
+        chomp($line);
+        next unless($line =~ s/^fs:\s+//);
+        $vol = $line;
+    }
+    close($D);
+
+    return($vol, $file);
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    my $productName;
+    my $service;
+    my $bcvid;
+    my $snapCopy = "";
+    my $physical = 0;
+    my $incrementalPhysical = 0;
+    my $requestingSuspendUntil;
+    my $timeout = $DEFAULT_TIMEOUT;
+    my $removeSnapCopy = 0;
+    my @volumesToBackup;
+    my $fileWithVvList;
+    my $vvListForVolume;
+    my @childrenPids;
+    my $sid;
+    my $volType;
+    my $svSidsOnly;
+    my $txSidsOnly;
+    my $jira;
+    my $log;
+    my $help;
+    my $test;
+
+    GetOptions(
+        "snap"                => \$snapCopy,
+        "jira=s"              => \$jira,
+        "tmid=i"              => \$bcvid,
+        "sid=s"               => \$sid,
+        "volType=s"           => \$volType,
+        "sv"                  => \$svSidsOnly,
+        "tx"                  => \$txSidsOnly,
+        "bcv=s"               => \$bcvid,
+        "physical"            => \$physical,
+        "incrementalPhysical" => \$incrementalPhysical,
+        "removeSnapCopy"      => \$removeSnapCopy,
+        "timeout=i"           => \$timeout,
+        "suspend=i"           => \$requestingSuspendUntil,
+        "vol=s"               => \@volumesToBackup,
+        "vvlistForVolume=s"   => \$vvListForVolume,
+        "vvlist=s"            => \$fileWithVvList,
+        "volType=s"           => \$volType,
+        "log"                 => \$log,
+        "e"                   => \$sendEmail,
+        "p"                   => \$sendPage,
+        "debug"               => \$debug,
+        "test"                => \$test,
+        "help|?"              => \$help,
+    ) or pod2usage(2);
+
+    while( @ARGV ) {
+        if(!@volumesToBackup && !$productName && !$fileWithVvList) {
+            $productName = shift(@ARGV);
+        }
+        else {
+            $service = shift(@ARGV);
+        }
+    }
+
+    pod2usage(1) if $help;
+    $bcvid = ariba::Ops::Utils::fix_jira_id($jira) if $jira;
+    $updateMon = 0 if $debug;
+    $debug += 3 if $log;
+
+    if ($test) {
+        print "vvlistForVolume = $vvListForVolume\n";
+        print "vvlist = $fileWithVvList\n";
+        print "updateMon = $updateMon\n";
+        print "productName = $productName\n";
+        print "service = $service\n";
+        print "sv = $svSidsOnly\n";
+        print "tx = $txSidsOnly\n";
+        print "bcv/tmid = $bcvid\n";
+        print "jira = $jira\n";
+        print "physical = $physical\n";
+        print "incrementalPhysical = $incrementalPhysical\n";
+        print "removeSnapCopy = $removeSnapCopy\n";
+        print "timeout = $timeout\n";
+        print "suspend = $requestingSuspendUntil\n";
+        print "log = $log\n";
+        print "e = $sendEmail\n";
+        print "p = $sendPage\n";
+        print "debug = $debug\n";
+        print "snap = $snapCopy\n";
+        print "volType = $volType\n";
+        print "sid = $sid\n";
+        print "debug = $debug\n";
+        print "vol = " . join(',',@volumesToBackup) . "\n";
+
+        exit(2);
+    }
+
+
+    if($sid) {
+        ( $vvListForVolume, $fileWithVvList ) = findVolAndFileForSid($sid, $volType);
+        print "Using vvListForVolume=$vvListForVolume and fileWithVvList=$fileWithVvList for $sid\n";
+    }
+
+    pod2usage("Need to specify a BCV id\n") unless($bcvid);
+
+    if ($physical && $incrementalPhysical) {
+        pod2usage("-physical and -incrementalPhysical cannot be used together\n");
+    }
+
+    if ($snapCopy && ($physical || $incrementalPhysical)) {
+        pod2usage("-snapCopy is cannot be used with either -physical or -incrementalPhysical\n");
+    }
+    if ($snapCopy && $removeSnapCopy) {
+        pod2usage("-snap and -removeSnapCopy cannot be used together\n");
+    }
+
+    unless(@volumesToBackup || $fileWithVvList) {
+        pod2usage("Need to specify a productName\n") unless($productName);
+    }
+
+    if ($fileWithVvList && !$vvListForVolume) {
+        pod2usage("Need to specify a volume name that the list corresponds to\n");
+    }
+
+    if ($svSidsOnly && $txSidsOnly) {
+        pod2usage("Use either -tx or -sv. Don't specify the flags if you want to backup all SIDs.\n");
+    }
+
+    if ($debug > 1) {
+        print "DEBUG: debug level is $debug\n";
+        ariba::Ops::FileSystemUtils::setDebug($debug);
+    }
+
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    #
+    # If we are doing coldback without db being up, do it here and
+    # exit.
+    #
+    my @vvNamesToBackup;
+    if (!$productName && (@volumesToBackup || $fileWithVvList)) {
+        my $fakeProductName = "UnknownProduct(ColdBackup)";
+        my $fakeSid = "UnknownSid(ColdBackup)";
+
+        my $startTime = time();
+
+        if ($fileWithVvList) {
+            push(@vvNamesToBackup, ariba::Ops::InservUtils::vvNamesFromFile($fileWithVvList, $vvListForVolume));
+        }
+        my ($newBCV, $dataToSync, $errorString) = createBCVForID(undef, undef, $fakeSid, \@volumesToBackup, \@vvNamesToBackup, $fakeProductName, $bcvid, $physical, $snapCopy, $removeSnapCopy, $incrementalPhysical, $timeout);
+        my $endTime = time();
+
+        my @displayVolumeNames;
+
+        if ($fileWithVvList) {
+            push(@displayVolumeNames, $vvListForVolume);
+        } else {
+            push(@displayVolumeNames, @volumesToBackup);
+        }
+
+        print "Summary of Backup:\n";
+        print vmDisplayMessage($fakeProductName, $hostname, \@displayVolumeNames, \@vvNamesToBackup, $newBCV, $dataToSync, $startTime, $endTime, $errorString);
+        print "\n";
+
+        if ($errorString) {
+            exit(1);
+        } else {
+            exit(0);
+        }
+    }
+
+    pod2usage("Need to specify a serviceName\n") unless($service);
+
+    my $mon = ariba::rc::InstalledProduct->new('mon', $service);
+
+    if (0 && -t STDIN) {
+        ariba::rc::Passwords::initialize($service);
+    }
+
+    my $machine = ariba::Ops::Machine->new($hostname);
+    my $datacenter = $machine->datacenter();
+    my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+    #
+    # Get connection dictionary in case we are backing up a product
+    #
+    my @uniqueDbcs;
+    if ($productName) {
+        my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+        exit(0) unless(@products);
+
+        my @connections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+        #
+        # get the mysql connections too
+        #
+        push(@connections, ariba::Ops::DBConnection->connectionsToMySQLFromProducts(@products));
+
+        @uniqueDbcs = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections);
+
+        print "$productName has ", scalar(@uniqueDbcs), " unique host+sid\n" if ($debug);
+    }
+
+    my $suspendError;
+
+    eval {
+        ariba::monitor::BackupUtils::startBackupRun(
+            product => $productName,
+            service => $service,
+            hostname => $hostname   #this should match $activeHost defined in the loop below
+        );
+    };
+    if($@) {
+        #if this throws an exception, we probably have a stale record in the database
+        #at this time, we're going to let that slide and press on
+    }
+    for my $dbc (@uniqueDbcs) {
+
+        my $type       = $dbc->type();
+        my $host       = $dbc->host();
+        my $instance   = uc($dbc->sid());
+        my $product    = $dbc->product();
+        my $cluster    = $product->currentCluster();
+        my $customer   = undef;
+        my %queries    = ();
+        
+        next if ( ($tab eq ariba::monitor::StatusPage::replicationDatacenters()) && ($instance =~ /rmanpro1|rmanpro2/i) );
+        print "$instance: $type\n" if ($debug);
+   
+	#we've decided not to backup replicated DBs as of now
+	if ($type eq 'replicated'){
+                print "Skipping $instance\@$host because it is replicated.\n" if ($debug);
+                next;
+        }
+ 
+        if ($txSidsOnly && $dbc->isStarSchema()) {
+            print "Skipping $instance\@$host because it is not a TX SID and -tx was specified.\n" if ($debug);
+            next;
+        }
+
+        if ($svSidsOnly && !$dbc->isStarSchema()) {
+                print "Skipping $instance\@$host because it is not an SV SID and -sv was specified.\n" if ($debug);
+                next;
+        }
+
+        if($machine->provides("hana") && ($physical || $incrementalPhysical)) {
+            print "Skipping $instance\@$host because there are no physical backups for HANA.\n" if ($debug);
+            next;
+        }
+
+        #override current host if its a hana for testing
+        #if ( grep(/hana/, $host)) {
+        #   print "overriding host connection info from $host to $hostname\n";
+        #   $host = $hostname;
+        #}
+
+        my $activeHost = $product->activeHostForVirtualHostInCluster($host, $cluster);
+        if (!$activeHost || $activeHost ne $hostname) {
+            #check if the host is part of the hana cluster
+            if ( grep(/hana/, $host) && isHostPartofHanaCluster($hostname,$dbc)) {
+                $activeHost = $hostname;
+            }
+         }
+
+        if (!$activeHost || $activeHost ne $hostname) {
+            if (!$suspendError) {
+                if (!$activeHost) {
+                    $suspendError = "could not determine active host for virtual $host (is the database up?)";
+                } else {
+                    $suspendError = "suspend must be run on the active host ($activeHost) not $hostname";
+                }
+            }
+            print "Skipping $instance\@$host as current host, $hostname, is not the active host. Active host is ", $activeHost || 'unknown.', "\n" if ($debug);
+            next;
+        }
+
+        $suspendError = "ok";
+
+        # 
+        my $currentlySuspended = suspendBCVBackupUntil($instance, $bcvid, $requestingSuspendUntil);
+
+        #
+        # If suspend was requested, no need to do anything else
+        #
+        if ($requestingSuspendUntil) {
+            next;
+        }
+
+        # fork the backups off so they can run in parallel
+        my $pid = fork();
+        die "Failed to fork!: $!" unless defined($pid);
+        if ($pid == 0) {
+            # child
+
+            my %influx_data;
+            $influx_data{measurement} = 'dc_bcv_backup';
+            $influx_data{tags} = { product => $productName,
+                                   hostname => $hostname,
+                                   service => $service,
+                                   instance => $instance,
+                                   bcv_id => $bcvid,
+                                 };
+
+            # make sure to keep the splunk logger in eval - in odd case should constructor fail,
+            # this should be transparent and not affect the script at all.
+            local $@;
+            eval { 
+                if ( ! $debug ) {
+                    require ariba::Ops::SplunkLogger;
+                    $splunk_logger = ariba::Ops::SplunkLogger->new($influx_data{measurement}); 
+                }
+            };
+            if (my $exception = $@) { 
+                print "SplunkLogger exception: $exception\n"; 
+            }
+
+            if ($currentlySuspended ) {
+
+                $influx_data{data}{currently_suspended_until} =  $currentlySuspended;
+                # Make this look like the old query, so we can "append" to it.
+                $queries{"backup of $instance on $hostname to bcv $bcvid"} = {
+                    crit => undef,
+                    info => 1,
+                    description => 'Backup History Log can be found at /var/log/bcv-log-MMYYYY.txt',
+                    noRowCount => 1,
+                    perl => "main::stuffQueryWithPrevious($currentlySuspended)",
+                };
+
+            } else {
+
+                my $startTime = time();
+                my @volumes;
+                my $runPhysicalMsg = " Please run $0 -physical -bcv 1 PRODUCTNAME DATACENTER";
+         
+                my ($newBCV, $dataToSync, $errorString) = createBCVForID($dbc, $mon, $instance, \@volumes, undef, $productName, $bcvid, $physical, $snapCopy, $removeSnapCopy, $incrementalPhysical, $timeout);
+                if($newBCV && $newBCV eq 'SKIP') {
+                    print "[Skipping - data volume not mounted or different db type (like hana)]\n" if($debug);
+                    next;
+                }
+
+                my $endTime   = time();
+                #
+                # mysql & hana bcv backups don't sleep, so don't deduct sleepDuration
+                #
+                unless($dbc && ($dbc->dbServerType() eq ariba::Ops::DBConnection->mysqlDBServerType() || $dbc->dbServerType() eq ariba::Ops::DBConnection->hanaDBServerType() || $dbc->isDR() && $dbc->isPhysicalReplication())) {
+                    $endTime -= $sleepDuration;
+                }
+                my $volumeString = join(", ", @volumes);
+
+                $influx_data{data}{start_time} =  $startTime;
+                $influx_data{data}{end_time} = $endTime;
+
+                my $error;
+                if ( $errorString ne "" ) {
+                    # errors returned... so:
+                    $error = 1;
+
+                    # ... the error string will be in the log message
+                    # this will be indexed in splunk as part of $vmDispMsg
+                   
+                } elsif ( ! $volumeString ) { 
+                    # no volumes found
+                    $error = 2; 
+                } elsif ( ! $newBCV ) {
+                    # no backup virtual volumes found
+                    $error = 3;
+                } else {
+                    # no errors
+                    $error = 0;
+                }
+
+                $influx_data{data}{bcv_backup_status} = $error;
+
+                my $vmDispMsg = vmDisplayMessage($productName, $hostname,
+                            \@volumes, undef, $newBCV, $dataToSync, $startTime,
+                            $endTime, $errorString);
+
+                $queries{"backup of $instance on $hostname to bcv $bcvid"} = {
+                    crit => $errorString ne "" || !$volumeString || !$newBCV || $endTime < $startTime,
+                    info => 1,
+                    noRowCount => 1,
+                    description => 'Backup History Log can be found at /var/log/bcv-log-MMYYYY.txt',
+                    note => "",
+                    backupStartTime => $startTime,
+                    backupEndTime   => $endTime,
+                    note => 'http://ops.ariba.com/documentation/SRE/processes/operational/bcv-backup.txt',
+                    ticketOnWarnOpenAfterMinutes => 10,
+                    perl => sub { return $vmDispMsg },
+                };
+
+
+                # let's add physical copy metrics to the statsd metrics to be sent
+                map { $influx_data{tags}{$_} = $pcCopyMetrics->{tags}{$_} } keys %{$pcCopyMetrics->{tags}} ;
+                map { $influx_data{data}{$_} = $pcCopyMetrics->{data}{$_} } keys %{$pcCopyMetrics->{data}} ;
+
+                $queries{"Physical Copy of $instance on $hostname "} = {
+                    crit => "((!answer && !previousanswer) || (answer =~ /ERROR/i && previousanswer =~ /ERROR/i))",
+                    info => 1,
+                    uiHint => "BCV Physical Volume Copy Status",
+                    description => "If pc1-vvname copy is missing please create on 3par or if groupvvcopy is missing, $runPhysicalMsg", 
+                    ticketOnWarnOpenAfterMinutes => 10,
+                    perl => sub { return "$pcCopyStatus"; }, 
+                };
+
+                my $message = join("\n", $vmDispMsg, $pcCopyStatus);
+                local $@;
+                eval {
+                    if ( ! $debug ) {
+                        my $log_id = $splunk_logger->log_msg({ message => $message });
+                        $influx_data{data}->{"bcv_backup_log_id"} = $log_id;
+                    }
+                };
+                if (my $exception = $@) { 
+                    print "SplunkLogger log_msg() exception: $exception\n";
+                }
+               
+            }
+       
+            eval {
+                my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+                ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line );
+            };
+
+            my $q = ariba::monitor::QueryManager->newWithDetails(
+                    "bcv-backups", $tab, $service, $customer, \%queries
+                    );
+
+            $q->run();
+
+            my $email = $mon->default('notify.email');
+            my $pager = $mon->default('notify.pagers');
+
+            if ( $updateMon == 0 ) {
+                $q->displayToStdout();
+            } else {
+        $q->displayToStdout() if $debug;
+                $q->checkStatus();
+
+                my $monserver = 
+                    ($product->hostsForRoleInCluster('monitor', $cluster))[0] ||
+                    ($product->hostsForRoleInCluster('monserver', $cluster))[0];
+
+                if ((my $ret = $q->appendToServer($monserver)) != 0) {
+
+                    # this will be stale if something is wrong
+                    # with the queryd server
+                    if ($ret == EX_UNAVAILABLE()) {
+                        exit(0);
+                    } else {
+                        warn $ret;
+                        exit(0);
+                    }
+                }
+
+                $q->archiveResultsOnServer();
+                $q->notifyAboutStatusOnServer(ariba::monitor::QueryManager::notifyList(
+                            $sendEmail, $sendPage, $email, $pager
+                            ));
+            }
+
+            exit(0);
+        } else {
+            #parent
+            push(@childrenPids, $pid);
+        }
+    }
+
+    if ($requestingSuspendUntil && $suspendError ne 'ok') {
+        print "Error suspending BCV backup: $suspendError\n";
+        exit(1);
+    }
+
+
+    # wait for all the children to expire before exiting
+    for my $childPid (@childrenPids) {
+            waitpid($childPid, 0);
+    }
+    eval {
+        ariba::monitor::BackupUtils::finishBackupRun(
+            product => $productName,
+            service => $service,
+            hostname => $hostname
+        );
+    };
+    if($@) {
+        #if this throws an exception, we probably have a stale record in the database
+        #at this time, we're going to let that slide and press on
+    }
+}
+
+sub isHostPartofHanaCluster {
+    my $hostname = shift;
+    my $dbc    = shift;
+    my $found = 0;
+    my $hanaHosts = $dbc->hanaHosts();
+
+    if (defined($hanaHosts)) {
+        my @hostsArray = @{$hanaHosts};
+        foreach my $url (@hostsArray) {
+            if ($url =~ m/^$hostname/i) {
+                $found = 1;
+                last;
+            } 
+        }
+    } 
+                
+    return $found;
+}
+
+sub suspendBCVBackupUntil {
+    my $instance = shift;
+    my $bcvid    = shift;
+    my $until    = shift;
+
+    my $file     = sprintf("%s-%s-%s", $SUSPEND_FILE, $instance, $bcvid);
+
+    #
+    # If time is specified, we are trying to create the suspend file
+    # else we are trying to query it.
+    #
+    # until is specified in touch time format, so something like:
+    #
+    # touch -t 200406290000 $SUSPEND_FILE-ANPRO1-2
+    #
+    if ($until) {
+        print "Suspending backups for [$instance] bcv $bcvid until [$until]\n";
+        CORE::system("touch -t $until $file");
+        return 0;
+    }
+
+    if (my $mtime = (stat($file))[9]) {
+
+        if ($mtime <= time()) {
+            warn "Suspend file: $file exists, but it's modification date is in the past! Removing...\n";
+            unlink($file);
+            return 0;
+        }
+
+        return $mtime;
+    }
+
+    return 0;
+}
+
+sub stuffQueryWithPrevious {
+    my $until = shift || time() + 86400;
+
+    my $self  = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+    $self->setNote(sprintf("This BCV backup is disabled until: %s", scalar localtime($until)));
+    my @message = $self->results(); 
+    writeLogFile(@message); 
+    return join("\n", $self->results());
+}
+
+sub switchAndSaveArchiveLogs {
+    my $mon = shift;
+    my $dbc = shift;
+    my $productName = shift;
+    my $instance = shift;
+    my $bcvName = shift;
+    my $previousArchiveLogNum = shift;
+    my $numTimesSwitch = shift || 3;
+
+    for (my $i = 0; $i < $numTimesSwitch; $i++) {
+        ariba::DBA::SampleSQLQueries::executeSQLQuery($mon, "switchLogs", $dbc);
+    }
+
+    sleep($sleepDuration);
+
+    my ($archivePath, $newArchiveLogNum) = currentArchiveLog($mon, $dbc);
+
+    #
+    # Use new 3par based archive log backup directory when it exists.
+    # else default to old location.
+    #
+    my $archiveBackupLogRoot = "/archbak01";
+    my $backupDir = "$archiveBackupLogRoot/$productName/$instance/$bcvName";
+
+    unless ( -d $archiveBackupLogRoot) {
+        $archiveBackupLogRoot = "/oracle/bcvArchiveLogs";
+        $backupDir = "$archiveBackupLogRoot/$productName/$bcvName";
+    }
+
+    saveArchiveLogs($archivePath, $previousArchiveLogNum, $newArchiveLogNum, $backupDir, $instance);
+
+    return $newArchiveLogNum;
+}
+
+sub create3ParBCVForID {
+    my ($dbc, $mon, $instance, $volumesRef, $deviceDetailsRef, $vvNamesRef, $productName, $pcId, $physical, $snapCopy, $removeSnapCopy, $incrementalPhysical, $timeout) = @_;
+
+    my $errorString = "";
+    my $targetVolume;
+
+    my ( $backupVvNameString, $vvNameString );
+    my @virtualVols;
+
+    my $nm;
+    if ($vvNamesRef && @$vvNamesRef) {
+        my $inservHostname = shift @$vvNamesRef;
+        my $machine = ariba::Ops::Machine->new($inservHostname);
+        $nm = ariba::Ops::NetworkDeviceManager->newFromMachine($machine);
+    } else {
+        #
+        # Find a load up the inserv machinedb entry
+        #
+        my $machine = ariba::Ops::Machine->new();
+        my $datacenter = $machine->datacenter();
+        my $sharedDC = ariba::Ops::DatacenterController::switchDC($datacenter);
+        $datacenter = $sharedDC if ($sharedDC);
+
+        my @inservs = ariba::Ops::NetworkDeviceManager->newFromDatacenter($datacenter, 'inserv');
+        my @emc = ariba::Ops::NetworkDeviceManager->newFromDatacenter($datacenter, 'enginuity');
+        push(@inservs, @emc);
+
+        # We have the device details.  We can assume there's only one inserv/SID and that 
+        # if there are two plexes, we only care about the one that's marked primary.
+        $nm = $$deviceDetailsRef[0]->inservForDevice(\@inservs);
+
+        unless ($nm) {
+            my $wwn = ''; 
+            $wwn = ' ' . $$deviceDetailsRef[0]->hostTargetWWN() if ($$deviceDetailsRef[0]->hostTargetWWN());
+            $errorString = "ERROR: Target WWN$wwn of device " . $$deviceDetailsRef[0]->instance() . " for volume " . $$deviceDetailsRef[0]->veritasVolume() . " not found in WWNS list of " . join(", ", @inservs);
+            return ("", "", $errorString);
+        }
+
+    }
+
+    if(ref($nm) =~ /inserv/) {
+        # See TMID 49397.
+        # Turning on additional logging to /tmp/mon/inserv.XXX
+        $nm->setLogResponses(0);
+
+        if ($debug > 2) {
+            $nm->setDebug($debug);
+        }
+
+        my @vvNames;
+        if ($vvNamesRef && @$vvNamesRef) {
+            for my $vvName (@$vvNamesRef) {
+                push(@vvNames, $vvName);
+                push(@virtualVols, $nm->virtualVolumesByName($vvName));
+            }
+        } else {
+            #
+            # Get all the luns that correspond to the source devices
+            #
+            my @luns;
+
+            for my $device (@$deviceDetailsRef) {
+                if ($device->is3Par()) {
+                    push(@luns,  $device->lun());
+                }
+            }
+
+            #
+            # Get virtual volumes for the source luns
+            #
+            my $hostname = ariba::Ops::NetworkUtils::hostname();
+            @virtualVols = $nm->virtualVolumesForLunsOnHost(\@luns, $hostname);
+
+            #
+            # vv's for luns are named as 0043-0, 0043-1 etc.
+            # grab just the vol (0043) part of it.
+            #
+            for my $vv (@virtualVols) {
+                push(@vvNames, $vv->name());
+            }
+        }
+
+
+        #
+        # Get the corresponding backup vv information
+        #
+        my $physicalBackupVvName;
+        my @physicalBackupVvNames;
+
+        my $backupVvName;
+        my @backupVvNames;
+        for my $vvName (@vvNames) {
+            # get all virtual volumes which are part of $volId
+            if ($snapCopy) {
+                $backupVvName = $nm->_snapROCopyVolumeNameForId($vvName, $pcId);
+                $physicalBackupVvName = $nm->_physicalCopyVolumeNameForId($vvName, 1); 
+            } else {
+                $backupVvName = $nm->_physicalCopyVolumeNameForId($vvName, $pcId);
+            }
+            push(@backupVvNames, $backupVvName);
+            push(@physicalBackupVvNames, $physicalBackupVvName);
+        }
+
+        $pcCopyStatus = checkPhyiscalCopyStatus($nm, \@vvNames, \@physicalBackupVvNames); 
+        unless (length($pcCopyStatus) > 10) {
+            $pcCopyStatus  = "All physcial volume and it's copy are in Sync";         
+        }      
+        $vvNameString = join(", ", @vvNames);
+        $backupVvNameString = join(", ", @backupVvNames);
+
+        if ($debug) {
+            print "\n";
+            print "------ 3PAR Backup ------\n";
+            print "Product         = $productName\n";
+            print "Instance        = $instance\n";
+            print "volume(s)       = ", join(", ", @$volumesRef), "\n" if ($volumesRef);
+            print "inserv Hostname = ", $nm->hostname(), "\n";
+            print "Source VV       = $vvNameString\n";
+            print "Backup VV       = $backupVvNameString\n";
+            print "\n";
+        }
+
+
+        for (my $i = 0; $i < @vvNames; $i++) {
+            my $vvName = $vvNames[$i];
+            if (!$snapCopy && !$nm->isEqualVirutalVolumeCountForPrimayAndPhysicalCopy($vvName, $pcId)) {
+                $errorString = "ERROR: unequal number of vv for primary and physical copy [$pcId] for $vvName";
+                $nm->disconnect();
+                return ($backupVvNameString, "", $errorString);
+            }
+        }
+    } else {
+        #
+        # EMC code here
+        #
+        if($vvNamesRef) {
+            @virtualVols = (@$vvNamesRef);
+        } else {
+            for my $device (@$deviceDetailsRef) {
+                my @vv = $nm->volumeTagsForDevices($device);
+                push(@virtualVols, $vv[0]->name());
+            }
+        }
+
+        $vvNameString = join(' ', @virtualVols);
+        my @backupVvNames;
+        foreach my $vv (@virtualVols) {
+            my ( $dg, $device ) = $nm->dgAndDeviceForVV($vv);
+            my $target;
+            if($physical || $incrementalPhysical) {
+                $target = "CLONE-" . $pcId . "-" . $device;
+            } else {
+                $target = "VPSNAP-" . $pcId . "-" . $device;
+            }
+            push(@backupVvNames, $target);
+        }
+        $backupVvNameString = join(', ', @backupVvNames);
+
+        if ($debug) {
+            print "\n";
+            print "------ 3PAR Backup ------\n";
+            print "Product         = $productName\n";
+            print "Instance        = $instance\n";
+            print "volume(s)       = ", join(", ", @$volumesRef), "\n" if ($volumesRef);
+            print "inserv Hostname = ", $nm->hostname(), "\n";
+            print "Source VV       = $vvNameString\n";
+            print "Backup VV       = $backupVvNameString\n";
+            print "\n";
+        }
+    }
+
+
+    # sync virtual volumes with their corresponding bcv virtual volume.
+    my $returnCode = 1;
+    my ($archivePath, $archiveLogNum, $newArchiveLogNum);
+
+    #
+    # If we are doing a backup with database up (dbc specified), we are
+    # doing hot backup.
+    #
+    my $hotBackupModeErrorString = "";
+    my $isPhysicalReplication = $dbc && $dbc->isDR() && $dbc->isPhysicalReplication();
+    if($dbc && $dbc->dbServerType() eq ariba::Ops::DBConnection->oracleDBServerType()) {
+        eval "use ariba::DBA::SampleSQLQueries;";
+
+        unless ($isPhysicalReplication) {
+            ($archivePath, $archiveLogNum) = currentArchiveLog($mon, $dbc);
+            print "Current Archive Log: archivePath = $archivePath, Log num = $archiveLogNum\n" if ($debug);
+ 
+            #
+            # switch archive logs a few times and save away old archive logs
+            #
+            $newArchiveLogNum = switchAndSaveArchiveLogs($mon, $dbc, $productName, $instance, $pcId, $archiveLogNum);
+            print "start  : archivePath = $archivePath, Log num = $newArchiveLogNum\n" if ($debug);
+        }
+
+        #
+        # put db in hotbackup mode
+        #
+        unless(changeHotbackupMode($mon, $dbc, 1, $timeout, \$hotBackupModeErrorString)) {
+            $errorString = "could not put db $instance in backup mode:" . $hotBackupModeErrorString;
+            $nm->disconnect();
+            return ($backupVvNameString, "", $errorString);
+        }
+    }
+
+    my $snapshotModeErrorString = "";
+
+    if($dbc && $dbc->dbServerType() eq ariba::Ops::DBConnection->hanaDBServerType()) {
+        my $rc = checkSnapshotAlreadyExists($mon, $dbc, \$snapshotModeErrorString);
+        if ($rc eq -1) {
+            $errorString = "could not determine snapshot in db:" . $snapshotModeErrorString;
+            $nm->disconnect();
+            return ($backupVvNameString, "", $errorString);
+        } elsif ($rc eq 0) {
+
+            #
+            # create snapshot
+            #
+            unless(changeSnapshotMode($mon, $dbc, 1, $timeout, \$snapshotModeErrorString)) {
+                $errorString = "could not create snapshot in db:" . $snapshotModeErrorString;
+                $nm->disconnect();
+                return ($backupVvNameString, "", $errorString);
+            }
+        }
+    }
+
+    my $taskIdRef;
+
+    if ($snapCopy) {
+        print "Starting snap copy\n" if ( $debug );
+        $returnCode = $nm->makeSnapCopyForVirtualVolumes(\@virtualVols, $pcId, $snapCopy);
+
+        if ($returnCode == 0 ) {
+            $errorString =  "ERROR: Snap Copy of $vvNameString failed";
+            $errorString .= ":" . $nm->error() if $nm->error();
+        }
+    }
+    elsif ($physical || $incrementalPhysical) {
+        my $incremental = $incrementalPhysical ? 'incremental ' : '';
+        print "Starting ${incremental}physical copy\n" if ( $debug );
+
+        # It's safe to take Oracle out of hot backup mode once makePhysicalCopyForVirtualVolumes returns
+        ($returnCode, $taskIdRef) = $nm->makePhysicalCopyForVirtualVolumes(\@virtualVols, $pcId, $incrementalPhysical);
+
+        if ($returnCode == 0 ) {
+            my $type = ($incrementalPhysical) ? 'Incremental physical copy' : 'Physical copy';
+            $errorString = "ERROR: $type of $vvNameString failed";
+            $errorString .= ":" . $nm->error() if $nm->error();
+        }
+    }
+    else {
+        $errorString = "ERROR: Action not a snapshot, physical copy or incremental phsyical copy";
+        $errorString .= ":" . $nm->error() if $nm->error();
+    }
+
+    if($dbc && $dbc->dbServerType() eq ariba::Ops::DBConnection->oracleDBServerType()) {
+        #
+        # take db out of hotbackup mode (even if the command above failed)
+        #
+        unless(changeHotbackupMode($mon, $dbc, 0, $timeout, \$hotBackupModeErrorString)) {
+            $errorString = "could not put db $instance in normal mode:" . $hotBackupModeErrorString;
+            $nm->disconnect();
+            return ($backupVvNameString, "", $errorString);
+        }
+
+        unless ($isPhysicalReplication) {
+            #
+            # switch archive logs a few times and save away old archive logs
+            #
+            my $lastArchiveLogNum = switchAndSaveArchiveLogs($mon, $dbc, $productName, $instance, $pcId, $newArchiveLogNum);
+            print "end: archivePath = $archivePath, Log num = $lastArchiveLogNum\n" if ($debug);
+        }
+    }
+
+    if($dbc && $dbc->dbServerType() eq ariba::Ops::DBConnection->hanaDBServerType()) {
+        my $rc = checkSnapshotAlreadyExists($mon, $dbc, \$snapshotModeErrorString);
+        if ($rc eq -1) {
+            $errorString = "could not determine snapshot in db:" . $snapshotModeErrorString;
+            $nm->disconnect();
+            return ($backupVvNameString, "", $errorString);
+        } elsif ($rc ne 0) {
+            #
+            # drop snaphot
+            #
+            unless(changeSnapshotMode($mon, $dbc, 0, $timeout, \$snapshotModeErrorString)) {
+                $errorString = "could not drop snapshot in db:" . $snapshotModeErrorString;
+                $nm->disconnect();
+                return ($backupVvNameString, "", $errorString);
+            }
+        }
+    }
+
+
+    if ($taskIdRef) {
+        # Now that Oracle is out of hot backup mode and we've saved
+        # old archive logs we can block on any pending tasks.
+        my $successfulTaskIdsRef = $nm->_waitForTasksToComplete($taskIdRef);
+
+        if (scalar(@$successfulTaskIdsRef) != scalar(@$taskIdRef)) {
+            $errorString = "ERROR: Not all tasks completed successfully";
+            $errorString .= ":" . $nm->error() if $nm->error();
+        }
+    }
+
+    $nm->disconnect();
+    return ($backupVvNameString, "", $errorString);
+}
+
+sub createBCVForID {
+    my $dbc = shift;
+
+    if($dbc && $dbc->dbServerType() eq ariba::Ops::DBConnection->mysqlDBServerType()) {
+        return(createMySQLBCVForID($dbc, @_));
+    } elsif($dbc && $dbc->dbServerType() eq ariba::Ops::DBConnection->hanaDBServerType()) {
+        print "HANA backups handled by bcv-backup-hana script!\n" if $debug;
+        return "SKIP";
+    } else {
+        ## NOTE/WARNING: Be very careful, this createOracleBCV call needs to stay the default condition
+        ## Since this method (createBCVForId) gets called with undef as the DBC arg, we CANNOT test for
+        ## ariba::Ops::DBConnection->oracleDBServerType() here.  Cold backups WILL BREAK if createOracleBCVForID
+        ## is not called from this bare 'else'.
+        print "** NO DBC, assume Oracle!!\n" if $debug;
+        return(createOracleBCVForID($dbc, @_));
+    }
+}
+
+sub createMySQLBCVForID {
+    my ($dbc, $mon, $instance, $volumesRef, $vvNamesRef, $productName, $bcvid, $physical, $snapCopy, $removeSnapCopy, $incrementalPhysical, $timeout) = @_;
+
+    my ($bcvName, $dataToSync);
+    my $errorStr = "";
+    my @deviceDetails;
+
+    my $dbuser = "backup";
+    #
+    # this works (I think) because we check for activeHost == host in main loop
+    #
+    my $host = "127.0.0.1";
+    my $port = $dbc->port();
+    my $database = $dbc->database();    
+    my $password = $mon->default('dbainfo.backup.password');
+
+    local $@;
+    eval {
+        my $mydbc = ariba::Ops::MySQLClient->new(
+            $dbuser, $password, $host, $port, $database
+        );
+        unless ( $mydbc->connect() ) {
+            $errorStr = "Could not connect to mysql database.";
+            return(undef, undef, $errorStr);
+        }
+
+        #
+        # lock and flush tables
+        #
+        unless( ariba::Ops::MySQLHelper->lockAndFlushMyISAMTables($mydbc, 60) ) {
+            $errorStr = "Unable to lock and flush tables for mysql database";
+            return(undef, undef, $errorStr);
+        }
+
+        #
+        # get the filesystem(s) from database
+        #
+        my @dataDirs = ariba::Ops::MySQLHelper->getDataDir($mydbc);
+        unless(scalar(@dataDirs)) {
+            $errorStr = "Unable to find filesystem(s) for mysql database";
+            return(undef, undef, $errorStr);
+        }
+
+        #
+        # get mount points from filesystems
+        #
+        push(@$volumesRef, ariba::Ops::FileSystemUtils::uniqueMountPointsForPathList(\@dataDirs));
+
+        unless(scalar(@$volumesRef)) {
+            $errorStr = "volumes that need to be backed up are not defined.";
+            return(undef, undef, $errorStr);
+        }
+
+        #
+        # get device details from mount points
+        #
+        foreach my $volume (@$volumesRef) {
+            my @devicesForVolume = ariba::Ops::FileSystemUtils::devicesForMountPoint($volume);
+            unless(scalar(@devicesForVolume)) {
+                $errorStr = "could not determine device details for volume $volume";
+                return(undef, undef, $errorStr);
+            }
+            push(@deviceDetails, @devicesForVolume);
+        }
+
+        unless(scalar(@deviceDetails)) {
+            $errorStr = "could not determine devices that need to be backed up";
+            return(undef, undef, $errorStr);
+        }
+
+        #
+        # finally, do the BCV backup... we pass undef for the $dbc because
+        # the $dbc is used to determine the need to set hotbackup mode for
+        # oracle, and this does not apply to mysql databases
+        #
+        ($bcvName, $dataToSync, $errorStr) = create3ParBCVForID(
+            undef, $mon, $instance, $volumesRef, \@deviceDetails, $vvNamesRef,
+            $productName, $bcvid, $physical, $snapCopy, $removeSnapCopy,
+            $incrementalPhysical, $timeout
+        );
+
+        #
+        # lock and flush tables
+        #
+        unless( ariba::Ops::MySQLHelper->unlockMyISAMTables($mydbc, 60) ) {
+            $errorStr = "Unable to lock and flush tables for mysql database";
+            return($bcvName, $dataToSync, $errorStr);
+        }
+
+        #
+        # get the time of last BCV
+        #
+        ariba::rc::Utils::mkdirRecursively("/var/tmp/mysql");
+        my $type = "snap";
+        $type = "physical" if($physical || $incrementalPhysical);
+
+        my $tsFile="/var/tmp/mysql/mysql-last-bcv.$database.$port.$type";
+        my $timeSt;
+
+        #
+        # update time of last BCV
+        #
+        unless($errorStr) {
+            open(FOO, "> $tsFile");
+            print FOO time(),"\n";
+            close(FOO);
+        }
+
+        opendir(DIR, "/var/tmp/mysql");
+        while(my $f = readdir(DIR)) {
+            if($f =~ /^mysql-last-bcv.$database.$port/) {
+                #
+                # per James, we don't care about bcv, just snap or physical
+                # so we'll ignore any old snap1 or snap2 files
+                #
+                next if($f =~ /snap\d+$/);
+                open(FOO, "< /var/tmp/mysql/$f");
+                my $foo = <FOO>;
+                close(FOO);
+                chomp($foo);
+                if($foo && (!$timeSt || $timeSt > $foo)) {
+                    $timeSt = $foo;
+                }
+            }
+        }
+
+        #
+        # keep 2 hours more per James -- see TMID:78815
+        #
+        $timeSt -= (60*60*2) if($timeSt);
+
+        #
+        # XXX - purge logs older than oldest BCV
+        #
+        if( $timeSt ) {
+            my @foo;
+            my $sql = "purge binary logs before '" .
+                ariba::Ops::DateTime::prettyTime( $timeSt ) . "'";
+            my $resultExec = $mydbc->executeSqlWithTimeout($sql, 60, \@foo);
+
+            unless( $resultExec ) {
+                $errorStr = "Unable to purge binary logs.";
+                return($bcvName, $dataToSync, $errorStr);
+            }
+        }
+    };
+    
+    if($@) {
+        $errorStr = "$@";
+        $errorStr =~ s|\n$||;
+    }
+
+    return($bcvName, $dataToSync, $errorStr);
+    
+}
+
+sub createHanaBCVForID {
+    my ($dbc, $mon, $instance, $volumesRef, $vvNamesRef, $productName, $bcvid, $physical, $snapCopy, $removeSnapCopy, $incrementalPhysical, $timeout) = @_;
+
+    my ($bcvName, $dataToSync);
+
+    my $errorString = "";
+    my @vvNames;
+    my @deviceDetails;
+
+    #ariba::Ops::FileSystemUtils::setDebug(2);
+    my $skip = 0;
+    local $@;
+    eval {
+        if ($vvNamesRef) {
+            unless (@$vvNamesRef) {
+                $errorString = "could not determine virtual volumes that need to be backed up";
+                return 0;
+            }
+        } else {
+            #
+            # Get details of filesystem (WWID names)
+            # that need to be backed up, if they were not provided
+            my @wwIdNames = ariba::Ops::FileSystemUtils::WWIdBehindDeviceMapper('data');
+            if ( @wwIdNames ){
+                push(@$volumesRef, @wwIdNames);
+            } else {
+                ## If this volume is not mounted, this host is a failover host, exit bcv-backup cleanly
+                $skip = 1;
+                return;
+            }
+
+            unless (@$volumesRef) {
+                $errorString = "volumes that need to be backed up are not defined";
+                return 0;
+            }
+
+
+            #
+            # Get details of devices that make up the volumes
+            #
+            for my $volume (@$volumesRef) {
+                my @devicesForVolume = ariba::Ops::FileSystemUtils::devicesForWWId($volume);
+   
+                unless (@devicesForVolume) {
+                    $errorString = "could not determine device details for volume $volume";
+                    return 0;
+                }
+                push(@deviceDetails, @devicesForVolume);
+            }
+
+            unless (@deviceDetails) {
+                $errorString = "could not determine devices that need to be backed up";
+                return 0;
+            }
+        }
+
+        ($bcvName, $dataToSync, $errorString) = create3ParBCVForID($dbc, $mon, $instance, $volumesRef, \@deviceDetails, $vvNamesRef, $productName, $bcvid, $physical, $snapCopy, $removeSnapCopy, $incrementalPhysical, $timeout);
+
+    };
+    return("SKIP",1,1) if($skip);
+
+    #
+    # if one of the routines we call, die's catch it here
+    #
+    if ($@) {
+        $errorString = "$@";
+        print "errorString=$errorString\n";
+        $errorString =~ s|\n$||;
+    }
+
+    return ($bcvName, $dataToSync, $errorString);
+}
+
+sub createOracleBCVForID {
+    my ($dbc, $mon, $instance, $volumesRef, $vvNamesRef, $productName, $bcvid, $physical, $snapCopy, $removeSnapCopy, $incrementalPhysical, $timeout) = @_;
+
+    my ($bcvName, $dataToSync);
+
+    my $errorString = "";
+    my @vvNames;
+    my @deviceDetails;
+
+    local $@;
+    eval {
+        if ($vvNamesRef) {
+            unless (@$vvNamesRef) {
+                $errorString = "could not determine virtual volumes that need to be backed up";
+                return 0;
+            }
+        } else {
+            #
+            # Get details of filesystem (virtual volume names)
+            # that need to be backed up, if they were not provided
+
+            #
+            #
+            # If database connection was specified, get the volume to
+            # backup by querying the database
+            #
+            if ($dbc) {
+                print "Getting data files from $instance\n" if ( $debug ); 
+                my @dbFiles = ariba::Ops::FileSystemUtils::mountedFilesystemsForSID($dbc->sid());
+                @dbFiles = grep { $_ !~ /log\d+$/ } @dbFiles;
+                push(@$volumesRef, @dbFiles);
+            }
+
+            if ($dbc && !@$volumesRef) {
+                $errorString = "could not determine volume for $instance";
+                return 0;
+            }
+            unless (@$volumesRef) {
+                $errorString = "volumes that need to be backed up are not defined";
+                return 0;
+            }
+
+            #
+            # Get details of devices that make up the volumes
+            #
+            for my $volume (@$volumesRef) {
+                my @devicesForVolume = ariba::Ops::FileSystemUtils::devicesForMountPoint($volume);
+
+                unless (@devicesForVolume) {
+                    $errorString = "could not determine device details for volume $volume";
+                    return 0;
+                }
+                push(@deviceDetails, @devicesForVolume);
+            }
+
+            unless (@deviceDetails) {
+                $errorString = "could not determine devices that need to be backed up";
+                return 0;
+            }
+        }
+
+
+        ($bcvName, $dataToSync, $errorString) = create3ParBCVForID($dbc, $mon, $instance, $volumesRef, \@deviceDetails, $vvNamesRef, $productName, $bcvid, $physical, $snapCopy, $removeSnapCopy, $incrementalPhysical, $timeout);
+
+    };
+
+    #
+    # if one of the routines we call, die's catch it here
+    #
+    if ($@) {
+        $errorString = "$@";
+        $errorString =~ s|\n$||;
+    }
+
+    return ($bcvName, $dataToSync, $errorString);
+}
+
+sub vmDisplayMessage  {
+    my ($productName, $hostname, $volumesRef, $vvNamesRef, $bcv, $dataToSync, $startTime, $endTime, $errorString) = @_;
+
+    my $message = "Product: $productName (";
+    if (@$volumesRef) {
+        $message .= "volume: " . join(", ", @$volumesRef);
+    }
+    if ($vvNamesRef && @$vvNamesRef) {
+        $message .= " " if (@$volumesRef);
+        $message .= "virtual volumes: " . join(", ", @$vvNamesRef);
+    }
+    if ($bcv) {
+        $message .= " bcv: $bcv";
+    }
+    $message .= ")";
+
+    my @msg = $message;
+
+    if ($errorString) {
+
+        push(@msg, "Begin: " . localtime($startTime));
+        push(@msg, "Sync Failed: error was [$errorString]");
+
+    } else {
+
+        my $duration = sprintf ("%0.2f",($endTime - $startTime)/60);
+        push(@msg, "Begin: " . localtime($startTime) .  " (duration: $duration min(s))");
+
+        if ($dataToSync) {
+            my $rate = sprintf("%0.2f", $dataToSync/$duration);
+            push(@msg, "Data Synced: $dataToSync MB (at $rate MB/min)");
+        }
+    }
+
+    writeLogFile(@msg);
+    return (join("\n", @msg));
+}
+
+sub checkSnapshotAlreadyExists {
+    my $mon = shift;
+    my $dbc = shift;
+    my $snapshotModeErrorStringRef = shift;
+    my $rc;
+
+    my @results = ariba::DBA::HanaSampleSQLQueries::executeSQLQuery($mon, "checkSnapshot", $dbc);
+    if (ariba::DBA::HanaSampleSQLQueries::hanaError()) {
+        $$snapshotModeErrorStringRef = ariba::DBA::HanaSampleSQLQueries::hanaError();
+        return -1;
+    }
+
+    my $num = scalar(@results);
+
+    if ($num eq 1) {
+        $rc = $results[0];
+    } else {
+        $$snapshotModeErrorStringRef = "incorrect resultset";
+        $rc = -1;
+    }
+
+    return $rc;
+}
+
+sub changeSnapshotMode {
+    my $mon = shift;
+    my $dbc = shift;
+    my $mode = shift;
+    my $timeout = shift;
+    my $snapshotModeErrorStringRef = shift;
+
+    my $sqlName;
+
+    if ($mode eq '1') {
+       $sqlName = 'createSnapshot';
+    } else {
+       $sqlName = 'dropSnapshot';
+    }
+
+    ariba::DBA::HanaSampleSQLQueries::executeSQLQuery($mon, $sqlName, $dbc, undef, $timeout);
+    if (ariba::DBA::HanaSampleSQLQueries::timeoutOccured()) {
+        $$snapshotModeErrorStringRef = "timed out running SQL";
+        return 0;
+    }
+    if (ariba::DBA::HanaSampleSQLQueries::hanaError()) {
+        $$snapshotModeErrorStringRef = ariba::DBA::HanaSampleSQLQueries::hanaError();
+        return 0;
+    }
+
+    return 1;
+}
+
+sub changeHotbackupMode {
+    my $mon = shift;
+    my $dbc = shift;
+    my $mode = shift;
+    my $timeout = shift;
+    my $hotBackupModeErrorStringRef = shift;
+
+    my $verifyMode;
+
+    my $errorCount = 0;
+    my @tablesInWrongMode;
+
+    my $startSqlName = 'startBackup';
+    my $endSqlName = 'endBackup';
+    my $checkTablespaceMode = 1;
+    my $doModeChange = 1;
+
+    my $onOff = $mode ? 'on' : 'off';
+    print "Turning $onOff hot backup mode\n" if ( $debug );
+
+    if ($dbc->isDR() && $dbc->isPhysicalReplication()) {
+        $startSqlName = 'physicalReplication_setReadOnlyMode';
+        $endSqlName = 'physicalReplication_setLogApplyMode'; 
+
+        if($dbc->isPhysicalActiveRealtimeReplication()) {
+            $endSqlName = 'physicalActiveRealtimeReplication_setLogApplyMode';
+        }
+
+        $checkTablespaceMode = 0;
+
+        # Check current mode and skip if needed.
+        my ($currentMode) = ariba::DBA::SampleSQLQueries::executeSQLQuery($mon, 'physicalReplication_standbyStatus', $dbc, undef, $timeout);
+        if ($currentMode && 
+            (($mode && ($currentMode =~ m/READ ONLY/ || $currentMode =~ m/APPLY STOP/)) ||
+            (!$mode && $currentMode =~ m/APPLY/ && $currentMode !~ m/APPLY STOP/))) {
+            $doModeChange = 0;
+        }
+    }
+
+    while ($doModeChange) {
+        if ($mode) {
+            ariba::DBA::SampleSQLQueries::executeSQLQuery($mon, $startSqlName, $dbc, undef, $timeout);
+            $verifyMode = "ACTIVE";
+        } else {
+            ariba::DBA::SampleSQLQueries::executeSQLQuery($mon, $endSqlName, $dbc, undef, $timeout);
+            $verifyMode = "NOT ACTIVE";
+        }
+
+        if (ariba::DBA::SampleSQLQueries::timeoutOccured()) {
+            $$hotBackupModeErrorStringRef = "timed out running SQL";
+            return 0;
+        }
+
+        @tablesInWrongMode = tablesNotInCorrectMode($mon, $dbc, $verifyMode) if ($checkTablespaceMode);
+
+        if (ariba::DBA::SampleSQLQueries::oracleError()) {
+            $$hotBackupModeErrorStringRef = ariba::DBA::SampleSQLQueries::oracleError();
+            if ($$hotBackupModeErrorStringRef =~ /ORA-00235|ORA-01093/i && $errorCount < 10) {
+                ++$errorCount;
+                $$hotBackupModeErrorStringRef = undef;
+                sleep(60);
+                next;
+            }
+            if ( $$hotBackupModeErrorStringRef ) {
+                $$hotBackupModeErrorStringRef .= " [retry count = $errorCount] ";
+            }
+            return 0;
+        }
+        last;
+    }
+
+    if (@tablesInWrongMode) {
+        $$hotBackupModeErrorStringRef = 
+            "ERROR: found following tables that are not in $verifyMode state\n"
+            . "  " . join("  \n", @tablesInWrongMode) . "\n";
+        return 0;
+    }
+
+    return 1;
+}
+
+#
+# This check may take up to 5 minutes to complete.  This is due to
+# the fact that the mode-change operation can take 2 to 3 minutes to
+# finish.
+sub tablesNotInCorrectMode {
+    my $mon = shift;
+    my $dbc = shift;
+    my $verifyMode = shift;
+
+
+    my $currentTry;
+    my $MAXTRIES = 10;
+    my @tablesInWrongMode;
+
+    while (1) {
+        ++$currentTry;
+        @tablesInWrongMode = ();
+
+        my @results = ariba::DBA::SampleSQLQueries::executeSQLQuery($mon, "checkBackupMode", $dbc);
+
+        for my $result (@results) {
+            next if ($result =~ m|^\s*$|);
+
+            my ($table, $curMode) = split(/\s+/, $result, 2);
+
+            if ($curMode ne $verifyMode) {
+                push(@tablesInWrongMode, $table);
+            }
+        }
+
+        if (scalar(@tablesInWrongMode) && $currentTry < $MAXTRIES) {
+            sleep 30;
+            next;
+        }
+
+        last;
+    }
+
+    return (@tablesInWrongMode);
+}
+
+sub currentArchiveLog {
+    my $mon = shift;
+    my $dbc = shift;
+
+    my @results = ariba::DBA::SampleSQLQueries::executeSQLQuery($mon, "findCurrentLog", $dbc);
+
+    my ($path, $num);
+
+    if (@results) {
+        ($path, $num) = ( $results[0] =~ /(.*\*)(\d+)\.arc/ );
+        $num--;
+    }
+
+    if (wantarray()) {
+        return ($path, $num);
+    } else {
+        return ($num);
+    }
+}
+
+sub saveArchiveLogs {
+    my $archivePath = shift;
+    my $start = shift;
+    my $end = shift;
+    my $backupPath = shift;
+    my $sid = shift;
+
+    rmtree($backupPath);
+    mkpath($backupPath);
+
+    my ($uid,$gid) = (getpwnam('oracle'))[2,3];
+
+    my $controlFile = "/tmp/control.$sid";
+    if (-f $controlFile) {
+        print "saveArchiveLogs() moving $controlFile to $backupPath\n" if ($debug);
+        move($controlFile, "$backupPath/");
+        chown ($uid, $gid, "$backupPath/control.$sid");
+    }
+
+    #
+    # expand path of following form
+    # "/ora05/oraarch1/ANLAB/ANLAB_*" into
+    # /ora05/oraarch1/ANLAB/ANLAB_0000003373.arc
+    # /ora05/oraarch1/ANLAB/ANLAB_0000003374.arc
+    # etc.
+    #
+    my $dir = dirname($archivePath);
+    my $base = basename($archivePath);
+
+    $base =~ s/\*/(0+|_)/;
+    my $exp = "${base}(" . join("|", ($start .. $end)) . ")\\.arc";
+
+    opendir(DIR, "$dir");
+    my @matches = grep(/$exp/, readdir(DIR));
+    closedir(DIR);
+
+
+    for my $file (@matches) {
+        print "saveArchiveLogs() copying $file to $backupPath\n" if ($debug);
+        copy("$dir/$file", "$backupPath/") || print "warning: failed to copy $file\n";
+        chown ($uid, $gid, "$backupPath/$file");
+    }
+
+}
+
+sub checkPhyiscalCopyStatus {
+    my $nm = shift;
+    my $vvNames = shift;
+    my $backupVvNames = shift;
+
+    my $vvNameString = join("| ", @{$vvNames});
+    my $backupVvNameString = join("|", @{$backupVvNames});
+    my @presentpcvvs;
+    my @presentvvs;
+
+    my @vvs_a = $nm->cmdShowvv($vvNameString);
+    my $phRunMsg = "ERROR: Initial groupvvcopy (VV->pc1-VV) was not run on this VV.";
+    my $pcCopyMsg = "ERROR: Destination volume (pc1-VVName) for physical copy does not exist on storage array.";
+    my %pcMap;
+    my @pcVvs_a;
+    my $try = 3;    
+    while ($try > 0 && !scalar(@pcVvs_a)) { 
+        sleep (10);
+        @pcVvs_a = $nm->cmdShowvv($backupVvNameString);
+        $try--; 
+    } 
+    if (scalar(@pcVvs_a)) {
+        foreach my $pcvv (@pcVvs_a) {
+           my $pcvvName = $pcvv->name;
+           my $oriVV  = $pcvvName ;
+           $oriVV =~ s/pc1-//g;
+           my $pcvvCopyOf = ($pcvv->copyOf !~ /vvcp/) ? "MISSING" : $pcvv->copyOf;
+           $pcMap{$oriVV} = "$pcvvName\t$pcvvCopyOf";
+        }
+     }
+
+     if (scalar(@vvs_a)) {
+        foreach my $vv (@vvs_a) {
+           push (@presentvvs, $vv->name);
+        }
+     }
+
+     my $result = "";
+     foreach my $pv (@presentvvs) {
+         if (defined $pcMap{$pv} && $pcMap{$pv} =~ /MISSING/) {
+             my $pc = (split("\t", $pcMap{$pv}))[0];
+             $result .= "$pv " . "-"x(30-length($pv)) . " $pc " . "-"x(30-length($pc)) . " $phRunMsg\n";
+         }
+         elsif (! $pcMap{$pv} ) {
+             $result .= "$pv " . "-"x(67-length($pv)) . " $pcCopyMsg\n";
+         }
+     }
+     my $status = "";
+     if (length($result) > 10) {
+        $status = "Physical Volume/Copy mismatched on ". $nm->hostname() ."\n$result";
+        $pcCopyMetrics->{tags}{mismatched_host} = $nm->hostname();
+        $pcCopyMetrics->{data}{physical_copy_status} = 1;
+     } else {
+        $pcCopyMetrics->{data}{physical_copy_status} = 0;
+     }
+     return $status;
+}
+
+
+sub writeLogFile {
+    my @msg = @_;
+    my $message = join("\n", @msg);
+
+    my $date = strftime "%m%Y", localtime;
+    my $timeStamp = strftime "%d%m%Y-%H%M", localtime;
+
+    my $bcvLog = "/var/log/bcv-log-$date.txt";
+    open BCVLOG, ">>", $bcvLog or die "Unbale to open $bcvLog File $!\n";
+
+    print BCVLOG "******************* $0 STARTED - $timeStamp *********************\n";
+    print BCVLOG "$message\n";
+    
+}
+
+main();
+
+__END__

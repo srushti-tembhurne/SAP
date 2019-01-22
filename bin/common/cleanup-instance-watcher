@@ -1,0 +1,91 @@
+#!/usr/local/bin/perl -w
+
+# $Id$
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::misc;
+use ariba::monitor::QueryManager;
+use File::Find;
+
+my $debug = 0;
+
+sub main {
+
+	my $sendEmail = 0;
+        my $sendPage  = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if( $arg =~ /^-e/o ){ $sendEmail = 1; };
+		if( $arg =~ /^-p/o ){ $sendPage = 1; };
+		if( $arg =~ /^-d/o ){ $debug = 1; };
+	}
+
+	my $me		  = ariba::rc::InstalledProduct->new();
+	my @products	  = ariba::rc::InstalledProduct->installedProductsList( $me->service() );
+
+	# Find out what we run
+	for my $product (@products) {
+
+		my $name	= $product->name();
+		my $service	= $product->service();
+		my $queryDir	= ariba::monitor::misc::queryStorageDir();
+		my $cdbDir	= ariba::monitor::misc::circularDBDir();
+
+		my %instances	= map { $_->instanceName() => $_ } ($product->appInstances());
+
+		# short circuit for ws, mon, etc.
+		next if scalar keys %instances == 0;
+
+		print "Checking $name $service\n" if $debug;
+
+		next unless (-d "$queryDir/$name");
+
+		# read from the on disk copy
+		finddepth sub {
+			my $file = $File::Find::name;
+
+			return unless -w $file;
+
+			# derive the instanceName from the file.
+			return unless $file =~ m!/(\w+/([\w-]+?)((?:_test)?_percent_CPU_usage|(?:_test)?_private_mem_size_in_KBytes))!;
+
+			$file = $1;
+			my $instanceName = $2;
+			$instanceName =~ s/_/@/;
+
+			return if defined $instances{$instanceName};
+
+			for my $file ("$cdbDir/$file.cdb", "$queryDir/$file.query") {
+
+				if ($debug) {
+					print "would remove [$file]\n";
+				} else {
+					unlink $file;
+				}
+			}
+
+		}, "$queryDir/$name";
+
+		# now walk through the queries file, and check that the files all exist.
+		#my $queries  = ariba::monitor::QueryManager->new("$name/http-watcher-urls");
+		my $queries  = ariba::monitor::QueryManager->new("$name/instance-watcher");
+
+		for my $query ($queries->queries()) {
+
+			if (!-f $query->_backingStore()) {
+				# nuke the old queries file, it will be rebuilt.
+				unlink $queries->_backingStore();
+
+				last;
+			}
+		}
+	}
+}
+
+main();
+
+__END__

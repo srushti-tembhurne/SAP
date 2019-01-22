@@ -1,0 +1,139 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/disaster-datacenter-capacity#17 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Machine;
+use ariba::Ops::Constants;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Globals;
+
+my $debug = 0;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my @products = ariba::rc::InstalledProduct->installedProductsList( $me->service() );
+	my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+
+	my $primaryDC = $me->mainDatacenterForCluster('primary');
+	my $backupDC  = $me->mainDatacenterForCluster('secondary');
+
+	my %skippedProducts = ();
+	my %queries   = ();
+
+	for my $product (@products) {
+
+		my %capacity  = ();
+		my %allocated = ();
+		my %hostCache = ();
+
+		my $pname = $product->name();
+
+		# we don't do DR for any ASP products yet
+		unless ($product->mainDatacenterForCluster('secondary')) {
+			$skippedProducts{ $pname } = 1;
+			next;
+		}
+		# webservers are already included 
+		next if ($pname =~ /^(?:aesws|ssws|ws)$/);
+
+		for my $host ($product->allHosts()) {
+
+			# we only need to count each machine once.
+			if (exists $hostCache{$host}) {
+				next;
+			} else {
+				$hostCache{$host} = 1;
+			}
+
+			my $server = ariba::Ops::Machine->new($host);
+
+			for my $type ($server->providesServices()) {
+
+				# only care about these for now.
+				next unless $type eq 'app' or $type eq 'web';
+				my $memory = $server->memorySize();
+
+				$capacity{$type}{$server->datacenter()} += $memory;
+			}
+		}
+
+		%hostCache = ();
+		for my $instance ($product->appInstances()) { 
+			my $host = $instance->host(); 
+			my $machine = ariba::Ops::Machine->new($host); 
+			
+			for my $type ($machine->providesServices()) {
+				if ($type =~ /^(?:app|web)$/) { 
+					my $memory = $instance->maxInstanceMemory() / 1024 / 1024;
+					unless (exists $hostCache{$host}) { 
+						$memory += ariba::Ops::Constants->minMemorySizeUsedByOs();
+						$hostCache{$host} = 1;
+					}
+					$allocated{$type}{$machine->datacenter()} += $memory;
+				}
+			}
+		}
+
+		while (my ($type,$data) = each %capacity) {
+			my $warn = 75;
+			my $crit = 50;
+			my $totalCapacity = \%capacity;
+			my $allocatedWord = "";
+		
+			if ($type eq 'web') {
+				$warn = 50; 
+				$crit = 33;
+			} elsif ($pname =~ /^(?:s4|an|buyer|sdb|estore)$/) { 
+				$warn = 100; 
+				$crit = 85;
+				$totalCapacity = \%allocated;
+				$allocatedWord = " memory allocated on ";
+			}
+		
+			$queries{"$pname percentage of memory available on backup $type servers relative to $allocatedWord primary"} = {
+				format => "%d%%",
+				info => "answer >= $warn",
+				warn => "answer < $warn && answer >= $crit",
+				crit => "answer < $crit",
+				perl => int(($capacity{$type}{$backupDC} / $totalCapacity->{$type}{$primaryDC}) * 100),
+			};
+
+			$queries{"$pname excessive memory available on backup $type servers relative to$allocatedWord primary"} = {
+				format => "%dMB",
+				info => "1",
+				perl => int($capacity{$type}{$backupDC} - $totalCapacity->{$type}{$primaryDC}),
+			};
+		}
+	}
+
+	$queries{"Does not include the following products"} = {
+		info => 1,
+		perl => sub { return join(', ', sort keys %skippedProducts) },
+	};
+
+	my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($dataCenters[0]);
+
+	my $q = ariba::monitor::QueryManager->newWithDetails(
+			"disaster-service-capacity", $pn, $me->service(), $me->customer(), \%queries
+			);
+
+	$q->processQueries($debug, $me->default('notify.email'), $sendEmail, $sendPage);
+}
+
+main();
+
+__END__

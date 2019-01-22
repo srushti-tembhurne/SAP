@@ -1,0 +1,53 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/mon/run-cipherstore-watcher#2 $
+#
+# Verify that cipherstore is started up and working correctly
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use ariba::rc::CipherStore;
+
+my $debug = 0;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ m/^-e/o) { $sendEmail = 1; }
+		if ($arg =~ m/^-p/o) { $sendPage = 1; }
+		if ($arg =~ m/^-d/o) { $debug = 1; }
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my %hosts = ();
+
+	foreach my $role ("monserver", "backup-monserver", "replication-source", "database", "product-db-server", "tapebackup-server", "replication-dest", "dataguard-dest", "replication-dest-dr", "veritas-storage", "replication-dest-reporting", "migration-ui") {
+		foreach my $host ($me->hostsForRoleInCluster($role)) {
+			$hosts{$host} = 1;
+		}
+	}
+
+	my $user = getpwuid($>);
+	my $service = $me->service();
+	my $cipherstore = ariba::rc::CipherStore->new($service);
+	my $password = $cipherstore->valueForName($user);
+	my $remotecommand = "bin/everywhere/cipherstore-watcher";
+	$remotecommand .= " -e" if $sendEmail;
+	$remotecommand .= " -p" if $sendPage;
+	$remotecommand .= " -d" if $debug;
+
+	foreach my $host (keys %hosts) {
+		my $sshcommand = "ssh $user\@$host \"$remotecommand\"";
+		ariba::rc::Utils::executeRemoteCommand($sshcommand, $password);
+	}
+}
+
+main();

@@ -1,0 +1,370 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/estore/queue-status#5 $
+
+use strict;
+
+use Time::Local;
+use FindBin;
+use lib "$FindBin::Bin/../../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+use ariba::Ops::NotificationRequest;
+use dmail::LockLib;
+use Date::Parse;
+
+my $LOCKFILE = '/tmp/estore-queue-status';
+
+my $debug = 0;
+my $me = ariba::rc::InstalledProduct->new();
+my $estore = ariba::rc::InstalledProduct->new("estore", $me->service());
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my %rateQueues;
+
+    while(my $arg=shift(@ARGV)){
+        if($arg =~ /^-d/o){ $debug = 1; }
+        if($arg =~ /^-e/o){ $sendEmail = 1; };
+        if($arg =~ /^-p/o){ $sendPage = 1; };
+    }
+
+    my %queries = ();
+
+    my @queues  = (
+        {table => "mail_disp_queue", index => "IND_B0C5B8E2_CD3323B5", type => "docRegulated"},
+        {table => "report_disp_que", index => "IND_97F0D1D1_CD3323B5", type => "docRegulated"},
+        {table => "cxml_disp_que", index => "IND_5FA597A9_CD3323B5", type => "docRegulated"},
+        {table => "st_disp_queue", index => "IND_1EC4D3AA_B1A4A7A0", type => "docRegulated"},
+    );
+
+    my $email = $me->default('notify.email');
+
+    for my $queueDescription (@queues) {
+
+        my $hours = 2;
+        my $note = undef;
+        my $critRows = 500;
+        my $warnRows = 0;
+        my $skipNotifications = 0;
+        my $warn = 30;
+        my $crit = 100;
+        my $hysteresis = "";
+        my $queue = $queueDescription->{"table"};
+        my $index = $queueDescription->{"index"};
+        my $type  = $queueDescription->{"type"};
+        my $openTicket;
+
+        if ($queue eq "mail_disp_queue") {
+            $skipNotifications = 1;
+            $warn = 30000;
+            $crit = 50000;
+            $hysteresis = "and previousAnswer > $crit"
+        }
+
+        if ($type eq 'docRegulated') {
+
+            my $time = time();
+            #
+            # For ingress/egress:
+            #
+            # Look only at the last week -- this means we'll have a pass at
+            # midnight daily that doesn't get ingress/egress, but that's pretty
+            # acceptable, and limiting the result set makes the query run MUCH
+            # faster.
+            #
+            my ($month, $year, $day) = (localtime($time - 604800))[4,5,3];
+            my $cut = timelocal( 0,0,0,$day,$month,$year );
+            #
+            # status_changed is in thousands of a second.
+            #
+            $cut .= "000";
+
+            $queries{"$queue: items stuck more than $hours hrs"} = {
+                recordMaxResults => 20000,
+                recordDataType=> "gauge",
+                recordItem => "numrows",
+                info => "numrows > -1",
+                warn => "numrows > 0",
+                crit => "numrows > $critRows",
+                format => "$queue.id %s $queue.item %s community %s %s %s hours\n",
+                note => $note,
+
+                sql => "select /*+ INDEX($queue $index) */ 
+                    id, item, schema_community,
+                    decode(status, 1, 'Queued', 2, 'Processing', 'Unknown' || status),
+                    round(($time - (status_changed/1000))/3600) stuck_time from $queue
+                    where status in (1, 2) and $time - (status_changed/1000) > $hours * 3600",
+            };
+
+            $queries{"$queue: queue length (Queued, Processing)"} = {
+                recordMaxResults => 20000,
+                recordDataType=> "gauge",
+                info => "answer > -1",
+                warn => "answer > $warn",
+                crit => "answer > $crit $hysteresis",
+                skipNotifications => $skipNotifications,
+                sql  => "select /*+ INDEX($queue $index) */ count(id) from $queue where status in (1,2)",
+
+                details => {
+                    "$queue status summary" => {
+                        noRowCount => 1,
+                        format     => "%s -> %s  %s  num: %s  avg retry: %s\n",
+                        sql => "select /*+ index(pdq $index) use_nl(pdq p so bo) */
+                            nvl(bo.name, 'Name unavailable'),
+                            nvl(so.name, 'Name unavailable'),
+                            decode(pdq.status, 1, 'Queued', 2, 'Processing', 'Unknown'||pdq.status),
+                            count(p.id),
+                            round(avg(pdq.retry_count))
+                                from org_join bo,
+                                  org_join so,
+                                  cxml_document p,
+                                  $queue pdq
+                                where pdq.status in (1, 2)
+                                  and pdq.item = p.id
+                                  and p.from_org = bo.id(+)
+                                  and p.to_org = so.id(+)
+                                group by bo.id,
+                                  so.id,
+                                  bo.name,
+                                  so.name,
+                                  pdq.status
+                                order by count(p.id) desc
+                        ",
+                    },
+
+                    "$queue item summary" => {
+                        noRowCount => 1,
+                        format     => "%s transactions in %s from %s -> %s\n",
+                        sql => "select /*+ index(pdq $index) use_nl(pdq p sorg borg) */
+                              count(pdq.item),
+                              decode(pdq.status, 1, 'Queued', 2, 'Processing', 'Unknown'||pdq.status),
+                              nvl(borg.deployment, 'Not available'),
+                              nvl(sorg.deployment, 'Not available')
+                            from
+                              org_join borg,
+                              org_join sorg,
+                              cxml_document p,
+                              $queue pdq
+                            where pdq.status in (1,2)
+                              and p.id = pdq.item
+                              and p.from_org = borg.id(+)
+                              and p.to_org = sorg.id(+)
+                            group by pdq.status,
+                              borg.deployment,
+                              sorg.deployment
+                        ",
+                    },
+                }
+            };
+
+            $rateQueues{$queue} = 1;
+
+            $queries{"$queue: completed length"} = {
+                info => 1,
+                recordMaxResults => 20000,
+                recordDataType=> "gauge",
+                uiHint => "ignore",
+                sql  => "select count(id) from $queue where (status_changed) > $cut AND status not in (1,2)",
+            };
+
+            $queries{"$queue: total length"} = {
+                info => 1,
+                recordMaxResults => 20000,
+                recordDataType=> "gauge",
+                uiHint => "ignore",
+                sql  => "select count(id) from $queue WHERE (status_changed) > $cut",
+            };
+
+        } else {
+
+            $queries{"$queue: items stuck more than $hours hrs"} = {
+                  recordMaxResults => 20000,
+                  recordDataType=> "gauge",
+                  recordItem => "numrows",
+                  info => "numrows > -1",
+                  warn => "numrows > $warnRows",
+                  crit => "numrows > $critRows",
+                  format => "$queue.id %s $queue.item %s community %s %s %d hours\n",
+
+                  note => $note,
+
+                  sql => "select /*+ INDEX($queue $index) */ 
+                    id,item,schema_community,status,(sysdate-status_changed)*24 stuck_time 
+                    from $queue where 
+                        status in ('Queued','Processing') and 
+                        (sysdate-status_changed)*24 > $hours",
+            };
+
+            $queries{"$queue: queue length (Queued, Processing)"} = {
+                recordMaxResults => 20000,
+                recordDataType=> "gauge",
+                info => "answer > -1",
+                warn => "answer > $warn",
+                crit => "answer > $crit $hysteresis",
+                skipNotifications => $skipNotifications,
+                ticketOnWarnOpenAfterMinutes => $openTicket,
+
+                sql => "select /*+ INDEX($queue $index) */ 
+                    count(id) from $queue where status in ('Queued','Processing')",
+            };
+
+            $rateQueues{$queue} = 1;
+
+            #
+            # Again for ingress/egress, we'll only look at the last week.
+            #
+            # same pro/con as above.
+            #
+            my ($month, $year, $day);
+            if($queue eq 'error_queue') {
+                #
+                # error queue is too big, look at a smaller window.
+                #
+                ($month, $year, $day) = (localtime(time() - 259200))[4,5,3];
+            } else {
+                ($month, $year, $day) = (localtime(time() - 604800))[4,5,3];
+            }
+            $month++;
+            $year+=1900;
+            my $cut = sprintf("%4d-%02d-%02d", $year, $month, $day);
+
+            $queries{"$queue: completed length"} = {
+                info => 1,
+                recordMaxResults => 20000,
+                recordDataType=> "gauge",
+                uiHint => "ignore",
+
+                sql => "select count(id) from $queue where status_changed > to_date('$cut', 'YYYY-MM-DD') AND status in ('Processed','Failed')",
+
+            };
+
+            $queries{"$queue: total length"} = {
+                info => 1,
+                recordMaxResults => 20000,
+                recordDataType=> "gauge",
+                uiHint => "ignore",
+
+                sql => "select count(id) from $queue where status_changed > to_date('$cut', 'YYYY-MM-DD')",
+            };
+        }
+    }
+    
+    # Stuff each query that has a format with the AdminAppURL result.
+    while (my ($key, $query) = each %queries) {
+
+        last; # keeping this code here for now, but not going to make sure
+              # it works for estore just yet
+        next unless $queries{$key}->{'format'};
+        next if (exists $queries{$key}->{'processAnswer'});
+
+        $queries{$key}->{'processAnswer'} = sub {
+            ariba::monitor::StatusPage::addAdminAppLinksToQueueResults($estore->default('acadminurlprefix'));
+        }
+    }
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails(
+        "queue-status", "estore", $me->service, $me->customer(), \%queries
+    );
+
+    unless (dmail::LockLib::requestlock($LOCKFILE,5)) {
+        die "can't grab lock\n";
+    }
+
+    my $dbc = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndSchemaId($estore, 'main-estorebuyer', 0);
+
+    $qm->setSQLConnectInfo($dbc->user(), $dbc->password(), $dbc->sid(), $dbc->host());
+
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+    my %qq;
+    foreach my $queue (keys %rateQueues) {
+            my $subdir = "";
+            my $qname = "$queue: total length";
+            $qname .= " for community $subdir" if($subdir);
+            my $instance = ariba::monitor::Query->generateInstanceName(
+                $qname, "estore", $me->customer(), $me->currentCluster(), $subdir
+            );
+            my $totalQuery = ariba::monitor::Query->new($instance);
+
+            $qname = "$queue: completed length";
+            $qname .= " for community $subdir" if($subdir);
+            $instance = ariba::monitor::Query->generateInstanceName(
+                $qname, "estore", $me->customer(), $me->currentCluster(), $subdir
+            );
+            my $completedQuery = ariba::monitor::Query->new($instance);
+
+            my ($egress, $ingress, $delta) = (undef, undef, undef);
+
+            #
+            # at midnight, when seven days ago changes, our result counters
+            # will shrink.  We'll just skip this pass.
+            #
+            if( $totalQuery->hasAttribute('previousResults') &&
+                $totalQuery->results() >= $totalQuery->previousResults()
+            ) {
+                my $interval = $totalQuery->checkTime() - $totalQuery->previousCheckTime();
+                $interval /= 3600;
+
+                $egress = ($completedQuery->results() - $completedQuery->previousResults()) / $interval;
+                $egress = (int($egress*100))/100;
+                $ingress = ($totalQuery->results() - $totalQuery->previousResults()) / $interval;
+                $ingress = (int($ingress*100))/100;
+
+                $delta = $ingress - $egress;
+                $delta = (int($delta*100))/100;
+            }
+
+            my $uiHint = "Aggregated";
+            $uiHint = "community $subdir" if($subdir);
+
+            $qname = $queue;
+            $qname .= " in community $subdir" if($subdir);
+
+            $qq{"$qname egress rate (items per hour)"} = {
+                info => 1,
+                perl => $egress,
+                uiHint => $uiHint,
+                recordMaxResults => 20000,
+                recordDataType => "gauge",
+                recordDataUnits => "items/hour",
+                recordItem => "answer",
+            };
+
+            $qq{"$qname ingress rate (items per hour)"} = {
+                info => 1,
+                perl => $ingress,
+                uiHint => $uiHint,
+                recordMaxResults => 20000,
+                recordDataType => "gauge",
+                recordDataUnits => "items/hour",
+                recordItem => "answer",
+            };
+
+            $qq{"$qname size change rate (items per hour)"} = {
+                info => 1,
+                perl => $delta,
+                uiHint => $uiHint,
+                recordMaxResults => 20000,
+                recordDataType => "gauge",
+                recordDataUnits => "items/hour",
+                recordItem => "answer",
+            };
+    }
+
+    my $qqm = ariba::monitor::QueryManager->newWithDetails(
+        "queue-egress-and-ingress", "estore", $me->service, $me->customer(), \%qq
+    );
+    $qqm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+    dmail::LockLib::releaselock($LOCKFILE);
+}
+
+main();

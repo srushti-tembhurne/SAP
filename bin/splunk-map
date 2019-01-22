@@ -1,0 +1,89 @@
+#!/usr/local/bin/perl
+use strict;
+use warnings;
+###############################################################################
+# $Id: //ariba/services/monitor/bin/splunk-map#1 $
+#
+# Copyright (c) 2014 SAP
+#
+###############################################################################
+
+use FindBin;
+use lib ("$FindBin::Bin", "$FindBin::Bin/../lib", "$FindBin::Bin/../lib/perl");
+
+use Data::Dumper;
+use Pod::Usage;
+use Getopt::Long;
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::rc::CipherStore;
+use ariba::rc::Utils;
+use ariba::rc::ServicesCfg;
+
+sub main {
+    my $service;
+    my %map;
+
+    pod2usage( -verbose => 1 ) unless GetOptions(
+        'help|h' => sub { pod2usage( -verbose => 1 ); },
+        'man|m' => sub { pod2usage( -verbose => 2 ); },
+        'service|s=s' => \$service,
+    );
+
+    # Get a list of all installed products.
+    my @products = ariba::rc::InstalledProduct->installedProductsList( $service );
+
+    # For each product get all the hosts on which it runs, both datacenters.  Then for each host
+    # get its providesServices from machinedb.  Using the host-product unique key create a results hash.
+    foreach my $product ( @products ) {
+        my @hosts = $product->allHosts();
+        my $productName = $product->name();
+        foreach my $hostName ( @hosts ) {
+
+            my $hostObj =  ariba::Ops::Machine->new( $hostName );
+            my $providesServices = join( ",", $hostObj->providesServices() );
+
+            $map{ "$hostName-$productName" }->{ 'product' } = $productName;
+            $map{ "$hostName-$productName" }->{ 'host' } = $hostName;;
+            $map{ "$hostName-$productName" }->{ 'services' } = $providesServices;
+        }
+    }
+
+    # Write the hash to a file.  Format the output host|product|providesServices
+    my $file = '/tmp/splunk.txt';
+    open( my $fh, '>', $file );
+    foreach my $key ( sort keys( %map )) {
+        my $line = $map{ $key }->{ 'host' } . "|" .
+                   $map{ $key }->{ 'product' } . "|" .
+                   $map{ $key }->{ 'services' } . "\n";
+        print $fh $line;
+    }
+    close $fh;
+
+    # Create a cipherstore object and extract the mon<service> password.
+    my $cipher = ariba::rc::CipherStore->new( $service );
+    my $user = "mon$service";
+    my $pass = $cipher->valueForName($user);
+
+    # Create a ServicesCfg object and get the list of datacenters for this service.
+    my $services = ariba::rc::ServicesCfg->new();
+    my @dataCenters = $services->datacentersForService( $service );
+
+    # Loop each service.  Copy the output file to each splunk-deployment host
+    foreach my $dc ( @dataCenters ) {
+        my %dcHash = (
+            'datacenter' => $dc,
+            'providesServices' => 'splunk-deployment',
+        );
+
+        my @splunkHosts = ariba::Ops::Machine->machinesWithProperties( %dcHash );
+        foreach my $host ( @splunkHosts ) {
+            my $hostName = $host->hostname();
+            my $cmd = "scp $file $user\@$hostName:$file";
+            ariba::rc::Utils::executeRemoteCommand( $cmd, $pass, 0, undef, undef, undef );
+        }
+    }
+}
+
+main();

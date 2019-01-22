@@ -1,0 +1,831 @@
+#!/usr/local/bin/perl -w
+#
+# Walk the mon db and compute our uptime
+#
+
+my $ver = '$Id: //ariba/services/monitor/bin/recent-outages#54 $';
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::DateTime;
+use ariba::monitor::Outage;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Product;
+use Date::Parse;
+use POSIX qw(strftime);
+use Text::Wrap;
+
+$Text::Wrap::columns = 70;
+
+my ($debug, $verbose, $customerView, $archiveStats);
+
+# see ariba::HTTPWatcherPlugin::DeploymentDefaultsUrls
+
+my @fakeSharedServiceProducts = ('fax', 'invoice-signing', 'edi-van', 's4+buyer');
+my @productsForSLAGraphs = qw(an buyer s4);
+
+sub usage {
+	print "Error: $_[0]\n" if $_[0];
+	print "usage: $0 [args below]  (version $ver)\n";
+	print "       -help  this help\n";
+	print "       -product <an|...>\n";
+	print "              You can specify a comma seperated list of products.\n";
+	print "              This list can include conventions such as:\n";
+	print "                  s4+buyer -- report for s4 and buyer merged.\n";		print "                  aes/bp -- report for aes customer bp.\n";
+    print "                  all/bp -- report for customer bp's ASP suite.\n";
+    print "                  aes/bp+anl/bp -- merged aes and anl report for bp.\n";
+	print "       -product-family <shared|asp>\n";
+	print "       -customer display single ASP customer\n";
+	print "       -type <planned|unplanned>\n";
+	print "       -end YYYY-MM-DD]\n";
+	print "       -start YYYY-MM-DD]\n";
+	print "       -report show the previous month's data\n";
+	print "       -verbose display as much as possible from the db\n";
+	print "       -customerView display customer view\n";
+	print "       -lumped display report lumped (instead of monthly)\n";
+	print "       -nodetails skip the details section in the report.\n";
+	print "       -debug\n";
+	print "\n";
+	print "This connects to the monitor product's opsmetrics database\n";
+	print "and summarizes downtimes.  Currently http-watcher is doing\n";
+	print "the monitoring and recording to the db based on the\n";
+	print "RecordStatus column in apps.cfg for products.\n";
+	print "\n";
+	print "This defaults to reporting status on all products with\n";
+	print "downtime for the current month.\n";
+	print "\n";
+	print "The end time is up to but not including the end day.\n";
+	print "-start 2001-08-01 -end 2001-09-01 covers the month of August\n";
+	print "and nothing more.\n";
+	print "\n";
+	exit(1);
+}
+
+sub main {
+	my ($arg, $start, $end, $product, $productFamily, $customer, $qtype, $qmtype, $lumpReport, $noDetails, $report);
+
+	while ( $arg = shift(@ARGV) ) {
+		if ( $arg =~ /^-h/ ) { usage(); next; }
+		if ( $arg =~ /^-d/ ) { $debug = 1; next; }
+		if ( $arg =~ /^-v/ ) { $verbose = 1; next; }
+		if ( $arg =~ /^-a/ ) { $archiveStats = 1; next; }
+		#
+		# have to also accept customerView with no dash for http/cgi usage
+		# which passes it as an arg with ?customerView
+		#
+		if ( $arg =~ /^-?customerView/i ) { $customerView = 1; next; };
+		if ( $arg =~ /^-customer$/ ) { $customer = shift(@ARGV); next; };
+		if ( $arg =~ /^-type$/ ) { $qtype = shift(@ARGV); next; };
+		if ( $arg =~ /^-start/ ) { $start = shift(@ARGV); next; }
+		if ( $arg =~ /^-end/ ) { $end = shift(@ARGV); next; }
+		if ( $arg =~ /^-products?$/ ) { $product = shift(@ARGV); next; }
+		if ( $arg =~ /^-product-family/ ) { $productFamily = shift(@ARGV); next; }
+		if ( $arg =~ /^-lumped/ ) { $lumpReport = 1; next; }
+		if ( $arg =~ /^-nodetails/ ) { $noDetails = 1; next; }
+		if ( $arg =~ /^-report/ ) { $report = 1; next; }
+		usage("Invalid argument: $arg"); 
+	}
+
+	# set to "mon" instead of just undef to allow for testing by non-mon user
+	ariba::monitor::Outage->connect();
+	ariba::monitor::Outage->setDebug($debug);
+
+	if( $ENV{'REQUEST_METHOD'} ){
+		print "Content-Type: text/plain\n\n";
+		if ( $ENV{'QUERY_STRING'} ) {
+			$customerView = 1;
+		} else {
+			$verbose = 1;
+		}
+	} 
+
+	close(STDERR) unless ($debug); # fake products cause product API to spew
+
+	my ($sDate,$eDate);
+
+	if ( defined($start) && defined($end) ) {
+		if ( $start !~ /^\d\d\d\d-\d\d-\d\d$/ ) {
+			usage("Bad start date format");
+		}
+
+		if ( $end !~ /^\d\d\d\d-\d\d-\d\d$/ ) {
+			usage("Bad end date format");
+		}
+
+		if ($start gt $end) {
+			usage("End date must be after start date");
+		}
+
+		$sDate = $start;
+		$eDate = $end;
+	} else {
+		($sDate, $eDate) = ariba::Ops::DateTime::computeStartAndEndDate(time, $report);
+		if( (localtime(time()))[3] >= 4 && !$report) {
+			#
+			# XXX - make eDate now unless we are running in last month mode.
+			# this logic should be in the library, but until I can check all
+			# calling code out, put it here.
+			#
+			my ($s, $min, $h, $d, $mon, $y) = localtime();
+			$eDate = sprintf("%4d-%02d-%02d:%02d:%02d:%02d",
+				$y+1900,$mon+1,$d,$h,$min,$s);
+		}
+	}
+
+	#
+	# product family is really just a fake product internally, so add it here
+	#
+	if($productFamily) {
+		if($product) {
+			$product = join(',', $product, $productFamily);
+		} else {
+			$product = $productFamily;
+		}
+	}
+
+	if ( $customer =~ /,/ ) {
+		print "Comma seperated customer list is not supported.\n";
+		exit 1;
+	}
+
+	if ($qtype) {
+
+		unless ( $qtype =~ /^planned|unplanned$/ ) {
+			print "Invalid type, please specify -type 'planned' or 'unplanned'.\n";
+			exit 1;
+		}
+	
+		if ( $qtype =~ /^planned$/ ) { 
+			$qmtype = 1; 
+		} elsif ( $qtype =~ /^unplanned$/ ) { 
+			$qmtype = 0; 
+		} 
+	} 
+	
+	my @productList = ();
+
+	# jump through some hoops to get real product objects.
+	if ($product && $customer) {
+
+		if( $product =~ /,/ ) {
+			print "Cannot specify comma seperated product list and customer together.\n";
+			exit 1;
+		}
+		checkCustomer($customer, $product); 
+		#
+		# make the fake 'all' product work as expected.
+		#
+		if( $product eq 'all' || $product eq '*' ) {
+			$product .= "/$customer";
+			$customer = undef;
+		}
+
+		@productList = ariba::rc::InstalledProduct->new(lc($product),undef,undef,$customer);
+
+	} elsif ($product) {
+
+		foreach my $prod (split(/,/,$product)) {
+			# grab all the ASP products
+			if (ariba::rc::Globals::isASPProduct($prod)) {
+
+				push(@productList,ariba::rc::InstalledProduct->installedProductsList(undef, $prod));
+
+			} elsif ($product eq 'asp') {
+
+				my $customers;
+				foreach my $prod (ariba::rc::InstalledASPProduct->installedProductsList()) {
+					next unless($prod->customer());
+					$customers->{$prod->customer()}->{$prod->name()} = 1;
+					print "add ", $prod->name(), "/", $prod->customer(), "\n" if($debug);
+				}
+
+				foreach my $cust (keys %$customers) {
+					my @prod = keys %{$customers->{$cust}};
+					if(scalar @prod == 1) {
+						my $p = $prod[0] . "/" . $cust;
+						push(@productList,ariba::rc::InstalledProduct->new(lc($p)));
+						print "\@prod == 1, adding $p\n" if ($debug);
+					} elsif (scalar @prod == 2) {
+						my $p = $prod[0] . "/" . $cust;
+						$p .= "+";
+						$p .= $prod[1] . "/" . $cust;
+						push(@productList,ariba::rc::InstalledProduct->new(lc($p)));
+						print "\@prod == 2, adding $p\n" if ($debug);
+					} else {
+						push(@productList,ariba::rc::InstalledProduct->new(lc("all/$cust")));
+						print "else, adding all/$cust\n" if ($debug);
+					}
+				}
+
+			} elsif ($product eq 'shared') {
+
+				foreach my $prod (ariba::rc::InstalledProduct->installedProductsList()) {
+					next if($prod->customer());
+					push(@productList,$prod);
+
+				}
+
+				foreach my $prod ( @fakeSharedServiceProducts ) {
+					push @productList, ariba::rc::Product->new($prod);
+				}
+			
+			} else {
+
+				#
+				# this will create dummys for fax, ss-suite, and any other
+				# $product/$customer or $product1+$product2 combinations
+				#
+
+				push(@productList,ariba::rc::InstalledProduct->new(lc($prod)));
+			}
+		}
+
+	} elsif ( $customer ) {
+
+		my $prod = "all/$customer";
+		checkCustomer($customer); 
+		push(@productList,ariba::rc::InstalledProduct->new(lc($prod)));
+
+	} else {
+
+		my @allInstalledProducts = ariba::rc::InstalledProduct->installedProductsList();
+		my @productsInDowntimeDatabase = getProductListFromDatabase($sDate, $eDate);
+		my %uniqHash;
+
+		for my $p ( @allInstalledProducts, @productsInDowntimeDatabase ) {
+			my $key;
+			$key = $p->name() . "/" . $p->buildName();
+			$key .= "/". $p->customer() if ($p->customer());
+			$uniqHash{$key} = $p;
+		}
+		@productList = values(%uniqHash);
+
+		# Stuff the fake fax and ss-suite products onto the list too.
+		foreach my $prod ( @fakeSharedServiceProducts ) {
+			push @productList, ariba::rc::Product->new($prod);
+		}
+	}
+
+	if($lumpReport) {
+		summarizeDowntimeOverRange($sDate, $eDate, \@productList, 1, $noDetails, $qmtype);
+	} else {
+		#
+		# break this into montly blocks
+		#
+		while($sDate ne $eDate) {
+			my $tmpEnd = nextMonth($sDate);
+			if(ariba::Ops::DateTime::oracleToTimestamp($tmpEnd) > ariba::Ops::DateTime::oracleToTimestamp($eDate)) {
+				$tmpEnd = $eDate;
+			}
+
+			summarizeDowntimeOverRange($sDate, $tmpEnd, \@productList, 0, $noDetails, $qmtype);
+
+			$sDate = $tmpEnd;
+		}
+	}
+}
+
+sub nextMonth {
+	my $tm = shift;
+
+	my ( $y, $m, $d ) = split(/-/,$tm,3);
+
+	$m++;
+	if($m == 13) { $y++; $m = 1; }
+
+	my $ret = sprintf("%4d-%02d-%s", $y, $m, $d);
+
+	return($ret);
+}
+
+sub getProductListFromDatabase {
+	my $sDate = shift;
+	my $eDate = shift;
+
+	my $dateInRange = dateInRangeSQL($sDate, $eDate);
+	my @products    = ();
+
+	print "dateInRange: [$dateInRange]\n" if $debug;
+
+	# this pulls both the product name and customer name.
+	# backwards compatiblity - always have AN even if there is no downtime.
+	my @productList = ariba::monitor::DowntimeEntry->productList($dateInRange);
+
+	push @products, ariba::rc::InstalledProduct->new('an');
+
+	# 
+	for my $product (@productList) {
+
+		next if grep { /^an$/ } $product->[0];
+
+		push @products, ariba::rc::InstalledProduct->new($product->[0],undef,undef,$product->[1]);
+	}
+
+	return @products;
+}
+
+sub dateInRangeSQL {
+	my $sDate = shift;
+	my $eDate = shift;
+
+	my $esql;
+	my $format = '%Y-%m-%d:%H:%M:%S';
+
+	# adjust to UTC
+	my $ssql = strftime($format, localtime(dateToTime($sDate)));
+
+	if ($eDate =~ m/-/) {
+		$esql = strftime($format, localtime(dateToTime($eDate)));
+	} else {
+		$esql = strftime($format, localtime());
+	}
+
+	if (wantarray()) {
+		return ($ssql, $esql);
+	} else {
+		return "timestamp between '$ssql' and '$esql'";
+	}
+}
+
+sub summarizeDowntimeOverRange {
+	my $sDate = shift;
+	my $eDate = shift;
+	my $products = shift;
+	my $lumpedReport = shift;
+	my $noDetails = shift;
+	my $qmtype = shift;
+	my %queries;
+	my %seenProduct;
+
+	# hand this to the sql statement.
+	($sDate,$eDate) = dateInRangeSQL($sDate, $eDate);
+
+	print "dateInRange: [timestamp between $sDate and $eDate]\n" if $debug;
+
+	# sort these by name under each shared service and asp product.
+	my %sortedProducts = ();
+
+	for my $prod (sort { $a->name() cmp $b->name() } @$products) {
+
+		print "sorting ", $prod->name(), "\n" if($debug);
+
+		if ($prod->isSharedServiceProduct()) {
+			push @{$sortedProducts{'shared'}}, $prod;
+		} else {
+			push @{$sortedProducts{'asp'}}, $prod;
+		}
+	}
+
+	for my $prod (@{$sortedProducts{'shared'}}, @{$sortedProducts{'asp'}}) {
+
+		my $product  = $prod->name();
+		my $customer = $prod->customer();
+
+		next if($seenProduct{"$product$customer"});
+		$seenProduct{"$product$customer"} = 1;
+
+		if ($debug) {
+			print "Checking product $product\n";
+			print "for customer: $customer\n" if $customer;
+		}
+
+		my (@outages) = ();
+
+		@outages = ariba::monitor::Outage->entriesForDateRangeAndProductAndCustomer(
+			$sDate, $eDate, $product, $customer, $qmtype
+			);
+
+		my $totalTime = dateToTime($eDate) - dateToTime($sDate);
+		my ($totalCount, $totalDowntime) = ariba::monitor::Outage->totalDowntime(@outages);
+		my ($unplannedCount, $unplannedDowntime) = ariba::monitor::Outage->unplannedDowntime(@outages);
+		my ($plannedCount, $plannedDowntime) = ariba::monitor::Outage->plannedDowntime(@outages);
+		my ($slaCount, $slaUnplannedDowntime) = ariba::monitor::Outage->SLADowntime(@outages);
+
+
+		my $uptimePercent = 0.00;
+		$uptimePercent = sprintf("%.2f", ($totalTime - $totalDowntime) / ($totalTime - $plannedDowntime) * 100) if($totalTime - $plannedDowntime);
+		my $totalUptimePercent = 0.00;
+		$totalUptimePercent = sprintf("%.2f", ($totalTime - $totalDowntime) / $totalTime * 100) if($totalTime);
+		my $slaUptimePercent = 0.00;
+		$slaUptimePercent = sprintf("%.2f", ($totalTime - $slaUnplannedDowntime - $plannedDowntime) / ($totalTime - $plannedDowntime) * 100) if($totalTime - $plannedDowntime);
+
+		print "\n\n\n";
+
+		if ( $customerView ) {
+			print "*** FOR ARIBA CUSTOMERS ONLY ***\n";
+		} else {
+			print "*** ARIBA CONFIDENTIAL INFORMATION: DO NOT DISTRIBUTE ***\n";
+		}
+
+		print "\n";
+		print "Availability Report for ";
+		if($product =~ m|[/+]|) {
+			my @list;
+			foreach my $p (split(/\+/, $product)) {
+				$p = uc($p);
+				if($p =~ m|([^/]+)/(\w+)|) {
+					$p = $1;
+					my $c = $2;
+
+					if($p eq '*') {
+						push(@list, "$c (ALL)");
+					} else {
+						push(@list, "$c ($p)");
+					}
+				} else {
+					push(@list, "$p");	
+				}
+			}
+			my $str;
+			if(scalar(@list) > 2) {
+				$str = join(', ',@list);
+				$str =~ s/,([^,]+)$/, AND$1/;
+			} else {
+				$str = join(' AND ',@list);
+			}
+			print "$str\n";
+		} else {
+			print "customer: \U$customer " if $customer;
+			print "\U($product)\n";
+		}
+		print "(with verbose details)\n" if $verbose;
+
+		print "\n";
+		print "Report period: ", dateToString($sDate), " through ", dateToString($eDate), "\n\n";
+		
+		unless ($customerView) {
+			if ($qmtype eq 0) {
+				print "Uptime (excluding planned downtime): $uptimePercent %\n";
+			} elsif ($qmtype eq 1) {
+				print "Uptime (including planned downtime): $totalUptimePercent %\n";
+			} else {
+				print "Uptime (excluding planned downtime): $uptimePercent %\n";
+				print "Uptime (including planned downtime): $totalUptimePercent %\n";
+			}
+		}
+
+		if ($lumpedReport) {
+			print "SLA Uptime: (skipped for lump report)\n\n";
+		} else {
+			print "SLA Uptime: $slaUptimePercent %\n\n";
+		}
+
+		unless ($customerView) {
+			unless (defined($qmtype)) {
+				print "All down times: ", $plannedCount + $unplannedCount, "\n";
+				print "Total of all down time: ", ariba::Ops::DateTime::scaleTime($totalDowntime), "\n";
+			}
+		}
+		unless ($qmtype eq 0) {
+			print "Planned down times:  ",$plannedCount,"\n";
+			print "Total of planned down time: ", ariba::Ops::DateTime::scaleTime($plannedDowntime), "\n";
+		}
+		unless ($customerView) {
+			unless ($qmtype eq 1) {
+				print "Unplanned down times: ",$unplannedCount,"\n";
+				print "Total of unplanned down time: ", ariba::Ops::DateTime::scaleTime($unplannedDowntime), "\n";
+			}
+		}
+		if( $lumpedReport ) {
+			unless ($qmtype eq 1) {
+				print "SLA Unplanned down times: (skipped for lump report)\n";
+				print "Total of SLA unplanned down time: (skipped for lump report)\n";
+			}
+		} else {
+			unless ($qmtype eq 1) {
+				print "SLA Unplanned down times: ",$slaCount,"\n";
+				print "Total of SLA unplanned down time: ", ariba::Ops::DateTime::scaleTime($slaUnplannedDowntime), "\n";
+			}
+		}
+		print "-----------------------------------------\n";
+		unless ( $noDetails ) {
+			print "\n";
+			print "Downtime details for period\n";
+			print "\n";
+
+			print "     No recorded downtime\n" if scalar @outages < 1;
+
+			my @mergedOutages = ariba::monitor::Outage->groupOutages(@outages);
+
+			my $microOutages = 0;
+
+			#
+			# show everything on a lumped report, unless...
+			#
+			$microOutages = ariba::monitor::Outage->microThreshold() if($lumpedReport);
+			#
+			# show no micro outages before the SLA changed
+			#
+			$microOutages = -99999999 if(ariba::Ops::DateTime::oracleToTimestamp($eDate) < ariba::monitor::Outage->SLAChangeTime());
+
+			for my $outage (@mergedOutages) {
+				next unless($verbose || !($outage->badData()));
+				my $type = $outage->planned() ? "planned" : "unplanned";
+
+				$microOutages++ if($type eq "unplanned" && $outage->downtime() < ariba::monitor::Outage->microThreshold());
+				next if ($customerView && $type eq "unplanned" && ($microOutages <= 3 && $outage->downtime() < ariba::monitor::Outage->microThreshold()));
+
+				my ($start, $end);
+				if($outage->downTimestamp()) {
+					$start = localtime($outage->downTimestamp());
+				} else {
+					$start = "undef";
+				}
+				if($outage->upTimestamp()) {
+					$end   = localtime($outage->upTimestamp());
+				} else {
+					$end   = "undef";
+				}
+
+				unless($outage->badData()) {
+					print "     Type: $type\n";
+					print "    Start: $start PT \n";
+					print "      End: $end PT\n";
+					print "   Length: ", ariba::Ops::DateTime::scaleTime($outage->downtime()), "\n";
+					print "\n" if $verbose;
+
+					if ($customerView) {
+						print "\n";
+						next;
+					}
+				}
+
+				my %notes;
+				foreach my $o ($outage->subOutages()) {
+					my $note 	   = $o->note() || '';
+					my $opsnote 	   = $o->opsnote() || '';
+
+					if ($note || $opsnote) {
+
+						$note =~ s/^\s*//g;
+						$note =~ s/\s*$//g;
+
+						push(@{$notes{"$note^^$opsnote"}}, $o->downId());
+					}
+				}
+			
+				displayNotes($verbose, \%notes);
+						%notes = ();
+
+				foreach my $o ($outage->subOutages()) {
+					my $downid		   = $o->downId() ||  99999;
+					my $upid		   = $o->upId() || 99999;
+					my $appName	   = $o->appName();
+					my $planned	   = $o->planned();
+					my $plannedAsString = ($planned) ? "planned" : "unplanned";
+					my $downTime	   = $o->downTimestamp() || "undef";
+					my $upTime	   = $o->upTimestamp() || "undef";
+
+					if ($verbose) {
+						if($downTime eq "undef") {
+							print "* BAD * ";
+							printf("%d %-14s  up->down  %-9s  %s\n",$downid,$appName, 
+								$plannedAsString, $downTime );
+					
+						} else {
+							print "        ";
+							printf("%d %-14s  up->down  %-9s  %s\n",$downid,$appName, 
+								$plannedAsString, localtime($downTime)."" );
+						}
+						if($upTime eq "undef") {
+							print "* BAD * ";
+							printf("%d %-14s  down->up  %-9s  %s\n", $upid, $appName, 
+								$plannedAsString, $upTime );
+						} else {
+							print "        ";
+							printf("%d %-14s  down->up  %-9s  %s\n", $upid, $appName, 
+								$plannedAsString, localtime($upTime)."" );
+							print "\n";
+						}
+					}
+				}
+			}
+		}
+
+		buildSLAQueries(\%queries, $prod, dateToTime($sDate), $slaUnplannedDowntime, $slaUptimePercent, $plannedDowntime);
+
+		# write out metrics to a CDB
+		if ($product eq 'an' && $archiveStats) {
+			writeCDBUptimeStats($prod, $uptimePercent, $totalUptimePercent, $slaUptimePercent);
+		}
+	}
+
+	runSLAQueries(\%queries) if ($archiveStats);
+
+}
+
+sub dateToTime {
+	my $date = shift;
+
+	if ( $date =~ m/-/ ) {
+		return str2time($date);
+	} else {
+		return $date;
+	}
+}
+
+sub dateToString {
+	my $date = shift;
+	my $string;
+
+	if ( $date =~ m/-/ ) {
+		$string = $date;
+		$string =~ s/:/ /;
+	} else {
+		$string = localtime($date);
+	}
+	return $string;
+}
+
+sub displayNotes {
+	my $verbose = shift;
+	my $notes = shift;
+	my %seenNotes;
+	my %seenOpsnotes;
+
+	my (@rows,@notes,@opsnotes) = ();
+
+	while (my ($text,$v) = each %$notes) {
+
+		my ($note,$opsnote) = split /\^\^/, $text;
+
+		push(@notes, $note) if $note and $note !~ /^\s*$/ and !$seenNotes{$note};
+		push(@opsnotes, $opsnote) if $opsnote and $opsnote !~ /^\s*$/ and !$seenOpsnotes{$opsnote};
+		push(@rows, @$v);
+
+		$seenNotes{$note} = 1;
+		$seenOpsnotes{$opsnote} = 1;
+	}
+
+	my ($indent, $firstIndent);
+
+	# programatically generated errors
+	if (scalar @notes > 0) {
+
+		if ($verbose) {
+			$indent = "            ";
+			print $indent . "*** ";
+			print "Error for events ", join(", ", sort @rows), ":\n";
+			$indent .= "    ";
+			$firstIndent = $indent;
+		} else {
+			print "    Error: ";
+			$indent = "           ";
+			$firstIndent = " ";
+		}
+
+		print wrap($firstIndent, $indent, @notes) . "\n\n";
+	}
+
+	# and now the ops entered notes
+	if (scalar @opsnotes > 0) {
+
+		if ($verbose) {
+			$indent = "            ";
+			print $indent . "*** ";
+			print "Note for events ", join(", ", sort @rows), ":\n";
+			$indent .= "    ";
+			$firstIndent = $indent;
+		} else {
+			print "    Notes: ";
+			$indent = "           ";
+			$firstIndent = " ";
+		}
+
+		print wrap($firstIndent, $indent, @opsnotes) . "\n\n";
+	}
+}
+
+sub writeCDBUptimeStats {
+	my ($product, $uptimePercent, $totalUptimePercent, $slaUptimePercent) = @_;
+
+	my $name    = $product->name();
+	my $baseDir = "$name/business-metrics/uptime";
+
+	my %queries = (
+
+		"$baseDir/all" => {
+			recordMaxResults => 500,
+			recordDataType => "gauge",
+			recordDBFileName => "$baseDir/all",
+			perl => "return $totalUptimePercent",
+                },
+
+		"$baseDir/sla" => {
+			recordMaxResults => 500,
+			recordDataType => "gauge",
+			recordDBFileName => "$baseDir/sla",
+			perl => "return $slaUptimePercent",
+                },
+
+		"$baseDir/unplanned" => {
+			recordMaxResults => 500,
+			recordDataType => "gauge",
+			recordDBFileName => "$baseDir/unplanned",
+			perl => "return $uptimePercent",
+                },
+	);
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails('business-metrics', $name, $product->service(), 'business-metrics', \%queries);
+
+	$qm->run();
+
+	if ($debug) {
+		$qm->displayToStdout();
+	} else {
+		$qm->archiveResults();
+	}
+}
+
+sub checkCustomer {
+	my $customer = shift;
+	my $product = shift;
+	my @products;
+	my $isInstalled = 0;
+
+	if ($product && ariba::rc::Globals::isASPProduct($product)) {
+		push(@products, $product);
+	} else {
+		push(@products, ariba::rc::Globals::allASPProducts);
+	}
+
+	my $me = ariba::rc::InstalledProduct->new(); 
+	foreach $product (@products) {
+		$isInstalled = ariba::rc::InstalledProduct->isInstalled($product, $me->service(), undef, $customer);
+		last if ($isInstalled);
+	}
+
+	unless ($isInstalled) {
+		print "$customer is not a valid customer.\n";
+		exit(1);
+	}
+}
+
+sub buildSLAQueries {
+	my $queriesRef = shift;
+	my $prod = shift;
+	my $recordTime = shift;
+	my $slaUnplannedDowntime = shift;
+	my $slaUptimePercent = shift;
+	my $plannedDowntime = shift;
+
+	my $product = $prod->name();
+	my $customer = $prod->customer();
+	return unless (grep(/^$product$/, @productsForSLAGraphs));
+
+	# %.0f does round up - this is desired behavior. TMID: 92808
+	my $slaUnplannedDowntimeInMinutes = sprintf('%.0f', $slaUnplannedDowntime / 60);
+	my $plannedDowntimeInMinutes = sprintf('%.0f', $plannedDowntime / 60);
+	$product .= "/$customer" if ($customer);
+
+	$queriesRef->{"$product SLA unplanned downtime"} = {
+		info	=> 1,
+		perl	=> sub { return $slaUnplannedDowntimeInMinutes; },
+		format	=> '%d mins(s)',
+		uiHint	=> 'SLA',
+		recordTime			=> $recordTime,
+		recordMaxResults	=> 500,
+		recordDataUnits		=> 'minute(s)',
+	};
+
+	$queriesRef->{"$product SLA uptime"} = {
+		info	=> 1,
+		perl	=> sub { return $slaUptimePercent; },
+		format	=> '%.2f%%',
+		uiHint	=> 'SLA',
+		recordTime			=> $recordTime,
+		recordMaxResults	=> 500,
+		recordDataUnits		=> 'percent',
+	};
+
+	$queriesRef->{"$product planned downtime"} = {
+		info	=> 1,
+		perl	=> sub { return $plannedDowntimeInMinutes; },
+		format	=> '%d mins(s)',
+		uiHint	=> 'SLA',
+		recordTime			=> $recordTime,
+		recordMaxResults	=> 500,
+		recordDataUnits		=> 'minute(s)',
+	};
+}
+
+sub runSLAQueries {
+	my $queriesRef = shift;
+
+	return unless (%$queriesRef);
+
+	my $me = ariba::rc::InstalledProduct->new();
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails('downtime', $me->name(), $me->service(), $me->customer(), $queriesRef);
+	$qm->processQueriesUsingServer($debug);
+}
+
+main();
+
+__END__

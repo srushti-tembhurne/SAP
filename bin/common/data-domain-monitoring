@@ -1,0 +1,100 @@
+#!/usr/local/bin/perl -w
+# $Id: //ariba/services/monitor/bin/common/data-domain-monitoring#1 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::CircularDB;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::monitor::misc;
+use ariba::SNMP::Session;
+use ariba::Ops::Machine;
+use Data::Dumper;
+my $debug = 0;
+my @nicports = qw/veth0 ethMe ethMf/;
+
+sub main {
+        my $sendEmail = 0;
+        my $sendPage = 0;
+
+        while(my $arg=shift(@ARGV)){
+                if($arg =~ /^-d/o){ $debug++ ; };
+                if($arg =~ /^-e/o){ $sendEmail = 1; };
+                if($arg =~ /^-p/o){ $sendPage = 1; };
+        }
+
+        my $me = ariba::rc::InstalledProduct->new();
+        my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+        my $cluster = $me->currentCluster();
+        my $email = $me->default('notify.email');
+
+        for my $datacenter ( @dataCenters ) {
+
+                my %matchDatacenter = (
+                        status => 'inservice',
+                        datacenter => $datacenter,
+                        os => 'ddos'
+                );
+
+                my @machines = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+                my %queries  = ();
+                my $nicStatus = {};
+                for my $machine (@machines) {
+                        my $hostname = $machine->hostname();
+                        print "dd hostname : $hostname \n" if($debug);
+
+                        my $snmp    = ariba::SNMP::Session->newFromMachine($machine) || next;
+                        foreach my $nicport(@nicports) {
+
+                                 ($nicStatus->{$nicport}->{"Admin Status"},$nicStatus->{$nicport}->{"Operational Status"}) = nicWalkOidExpr($snmp,$machine,"ifDescr.0",$nicport);
+                                foreach my $status ("Admin Status","Operational Status") {
+
+
+                                        $queries{"$nicport $status"} = {
+                                                info => "answer eq 'up'",
+                                                crit => "answer ne 'up'",
+                                                severity => 1,
+                                                 correctiveActions => [
+                                                  Ops => '1) Call and  Send email to SA team DL_52D970AADF15DB6F7301031A@exchange.sap.corp',
+                                                ],
+                                                perl => sub {return $nicStatus->{$nicport}->{$status};},
+                                        };
+                                }
+                        }
+                }
+
+
+                my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+                my $qm = ariba::monitor::QueryManager->newWithDetails(
+                                'Data-Domain-NIC-Status', $tab, $me->service(), $me->customer(), \%queries
+                );
+                $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+        }
+}
+
+sub nicWalkOidExpr {
+    my ($snmp,$machine,$oid,$nic) = @_;
+
+    my $node = {};
+        my %indexes = $snmp->walkOidExpr($oid);
+        print Dumper(\%indexes) if ($debug > 2);
+        for my $index (keys %indexes) {
+            my ($name,$oidNum) =  $index =~ /(\w+)\.(.*)/;
+                my $oidname = $snmp->valueForOidExpr("$index");
+                print "$index => $oidname \n" if($debug > 2);
+                 if($oidname eq $nic) {
+                        my $AdminStatus = $snmp->valueForOidExpr("ifAdminStatus.$oidNum");
+                        my $OperStatus = $snmp->valueForOidExpr("ifOperStatus.$oidNum");
+                        print " $nic AdminStatus \t $AdminStatus \n $nic  OperStatus \t $OperStatus \n" if($debug);
+                        return($AdminStatus,$OperStatus);
+                }
+        }
+        return(0,0);
+}
+
+main();

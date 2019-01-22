@@ -1,0 +1,979 @@
+#!/bin/perl -w
+
+use strict;
+
+use lib '/usr/local/ariba/lib';
+
+use ariba::DBA::SampleSQLQueries;
+use ariba::Ops::NetworkUtils;
+use ariba::rc::Globals;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use File::Basename;
+
+my $debug = 0;
+my $cmdDir = '/usr/symcli/bin';
+
+=pod
+
+=head1 NAME
+
+emc-disk-info
+
+=head1 VERSION
+
+ $Id: //ariba/services/monitor/bin/sysadmin/emc-disk-info#2 $
+ Last modified by $Author: asandbak $ on $Date: 2004/01/21 $
+
+=head1 DESCRIPTION
+
+Show Volume Group and BCV Disk Group information for the current host
+
+=head1 FUNCTIONS
+
+=over 4
+
+=cut
+
+sub usage {
+        print "emc-disk-info\n";
+        print "Show Volume Group and BCV Disk Group information for ".
+		"the current host\n\n";
+
+        print "Usage: ./emc-disk-info <args>\n";
+        print "        -d  Debug\n";
+        print "        -h  This help screen\n\n";
+
+        exit;
+}
+
+
+=item * stdVolumeGroups(\@lvmtab)
+
+Return an array of the names of all visible VGs.
+
+=cut
+
+sub stdVolumeGroups {
+	my $lvmtab = shift;
+
+	my @allGroups = glob '/dev/*/group';
+
+	my @groups;
+
+	for my $group (@allGroups) {
+		#
+		# Only include volume groups that appear in lvmtab
+		#
+		next unless grep { $_ . "/group" eq $group } @{$lvmtab};
+
+		#
+		# Strip leading and trailing path info. We want the middle item
+		# /dev/c0xdeadbeef/group
+		#      ^^^^^^^^^^^
+		#
+		$group =~ s/\/.*?\/(.*?)\/.*/$1/;
+
+		next if $group =~ /vg00/;
+
+		push(@groups, $group);
+	}
+
+	return \@groups;
+}
+
+
+=pod
+
+=item * bcvDiskGroups($sudoCmd)
+
+Return a hash reference containing a mapping of BCV disk groups to their
+standard (std) and locally associated BCV (bcv) devices. This is generated
+by scraping the output of `symdg list` and then doing a `symdg show` for
+each disk group.
+
+Each element in the returned hash reference looks like:
+		
+ $name = {
+   'std' => {
+     'ldev' => \@{LdevNames},
+     'pdev' => \@{PdevNames},
+     'lun' => \@{SymDevs}
+   },
+
+  'bcv' => {
+    'ldev' => \@{LdevNames},
+    'pdev' => \@{PdevNames},
+    'lun' => \@{SymDevs},
+   }
+ }
+
+=cut
+
+sub bcvDiskGroups {
+	my $sudoCmd = shift;
+
+	my @symdgList = split(/\n/, `$sudoCmd $cmdDir/symdg list`);
+#
+# `symdg list` output looks like:
+# 
+#    ...
+#
+#                                                       Num of   Num of  Num of
+#    Name               Type     Valid  Symmetrix ID    Devices  GK's    BCV's 
+#
+#    ora04a-1           REGULAR  Yes    000184501141       3        0       3
+#    ora01a-1           REGULAR  Yes    000184501141       1        0       1
+#    ora02a-1           REGULAR  Yes    000184501141       1        0       1
+#    ora05a-1           REGULAR  Yes    000184501141       2        0       2
+#    ora06a-1           REGULAR  Yes    000184501141       1        0       1
+#
+
+	#
+	# Throw away the first 6 lines of `symdb list` output, it's not useful
+	#
+	for (my $i = 0; $i < 6; $i++) {
+		shift @symdgList;
+	}
+
+	my %diskGroups;
+
+	for my $row (@symdgList) {
+		$row =~ s/^\s+//;
+
+		my (
+			$name, $type, $valid, $symmetrix,
+			$devices, $gks, $bcvs
+		) = split (/\s+/, $row);
+
+		my $symdgShow = `$sudoCmd $cmdDir/symdg show $name`;
+
+#
+# `symdg show <group>` output looks like:
+#
+#    ...
+#
+#    Standard (STD) Devices (3):
+#        {
+#        --------------------------------------------------------------------
+#                                                      Sym               Cap 
+#        LdevName              PdevName                Dev  Att. Sts     (MB)
+#        --------------------------------------------------------------------
+#        DEV001                /dev/rdsk/c3t0d7        0008      RW     12331
+#        DEV002                /dev/rdsk/c3t1d0        0009      RW     12331
+#        DEV003                /dev/rdsk/c3t1d3        000C      RW     12331
+#        }
+#
+#        
+#    BCV Devices Locally-associated (3):
+#        {
+#        --------------------------------------------------------------------
+#                                                      Sym               Cap 
+#        LdevName              PdevName                Dev  Att. Sts     (MB)
+#        --------------------------------------------------------------------
+#        BCV001                /dev/rdsk/c3t10d7       00CE      RW     12331
+#        BCV002                /dev/rdsk/c3t11d1       00D0      RW     12331
+#        BCV003                /dev/rdsk/c3t11d2       00D1      RW     12331
+#        BCV024                /dev/rdsk/c6t1d7        00E9 (M)  RW     69716
+#        }
+#
+
+		my (@stdLDev, @stdPDev, @stdLun);
+		my (@bcvLDev, @bcvPDev, @bcvLun);
+
+		for my $line ( split(/\n/, $symdgShow) ) {
+			$line =~ s|^\s*||;
+			$line =~ s|\s*$||;
+
+			if ($line &&
+				($line =~ /^DEV\d+/ || $line =~ /^BCV\d+/)
+			) {
+				$line =~ s/\(M\)\s+/\(M\)/;
+
+				my (
+					$dev, $pDev, $lun, $stats, $size
+				) = split(/\s+/, $line);
+
+				$pDev =~ s/.*\///;
+
+				if ($dev =~ /^DEV/) {
+					push (@stdLDev, $dev);
+					push (@stdPDev, $pDev);
+					push (@stdLun, $lun);
+				} elsif ($dev =~ /^BCV/) {
+					push (@bcvLDev, $dev);
+					push (@bcvPDev, $pDev);
+					push (@bcvLun, $lun);
+				}
+			}
+		}
+
+		$diskGroups{$name} = {
+		  'std' => {
+		    'ldev' => \@stdLDev,
+		    'pdev' => \@stdPDev,
+		    'lun' => \@stdLun
+		  },
+
+		  'bcv' => {
+		    'ldev' => \@bcvLDev,
+		    'pdev' => \@bcvPDev,
+		    'lun' => \@bcvLun
+		  }
+		}
+	}
+
+	return \%diskGroups;
+}
+
+
+=pod
+
+=item * detailsOfAllLocalDevices(\@lvmtab, \%dgsRef, $sudoCmd)
+
+Return a hash of known disk devices with their meta-information. This
+is mapped from the output of `sympd list`.
+
+Each element in the hash is an anonymous hash reference, formed as follows:
+
+ {
+   'lun'    => $lun,
+   'sa'     => $sa,
+   'da'     => $da,
+   'config' => $config,
+   'attrib' => $attrib,
+   'status' => $status,
+   'size'   => $size,
+   'used'   => $used (we figure this out on our own)
+ }
+
+=cut
+
+sub detailsOfAllLocalDevices {
+	my $lvmtab = shift;
+	my $dgsRef = shift;
+	my $sudoCmd = shift;
+
+	#
+	# This array is for telling if a BCV disk is in use or not
+	#
+	my %bcvLuns;
+
+	for my $group (keys %{$dgsRef}) {
+		for my $type (keys %{$dgsRef->{$group}}) {
+			for my $lun ( @{$dgsRef->{$group}->{$type}->{'lun'}} ) {
+				$bcvLuns{$lun} = 1;
+			}
+		}
+	}
+
+	my %devices;
+
+	my $sympdList = `$sudoCmd $cmdDir/sympd list`;
+
+#
+# Here's what we're scraping:
+#
+#        Device Name          Directors                  Device                
+# ------------------------- ------------- -------------------------------------
+#                                                                          Cap 
+# Physical             Sym  SA :P DA :IT  Config        Attribute    Sts   (MB)
+# ------------------------- ------------- -------------------------------------
+# /dev/rdsk/c8t13d3    00E2 03A:0 15B:C1  BCV           N/Asst'd     RW   12331
+# /dev/rdsk/c8t15d0    00E3 03A:0 16B:D1  2-Way Mir     N/Grp'd      RW       3
+# /dev/rdsk/c8t2d1     0142 03A:0 16A:D2  2-Way Mir     N/Grp'd      RW   12331
+#
+# What is all this stuff?
+#
+# PD: Physical Device name given to the Symm Device by the host system. 
+# Symm ID: Symm serial number (We call this the LUN)
+# SA (FA) Port: Front end connection to which the DEV is shown. (Fibre Adapter)
+# DA: IT: The back end connection map to the physical location of the DEV.
+# Config: The striping (use this to determine if it's a BCV disk)
+# Attribute: The new Symm CLI software allows grouping of DEVs.
+# Status: Read Write, Write Disabled, etc...
+# Size: Size in MB.
+#
+# DEV: A HEX numeric designator for a Symm Logical Volume, device, slice.
+#
+
+	my $symmetrixID = 0;
+
+	if ($sympdList =~ /Symmetrix ID: (\d+)/) {
+		$symmetrixID = $1;
+	}
+
+	for my $entry ( split /\n/, $sympdList ) {
+		$entry =~ s/ Mir/Mir/; # Space in '2-Way Mir' throws us off by 1
+
+		#
+		# Is this entry a meta-volume? This is denoted by (M)
+		#
+		my $metaVol = ($entry =~ s/\s+\(M\)/\(M\)/) ? 1 : 0;
+
+		my (
+	  	  $device, $lun, $sa, $da, $config,
+	  	  $attrib, $status, $size
+		) = split /\s+/, $entry;
+
+		next if !$size || $size =~ /[^\d]/ || $size <= 3000;
+
+		$device =~ s/rdsk/dsk/;
+
+		my $used = 0;
+
+		if ($config eq 'BCV') {
+			$used = 1 if (grep { $_ eq $lun } keys %bcvLuns);
+		} else {
+			$used = 1 if (grep { $_ eq $device } @{$lvmtab});
+		}
+
+		$device = basename($device);
+
+		chomp $device;
+
+		$devices{$device} = {
+			'lun'    => $lun,
+			'sa'     => $sa,
+			'da'     => $da,
+			'config' => $config,
+			'attrib' => $attrib,
+			'status' => $status,
+			'size'   => $size,
+			'used'   => $used,
+			'meta'   => $metaVol
+		};
+	}
+
+	return \%devices, $symmetrixID
+}
+
+
+=pod
+
+=item * detailsOfDevicesForVolumeGroup($vg, \%devices, \@lvmtab)
+
+Return a hash reference containing any elements from %devices which are
+part of the received volume group ($vg).
+
+=cut
+
+sub detailsOfDevicesForVolumeGroup {
+	my $vg = shift;
+	my $devicesRef = shift;
+	my $lvmtabRef = shift;
+
+	my @devList;
+
+	my @lvmtab = @{$lvmtabRef};
+
+	my %vgDevices;
+
+	for (my $i = 0; $i < @lvmtab; $i++) {
+		my $device = $lvmtab[$i];
+
+		next if $device =~ /vg00/;
+
+		if ($device eq "/dev/$vg") {
+			for (my $j = $i + 1; $j < @lvmtab; $j++) {
+				#
+				# Noise from doing `strings` on lvmtab- skip
+				#
+				next unless $lvmtab[$j] =~ /\//;
+
+				#
+				# Probably hit the next VG- we're done here
+				#
+				last unless $lvmtab[$j] =~ /^\/dev\/dsk\//;
+
+				my $dev = basename($lvmtab[$j]);
+
+				$vgDevices{$dev} = $devicesRef->{$dev};
+			}
+			return \%vgDevices;
+		}
+	}
+}
+
+
+=pod
+
+=item * lunsAndChansForVolumeGroup($vg, \%devices, \@lvmtab, \%vgDevicesRef)
+
+Return arrays of all used luns, used FAs, unused luns, and unused FAs for the received VG name. 
+
+=cut
+
+sub lunsAndChansForVolumeGroup {
+	my $vg = shift;
+	my $devices = shift;
+	my $lvmtab = shift;
+	my $vgDevicesRef = shift;
+
+	my %vgDevices = %{$vgDevicesRef};
+
+	my %devices = %{$devices};
+
+	my %usedLuns;
+	my %unusedLuns;
+	my %usedFibrechans;
+	my %unusedFibrechans;
+
+	for my $deviceName ( keys( %vgDevices ) ) {
+		my %device = %{$devices{$deviceName}};
+
+		$usedLuns{$device{'lun'}} = 1 if $device{'used'} == 1;
+		$unusedLuns{$device{'lun'}} = 1 if $device{'used'} == 0;
+	}
+
+	my @usedLuns = sort(keys(%usedLuns));
+	my @unusedLuns = sort(keys(%unusedLuns));
+
+	for my $lun (@usedLuns, @unusedLuns) {
+		for my $dsk (keys(%devices)) {
+			my %device = %{$devices{$dsk}};
+			if ($device{'lun'} eq $lun) {
+				$usedFibrechans{$device{'sa'}} = 1 if $device{'used'} == 1;
+				$unusedFibrechans{$device{'sa'}} = 1 if $device{'used'} == 0;
+			}
+		}
+	}
+
+	my @usedChans = keys(%usedFibrechans);
+	my @unusedChans = keys(%unusedFibrechans);
+
+	return (\@usedLuns, \@usedChans, \@unusedLuns, \@unusedChans);
+}
+
+
+=pod
+
+=item * dbInstancesToVolumeGroups()
+
+Return a hash reference containing a mapping of DB instances
+(ie ANDEV, AESPRO1) to volumes.
+
+=cut
+
+sub dbInstancesToVolumeGroups {
+	my %dbinstancesToVolumeGroups;
+
+	for my $service (ariba::rc::Globals::allServices()) {
+		next unless( ariba::rc::InstalledProduct->isInstalled('mon', $service) );
+
+		my $mon = ariba::rc::InstalledProduct->new('mon', $service);
+		my @products = ariba::rc::InstalledProduct->installedProductsList($service);
+		my @connections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+		my @uniqueDbcs = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections);
+		for my $dbc (@uniqueDbcs) {
+			my @results;
+
+			eval { @results = ariba::DBA::SampleSQLQueries::executeSQLQuery($mon, "getVolume", $dbc) };
+
+			#
+			# Don't let failure to determine DB instance kill us
+			#
+			next if $@;
+
+			my $sid = lc($dbc->sid());
+			my $volume;
+			for my $path (@results) {
+
+				if ($path =~ /oradata/) {
+					$path =~ s/\/oradata.*//;
+
+					$volume = $path;
+					if (-l $volume) {
+						$volume = readlink($volume);
+					}
+					$volume =~ s|^/||;
+					unless( grep(/^$volume$/, @{$dbinstancesToVolumeGroups{$sid}}) ) {
+						push(@{$dbinstancesToVolumeGroups{$sid}}, $volume);
+					}
+				}
+			}
+		}
+	}
+
+	return \%dbinstancesToVolumeGroups;
+}
+
+
+=pod
+
+=item * dbInstancesForVolumeGroup($vg, $dbInstancesToVolumeGroupsRef)
+
+=cut
+
+sub dbInstancesForVolumeGroup {
+	my $vg = shift;
+	my $dbInstancesToVolumeGroupsRef = shift;
+
+	my %sids;
+
+	for my $sid (keys(%{$dbInstancesToVolumeGroupsRef})) {
+		my @vgs = @{$dbInstancesToVolumeGroupsRef->{$sid}};
+
+		if ( grep (/^$vg$/, @vgs) ) {
+			$sids{$sid} = 1;
+		}
+	}
+
+	return keys(%sids);
+}
+
+
+=pod
+
+=item * dbInstancesForDiskGroup($dg, $dbInstancesToVolumeGroupsRef)
+
+=cut
+
+sub dbInstancesForDiskGroup {
+	my $dg = shift;
+	my $dbInstancesToVolumeGroupsRef = shift;
+
+	my $vg = $dg;
+	$vg =~ s/-\d+//;
+
+	return dbInstancesForVolumeGroup($vg, $dbInstancesToVolumeGroupsRef);
+}
+
+
+=pod
+
+=item * volumesForDbInstances($dbinstances, $dbInstancesToVolumeGroupsRef)
+
+=cut
+
+sub volumesForDbInstances {
+	my $dbinstances = shift;
+	my $dbInstancesToVolumeGroupsRef = shift;
+
+	my @volumes = ();
+
+	if (defined ($dbInstancesToVolumeGroupsRef->{$dbinstances}) ) {
+		@volumes = @{$dbInstancesToVolumeGroupsRef->{$dbinstances}};
+	}
+
+	return @volumes;
+}
+
+
+=pod
+
+=item * printLunsAndChans($luns, $chans)
+
+Pretty-print the received LUN and Fibre Adapter information to STDOUT
+
+=cut
+
+sub printLunsAndChans {
+	my $luns = shift;
+	my $chans = shift;
+	my $used = shift;
+
+	my %usedBool = (
+		'0' => 'Unused',
+		'1' => '  Used'
+	);
+
+	if (scalar @{$luns} > 0) {
+		print $usedBool{$used} ." LUNs: ";
+
+		my $i = 0; for my $lun (@{$luns}) {
+			$i++; print "$lun ";
+
+			if ($i == 10) {
+				$i = 0; print "\n             ";
+			}
+		}
+
+		print "\n ". $usedBool{$used} ." FAs: ".
+			join(', ', @{$chans}) . "\n";
+	}
+}
+
+
+=pod
+
+=item * diskUsageForVolumeGroup($vg)
+
+Make a system call to Berkeley 'df' to gather usage info for the received
+volume group. Returns the VG's size and the % that is in use.
+
+=cut
+
+sub diskUsageForVolumeGroup {
+	my $vg = shift;
+
+	return(undef, undef, undef) unless -e "/$vg";
+
+	#
+	# This is what we're scraping:
+	#
+	# Filesystem          kbytes    used   avail %used Mounted on
+	# /dev/ora02a/ora02a 239075328 66289856 171435592   28% /ora02a
+	#
+
+	my @df = split( /\n/, `bdf /$vg` );
+	@df = split( /\s+/, $df[1] );
+
+	my $mountPoint = $df[5];
+	return(undef, undef, undef) unless $mountPoint eq "/$vg";
+
+	my $total;
+
+	if ($df[1] > (1024*1024)) {
+		$total = $df[1] / (1024*1024);
+		$total =~ s/\..*//;
+		$total .= "gb"
+	} else {
+		$total = $df[1] ."kb";
+	}
+
+	my $free;
+
+	if ($df[3] > (1024*1024)) {
+		$free = $df[3] / (1024*1024);
+		$free =~ s/\..*//;
+		$free .= "gb"
+	} else {
+		$free = $df[3] ."kb";
+	}
+
+	return ($total, $free, $df[4]);
+}
+
+
+=pod
+
+=item * diskInfoForLun($lun, $sudoCmd)
+
+Return an array of the format ('16B, D, 1', '01A, C, 0'), representing
+the physical mirror locations for the received LUN.
+
+=cut
+
+sub diskInfoForLun {
+	my $lun = shift;
+	my $sudoCmd = shift;
+
+	my $symdev = `$sudoCmd $cmdDir/symdev show $lun`;
+
+	my @diskInfo;
+
+	for my $row (split /\n/, $symdev) {
+		#
+		# Looking for this in the symdev output:
+		#
+                # Disk [Director, Interface, TID]        : [16B, D, 1]
+                # Disk [Director, Interface, TID]        : [01A, C, 0]
+
+		if ($row =~ /Disk \[Director, Interface, TID\]\s+: \[(.*?)\]/) {
+			push @diskInfo, $1
+		}
+	}
+
+	return @diskInfo;
+}
+
+
+=pod
+
+=item * printDevices(\%devices)
+
+Print a big table of all devices, keyed by LUN
+
+=cut
+
+sub printDevices {
+	my $devices = shift;
+	my $sudoCmd = shift;
+
+	my $printFmt = " %4s %1s %15s %1s %15s %1s ".
+			"%11s %1s %7s %1s %15s %1s ".
+			"%10s %1s %10s %1s %10s %1s ".
+			"%10s %1s %4s\n";
+
+	printf $printFmt,
+		'LUN', ' ', 'Device1', ' ', 'Device2', ' ',
+		'Type', ' ', 'Size', ' ', 'SIDs', ' ',
+		'DG', ' ', 'VG', ' ', 'Disk1', ' ',
+		'Disk2', ' ', 'Used';
+
+	printf $printFmt,
+		'----', ' ', '---------------', ' ', '---------------', ' ',
+		'-----------', ' ', '-------', ' ', '---------------', ' ',
+		'----------', ' ', '----------', ' ', '----------', ' ',
+		'----------', ' ', '----';
+
+	my $luns = {
+		'0' => {
+			'2-WayMir' => {},
+			'BCV' => {}
+		},
+
+		'1' => {
+			'2-WayMir' => {},
+			'BCV' => {}
+		}
+	};
+
+	my %usedBool = (
+		'0' => 'No',
+		'1' => 'Yes'
+	);
+
+	#
+	# Reverse-map the %devices hash to a hash which keys on LUN
+	#
+	for my $deviceName (keys %{$devices}) {
+		#
+		# Shortcut to the current device
+		#
+		my %device = %{ $devices->{$deviceName} };
+
+		#
+		# Shortcut to this device's hash element in %luns
+		#
+		my $lunToDevices = $luns->{ $device{'used'} }->{ $device{'config'} }->{ $device{'lun'} };
+
+		#
+		# deviceKey is either device1 or device2, depending on if we've
+		# already seen a device for this LUN or not.
+		#
+		my $deviceKey = '';
+
+		if ($lunToDevices->{'device1'}) {
+			$deviceKey = 'device2';
+		} else {
+			$deviceKey = 'device1';
+		}
+
+		if ($device{'config'} eq 'BCV') {
+			#
+			# If this is a BCV device, there should not be any
+			# associated volume groups. If there are, flag the
+			# volume group name with a '!' to indicate a possible
+			# misconfiguration
+			#
+			if ($device{'vg'}) {
+				$lunToDevices->{'vg'} = "! ". $device{'vg'};
+			}
+
+			#
+			# Flag the device name with a * if this BCV device
+			# is part of a disk group.
+			#
+			if ($device{'dg'}) {
+				$lunToDevices->{$deviceKey} .= "* ";
+				$lunToDevices->{'dg'} = $device{'dg'};
+			}
+		} elsif ( $device{'vg'} ) {
+			$lunToDevices->{'vg'} = $device{'vg'};
+		}
+
+		unless ($lunToDevices->{'type'}) {
+			$lunToDevices->{'type'} = "+ " if $device{'meta'};
+			$lunToDevices->{'type'} .= $device{'config'};
+		}
+
+		# 
+		# LUN: Device1, Device2, Type, Size, SIDs, DG, VG, Used
+		#
+		$lunToDevices->{$deviceKey} .= $deviceName .'@'. $device{'sa'};
+		$lunToDevices->{'sids'} = $device{'sids'} if $device{'sids'};
+
+		#
+		# If there's already a 'device1', then we've already done the
+		# rest of the work needed here.
+		#
+		if ($deviceKey eq 'device2') {
+			$luns->{ $device{'used'} }->{ $device{'config'} }->{ $device{'lun'} } = $lunToDevices;
+			next;
+		}
+
+		my @diskInfo = diskInfoForLun($device{'lun'}, $sudoCmd);
+
+		$lunToDevices->{'disk1'} = shift @diskInfo;
+		$lunToDevices->{'disk2'} = shift @diskInfo || '';
+
+		$lunToDevices->{'size'} = $device{'size'};
+		$lunToDevices->{'used'} = $usedBool{$device{'used'}};
+		$lunToDevices->{'meta'} = $usedBool{$device{'meta'}};
+
+		$luns->{ $device{'used'} }->{ $device{'config'} }->{ $device{'lun'} } = $lunToDevices;
+	}
+
+	for my $usedState ( reverse sort keys %{$luns} ) {
+		for my $type (sort keys %{$luns->{$usedState}}) {
+			for my $lun (sort keys %{$luns->{$usedState}->{$type}}) {
+				my %item = %{$luns->{$usedState}->{$type}->{$lun}};
+
+				printf $printFmt,
+					$lun, '|',
+					$item{'device1'}, '|',
+					$item{'device2'}, '|',
+					$item{'type'}, '|',
+					$item{'size'}, '|',
+					$item{'sids'}, '|',
+					$item{'dg'}, '|',
+					$item{'vg'}, '|',
+					$item{'disk1'}, '|',
+					$item{'disk2'}, '|',
+					$item{'used'};
+			}
+		}
+	}
+
+	print "\n Symbol Key:\n";
+	print " ---------------------------------------\n";
+	print " + = LUN is a meta-volume\n";
+	print " * = BCV Device is a disk group member\n";
+	print " ! = BCV Device is a volume group member\n\n";
+}
+
+
+sub main {
+	while(my $arg = shift @ARGV) {
+		if ($arg =~ /-d/) { $debug = 1 }
+		if ($arg =~ /-h/) { usage(); }
+	}
+
+	#
+	# Prepare for sudo'ing:
+	#
+	my $sudoCmd = ariba::rc::Utils::sudoCmd();
+
+	my $me = ariba::rc::InstalledProduct->new();
+
+	my $user = ariba::rc::Globals::deploymentUser(
+		$me->name(), $me->service()
+	);
+
+	ariba::rc::Utils::refreshSudoPrompt($user);
+
+
+	#
+	# Look up all the info we need to start out with
+	# (lvmtab, all disk groups, all volume groups)
+	#
+	my @lvmtab = split /\n/, `$sudoCmd strings /etc/lvmtab`;
+	my $dgsRef = bcvDiskGroups($sudoCmd);
+	my $vgsRef = stdVolumeGroups(\@lvmtab);
+
+
+	#
+	# Start correlating the info gathered above
+	#
+	my ($devicesRef, $symmetrixID) = detailsOfAllLocalDevices(
+		\@lvmtab, $dgsRef, $sudoCmd
+	);
+
+	my $dbInstancesToVolumeGroupsRef = dbInstancesToVolumeGroups();
+
+
+	#
+	# Append disk group info to $devicesRef for easy display
+	#
+	for my $dg (keys %{$dgsRef}) {
+	        my %info = %{$dgsRef->{$dg}};
+
+		my @sids = dbInstancesForDiskGroup(
+			$dg, $dbInstancesToVolumeGroupsRef
+		);
+
+		for my $pdev (@{$info{'std'}{'pdev'}}) {
+			$devicesRef->{$pdev}->{'sids'} = join(', ', @sids);
+			$devicesRef->{$pdev}->{'dg'} = $dg;
+		}
+
+		for my $pdev (@{$info{'bcv'}{'pdev'}}) {
+			$devicesRef->{$pdev}->{'sids'} = join(', ', @sids);
+			$devicesRef->{$pdev}->{'dg'} = $dg;
+		}
+	}
+
+
+	#
+	# Start printing
+	#
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+
+	print "-----------------------------------------------------------\n";
+	print "$hostname [Symmetrix ID: $symmetrixID]\n";
+	print "-----------------------------------------------------------\n\n";
+
+
+	if (scalar(@{$vgsRef}) > 0) {
+		print "Volume groups visible on $hostname:\n\n";
+	}
+
+	#
+	# Show device info for each volume group
+	#
+	for my $vg (@{$vgsRef}) {
+		my @sids = dbInstancesForVolumeGroup(
+			$vg, $dbInstancesToVolumeGroupsRef
+		);
+
+		# Get list of devices in this VG
+		my $vgDevicesRef = detailsOfDevicesForVolumeGroup(
+			$vg, $devicesRef, \@lvmtab
+		);
+
+		for my $device (keys %{$vgDevicesRef}) {
+			$devicesRef->{$device}->{'vg'} = $vg;
+			$devicesRef->{$device}->{'sids'} = join(', ', @sids);
+		}
+
+		my ($total, $free, $usedPct) = diskUsageForVolumeGroup($vg);
+
+		if (!$total || $total eq 'kb') {
+			print "  ". uc($vg) ." - Not currently mounted\n";
+		} else {
+			print "  ". uc($vg) ." - Using $usedPct of $total, ".
+				"$free free\n";
+		}
+
+		print "       SIDs: ", join(", ", @sids), "\n" if scalar(@sids) > 0;
+
+		my (
+			$usedLuns, $usedChans, $unusedLuns, $unusedChans
+		) = lunsAndChansForVolumeGroup(
+			$vg, $devicesRef, \@lvmtab, $vgDevicesRef
+		);
+
+		if (scalar(@{$usedLuns} > 0)) {
+			printLunsAndChans($usedLuns, $usedChans, 1);
+		}
+
+		if (scalar(@{$unusedLuns} > 0)) {
+			printLunsAndChans($unusedLuns, $unusedChans, 0);
+		}
+
+		print "\n";
+	}
+
+	if (scalar(keys %{$devicesRef}) > 0) {
+		print "Device summary for $hostname:\n\n";
+	}
+
+	printDevices($devicesRef, $sudoCmd);
+}
+
+
+=pod
+
+=back
+
+=head1 AUTHORS
+
+Alex Sandbak <asandbak@ariba.com>, Manish Dubey <mdubey@ariba.com>
+
+Based on 20 lines of shell from Rich Steenburg <rsteenbu@ariba.com>
+
+=cut
+
+main();

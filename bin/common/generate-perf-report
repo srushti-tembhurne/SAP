@@ -1,0 +1,274 @@
+#!/usr/local/bin/perl -w
+#
+# This script generates daily summary and too-slow detail reports of user
+# activity based off of aggregated perf logs.
+#
+
+use strict;
+use DateTime;
+use FindBin;
+use File::Basename;
+
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Perf::Base;
+use ariba::Perf::Daily;
+use ariba::Perf::Monthly;
+use ariba::Perf::TimeRange;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DateTime;
+use dmail::LockLib;
+
+my $verbose = (-t STDIN || -t STDOUT) ? 1 : 0;
+
+sub usage {
+	print "Usage: ", basename($0), " [options] <product> <service>\n";
+	print "Must be run as a mon user\n\n";
+	print "-d          debug, use multiple times to increase verbosity\n";
+	print "\n";
+	print "-saveto     Save a copy of the summary, too slow, and error reports to dir.\n";
+	print "-startdate  start date\n";
+	print "-enddate    end date\n";
+	print "              Date format can be 09/30/2008  or 30/sep/08\n";
+	print "              Either both or neither must be specified\n";
+	print "              Defaults to yesterday (for daily report) or\n";
+	print "              current month (for -monthly)\n";
+	print "\n";
+	print "              For the purposes of daily reports, startdate is\n";
+	print "              inclusive and enddate is exclusive.\n"; 
+	print "              For example, -startdate 08/20/2008 -enddate 08/25/2008\n";
+	print "              will run dailys for 8/20, 8/21, 8/22, 8/23, and 8/24\n";
+	print "\n";
+	print "-monthly    generate monthly report (in addition to daily)\n";
+	print "              all report time spans will be monthly, e.g.\n";
+	print "              -startdate 08/01/2008 -enddate 10/01/2008\n";
+	print "              will do all days from aug 01 to the last day in oct\n";
+	print "\n";
+	print "               For monthly reports both -startdate and -enddate\n";
+	print "               are inclusive.\n";
+	print "               -startdate 08/20/2008 -enddate 10/01/2008 will run\n";
+	print "               monthlys for aug (08), sept (09), and oct (10)\n";
+	print "\n";
+	print "-hours      Sets the hour range (startHour,numOfHours)\n"; 
+	print "              Value is two numbers separated by a comma.\n";
+	print "              First number is startHour and the second is numOfHours.\n";
+	print "              When used, a single report is produced that uses data from the\n";
+	print "              startdate starting on startHour for numOfHours. \n"; 
+	print "              Ex, to report on data from 5pm to 7pm, use: -hours 17,2\n";
+	print "              To use this, -saveto must be specified.\n";
+	print "\n";
+	print "-noreport   don't generate report CSVs (only db files)\n";
+	print "-nodaily    don't (re)generate daily reports\n";
+	print "-dbinit Force re-init of underlying daily schemas\n";
+
+	print "\nError: ", join("", @_), "\n" if scalar(@_);
+
+	exit(-1);
+}
+
+sub main {
+	my $forceDBInit = 0;
+	my $noreports = 0;
+	my ($productName, $service);
+	my ($startDateString, $endDateString);
+	my $hours;
+	my $runMonthly = 1;
+	my $runDaily = 1;
+	my $runTimeRange = 0;
+	my $saveReportCopiesToDir;
+	my $debug = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-d$/i) { ++$debug; next; }
+		if ($arg =~ /^-h$/i) { usage(); }
+		if ($arg =~ /^-dbinit/i) { $forceDBInit = 1; next; }
+		if ($arg =~ /^-noreport/i) { $noreports = 1; next; }
+		if ($arg =~ /^-saveto/i) { $saveReportCopiesToDir = shift@ARGV; next; }
+		if ($arg =~ /^-startdate/i) { $startDateString = shift@ARGV; next; }
+		if ($arg =~ /^-enddate/i) { $endDateString = shift@ARGV; next; }
+		if ($arg =~ /^-hours/i) { $hours = shift@ARGV; next; }
+		if ($arg =~ /^-(no)?monthly/i) { $runMonthly = ($1 ? 0 : 1); next; }
+		if ($arg =~ /^-(no)?daily/i) { $runDaily = ($1 ? 0 : 1); next; }
+		if ($arg =~ /^-today/i) { 
+			$runMonthly = 0;
+			$runDaily = 1;
+			my $today = DateTime->now( time_zone => 'local' )->truncate( to => 'day' );
+			$startDateString = $today->ymd("-");
+			my $tomorrow = $today->add( days => 1 ); # today is tomorrow
+			$endDateString = $tomorrow->ymd("-");
+			next; 
+		}
+		if ($arg !~ /^-/) { 
+			unless ($productName) { $productName = $arg; next; }
+			unless ($service) { $service = $arg; next; }
+			next; 
+		} else {
+			usage("unknown arg $arg");
+		}
+	}
+
+
+	usage("Saveto directory '$saveReportCopiesToDir' doesn't exist or isn't writable") if ($saveReportCopiesToDir && !(-w $saveReportCopiesToDir));
+
+	# Prevent sqlite dbs / report csvs from being owned by different users.
+	my $userName = getpwuid($>);
+	usage('You must run this script using a mon user') unless ($userName =~ /^mon/);
+
+	unless ($productName && $service) {
+		usage("Need product and service");
+	}
+
+	unless (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
+		usage("$productName is not installed for service $service");
+	}
+
+	my $product = ariba::rc::InstalledProduct->new($productName, $service);
+
+	my ($startDate, $endDate);
+	my ($startHour, $numOfHours);
+
+	if ($hours) { 
+		$runMonthly = 0;
+		$runDaily = 0;
+		$runTimeRange = 1;
+		$endDateString = undef;
+
+		($startHour, $numOfHours) = split(/,/, $hours); 
+
+		usage("The start value in -hours must be between 0 and 23, inclusive.") unless ($startHour >= 0 && $startHour < 24); 
+		usage("The second value in -hours must be greater than 0") unless ($numOfHours > 0);
+		usage("-saveto must be specified when -hours is used.") unless ($saveReportCopiesToDir);
+	}
+
+	my $today = DateTime->now( time_zone => 'local' )->truncate( to => 'day' );
+
+	if ($startDateString) {
+		$runMonthly = 0;
+		$startDate = ariba::Ops::DateTime->parseDateFromString($startDateString);
+		usage("Error parsing $startDateString") unless ($startDate);
+	}
+
+	if ($endDateString) {
+		$runMonthly = 0;
+		$endDate = ariba::Ops::DateTime->parseDateFromString($endDateString);
+		usage("Error parsing $endDateString") unless ($endDate);
+	}
+
+	#  arg flags specified => actions truth table
+	#
+	#        startdate            enddate            monthly 
+	#
+	#    A    0                     0                  0        do yesterday's daily
+	if (!$startDateString && !$endDateString && !$runMonthly) {
+		$startDate = $today->clone()->add( days => -1 );
+		$endDate = $today->clone();
+	#    B    0                     0                  1        do month of now 
+	} elsif (!$startDateString && !$endDateString && $runMonthly) {
+
+		my $targetMonth;
+
+		# the first of the month is a special case, because last good
+		# report is always yesterday's, which is the previous month
+		if ($today->day() == 1) {
+			$targetMonth = $today->clone()->add( months => -1 )->truncate( to => 'month' );
+		} else {
+			$targetMonth = $today;
+		}
+
+		$startDate = $targetMonth->clone()->set( day => 1 );
+		$endDate = $targetMonth->clone()->add( months => 1 )->truncate( to => 'month' );
+
+	#    C    0                     1                  0        do day preceeding enddate 
+	} elsif (!$startDateString && $endDateString && !$runMonthly) {
+		$startDate = $endDate->clone()->add( days => -1 );
+
+	#    D    0                     1                  1        do month of enddate
+	} elsif (!$startDateString && $endDateString && $runMonthly) {
+		$startDate = $endDate->clone()->subtract( months => 1)->set( day=>1 );
+		$endDate = $endDate->truncate( to => 'month' );
+
+	#     E   1                     0                  0        do day of startdate
+	} elsif ($startDateString && !$endDateString && !$runMonthly) {
+		$endDate = $startDate->clone()->add( days => 1 );
+
+	#     F   1                     0                  1        do month of startdate
+	} elsif ($startDateString && !$endDateString && $runMonthly) {
+		$startDate->set( day => 1 );
+		$endDate = $startDate->clone()->add( months => 1 )->truncate( to => 'month' );
+
+	#     G   1                     1                  0        do days between startdate and enddate
+	} elsif ($startDateString && $endDateString && !$runMonthly) {
+		# use the given date range
+
+	#     H   1                     1                  1        do months between startdate and enddate
+	} elsif ($startDateString && $endDateString && $runMonthly) {
+		$startDate->set( day => 1 );
+		$endDate = $endDate->add( months => 1 )->truncate( to => 'month' );
+	} else {
+		die "WOAH! something weird happened in generate-perf-report";
+	}
+
+	ariba::Perf::Base->setDebug($debug);
+	ariba::Perf::Base->setSaveReportCopiesToDir($saveReportCopiesToDir) if ($saveReportCopiesToDir);
+	ariba::Perf::Base->setVerbose($verbose);
+
+	#
+	# We do monthly reports on a month-by-month basis, rather than a
+	# continuously rolling report.
+	#
+	my @monthlies = ();
+	my $monthly;
+	my $timeRange;
+
+	if ($runTimeRange) { 
+		$timeRange = ariba::Perf::TimeRange->newFromProductNameAndDate($product->name(), $startDate->clone(), $startHour, $numOfHours);
+
+		# Archived logs put perf logs of different dates together, so check more days.
+		$startDate->subtract( days => 2 );
+		$endDate->add ( days => 3, hours => $numOfHours ); 
+	}
+	$startDate->truncate( to => 'day' );
+	$endDate->truncate( to => 'day' );
+
+	my $archiveDir = $product->default('System.Logging.ArchiveDirectoryName');
+	
+	my $lockFile = "/tmp/generate-perf-report-for-$productName-$service"; 
+	dmail::LockLib::forceQuiet() unless ($debug);
+	exit() unless (dmail::LockLib::requestlock($lockFile, 1));
+
+	my $date = $startDate;
+	while ( DateTime->compare($date, $endDate) < 0 ) {
+
+		if ($runMonthly && $date->day() == 1) {
+			$monthly = ariba::Perf::Monthly->newFromProductNameAndDate($product->name(), $date->clone()->truncate( to => 'month' ));
+			push(@monthlies, $monthly);
+		}
+
+		my $daily = ariba::Perf::Daily->newFromProductNameAndDate($product->name(), $date->clone(), $archiveDir);
+
+		if ($daily && $daily->perfLogsExist()) {
+
+			$daily->generateDatabase($forceDBInit);
+			$daily->generateReport() if ($runDaily && !$noreports);
+
+			$monthly->appendToDailyList($daily) if ($runMonthly);
+			$timeRange->appendToDailyList($daily) if ($timeRange);
+		} else {
+			print "No log for ",$date->ymd('-'), " skipping\n" if $verbose;
+		}
+
+		$date->add( days => 1 );
+
+	}
+
+	if ($runMonthly && !$noreports) {
+		for my $monthly (@monthlies) {
+			$monthly->generateReport();
+		}
+	}
+	
+	$timeRange->generateReport() if ($timeRange);
+	dmail::LockLib::releaselock($lockFile);
+}
+
+main();

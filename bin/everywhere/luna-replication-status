@@ -1,0 +1,204 @@
+#!/usr/local/bin/perl -w
+
+# $Id: $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../lib";
+use Data::Dumper;
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::rc::CipherStore;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $service;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-s$/o) { $service = shift;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    usage( "Service is a required argument" ) unless $service;
+
+    my $me       = ariba::rc::InstalledProduct->new('an', $service);
+    my $cluster  = $me->currentCluster();
+
+    my @monhosts = $me->hostsForRoleInCluster( 'monitor', $cluster );
+    die "Error reading mon host for $service ...\n" unless ( scalar @monhosts );
+    my $monhost = $monhosts[0];
+
+    my $mon      = ariba::rc::InstalledProduct->new('mon', $service);
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my %queries;
+
+    my $cipherStore = ariba::rc::CipherStore->new($service);
+
+    my $dbUser  = $me->default('lumira.monitoring.subscriptions.username') || die "Couldn't read dbUser\n";
+    my $passKey = $me->name() . '/' . $me->service() . ':lumira.monitoring.subscriptions.password';
+    my $dbPass  = $cipherStore->valueForName($passKey) || die "Couldn't read dbPass\n";
+
+    my $numSubs = $me->default('lumira.monitoring.subscriptions.numsubs')
+        or die "Problem encountered reading the number of subscriptions from DD\n";
+
+    my $config;
+    foreach my $sub ( 1..$numSubs ){
+        my $subName = "sub$sub";
+        $config->{ $subName }->{ "name"  } = $me->default( "lumira.monitoring.subscriptions.$subName.name" );
+        $config->{ $subName }->{ "def"   } = $me->default( "lumira.monitoring.subscriptions.$subName.repdefinition" );
+        $config->{ $subName }->{ "db"    } = $me->default( "lumira.monitoring.subscriptions.$subName.repdatabase" );
+        $config->{ $subName }->{ "title" } = $me->default( "lumira.monitoring.subscriptions.$subName.title" );
+
+        $queries{"Luna Replication Status [$config->{ $subName }->{ 'title' }]"} = {
+            crit    => 'answer ne "OK"',
+            perl    => sub { return checkStatus( $config->{ $subName }, $dbUser, $dbPass, $me, $hostname ); },
+            ticketOnWarnOpenAfterMinutes    => 1,
+            ticketOwner => 'unassigned-dba',
+            severity    => 1,
+            description => "Monitoring for Luna Subscription [$config->{ $subName }->{ 'title' }]", 
+            correctiveActions => [
+                Ops => 'Inform the SRS/Luna team',
+                Engr => 'Fix the issue found by monitoring',
+            ],
+        };
+    }
+
+    ## admin who_is_down:
+    my $infile = '/tmp/luna_down.tmp';
+    my $outfile = '/tmp/luna_down.out';
+
+    my $sql = <<EOT;
+admin who_is_down
+go
+EOT
+
+    open my $OUT, '>', $infile || die "Problem encountered opening '$infile' for write: $!\n";
+    print $OUT $sql || die "Problem encountered writing to '$infile': $!\n";
+    close $OUT || die "Problem encountered closing '$infile' after write: $!\n";
+
+    my $cmd = "sudo -u sybase -i isql -H $hostname -U sa -P $dbPass -J utf8 -S LUNA_RS -i $infile -o $outfile";
+    print "Running '$cmd'\n" if $debug > 1;
+    `$cmd`;
+
+    die "'$outfile' not found, something went wrong running isql\n" unless ( -e $infile );
+
+    $queries{"Luna Down Nodes"} = {
+        crit    => 'answer ne "OK"',
+        perl    => sub { return checkDown( $outfile, $hostname ); },
+        ticketOnWarnOpenAfterMinutes    => 1,
+        ticketOwner => 'unassigned-dba',
+        severity    => 1,
+        description => 'Monitoring for Luna nodea that are down', 
+        correctiveActions => [
+            Ops => 'Inform the SRS/Luna team',
+            Engr => 'Fix the issue found by monitoring',
+        ],
+    };
+
+    my $email = $mon->default('notify.email');
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('srs-status', $me->name(), $service, $me->customer(), \%queries);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monhost);
+
+}
+
+sub checkStatus {
+    my $sub = shift;
+    my $user = shift;
+    my $pass = shift;
+    my $me = shift;
+    my $hostname = shift;
+
+    ## This value has a '$' which is causing problems in the filename, let's ditch it here
+    my $file = $sub->{ 'def' };
+    $file =~ s/\$//g;
+
+    my $ret = 'OK';
+    my $infile  = "/tmp/luna_$file.tmp";
+    my $outfile = "/tmp/luna_$file.out";
+
+    my $server = $me->default('lumira.monitoring.srsserver.instancename') || die "Couldn't read SRSServer\n";
+
+    my $sql = <<EOT;
+check subscription $sub->{'name'} for $sub->{ 'def' } with replicate at $sub->{ 'db' }
+go
+EOT
+    print $sql . "\n" if $debug > 1;
+
+    open my $OUT, '>', $infile || die "Problem encountered opening '$infile' for write: $!\n";
+    print $OUT $sql || die "Problem encountered writing to '$infile': $!\n";
+    close $OUT || die "Problem encountered closing '$infile' after write: $!\n";
+
+    my $cmd = "sudo -u sybase -i isql -H $hostname -U sa -P $pass -J utf8 -S LUNA_RS -i $infile -o $outfile";
+    print "Running '$cmd'\n" if $debug > 1;
+    `$cmd`;
+
+    die "'$outfile' not found, something went wrong running isql\n" unless ( -e $outfile );
+
+    open my $IN, '<', $outfile|| die "Problem encountered opening '$outfile' for read: $!\n";
+    ## These should be small, just slurp them:
+    my @data = <$IN>;
+    close $IN || die "Problem encountered closing '$outfile' after read: $!\n";
+
+    foreach my $line ( @data ){
+        $ret = 'Error' unless $line =~ m/(?:VALID|ACTIVE|MATERIALIZED)/;
+    }
+
+    unless ( $debug ) {
+        unlink $infile || die "Problem encountered removing $infile: $!\n";
+        unlink $outfile || die "Problem encountered removing $outfile: $!\n";
+    }
+
+    return $ret;
+}
+
+sub checkDown{
+    my $filename = shift;
+    my $hostname = shift;
+
+    my $ret = 'OK';
+
+    open my $IN, '<', $filename || die "Problem encountered opening '$filename' for read: $!\n";
+    my @data = <$IN>;
+    close $IN || die "Problem encountered closing '$filename' after read: $!\n";
+
+    my @status = grep {$_ =~ /down/i } @data;
+    my $numLines = scalar @status;
+
+    $ret = "One or more nodes are down. Please check $filename at $hostname", unless $numLines == 0;
+    return $ret;
+}
+
+main(@ARGV);
+
+__END__

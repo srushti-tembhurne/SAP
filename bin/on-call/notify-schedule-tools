@@ -1,0 +1,98 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/on-call/notify-schedule-tools#1 $
+# cron job that notifies people about upcoming scheduling
+# notify tomorrow's person today
+# if today is friday also notify weekend and monday people
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Oncall::Schedule;
+use ariba::Oncall::OperationsEngineer;
+use ariba::Oncall::Schedule_v2;
+
+use DateTime;
+use Data::Dumper;
+
+my $scheduleHomePath = '/home/svcops/on-call/schedule';
+
+my %MONTH_NUM_HASH = (
+    1 =>  'Jan', 2 =>  'Feb', 3 =>  'Mar', 4 =>  'Apr', 5 =>  'May', 6 =>  'Jun',
+    7 =>  'Jul', 8 =>  'Aug', 9 =>  'Sep', 10 => 'Oct', 11 => 'Nov', 12 => 'Dec',
+);
+
+# Return all records for a give team.
+sub findAllOnCallPeopleForTeam {
+    my @daySchedule = @{$_[0]};
+    my $desiredTeam = $_[1];
+
+    my %people;
+
+    foreach my $record (@daySchedule) {
+        my ( $dayNum, $team, $tier, $userId, $startTime, $endTime ) = split( ',', $record );
+
+        # Skip the entry if specified team does not match.
+        next if $team ne $desiredTeam;
+
+        # Any shift that starts at midnight is a continuation of a shift that started earlier the prior evening.
+                next if $startTime eq '0000';
+
+        $people{ $startTime } = $userId;
+    }
+
+    return %people;
+}
+
+sub getTeam {
+    my $day = shift;
+    my $month = shift;
+    my $year = shift;
+
+    # Get the on-call team for both today and yesterday
+    my $monthAbbrev = lc( $MONTH_NUM_HASH{ $month } );
+    my @v2MonthSchedule = ariba::Oncall::Schedule_v2::readMonthSchedule( $monthAbbrev, $year, $scheduleHomePath, '-v2' );
+    my @v2DaySchedule = ariba::Oncall::Schedule_v2::getDaySchedule( $day, \@v2MonthSchedule );
+
+    return( findAllOnCallPeopleForTeam( \@v2DaySchedule, 'TLS' ));
+}
+
+sub main {
+
+    # *T = Today.  *Y = Yesterday
+    my ($yearT, $monthT, $dayT) = ( DateTime->now->date() =~ /(\d+)-(\d+)-(\d+)/ );
+    my ($yearY, $monthY, $dayY) = ( DateTime->now->subtract(days => 1)->date() =~ /(\d+)-(\d+)-(\d+)/ );
+    my %teamToday     = getTeam( $dayT, $monthT, $yearT );
+    my %teamYesterday = getTeam( $dayY, $monthY, $yearY );
+
+    my $dtNow = DateTime->new( year => 1, month => 1, day => 1, hour => DateTime->now->hour, minute => DateTime->now->min );
+
+    while( my( $startTime, $user ) = each %teamToday ) {
+
+
+        my ( $hhStart, $mmStart ) = ( $startTime =~ /(\d\d)(\d\d)/ );
+        my $dtStart = DateTime->new( year => 1, month => 1, day => 1, hour => $hhStart, minute => $mmStart );
+        my $timeDelta = $dtNow->delta_ms( $dtStart )->in_units( 'minutes' );
+
+        # skip unless we're within 15 min of the start time of a shift
+        next unless ( $timeDelta < 15 );
+
+        # skip if the user has not been defined.
+        next if $user eq "???";
+
+        # If the engineer today and yesterday are the same then there is no shift change
+        next if ( $user eq $teamYesterday{ $startTime } );
+
+        my $person = ariba::Oncall::OperationsEngineer->new( $user );
+
+        if ( $person->hasEmail() ) {
+            my $message = "You are on-call starting at $startTime Pacific Time today.\n";
+            $person->sendEmail( "On-Call Awareness", $message );
+        }
+    }
+}
+
+main();
+
+__END__

@@ -1,0 +1,35 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/filter-solaris-accounting#4 $
+
+use strict;
+
+sub main {
+	my @files = @ARGV;
+
+	# files are in the form of /var/adm/pacct$HOUR
+	open(ACCT, "/usr/bin/acctcom -C 10 @files |") or die $!;
+
+	# Chop of the header
+	$_ = <ACCT>;
+	$_ = <ACCT>;
+
+	print join("\t", "COMMAND\t", "START\t", "END\t", "REAL", "CPU", "MEAN") . "\n";
+	print join("\t", "NAME\t", "TIME\t", "TIME\t", "(SECS)", "(SECS)", "SIZE(M)") . "\n";
+
+	# NAME       USER     TTYNAME       TIME     TIME       (SECS)  (SECS) SIZE(K)
+	while (<ACCT>) {
+		chomp;
+		my ($name,$user,$tty,$start,$end,$real,$cpu,$mem) = split /\s+/;
+
+		$mem = int($mem / 1024);
+
+		if (length($name) < 8) {
+			$name = "$name\t";
+		}
+
+		print join("\t", $name,$start,$end,$real,$cpu,"$mem M","\n");
+	}
+}
+
+main();

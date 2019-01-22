@@ -1,0 +1,110 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/ws/cws-cache-root#2 $
+#
+# Monitor cws  CacheRoot
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::rc::CipherStore;
+use ariba::rc::Utils;
+
+use Data::Dumper;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+    USAGE: $0  [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode.
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+    }
+
+    my $me  = ariba::rc::InstalledProduct->new();
+    my $service = $me->service();
+
+    exit unless (ariba::rc::InstalledProduct->isInstalled('cws', $service));
+    my $cws = ariba::rc::InstalledProduct->new('cws', $service);
+
+    my @hostsForRamdisk;  
+    push(@hostsForRamdisk, $cws->hostsForRoleInCluster('cwswebserver', $cws->currentCluster()));
+    push(@hostsForRamdisk, $cws->hostsForRoleInCluster('cwsadminserver', $cws->currentCluster()));
+
+    my $cacheRootDir; 
+    unless ($cacheRootDir = $cws->default('CacheRoot')) {
+        print "CacheRoot Is not defined in DD.xml, existing....\n";
+        exit ();
+    }
+
+    my %queries;
+    my $user = $cws->deploymentUser();
+    my $cipher = ariba::rc::CipherStore->new($service);
+    my $pass = $cipher->valueForName($user);
+
+    foreach my $host (@hostsForRamdisk) {
+        my @output;
+        my $cmd = "ssh -o StrictHostKeyChecking=no -l $user $host 'du -s $cacheRootDir' ";
+        print "Running $cmd\n", if $debug;
+        die "Could not execute command: $cmd" unless ( ariba::rc::Utils::executeRemoteCommand( $cmd, $pass, 0, undef, undef, \@output ));
+
+        print Dumper \@output, if ($debug > 1);
+        my $result = $output[1];
+        print "Cache Root Usage for $host ", $result, "\n", if $debug;
+       
+        $result =~ m/(\d+)/;
+        my $usage = $1;
+        my $usageMB = $usage / 1024 / 1024;
+        print "$host CacheRootDir $cacheRootDir $usageMB \n", if $debug;
+
+
+        $queries{"$host $cacheRootDir"} = {
+            warn  => "answer >= 1073741824 * 0.90",  ## If more than 90 % of 1 GB
+            crit  => "answer >= 1073741824 * 0.85",  ## If more than 85 % of 1 GB
+            format => "%.2f MB",
+            perl  => "return $usageMB" ,
+            recordDataType => 'gauge',
+            description => "Directory size of $usageMB " . $cacheRootDir,
+        };
+
+        # execute remote command
+        # verify you got a response (output)
+    # parse output to get return value
+        # create hash for query
+    }
+
+    print Dumper (\%queries), if $debug;
+    my $email = $cws->default('notify.email');
+    my $qm = ariba::monitor::QueryManager->newWithDetails('cacheroot-usage', $cws->name(), $cws->service(), undef, \%queries);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);
+
+__END__

@@ -1,0 +1,173 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/copy-blob-from-main-db-to-dest-dbs#7 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use DBI;
+use DBD::Oracle qw(:ora_types);
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::Passwords;
+use ariba::Ops::DBConnection;
+
+my $debug = 0;
+
+sub usage {
+
+	print "Error: $_[0]\n" if $_[0];
+	print "usage: $0 [-d|-h] [-<connexDictName>] <tableName> <columnname> <dbid1> <dbid2>...\n";
+	print "          [-d] debug\n";
+	print "          [-h] this help\n";
+	print "          [-<connexDictName>] arbitrary connex dict from DD.xml.\n";
+	print "              for ex. use -1 to connect to community 1 database.\n";
+	print "          tablename table with blob column in it.\n";
+	print "          columnname name of blob column in the table\n";
+	print "          dbid... list of primary keys for the rows that have blobs to be copied\n";
+	exit(1);
+}
+
+sub main {
+
+	my $community;
+	my $table;
+	my $column;
+	my @blobIds;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-h/) { usage(); next; }
+		if ($arg =~ /^-d/) { $debug++; next; }
+		if ($arg =~ /^-(\d+)/) { $community = $1; next; }
+
+		if ($arg =~ /^\d+/) { push(@blobIds, $arg); next; }
+
+		if ($arg =~ /^\w+/) { unless ($table) { 
+									$table = $arg;
+								} else {
+									$column = $arg;
+								}
+								next;
+							}
+	}
+
+	unless ($table) {
+		usage("Need to specify a table name");
+	}
+	unless ($column) {
+		usage("Need to specify a blob column name for table $table");
+	}
+	unless (@blobIds) {
+		usage("Need to specify atleast one blobId to copy");
+	}
+
+	print "This program only works for the AN!\n";
+
+	confirm("Is this what you want to do?");
+
+	my $productName = "an";
+	my $an = ariba::rc::InstalledProduct->new($productName);
+
+	ariba::rc::Passwords::initialize($an->service());
+
+	my $mainType = ariba::Ops::DBConnection->typeMain();
+	my $drType = ariba::Ops::DBConnection->typeDr();
+
+	my $mainDBC = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndInCommunity($an, $mainType, $community);
+	my $drDBC = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndInCommunity($an, $drType, $community);
+
+
+	my $mainuser = $mainDBC->user();
+	my $mainpass = $mainDBC->password();
+	my $mainsid = $mainDBC->sid();
+	my $mainHost = $mainDBC->host();
+
+ 	my $druser = $drDBC->user();
+	my $drpass = $drDBC->password();
+	my $drsid = $drDBC->sid();
+	my $drhost = $drDBC->host();
+
+	printDetails("main db", $mainDBC);
+	printDetails("dr db", $drDBC);
+
+	unless ( defined($drhost) ) {
+		print "Can't run -- dr db host not set as role dr-database in roles.cfg\n";	
+		print "Check roles.cfg in ", $an->configDir(),"\n";
+		exit(1);
+	}
+
+	confirm("This program will select $column from $table for id(s) = ", join(", ", @blobIds), ". Ok?");
+
+
+	# open connection to main db, fetch item
+	my %attr = (
+	    PrintError => 0,
+	    RaiseError => 1,
+	    AutoCommit => 0,
+	    LongReadLen => 14*1024*1024,
+	);
+
+	my $dbh = DBI->connect("dbi:Oracle:host=$mainHost;sid=$mainsid", $mainuser, $mainpass, \%attr);
+
+
+	my $drdbh = DBI->connect("dbi:Oracle:host=$drhost;sid=$drsid", $druser, $drpass, \%attr);
+
+	my %attrib;
+	$attrib{'ora_type'} = ORA_BLOB;
+
+	for my $blobId (@blobIds) {
+		my $blob = $dbh->selectrow_array("select $column from $table where id = $blobId");
+
+		print "Got blob from main db of size ", length($blob), " bytes\n";
+		confirm("Write this to dr db?");
+
+		my $drsth = $drdbh->prepare("update $table set $column = :1 where id = $blobId");
+		$drsth->bind_param(1, $blob, \%attrib);
+		$drsth->execute();
+
+		print "Commiting write to dr DB\n";
+
+		# commit
+		$drdbh->commit();
+		
+		# double check stored value is the same
+		my $b;
+
+		$b = $drdbh->selectrow_array("select $column from $table where id = $blobId");
+		unless ( $b eq $blob ) {
+			print "Blob in dr db NOT EQUAL to original!\n";
+			print "dr db blob length =", length($b),"\n";
+		}
+	}
+
+
+	$dbh->disconnect();
+	$drdbh->disconnect();
+}
+
+sub printDetails {
+	my $db = shift;
+	my $dbc = shift;
+
+
+	print "Database $db\n";
+	print "----------------------\n";
+	print "User: ", $dbc->user(), "\n";
+	print "Pass: ", $dbc->password(), "\n";
+	print " Sid: ", $dbc->sid(), "\n";
+	print "Host: ", $dbc->host(), "\n";
+	print "\n";
+}
+
+sub confirm {
+	my $question = shift;
+
+	print "$question [y/N]: ";
+	my $answer = <STDIN>;
+	exit unless $answer =~ /y/i;
+}
+
+
+main();

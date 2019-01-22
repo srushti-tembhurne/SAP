@@ -1,0 +1,131 @@
+#!/usr/local/bin/perl
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::CFEngine::MonitoringGlueUtils;
+use ariba::monitor::StatusPage;
+use ariba::rc::Utils;
+use Date::Calc qw(Localtime Delta_Days);
+use Data::Dumper;
+use DateTime;
+use JSON;
+
+our $debug = 0;
+my $influxDBUser;
+my $influxDBPass;
+my $port;
+my %queries;
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e       Enables sending of email for monitor query.
+    -p       Enables sending of pages for monitor query.
+    -d       Turns on debug mode.
+    -h       Shows this help.
+    -b       take backup daily
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $backup = 'weekly';  #by default weekly
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h/o) { usage();          next; }
+        if ($arg =~ /^-d/o) { $debug++;         next; }
+        if ($arg =~ /^-e/o) { $sendEmail = 1;   next; }
+        if ($arg =~ /^-p/o) { $sendPage = 1;    next; }
+        if ($arg =~ /^-b/o) { $backup = shift ;    next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $product = ariba::monitor::StatusPage::businessProcessProduct();
+    my $service = $me->service();
+    my $monuser = "mon".$service;
+    my $cipher = ariba::rc::CipherStore->new($service);
+    my $monpass = $cipher->valueForName($monuser);
+
+    my @influxServers = split (" ", $me->default("monitoring.bpm.influx.servers"));
+    $influxDBUser = $me->default("dbainfo.bpm.influx.username");
+    $influxDBPass = $me->default("dbainfo.bpm.influx.password");
+    $port = 8086;
+
+    usage("influxDBPass not found") unless ($influxDBPass);
+
+    my $NodeHost;
+    for my $dNode (@influxServers){
+        my $upTime = getUpTimeForNode($dNode);
+        if ( $upTime !~ /down/i ){
+            $NodeHost = $dNode;
+            last;
+        }
+    }
+    die "\n Datanodes are down.. cannot run backups " unless($NodeHost);
+
+    my $cmd = ($backup =~ /daily/i) ? 'influxd-ctl backup -db BPMPROD  /influxbpmbackup1/BPMPROD_INC_BKP' : 'influxd-ctl backup -db BPMPROD -full /influxbpmbackup1/BPMPROD_FULL_BKP';
+
+    my $command = "ssh $monuser\@$NodeHost " . $cmd;
+
+    print "Command to take backup $backup --> $command\n" if($debug);
+    my @output;
+    unless ($debug){
+        ariba::rc::Utils::executeRemoteCommand($command, $monpass, 0, undef, undef, \@output);
+        print "\n--->", join "\n-", @output;
+    }
+
+    #delete files older than 15 days
+ 
+    my $backup_location = ($backup =~ /daily/i) ? 'BPMPROD_INC_BKP' : 'BPMPROD_FULL_BKP';
+
+    my $delete_old_cmd = "ssh $monuser\@$NodeHost "."/usr/local/ariba/bin/clean-old-files-from-dir -d 15 /influxbpmbackup1/$backup_location";
+
+    print "Command to delete backup older than 15 days --> $delete_old_cmd\n" if($debug);
+
+    unless ($debug){
+
+       ariba::rc::Utils::executeRemoteCommand($delete_old_cmd, $monpass, 0, undef, undef, undef);
+
+    }
+
+}
+
+sub getUpTimeForNode{
+    my $node = shift;
+
+    #http://influxdb01.snv.ariba.com:8086/query?u=system&p=password&q=SHOW%20DIAGNOSTICS
+    my $cmd = "curl -s -G 'http://$node:$port/query?u=$influxDBUser&p=$influxDBPass&q=SHOW%20DIAGNOSTICS'";
+    my $ret = `$cmd`;
+    return "DOWN" unless($ret);
+    my $jsonVal = from_json($ret);
+    my $uptimeref = $jsonVal->{'results'}->[0]->{'series'};
+
+    for my $db(@$uptimeref){
+        next if ($db->{'name'} ne 'system');
+        if( defined $db->{'values'}) {
+                return pop @{$db->{'values'}->[0]};
+        }else {
+                return "DOWN";
+        }
+    }
+}
+
+main(@ARGV);
+
+__END__

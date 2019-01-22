@@ -1,0 +1,120 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: $
+#
+# Script to push data exported from -T to presentation instance.
+# 
+# Simple usage: anl-db-import <customer>
+#
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::ANLExportManager;
+use ariba::Ops::DateTime;
+use ariba::Ops::Utils;
+use ariba::rc::Passwords;
+
+use File::Path;
+use File::stat;
+use DirHandle;
+
+my $debug = 0;
+my $rotationCount = 7;
+my $noAction = 0;
+my ($sendEmail, $sendPage) = (0, 0);
+my $force = 0;
+my $import = 0;
+
+sub usage {
+	print 	"Error: $_[0]\n" if $_[0];
+	print	"\n",
+		"Usage: $0 [-d|-h|-force|-noaction|-showstats] <customer>\n",
+		"-d				turns on debugging\n",
+		"-force			forces an import; can be dangerous, will bypass\n",
+		"                all version and correctness checks. This should\n",
+		"                (almost) never be needed.\n",
+		"-noaction		no action; only print what would actually be done\n",
+		"-showstats		displays information about available export files\n",
+		"-postonly		only run the post-import tasks\n",
+		"-h				this help\n\n";
+	CORE::exit(0);
+}
+
+sub main {
+	my $customer = undef;
+	my $showStats = undef;
+	my $postonly = undef;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg eq '-d')             { ++$debug;         next; }
+		if ($arg eq '-h')             { usage();          next; }
+		if (lc($arg) eq '-force')     { $force    = 1;    next; }
+		if (lc($arg) eq '-noaction')  { $noAction = 1;    next; }
+		if (lc($arg) eq '-showstats') { $showStats= 1;    next; }
+		if (lc($arg) eq '-postonly')  { $postonly = 1;    next; }
+		if ($arg !~ /^-/)             { $customer = $arg; next; }
+
+		usage("uknown option: $arg");
+	}
+
+	usage("must specify a customer to perform import on") unless ($customer);
+
+	#
+	# force people to run inside of screen
+	#
+	ariba::Ops::Utils::checkForScreen();
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my ($prodname, $service) = ( "anl", $me->service() );
+
+	ariba::rc::Passwords::initialize($service);
+
+	my $exportMgr = ariba::monitor::ANLExportManager->createFromProduct(ariba::rc::InstalledProduct->new($prodname, $service, undef, $customer));
+	$exportMgr->setDebug($debug);
+	$exportMgr->setForce($force);
+	$exportMgr->setNoAction($noAction);
+
+	if ($showStats) {
+		print $exportMgr->exportStatsToString(), "\n";
+	}
+	else {
+		unless ($postonly) {
+			$exportMgr->importIntoPresentation();
+			if ($exportMgr->importStatus != ariba::monitor::ANLExportManager->SUCCESS() && !$noAction) {
+				CORE::exit(1);
+			}
+		}
+
+		# post-install commands
+		print "Running post-import tasks:\n";
+
+		my $presentation = $exportMgr->presentationProduct();
+
+		# Create an array with all of the tasks we need to run.
+		# The commands differ depending on whether we are deployed in
+		# integrated mode.
+
+		my @tasks = ("resetdatabaseowner");
+
+
+		if ( $presentation->isInstanceSuiteDeployed() ) {
+			push(@tasks, "initdb -reshapedb");
+			push(@tasks, "initdb -loaddb -file LoadDB.txt");
+		}
+		else {
+			push(@tasks, "initdb -reshapedb");
+			push(@tasks, "runtask -task Task.DBOLAPProcessing");
+		}
+
+		unless ($exportMgr->executeTasks(@tasks)) {
+			print "ERROR: one of the post-tasks failed\n";
+		}
+	}
+}
+
+main();

@@ -1,0 +1,81 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+#use CGI;
+use CGI qw( :standard );
+use Data::Dumper;
+use File::Basename;
+
+my $type = "*_FULL.txt";
+my $t = "FULL";
+
+if ($0 =~ /arch/) {
+    $t = "ARCH" if ($0 =~ /arch/) ;
+    $type = "*_ARCH.txt" if ($0 =~ /arch/) ;
+}
+
+my $inProgressFile = "/var/mon/docroot/omni-logs/inProgressCleanData.txt"; 
+my @files = glob ("/var/mon/docroot/omni-logs/$type");
+
+sub main {
+    my $q= new CGI;
+    my $tablecontent;
+    my $flag = 0;
+
+    print header, start_html(-title => 'Creating Tables');
+    
+    for my $f ($inProgressFile, @files) {
+        my @lines = getLines($f);
+        my @array = ();
+        my @headers;
+
+        if ($f =~ /inProgressCleanData/){
+            my $update = pop @lines;
+            chomp($update);
+            print "<h2 align='center'>In Progress Omni Backup Status:$t [$update]</h2>"; 
+        }
+
+        if ($f =~ /$t/ && $flag == 0 ){
+            print "<h2 align='center'>Completed Rman Backup Status: $t</h2>"; 
+            $flag = 1;
+        }
+
+        my $cnt = 0;
+        my $clr ;
+        foreach my $l (@lines) {
+            
+            $headers[1] = Tr({ -bgcolor => "#cccccc" }, th('Job Name'), th('Start time'), th('Status - end time'), th('Duration'), th('Session ID'));
+            my ($job_name, $stime, $status, $duration, $sessionID) = split (/,/, $l);
+            next unless ($job_name =~ $t);
+            $stime =~ s/\sStart Time:\s//g;
+            $duration =~ s/\sDuration:\s//g;
+            if ($status !~ /completed|In Progress/i){
+                $cnt += 1;
+                $clr = "#ff0000", if (($t =~ /FULL/ && $cnt >= 2) || ($t =~ /ARCH/ && $cnt >= 4));
+            }
+            
+            push @headers, Tr( { -bgcolor => $clr }, td($job_name), td($stime), td($status), td($duration), td($sessionID));
+        }
+
+        print table( { -border => 1, -width => "100%" }, @headers );
+        print "\b\b";
+
+  }
+}
+
+sub getLines {
+    my $file = shift;
+    my $REVERSE_FILE;
+    open($REVERSE_FILE, '-|', "/usr/bin/tac $file");
+    my @content = <$REVERSE_FILE>;
+    close($REVERSE_FILE);
+    return @content, if ($file =~ /inProgressCleanData/);
+
+    my @status; 
+    @status = @content[0..1]; ##Get the last Two Result
+    @status = @content[0..3], if ($file =~ /ARCH/ );  ##Get the last four Result for arch
+    
+    return @status;
+}
+
+main();

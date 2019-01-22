@@ -1,0 +1,92 @@
+#!/usr/local/bin/perl -w
+#
+# script to monitor scheduled tasks for edi
+#
+# $Id: $
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+
+sub main {
+	my $debug = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $queries = {};
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ m/^-d/o) { $debug = 1; }
+		if ($arg =~ m/^-e/o) { $sendEmail = 1; }
+		if ($arg =~ m/^-p/o) { $sendPage = 1; }
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $service = $me->service();
+	my $customer = $me->customer();
+	my $edi = ariba::rc::InstalledProduct->new("edi", $service);
+
+
+	$queries->{"Scheduled tasks stuck in processing"} = {
+		info			=> "numrows == 0",
+		crit			=> "numrows > 0",
+		format			=> "%s task id %d stuck in %s for %d hours\n",
+		timeout			=> 30,
+		sql			=> qq`
+			SELECT
+				st.name,
+				stdq.id,
+				stdq.status,
+				ROUND((sysdate - stdq.status_changed) * 24)
+			FROM
+				schedule_tasks st,
+				st_dispatcher_queue stdq
+			WHERE
+				st.id = stdq.item
+				and (sysdate - stdq.status_changed) * 24 > 4
+				and stdq.status = 'Processing'
+		`,
+	};
+
+	$queries->{"Failed scheduled tasks in past 7 days"} = {
+		info			=> "numrows == 0",
+		crit			=> "numrows > 0",
+		format			=> "task: %s, id: %d, status: %s\n",
+		sql			=> qq`
+			SELECT
+        			st.name,
+        			stdq.id,
+        			stdq.status
+			FROM
+        			schedule_tasks st,
+        			st_dispatcher_queue stdq
+			WHERE
+				stdq.status = 'Failed'
+        		and st.id = stdq.item
+				and (sysdate - stdq.status_changed) < 7
+				and st.name != 'Customer Reporting Task'
+		`,
+	};
+
+
+
+	my $email = $me->default('notify.email');
+
+	my $q = ariba::monitor::QueryManager->newWithDetails('scheduled-tasks', 'edi', $service, $customer, $queries);
+
+	$q->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($edi));
+        ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($edi, $q);
+
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+
+	exit 0;
+}
+
+main();
+

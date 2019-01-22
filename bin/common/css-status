@@ -1,0 +1,87 @@
+#!/usr/local/bin/perl -w
+#
+# $Id:$
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::NetworkDeviceManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProductAPIExtensions;
+
+sub main{
+
+	my $debug=0;
+	my $sendEmail=0;
+	my $sendPage=0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug=1; }
+		if($arg =~ /^-e/o){ $sendEmail=1; };
+		if($arg =~ /^-p/o){ $sendPage=1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+
+	#
+	# Find a load up the css machinedb entries
+	#
+
+	my @datacenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+	for my $datacenter (@datacenters) {
+		my %queries;
+		my @cssNetDev;
+		my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+		my %match = (
+			'os'          => 'css',
+			'datacenter'  => $datacenter,
+			'status' => 'inservice',
+		);
+		my @css = ariba::Ops::Machine->machinesWithProperties(%match);
+
+		next unless(@css);
+
+		foreach my $css (@css) {
+			my $nm = ariba::Ops::NetworkDeviceManager->newFromMachine($css);
+			push(@cssNetDev, $nm);
+		}
+
+		foreach my $css (@cssNetDev) {
+			my $snmp = $css->snmp();
+
+			my @oids = qw ( apIpv4RedundancyVRState apIpv4RedundancyVRIntAddr );
+			my $walked = $snmp->bulkWalkOids(@oids);
+
+			foreach my $k (keys (%$walked)) {
+				my $queryName = "VIP status for " . $walked->{$k}->{'apIpv4RedundancyVRIntAddr'} . " on " . $css->hostname();
+				my $queryResult = $walked->{$k}->{'apIpv4RedundancyVRState'};
+				my $info = 'master';
+				if($css->hostname() =~ /\-2\./) {
+					$info = 'backup';
+				}
+				$queries{$queryName} = {
+					perl => sub { return $queryResult },
+					info => "answer ne '' && answer eq '$info'",
+					warn => "answer eq ''",
+					crit => "answer ne '' && answer ne '$info'",
+					ticketOnWarnOpenAfterMinutes => 30,
+					ticketSubmitter => 'dept_an_ops_prod@ariba.com',
+					ticketOwner => "unassigned-network",
+				};
+			}
+		}
+
+		my $email = $me->default('notify.email');
+		my $q = ariba::monitor::QueryManager->newWithDetails("css-status", $tab, $me->service(), $me->customer(), \%queries);
+		$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+	}
+
+}
+
+main();

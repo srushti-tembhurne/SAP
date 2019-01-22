@@ -1,0 +1,193 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: $
+#
+# Script to export ANL schemas of staged customers (ending with "-T").
+# 
+# Simple usage: anl-db-export [-f <filename>]
+#
+# ...where <filename> is a file listing tables to import.  This file is looked
+# for in the product config directory.  By default it uses
+# "export-tables.cfg".
+#
+# This will iterate over all -T products.  To do an export on a particular
+# product, use -customer [<customer>].
+#
+# Syntax for the table listing file is:
+#     - one table name per line
+#     - [exclude-list] (including brakckets) on a line by itself will cause
+#     this list to be interpreted as an exlude list (i.e. tables not to be
+#     exported).
+#     - the '#' character starts a comment; comments must be on their own
+#     lines
+#
+# Products for which the value of ROOTDIRKEY (see
+# ariba::monitor::ANLExportMAnager) does not exist in
+# DD.xml will be skipped over.
+#
+# Note about export files:
+#
+# Normally there is one (unique) export file per customer per last dataload
+# for that day.  However, since the file name is derived from the time of the
+# last data load, it is posslbe to have two export files with the same name in
+# different directories for a given customer.  This occurs after a customer
+# gets upgraded to a newer version because for that new version the export has
+# not happened for the latest data load.  
+#
+# Since there is no way of knowng if there has been a schema change between
+# versions, we just do another export and then make a decision during cleanup
+# time as to which files we should keep.
+#
+# The decision logic goes like this:  Given two export files with the same
+# name but different base releases, if either one's base release matches the
+# current base release of the customer, keep that one and delete the other.
+# Failing this, pick the one whose base release number is higher.
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::Ops::DateTime;
+use ariba::Ops::Utils;
+use ariba::monitor::ANLExportManager;
+
+use File::Path;
+use File::stat;
+use DirHandle;
+
+my $rotateOnly = 0;
+my $debug = 0;
+my ($sendEmail, $sendPage) = (0, 0);
+
+sub usage {
+	print     "Error: $_[0]\n" if $_[0];
+	print    "\n",
+		"Usage: $0 [-d|-e|-p|-f|-r|-h|-force|-noaction|-customer|-rotateOnly]\n",
+		"-d                 turns on debugging\n",
+		"-e                 send email notification\n",
+		"-p                 send pager notification\n",
+		"-r <integer>       sets export file rotation count (default is 1)\n",
+		"-noaction          no action; only print what would actually be done\n",
+		"-force             forces an export (can be dangerous)\n",
+		"-customer          select a customer (all customers are done by default)\n",
+		"-rotateOnly        don't do export, just purge the export files down to the given count\n",
+		"-showstats         displays information about available export files\n",
+		"-h                 this help\n",
+		"\n",
+		"The list of tables to drop comes from a required file <product-config-dir>/export-tables.cfg\n",
+		"and an optional file <product-config-dir>/customer-export-tables.cfg that is read in if it exists.\n",
+		"\n",
+		"Typical usage for export:\n",
+		"$0 [-customer <customer>]\n\n";
+	CORE::exit(0);
+}
+
+
+sub doExport {
+	my $me = shift;
+	my $exportMgr = shift;
+	my %query = ();
+
+	my $loadingProduct = $exportMgr->loadingProduct();
+
+	print "Performing export on ", $loadingProduct->customer(), "\n" if $debug;
+
+	my $result;
+
+	unless ($rotateOnly) {
+		$exportMgr->exportFromLoading();
+		$result = $exportMgr->exportStatus();
+
+		$query{"DB Export for data load instance"} = {
+			'crit' => !defined($result) || $result == ariba::monitor::ANLExportManager->FAILURE(),
+			'warn' => $result == ariba::monitor::ANLExportManager->WARNING(),
+			'info' => $result == ariba::monitor::ANLExportManager->SUCCESS(),
+			'perl' => "\"". $exportMgr->exportStatusString() ."\"",
+		};
+
+	}
+	# Clean up the export directory, but only if the export did not fail or
+	# this is a dry run.
+	if ( $result == ariba::monitor::ANLExportManager->SUCCESS() || $rotateOnly ){
+		$exportMgr->rotateExportFiles();
+	} else {
+		print "Export failed, not performing export file rotation\n" if $debug;
+	}
+
+	my $email = $me->default('notify.email');
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails( 
+			"anl-db-export", $loadingProduct->name(), $loadingProduct->service(), $loadingProduct->customer(), \%query
+			);
+	$qm->processQueries( $debug, $email, $sendEmail, $sendPage );
+
+}
+
+sub main {
+	my $customer = undef;
+	my $showStats = undef;
+
+	my $noAction = 0;
+	my $force = 0;
+	my $rotationCount = 1;
+
+
+	while (my $arg = shift(@ARGV)) {
+
+		if ($arg =~ /^-d/) { ++$debug;                                          next; }
+		if ($arg =~ /^-e/) { $sendEmail = 1;                                    next; }
+		if ($arg =~ /^-p/) { $sendPage = 1;                                     next; }
+		if ($arg =~ /^-r/) { $rotationCount = shift(@ARGV);                     next; }
+		if ($arg =~ /^-h/) { usage();                                           last; }
+
+		if (lc($arg) =~ /^-force/)      { $force = 1; $debug = 1 unless $debug; next; }
+		if (lc($arg) =~ /^-noaction/)   { $noAction = 1;                        next; }
+		if (lc($arg) =~ /^-customer/)   { $customer = shift(@ARGV);             next; }
+		if (lc($arg) =~ /^-rotateonly/) { $rotateOnly = 1;                      next; }
+		if (lc($arg) =~ /^-showstats/)  { $showStats= 1;                        next; }
+
+		usage("uknown option: $arg");
+	}
+
+	usage("invalid rotation count $rotationCount") unless ($rotationCount =~ /^\d+$/);
+	usage("rotation count of $rotationCount doesn't make sense") if ($rotationCount < 1);
+	usage("need to specify a -T customer for export") if ($customer && $customer !~ /-T$/);
+
+	ariba::Ops::Utils::checkForScreen();
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my ($prodname, $service) = ( "anl", $me->service() );
+
+	my $interactive = -t STDIN && -t STDOUT;
+
+	if ($interactive) {
+		ariba::rc::Passwords::initialize($service);
+		$debug = 1 unless $debug > 0;
+	}
+
+	my @products = ariba::rc::InstalledProduct->installedProductsList($service, $prodname, $customer);
+	foreach my $product (@products) {
+
+		next unless $product->customer() =~ /-T$/;
+
+		my $exportMgr = ariba::monitor::ANLExportManager->createFromProduct($product);
+		$exportMgr->setDebug($debug);
+		$exportMgr->setForce($force);
+		$exportMgr->setNoAction($noAction);
+		$exportMgr->setRotationCount($rotationCount);
+
+		if ($showStats) {
+			print $exportMgr->exportStatsToString(), "\n";
+		}
+		else {
+			doExport($me, $exportMgr);
+		}
+	}
+}
+
+main();

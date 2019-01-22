@@ -1,0 +1,2712 @@
+#!/usr/local/bin/perl
+
+use lib '/usr/local/ariba/lib';
+use ariba::rc::Utils;
+use Getopt::Long;
+use JSON;
+use strict;
+use Data::Dumper;
+
+use File::Basename;
+use FindBin;
+
+
+use ariba::Ops::PersistantObject;
+use ariba::Ops::MCLGen;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+use ariba::rc::Passwords;
+use ariba::rc::Globals;
+use ariba::Ops::MCL;
+use ariba::Ops::Utils;
+use ariba::Ops::DatabasePeers;
+use ariba::Ops::MCL;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::MCL::VIPMapping;
+use ariba::rc::Utils;
+use ariba::Ops::Utils;
+use ariba::Ops::Logger;
+use ariba::Ops::Machine;
+
+
+my $command = 'sudo crontab -l';
+#my $command = '/usr/local/ariba/bin/svc_health -product buyer -service lq25 ';
+my @output;
+my @incs;
+my $action;
+my $step;
+my $verbose;
+my $product;
+my $service;
+my @gen_mcls;
+my $sname;
+my $failtype;
+my $jira;
+my %peersForHost;
+my $help;
+my %hanacache;
+
+sub usage {
+
+     print <<EOF;
+Usage: $0 -action init|run -type failover|failback -service service_name -jira jira_number
+      init: Exit after generating mcls
+      run:  Generate and run the mcl
+EOF
+
+exit(1);
+
+}
+
+GetOptions (
+              "action=s"   => \$action,     #init, run, retry
+              "type:s"   => \$failtype,
+              "product:s"   => \$product,
+              "service:s"   => \$service,
+              "mcl:s"   => \$step,     #mcl name, used to get the mcl name
+              "stepname:s"   => \$sname,     #step name, incase of retry
+              "jira:s"   => \$jira, 
+              "verbose"  => \$verbose,   # flag
+              "help|h" => \$help
+           );
+
+usage() unless ($action && $failtype && $service);
+usage() if $help;
+
+# Step names - hotbackup, dbswitch, networkswitch, nfsswtich
+ariba::rc::Passwords::initialize($service);
+
+
+my $odir = '/tmp/cobalt-failover';
+if($failtype eq 'failback') { 
+	$odir = '/tmp/cobalt-failback';
+}
+
+if(! -d $odir){
+        my $r = `mkdir -p $odir`;
+}
+my %vipmap;
+if($action eq 'init'){
+        die "\n no service specified"   if($service !~/\S+/);
+	
+	if($failtype eq 'failover'){
+	        generateFailoverMCLS($service);
+	}
+	if($failtype eq 'failback'){
+	        generateFailbackMCLS($service);
+	}
+}
+elsif($action eq 'run'){
+	my $mcl = $step.'.mcl';
+	my $ecom = '/usr/local/ariba/bin/mcl-control run -dir '.$odir.' '.$mcl. ' -noui';
+	print "\n Running $ecom";
+	#my $result = `$ecom`;
+	#print "\n $result";
+	ariba::Ops::MCL::setDirectory($odir);
+	my $mcl = ariba::Ops::MCL->new($mcl);
+	$mcl->executeInParallel();
+	my $mclStatus = $mcl->topLevelStatus();
+	print "\nStatus : [$mclStatus]\n";
+	foreach my $step ($mcl->steps()) {
+		print "\n", $step->output();
+	}
+	
+}
+elsif($action eq 'retry'){
+	my $mcl = $step.'.mcl';
+        ariba::Ops::MCL::setDirectory($odir);
+        my $mcl = ariba::Ops::MCL->new($mcl);
+        my $mclStatus = $mcl->topLevelStatus();
+        print "\nStatus : [$mclStatus]\n";
+        foreach my $step ($mcl->steps()) {
+                if($step->name eq $sname){
+			$step->execute();
+			print "\n ", $step->output(), "|", $step->status();
+		}
+        }
+
+}
+else {
+        die "\n wrong action ";
+}
+
+
+#my $ret = ariba::rc::Utils::executeLocalCommand(
+#                        "$command 2>&1",
+#                        0,
+#                        \@output,
+#                        $master,
+#                        "undef",
+#                        undef,
+#                        $password
+#                );
+
+#print "\n", join "\n", @output;
+
+#######################
+sub generateFailoverMCLS{
+        my $service = shift;
+        my $mcl_file = generateRoute53Steps($service);
+        $mcl_file = generateConsulSteps($service);
+        my $mcl_file = generateSanity();
+          print "\n $mcl_file Generated";
+         push @incs, $mcl_file;
+        #my $dbhosts = get_db_hosts($service);
+         $mcl_file = cleanup_vvf($service);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+         $mcl_file = generateFileSystemDeviceDetailsSteps($service);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        $mcl_file = dbBackupInitial('primary',$service);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        $mcl_file = generateBackupDatabaseSteps('primary',$service);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        $mcl_file = pageFilters($service, "B", "create", "primary", "SetPageFilter", 'set-pagefilter','SANITY');
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        generateDBFailoverSteps($service);
+        print "\n DBfailover mcl  Generated";
+        #$mcl_file = generateResetSnapPolicySteps($service, "U");
+        #print "\n $mcl_file Generated";
+        #push @incs, $mcl_file;
+        $mcl_file = generateSnapMirrorSteps($service);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        $mcl_file = generateStartAppSteps($service);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        $mcl_file = generateRoute53Steps($service);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        $mcl_file = generateConsulSteps($service);
+         print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        my $region = $service;
+        $region =~ s/^prod//;
+        $region =~ s/ms$//;
+        $region = 'us' if $service eq 'prodms';
+        $mcl_file = generateSplunkSteps($service,$region);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        sleep 5;
+        open my $OUT, ">", "$odir/cobalt-failover.mcl" or die "cannot open file";
+        #print $OUT defineVariable('SERVICE', $service);
+
+        foreach my $inc ( @incs) {
+            my $in;
+            print "\n ====== Reading $inc";
+            chomp($inc);
+	    next if($inc !~ /\S+/);
+            open my $in, "<", $inc || die("\n Cannot open $inc for reading.$!");
+            my @data = <$in>;
+            close($in);
+            print $OUT join("", @data), "\n\n";
+        }
+        close $OUT;
+
+
+
+        exit;
+
+}
+
+######################
+
+sub generateFailbackMCLS{
+        my $service = shift;
+        my $mcl_file = generateSanity();
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        #my $dbhosts = get_db_hosts($service);
+        $mcl_file = cleanup_vvf($service);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        $mcl_file = generateFileSystemDeviceDetailsSteps($service);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        $mcl_file = dbBackupInitial('secondary',$service);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        $mcl_file = generateBackupDatabaseSteps('secondary',$service);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        $mcl_file = pageFilters($service, "B", "create", "secondary", "SetPageFilter", 'set-pagefilter', 'SANITY');
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        $mcl_file = generateSnapMirrorStepsFailback($service);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        generateDBFailoverSteps($service);
+        print "\n DB Failback mcl Generated";
+        #$mcl_file = generateResetSnapPolicySteps($service, "U");
+        #print "\n $mcl_file Generated";
+        #push @incs, $mcl_file;
+        $mcl_file = generateStartAppSteps($service);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        $mcl_file = generateRoute53Steps($service);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        $mcl_file = generateConsulSteps($service);
+         print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        my $region = $service;
+        $region =~ s/^prod//;
+        $region =~ s/ms$//;
+        $mcl_file = generateSplunkSteps($service,$region);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+        sleep 5;
+        open my $OUT, ">", "$odir/cobalt-failback.mcl" or die "cannot open file";
+        foreach my $inc ( @incs) {
+            my $in;
+            print "\n ====== Reading $inc";
+            chomp($inc);
+            open my $in, "<", $inc || die("\n Cannot open $inc for reading.$!");
+            my @data = <$in>;
+            close($in);
+            print $OUT join("", @data), "\n\n";
+        }
+        close $OUT;
+
+
+        exit;
+}
+
+sub generateSanity {
+        my $pr; 
+        $pr .= defineStep("SANITY", "SANITY",undef, undef, undef, undef, undef, undef);
+        $pr .= defineAction("Wait", undef, "Wait Step for SANITY");
+        my $mcl_file = "$odir/sanity.mcl";
+        open my $mcl, ">" ,$mcl_file ||  die "\n Cannot open mcl file $mcl_file : $!";
+        print $mcl $pr;
+        close $mcl;
+        return $mcl_file;       
+
+}
+
+my $monpassword = ariba::rc::Passwords::lookup("mon$service");
+
+sub cleanup_vvf {
+        my $service = shift;
+        my @products = productsList($service);
+        my @dbhosts;
+        my @dbcs;
+        foreach my $p (@products) {
+        next if($p->isASPProduct()); # for now we aren't failing over ASP
+        next if($p->name() eq 'ebs'); # ebs just echos the AN db config
+        my @pdbcs = dbConnectionsFromProducts($p);
+        push(@dbcs,ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@pdbcs));
+        }
+        getVIPmap($service,\@dbcs);
+        my %uniqhosts;
+        @dbhosts = grep{!$uniqhosts{$_}++}map{push(@dbhosts,$vipmap{$_->host()});$vipmap{$_->host()}}@dbcs;
+	my $mcl_file = $odir. '/cleanup_vvfs.mcl';
+	open my $MCL, ">", $mcl_file or die "\n Cannot open mcl file $mcl_file";
+	my $mtext = "Variable: SERVICE=$service\n";
+	$mtext .= 'Variable: TRANSFERDIR=/var/mcl/cobalt-dr/locks'."\n\n";
+        $mtext .= "MCLTitle\: DR Failover for  $service\n";
+	my $expando = "CleanupVVS";
+	$mtext .= defineExpando($expando, "Clean Up VVS on all DB hosts");
+
+	$mtext .= defineRunGroup('COBALT-CVF', 20);
+        for(my $j=0; $j < scalar @dbhosts; $j++){
+                next if $dbhosts[$j] =~ m/hana/i;
+                $mtext .= "\n". "Step $j";
+                $mtext .= "\n". "Title\: Cleanup VVFs for $dbhosts[$j] ";
+                $mtext .= "\n". "RunGroup\: COBALT-CVF";
+                $mtext .= "\n". "Expando\: CleanupVVS";
+                $mtext .= "\n". "Depends\: group:set-pagefilter";
+                $mtext .= "\n". "Action\: Shell mon$service\@". $dbhosts[$j] ." \{\n     \$ ".'sudo rm -f /var/tmp/ora*-*-virtual-volumes.txt '."\n \}";
+                $mtext .= "\n\n";
+        }
+        print $MCL $mtext;
+        close $MCL;
+	return $mcl_file;
+
+}
+
+sub get_db_hosts {
+        my $service = shift;
+        my $consul_url;
+        my $mon = ariba::rc::InstalledProduct->new('mon', $service);
+        $consul_url = 'http://'.$mon->default('Ops.Consul.ConsulPrimary').':8500/v1/catalog/services';
+        my $consul_url_sec = 'http://'.$mon->default('Ops.Consul.ConsulDr').':8500/v1/catalog/services';
+        #$consul_url = 'http://mo-4f3b6c5d2.mo.sap.corp:8500/v1/catalog/services';
+        my @nds;
+        for($consul_url,$consul_url_sec) {
+        my $output = `curl -s $_`;
+        my $type = $_;
+        my $json = from_json($output);
+        foreach my $serv(keys %$json){
+                if($serv =~ /oracle/i){
+                        my $surl = 'http://'.$mon->default('Ops.Consul.ConsulPrimary').':8500/v1/catalog/service/'.$serv;
+                        if($type =~ m/2\-ms/i) {
+                              $surl = 'http://'.$mon->default('Ops.Consul.ConsulDr').':8500/v1/catalog/service/'.$serv; 
+                        }
+                        $output = `curl -s $surl`;
+                        my $sjson = from_json($output);
+                        foreach my $node(@$sjson){
+                               print "address is".$node->{'ServiceAddress'}."\n";
+                                push @nds,  $node->{'ServiceAddress'};
+                        }
+                }
+        }
+        }
+        my %d;
+        @nds = grep{!$d{$_}++}@nds;
+        use Data::Dumper;
+        print Dumper(\@nds); 
+        return \@nds;
+}
+
+
+sub generateFileSystemDeviceDetailsSteps {
+    my $service = shift;
+    my $depends = "group:COBALT-CVF";
+    my $prefix = "H";
+    my $count = 1;
+
+    my $expando = "FilesystemDevice";
+    my $pr = defineExpando($expando, "Run filesystem-device-details on all DB hosts");
+    my $group = "filesystem-details";
+    $pr .= defineRunGroup($group, 5);
+    my $upr = $pr;
+
+    my @products = productsList($service);
+    p: foreach my $p (@products) {
+        next if($p->isASPProduct());
+        next if($p->name() eq 'ebs');
+
+        my @dbcs = dbConnectionsFromProducts($p);
+        @dbcs = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbcs);
+	getVIPmap($service,\@dbcs);
+
+        foreach my $dbc (@dbcs) {
+           print "**working on\t".$dbc->sid()."\n";
+            my $hana;
+            #print "**host is $dbc->host() ".$dbc->dbServerType()."\n";
+            next if($dbc->dbServerType() eq 'hana');
+            next if($dbc->isDR());
+            my $orig_dbc = $dbc;
+            my $secondary;
+            ($dbc, $secondary) = sanitizeDBCs($dbc, $service);
+             unless($secondary) { 
+                 print "skipping\t".$orig_dbc->sid()."\tfor\t".$orig_dbc->product()->name()."\n"; 
+                 next; 
+             }
+            my @primaryHosts;
+            my @secondaryHosts;
+            if($hana) {
+                my $peer = getPeerForDBCs($dbc, $dbc->drDBPeer());
+                foreach my $pc ($peer->allPeerConnections('primary')) {
+                    push(@primaryHosts, $pc->host());
+                }
+                foreach my $pc ($peer->allPeerConnections('secondary')) {
+                    push(@secondaryHosts, $pc->host());
+                }
+            } else {
+                @primaryHosts = ($dbc->host());
+                push(@secondaryHosts, $secondary->host());
+            }
+	    my %found;
+            foreach my $hostname (@primaryHosts) {
+                $hostname = $vipmap{$hostname};
+                my $sid = $dbc->sid();
+ 		next if(defined $found{$hostname});
+		$found{$hostname} = 1;
+		
+                $pr .= defineStep("${prefix}$count", "filesystem-device-details on $sid\@$hostname",
+                    $depends, $expando, $group, undef, undef, undef
+                );
+                $sid = 'hana' if($hana);
+                $pr .= defineAction("Shell", "mon$service\@$hostname",
+                    "\$ sudo /usr/local/ariba/bin/filesystem-device-details -f -s $sid",
+                );
+                $pr .= "\n";
+                $count++;
+            }
+	    %found =();
+            foreach my $hostname (@secondaryHosts) {
+                $hostname = $vipmap{$hostname};
+                my $sid = $dbc->sid();
+ 		next if(defined $found{$hostname});
+		$found{$hostname} = 1;
+                my $step .= defineStep("${prefix}$count", "filesystem-device-details on $sid\@$hostname",
+                    $depends, $expando, $group, undef, undef, undef
+                );
+                $sid = 'hana' if($hana);
+                $step .= defineAction("Shell", "mon$service\@$hostname",
+                    "\$ sudo /usr/local/ariba/bin/filesystem-device-details -f -s $sid",
+                );
+                $step .= "\n";
+                $count++;
+
+                $upr .= $step;
+                $pr .= $step;
+            }
+        }
+    }
+
+    my $mcl = "$odir/db.mcl";
+
+    open my $OUT, ">", $mcl or die "\n cannot open $mcl";
+    print $OUT $pr;
+    close($OUT);
+
+    return $mcl;
+}
+sub productsList {
+    my $service = shift;
+    my @products = ariba::rc::InstalledProduct->installedProductsList($service);
+
+    #@products = grep { !defined($doNotTouchProducts{$_->name()}) } @products;
+
+    return(@products);
+}
+sub dbConnectionsFromProducts {
+    my (@p) = (@_);
+
+    my @dbcs = ariba::Ops::DBConnection->connectionsFromProducts(@p);
+
+    #
+    # skip rman databases
+    #
+    @dbcs = grep { $_->sid() !~ /(?:^rmn|^rman)/i } @dbcs;
+
+    #
+    # skip hana for now
+    #
+#    @dbcs = grep { $_->dbServerType ne 'hana' } @dbcs;
+
+    return(@dbcs);
+}
+sub sanitizeDBCs {
+    my $dbc = shift;
+    my $service = shift;
+
+    #printf("host = %s, sid = %s, schema = %s\n", $dbc->host, $dbc->sid, $dbc->schemaId) if ($DEBUG);
+    my $secondary = 0;
+    my $primary = 0;
+    ($primary, $secondary) = ariba::Ops::DBConnection::sanitizeDBCs($dbc, $service);
+    return 0 unless $secondary;
+    if($primary->dbServerType() eq 'hana') {
+        #
+        # for HANA, we also have to look this up so that the DBCs have
+        # the master node instead of a slave node.
+        #
+        my $peer = getPeerForDBCs($primary, $secondary);
+
+        $primary->setSid($peer->sid());
+        $secondary->setSid($peer->sid());
+        $dbc->setSid($peer->sid());
+        $dbc->drDBPeer()->setSid($peer->sid());
+        if($primary->host() eq $peer->primary()->host()) {
+            $primary->setHost($peer->primary()->host());
+            $secondary->setHost($peer->secondary()->host());
+        } else {
+            $primary->setHost($peer->secondary()->host());
+            $secondary->setHost($peer->primary()->host());
+        }
+    }
+
+    return($primary, $secondary);
+}
+
+sub getPeerForDBCs {
+	my $primary = shift;
+	my $secondary = shift;
+
+	return($peersForHost{$primary->host()}) if($peersForHost{$primary->host()});
+
+	my @peers = ariba::Ops::DatabasePeers->newListFromDbcs({}, $primary, $secondary);
+	my $peer = shift(@peers);
+	$peersForHost{$peer->primary()->host()} = $peer;
+	$peersForHost{$primary->host()} = $peer;
+	return($peer);
+}
+
+
+sub dbBackupInitial {
+    my $env = shift;
+    my $service = shift;
+    my $failback = shift;
+
+    my $arg;
+
+    if($failback) {
+        $arg = "failback";
+    }
+	
+    my $expando = "DBBackupInitial-$env";
+    my $pr = defineExpando($expando, "Take Initial Backups of $env DB filesystems");
+
+    my $group = "DBBackup-Initial";
+    $pr .= defineRunGroup($group, 10);
+    my $pre = "ID";
+    my $i = 1;
+    my @products = productsList($service);
+    foreach my $p(@products){
+	my $pname = $p->name();
+	my @dbcs = dbConnectionsFromProducts($p);
+        @dbcs = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbcs);
+        my %found;
+        foreach my $dbc (@dbcs) {
+		my $host = $dbc->host();
+                next if($host =~ /hana/);
+		next if(not defined $vipmap{$host});
+		next if( defined $found{$vipmap{$host}});
+		$host = $vipmap{$host};
+		$found{$host} = 1;
+		$i++;
+		my $step = $pre.$i;
+	        $pr .= defineStep($step, "Hot Backup of $pname on $host",
+	            "SANITY group:filesystem-details", $expando, $group, undef, undef, undef
+	        );
+		my $bcmd = '/usr/local/ariba/bin/bcv-backup';
+               ##HANA doesn't support tx snapshots as of now so the default is sv
+               if($host =~ /hana/) {
+                          $pr .= defineAction("Shell", "mon$service\@$host",
+                           "\$ sudo su - root -c \'$bcmd -bcv 2 $pname  $service\'",
+                           "ErrorString: (ERROR|FAILED)",
+                          ) . "\n";
+                } elsif($pname eq 's4'){
+	        	$pr .= defineAction("Shell", "mon$service\@$host",
+	        	   "\$ sudo su - root -c \'$bcmd -jira $jira -snap -sv -bcv 2 $pname  $service\'",
+	        	   "\$ sudo su - root -c \'$bcmd -jira $jira -snap -tx -bcv 2 $pname  $service\'",
+        		   "ErrorString: (ERROR|FAILED)",
+	    		) . "\n";
+		  } else { 
+		        $pr .= defineAction("Shell", "mon$service\@$host",
+		           "\$ sudo su - root -c \'$bcmd -jira $jira -snap -bcv 2 $pname  $service\'",
+	        	   "ErrorString: (ERROR|FAILED)",
+		    	) . "\n";
+	            }
+       }
+    }
+    my $mcl = "$odir/db_backup.mcl";
+
+    open my $OUT, ">", $mcl or die "\n cannot open $mcl";
+    print $OUT $pr;
+    close($OUT);
+
+    return $mcl;
+
+}
+
+sub getVIPmap(){
+	  my $service = shift;
+	  my $dbs = shift;
+	  my $password = ariba::rc::Passwords::lookup("mon$service");
+	  foreach my $dbc(@$dbs){		
+		  my $vip = $dbc->host();
+		  if($vip =~ /hana/){
+			$vipmap{$vip} = $vip;
+			next;
+		  }
+		  my $sshCommand = "ssh mon$service\@$vip hostname";
+		  my @cmdOutput;
+		  my $ret = executeRemoteCommand(
+                    $sshCommand,
+                    $password,
+                    0,
+                    undef,
+                    undef,
+                    \@cmdOutput,
+                );
+                 @cmdOutput = map{chomp($_);$_}@cmdOutput;
+                 my @result = grep{$_=~m/^.*?\.ariba\.com$/i && $_ !~ m/Connection\s*to.*?closed/i}@cmdOutput;
+		$vipmap{$vip} = $result[0];
+		if(!$ret || $result[0] !~ /\S+/) { $vipmap{$vip} = $vip;}
+	   }
+}
+
+sub generateBackupDatabaseSteps {
+    my $env = shift;
+    my $service = shift;
+    my $failback = shift;
+    my $senv ;
+    if($env eq 'primary' ) { $senv = 'secondary';} else { $senv = 'primary';}
+
+    my $arg;
+    my $depends = takeDBBackupDepends($env);
+
+    if($failback) {
+        $arg = "failback";
+        $depends = takeDBBackupDependsFailback($env);
+    }
+
+    my $expando = "DBBackup-$env";
+    my $pr = defineExpando($expando, "Take Backups of $env and $senv DB filesystems");
+    my $upr = $pr;
+
+    $pr .= veritasCommands($service, "IA", $expando, "group:DBSWITCH", "offline", $arg, "$env");
+    #$pr .= veritasCommands($service,"IC", $expando, "group:hagrp-offline-$env", "offline-status",$arg, $env);
+    $pr .= veritasCommands($service, "IB", $expando, "group:hagrp-offline-$env", "backup", $arg, $env);
+    $pr .= veritasCommands($service, "IS", $expando, "group:hagrp-offline-$env", "backup", $arg, $senv);
+    $pr .= veritasCommands($service, "KA", $expando, "group:bcv-backup", "online", $arg, $env);
+    #$pr .= veritasCommands($service, "KB", $expando, "group:hagrp-online-$env", "status", $arg, $env);
+    $pr .= veritasCommands($service, "KDG", $expando, "group:hagrp-online-$env", "startdg", $arg, $env);
+    $pr .= veritasCommands($service, "KUF", $expando, "group:hagrp-startdg-$env", "unfreeze", $arg, $env);
+    $pr .= veritasCommands($service, "KUF", $expando, "group:hagrp-startdg-$env", "unfreeze", $arg, $senv);
+	# Freeze/Unfreeze both primary and secondary
+    $pr .= veritasCommands($service, "KC", $expando, "SANITY", "freeze", $arg, $env);
+    $pr .= veritasCommands($service, "KC", $expando, " SANITY", "freeze", $arg, $senv);
+    #$pr .= veritasCommands($service, "KUF", $expando, "group:DBSWITCH", "unfreeze", $arg, $env);
+    #$pr .= veritasCommands($service, "KUF", $expando, "group:DBSWITCH group:hagrp-startdg-primary", "unfreeze", $arg, $senv);
+
+
+    #unless($failback) {
+    #  $arg = "unplanned";
+    #  $upr .= veritasCommands($service, "IA", $expando, $depends, "offline", $arg ,$env);
+    #  $upr .= veritasCommands($service, "IB", $expando, "group:hagrp-offline-$env", "backup", $arg, $env);
+    #  $upr .= veritasCommands($service, "KA", $expando, "group:bcv-backup", "online", $arg, $env);
+    #  $upr .= veritasCommands($service, "KB", $expando, "group:hagrp-online-$env", "status", $arg, $env);
+    #  $upr .= veritasCommands($service, "KC", $expando, "group:hagrp-status-primary", "freeze", $arg, 'primary');
+    #  $upr .= veritasCommands($service, "KUF", $expando, "group:DBSWITCH", "unfreeze", $arg, 'primary');
+    #  $upr .= veritasCommands($service, "KC", $expando, "group:hagrp-status-secondary", "freeze", $arg, 'secondary');
+    #  $upr .= veritasCommands($service, "KUF", $expando, "group:DBSWITCH", "unfr	eeze", $arg, 'secondary');
+    #}
+
+  my $mcl = "$odir/db_cold_backup_and_switch.mcl";
+    my $OUT;
+    open($OUT, "> $mcl") || die("Failed to open $mcl: $!");
+    print $OUT $pr;
+    close($OUT);
+  return $mcl;
+    #unless($failback) {
+    #  $mcl = $odir . "/KU-backupDatabases-".$env.".mcl";
+
+    #  open($OUT, "> $mcl") || die("Failed to open $mcl: $!");
+    #  print $OUT $upr;
+    #  close($OUT);
+    #}
+
+}
+
+sub generateResetSnapPolicySteps {
+    my $service = shift;
+    my $prefix = shift;
+    my $depends = "consulSwitch group:hagrp-online-primary";
+       if($failtype eq 'failback') {
+          $depends = "consulSwitch group:hagrp-online-secondary";
+       }
+    my $group = "reset-3par-policy";
+    my $pr = defineRunGroup($group, 5);
+
+    my $expando = "manageBackup";
+    my $count = 1;
+
+    $pr .= defineExpando($expando, "Reset 3par snapshot policies");
+    my $upr = $pr;
+
+    my @products = productsList($service);
+
+
+    p: foreach my $p (@products) {
+        next if($p->isASPProduct());
+        next if($p->name() eq 'ebs');
+
+        my @dbcs = dbConnectionsFromProducts($p);
+        @dbcs = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbcs);
+
+        foreach my $inputDbc (@dbcs) {
+            next if($inputDbc->isDR() );
+            my ($primary, $secondary) = sanitizeDBCs($inputDbc, $service);
+                next unless $secondary;
+		my $dbc = $primary;
+		if($failtype eq 'failback') { $dbc = $secondary;}
+                #my $hostname = $vipmap{$dbc->host()};
+                my $hostname = $dbc->host();
+                my $sid; 
+                next if($hostname =~ m/hana/); 
+                  $sid = $dbc->sid();
+                my @cmds = (
+                    "\$ sudo /usr/local/ariba/bin/manage-backup -d -policy stale_ss -sid $sid -volType data01",
+                    "\$ sudo /usr/local/ariba/bin/manage-backup -d -policy stale_ss -sid $sid -volType log01",
+                    "\$ sudo /usr/local/ariba/bin/manage-backup -d -policy stale_ss -sid $sid -volType log02",
+                );
+
+                my $step = defineStep("${prefix}$count", "manage-backup for volumes on $sid\@$hostname",
+                    $depends, $expando, $group, undef, undef, undef
+                );
+                $step .= defineAction("Shell", "mon$service\@$hostname",
+                    @cmds
+                );
+                $step .= "\n";
+
+                $pr .= $step;
+                $upr .= $step if($secondary->host() eq $hostname);
+
+                $count++;
+    }
+    }
+
+   my($mcl,$OUT);
+   if($failtype eq 'failover') { 
+      $mcl = "$odir/$prefix-resetSnapshotPolicy.mcl";
+       open  $OUT, ">", $mcl or die "\n cannot open $mcl : $!";
+       print $OUT $pr;
+       close($OUT);
+       return $mcl;
+    } else {
+      $mcl = "$odir/${prefix}U-resetSnapshotPolicy.mcl";
+      open($OUT, "> $mcl") || die("Failed to open $mcl: $!");
+      print $OUT $upr;
+      close($OUT);
+      return $mcl;
+     }
+}
+
+sub takeDBBackupDepends {
+    my $env = shift;
+    if($env =~ /secondary/i){
+        return("consulSwitch SANITY");
+    }
+    if($env =~ /primary/i){
+        return("consulSwitch group:start-apps");
+    }
+
+}
+
+sub veritasCommands {
+    my $service = shift;
+    my $prefix = shift;
+    my $expando = shift;
+    my $depends = shift;
+    my $action = shift;
+    my $args = shift;
+    my $env = shift;
+
+    my $group = "hagrp-$action-$env";
+    $group = "bcv-backup" if($action eq "backup");
+
+    my $count = 1;
+    my $skipPrimary;
+
+    #$skipPrimary = 1 if(($args && $args =~ /unplanned/) || $action eq 'startdg' || $env eq 'secondary');
+    $skipPrimary = 1 if(($args && $args =~ /unplanned/) ||  $env eq 'secondary');
+    if($env eq 'primary' ) {
+	$prefix = $prefix."P";
+    }
+    else {
+	$prefix = $prefix."S";
+    }
+
+    my $pr = defineRunGroup($group, 10);
+
+    my @products = productsList($service);
+    p: foreach my $p (@products) {
+        next if($p->isASPProduct());
+        next if($p->name() eq 'ebs');
+
+        my @dbcs = dbConnectionsFromProducts($p);
+        @dbcs = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbcs);
+        #
+        # in unplanned mode, we skip hana since that process is not defined
+        #
+        #@dbcs = grep { $_->dbServerType() ne 'hana' } @dbcs if $skipPrimary;
+
+        my %dbcs;
+        map { $dbcs{$_->host} = $_ } @dbcs;
+
+        foreach my $dbc (@dbcs ) {
+            my $drDbc = $dbc->drDBPeer();
+            next unless($drDbc);
+            next if ($dbc->host() =~ m/^hana/i);
+  
+            if($args && $args =~ /failback/) {
+                ( $drDbc, $dbc ) = sanitizeDBCs($dbc, $p->service());
+                next unless $dbc;
+            } else {
+                ( $dbc, $drDbc ) = sanitizeDBCs($dbc, $p->service());
+                next unless $drDbc;
+            }
+
+            my ( $retries, $interval );
+            if($action eq 'status' || $action eq 'offline-status') {
+                $retries = 5;
+                $interval = 20;
+            }
+            my $drDepends = $depends;
+
+            my $sid = $dbc->sid();
+            my $host = $vipmap{$dbc->host()};
+	    #my @dreal = $drDbc->realHosts();
+            #my $drHost = shift @dreal;
+            my $drHost = $vipmap{$drDbc->host()};
+	    my $shortDrHost = $drHost;
+            $shortDrHost =~ s/^([^\.]+)\..*/$1/;
+	    my $sid = $dbc->sid(); 
+            unless($skipPrimary) {
+             $pr .= defineStep("${prefix}${count}", "$action $sid\@$host",$depends, $expando, $group, undef, $retries, $interval);
+       	     $pr .= veritasAction($dbcs{$dbc->host}, $action, $service, $depends);
+             $drDepends .= " ${prefix}${count}" if($action eq 'offline');
+             $count++;
+            }
+                     if($env eq 'secondary'){
+
+                    my $peer_host = $drDbc->host();
+                    $pr .= defineStep("${prefix}${count}", "$action $sid\@$peer_host",
+                        $drDepends, $expando, $group, undef, $retries, $interval);
+                    $pr .= veritasAction($drDbc, $action, $service);
+                      $count++;
+          
+                   }
+
+	
+       	 }
+	}
+
+    return($pr);
+}
+
+sub veritasAction {
+    my $dbc = shift;
+    my $action = shift;
+    my $service = shift;
+    my $depends = shift;
+    my %clusteredActions = (
+        'offline' => 1,
+        'online' => 1,
+        'status' => 1,
+        'freeze' => 1,
+        'unfreeze' => 1,
+        'offline-status' => 1,
+    );
+
+    if($clusteredActions{$action} && nonClusteredDatacenter($dbc)) {
+        return(nonClusteredVeritasAction($dbc, $action, $service));
+    }
+
+    my $sid = $dbc->sid();
+    my $ucSid = uc($sid);
+    #my @real = $dbc->realHosts();
+    #my $host = shift @real;
+    my $host;
+    $host = $action =~ m/(?:backup|online|offline|status)/i ? $vipmap{$dbc->host()} : $dbc->host();
+     if($action eq 'offline') { $host = $vipmap{$dbc->host()}; } 
+    return if($host =~/hana/ & $action eq 'startdg');
+    my $type = "Shell";
+    my $args = "mon${service}\@$host";
+    my @commands;
+
+    if( $action eq 'offline' ) {
+        $type = "Oracle";
+        $args = "$ucSid\@$host";
+        @commands = ( "\$ SHUTDOWN IMMEDIATE;" );
+    } elsif( $action eq 'online' ) {
+        $type = "Oracle";
+        $args = "$ucSid\@$host";
+        @commands = ( "\$ STARTUP;" );
+
+    } elsif( $action eq 'offline-status') {
+        @commands = ( "\$ sudo /opt/VRTS/bin/hastatus -sum | grep -i $sid | awk '{print \$6}' | sort -u | wc -l",
+                     "SuccessString:1");
+      } elsif( $action eq 'backup' ) {
+          my $stale = ($depends =~ m/hagrp-offline/i ? 'stale_ss' : 'no_stale_ss');
+        @commands = (
+          "\$ sudo /usr/local/ariba/bin/bcv-backup -d -jira $jira -snap -sid $sid -volType data01",
+        );
+    } elsif( $action eq 'status' ) {
+        @commands = (
+          "\$ sudo /opt/VRTS/bin/hastatus -sum | grep ONLINE | grep -i $ucSid",
+          "SuccessString: ONLINE"
+        );
+    } elsif( $action eq 'startdg' ) {
+        $type = "Oracle";
+        $args = "$sid\@$host";
+	next if($host =~/hana/i);
+
+        if($dbc->isPhysicalActiveRealtimeReplication()) {
+            @commands = (
+              "\$ alter system register;",
+              "\$ alter database recover managed standby database using current logfile disconnect;",
+            );
+        } elsif($dbc->isPhysicalActiveReplication()) {
+            @commands = (
+              "\$ alter system register;",
+              "\$ alter database recover managed standby database disconnect;",
+            );
+        } elsif($dbc->isPhysicalReplication()) {
+            @commands = (
+              "\$ alter database recover managed standby database disconnect;",
+            );
+        } else {
+            @commands = (
+              "\$ alter database start logical standby apply immediate;",
+            );
+        }
+    } else {
+        @commands = ( "\$ sudo /opt/VRTS/bin/hagrp -$action $ucSid -wait" );
+    }
+
+    my $ret = defineAction($type, $args, @commands) . "\n";
+    return($ret);
+}
+sub nonClusteredDatacenter {
+    my $dbc = shift;
+    my $host = $dbc->host();
+
+    my @oldDCs = (
+        'opslabdr',
+        'bou'
+    );
+
+    foreach my $dc (@oldDCs) {
+        return(1) if($host =~ m|\.$dc\.|);
+    }
+
+    return(0);
+}
+
+sub nonClusteredVeritasAction {
+    my $dbc = shift;
+    my $action = shift;
+    my $service = shift;
+
+    my $sid = $dbc->sid();
+    my $ucSid = uc($sid);
+    my $host = $dbc->host();
+
+    my $type = "Shell";
+    my $args = "mon${service}\@$host";
+    my @commands;
+
+    if( $action eq 'offline' ) {
+        @commands = (
+            "\$ sudo /usr/local/ariba/bin/database-control -d -n stop $sid",
+            "\$ sudo umount `ls /var/tmp/ora*data01-${sid}-virtual-volumes.txt | perl -pe 's|^/var/tmp||; s|-\\w+-virtual-volumes.txt\$||;'`",
+            "\$ sudo umount `ls /var/tmp/ora*log01-${sid}-virtual-volumes.txt | perl -pe 's|^/var/tmp||; s|-\\w+-virtual-volumes.txt\$||;'`",
+            "\$ sudo umount `ls /var/tmp/ora*log02-${sid}-virtual-volumes.txt | perl -pe 's|^/var/tmp||; s|-\\w+-virtual-volumes.txt\$||;'`",
+        );
+    } elsif( $action eq 'online' ) {
+        @commands = (
+            "\$ sudo mount `ls /var/tmp/ora*data01-${sid}-virtual-volumes.txt | perl -pe 's|^/var/tmp||; s|-\\w+-virtual-volumes.txt\$||;'`",
+            "\$ sudo mount `ls /var/tmp/ora*log01-${sid}-virtual-volumes.txt | perl -pe 's|^/var/tmp||; s|-\\w+-virtual-volumes.txt\$||;'`",
+            "\$ sudo mount `ls /var/tmp/ora*log02-${sid}-virtual-volumes.txt | perl -pe 's|^/var/tmp||; s|-\\w+-virtual-volumes.txt\$||;'`",
+            "\$ sudo /usr/local/ariba/bin/database-control -d -n start $sid",
+        );
+    } else {
+        # placeholder -- freeze, unfreeze, and status are meaningless in this
+        # context
+        @commands = ( "\$ echo $action does not apply to non-clustered setup" );
+    }
+
+    my $ret = defineAction($type, $args, @commands) . "\n";
+    return($ret);
+}
+
+sub pageFilters {
+    my $service = shift;
+    my $prefix = shift;
+    my $remove = shift;
+    my $cluster = shift;
+    my $expando = shift;
+    my $group = shift;
+    my $depends = shift;
+
+    my $pr = "";
+    $pr .= defineExpando($expando, $remove." PageFilter");
+
+    my $mon = ariba::rc::InstalledProduct->new('mon', $service);
+    my @monservers = $mon->hostsForRoleInCluster('monserver', $cluster);
+    my $monserver = shift(@monservers);
+
+    my $rem = "";
+    my $stop = " -start";
+    my $action = "Set";
+    if($remove eq 'remove') {
+        my $expando = "removePageFilter";
+        $rem = " -remove";
+        $stop = " -stop";
+        $action = "Remove";
+        $depends =~ s/consulSwitch/consulSwitchSecondary/igs;
+        $depends .= " group:hagrp-startdg-$cluster";
+        $depends .= ' group:start-apps';
+    }
+
+    $pr .= defineRunGroup($group, 5);
+
+    my $count = 0;
+    my @products = productsList($service);
+    my $products = join(',',map{$_->name()}@products);
+
+
+        $pr .= defineStep("${prefix}$count", "$action planned downtime and page filters for $service",
+                $depends, $expando, $group, undef, undef, undef
+        );
+        $pr .= defineAction("Shell", "mon$service\@$monserver",
+            "\$ /home/mon$service/bin/page/nopage -user mcltool -service $service -ttl 240 -note 'DR failover'$rem",
+            "\$ /home/mon$service/bin/planned-downtime -service $service -comment 'DR failover' -mclname 'dr/failover.txt'$stop -products $products  -jira $jira -duration 240",
+        );
+        $pr .= "\n";
+    my $ff = "$odir/$action"."_page_filter.mcl";
+    #my $mcl = "$odir/set_page_filter.mcl";
+    my $mcl = "$ff";
+    my $OUT;
+    open($OUT, "> $mcl") || die("Failed to open $mcl: $!");
+    print $OUT $pr;
+    close($OUT);
+    return $mcl;
+
+}
+
+sub physicalSwitch {
+    my $fromDbc = shift;
+    my $toDbc = shift;
+    my $expando = shift;
+    my $failback = shift || 0;
+    my $dbDepends = databaseFailoverDepends();
+    my $group = "DBSWITCH";
+    my $primaryHost = $fromDbc->host();
+    my $drHost = $toDbc->host();
+    my $sid = $fromDbc->sid();
+
+    my $pre = $fromDbc->sid();
+
+    my $ret = "";
+
+    $ret .= defineStep("1${pre}", "Verify $sid\@$primaryHost Can Be Switched to Standby",
+            $dbDepends, $expando, $group, undef, 5, 20
+    );
+    $ret .= defineAction("Oracle", "$sid\@$primaryHost",
+        "\$ SELECT SWITCHOVER_STATUS FROM V\$DATABASE;",
+        'SuccessString: (?:TO\s+STANDBY|SESSIONS\s+ACTIVE)',
+    );
+    $ret .= "\n";
+
+
+    $ret .= defineStep("2${pre}", "Initiate Switchover of $sid\@$primaryHost",
+            "$dbDepends 1${pre}", $expando, $group, undef, undef, undef
+    );
+    $ret .= defineAction("Oracle", "$sid\@$primaryHost",
+        "\$ ALTER DATABASE COMMIT TO SWITCHOVER TO PHYSICAL STANDBY WITH SESSION SHUTDOWN;",
+    );
+    $ret .= "\n";
+
+    my $mount = "";
+    $mount = " MOUNT" unless(
+                $fromDbc->isPhysicalActiveRealtimeReplication() ||
+                $fromDbc->isPhysicalActiveReplication()
+            );
+
+    $ret .= defineStep("3${pre}", "Shutdown/Restart $sid\@$primaryHost",
+            "$dbDepends 2${pre}", $expando, $group, undef, undef, undef
+    );
+    $ret .= defineAction("Oracle", "$sid\@$primaryHost",
+        "\$ SHUTDOWN ABORT;",
+        "\$ STARTUP$mount;"
+    );
+    $ret .= "\n";
+
+    $ret .= defineStep("4${pre}", "Verify $sid\@$drHost Can Be Switched to Primary",
+            "$dbDepends 3${pre}", $expando, $group, undef, 5, 25
+    );
+    $ret .= defineAction("Oracle", "$sid\@$drHost",
+        "\$ SELECT SWITCHOVER_STATUS FROM V\$DATABASE;",
+        'SuccessString: (?:TO\s+PRIMARY|SESSIONS\s+ACTIVE|SWITCHOVER\s+PENDING)'
+    );
+    $ret .= "\n";
+
+    $ret .= defineStep("5${pre}", "Initiate Switchover of $sid\@$drHost",
+            "$dbDepends 4${pre}", $expando, $group, undef, undef, undef
+    );
+    $ret .= defineAction("Oracle", "$sid\@$drHost",
+        "\$ ALTER DATABASE COMMIT TO SWITCHOVER TO PRIMARY WITH SESSION SHUTDOWN;",
+    );
+    $ret .= "\n";
+    
+    my @step7Cmd;
+    my @step6Cmd;
+    @step6Cmd = ( "\$ SHUTDOWN ABORT;","\$ STARTUP;" );
+
+    if( scalar(@step6Cmd) ) {
+        $ret .= defineStep("6${pre}", "Open DB on $sid\@$drHost",
+            "$dbDepends 5${pre}", $expando, undef, undef, undef, undef
+        );
+        $ret .= defineAction("Oracle", "$sid\@$drHost",
+            @step6Cmd,
+        );
+        $ret .= "\n";
+    } else {
+        $ret .= "Declare: 6${pre}\n\n";
+    }
+
+    if( scalar(@step7Cmd) ) {
+        $ret .= defineStep("7${pre}", "Start redo/apply on $sid\@$primaryHost",
+            "$dbDepends 6${pre} 5${pre}", $expando, $group, undef, undef, undef
+        );
+        $ret .= defineAction("Oracle", "$sid\@$primaryHost",
+            @step7Cmd,
+        );
+        $ret .= "\n";
+    } else {
+        #$ret .= "Declare: 7${pre}\n\n";
+    }
+
+    my $link = uc($sid);
+    if($failback) {
+        $link .= "_B";
+    } else {
+        $link .= "_A";
+    }
+
+    $ret .= defineStep("8${pre}", "recreate dblink on $sid\@$drHost",
+        "$dbDepends 6${pre} 5${pre}", $expando, $group, undef, undef, undef
+    );
+    $ret .= defineAction("Oracle", "$sid\@$drHost",
+        "\$ drop public database link dg_standby;",
+        "\$ create public database link dg_standby connect to system identified by PASSWORD:system using '${link}';",
+    );
+    $ret .= "\n";
+
+    return($ret);
+}
+sub physicalFailover {
+    my $dbc = shift;
+    my $expando = shift;
+    my $service = shift;
+
+    my ( $primary, $secondary ) = sanitizeDBCs($dbc, $service);
+
+    return( physicalSwitch( $primary, $secondary, $expando ) );
+}
+
+sub generateDBFailoverSteps {
+    my $service = shift;
+
+    my @products = productsList($service);
+        my $comment = "#\n";
+        my $failOverInc;
+        my $failBackInc;
+        my $group = "DBSWITCH";
+        #$failover .= defineRunGroup($group, 20);
+        #$failback .= defineRunGroup($group, 20);
+        my $c = 1;
+        my $skiphana = 0;
+    foreach my $p (@products) {
+        next if($p->isASPProduct()); # for now we aren't failing over ASP
+        next if($p->name() eq 'ebs'); # ebs just echos the AN db config
+        $comment = "#\n";
+        my $failover = "";
+        my $failback = "";
+        if($c == 1) {
+           $failover .= defineRunGroup($group, 20);
+           $failback .= defineRunGroup($group, 20);
+        }
+        $c++;
+        $failOverInc = "/tmp/cobalt-failover" . "/L-" . $p->name() . "-$service.mcl";
+        $failBackInc = "/tmp/cobalt-failback" . "/L-" . $p->name() . "-$service.mcl";
+
+        my $expando = $p->name() . "DB";
+  
+        #my @dbcs =  ariba::Ops::DBConnection->connectionsFromProducts($p);
+	my @dbcs = dbConnectionsFromProducts($p);
+
+        my $validSid = 0;
+        d: for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbcs)) {
+            next unless($dbc->drDBPeer());
+            next if $dbc->sid() =~ /(?:^rmn|^rman)/i;
+            $validSid = 1;
+            if($dbc->dbServerType() eq 'hana') {
+
+           if ($skiphana == 0) {
+           $failover .= defineExpando($expando, "DB Failover for " . $p->name());
+           $failback .= defineExpando($expando, "DB Failback for " . $p->name());
+           }
+                if ( grep{$_ eq $dbc->sid()}keys %hanacache ) {
+                       $skiphana = 1;
+                       print "**new skipping for ".$p->name()."\n";
+                       next d;
+                 }
+                $failover .= hanaFailover($dbc, $expando, $service);
+                $failback .= hanaFailback($dbc, $expando, $service);
+                $hanacache{$dbc->sid()} = 1;
+            } elsif ($dbc->dbServerType() eq 'oracle') {
+           $failover .= defineExpando($expando, "DB Failover for " . $p->name());
+           $failback .= defineExpando($expando, "DB Failback for " . $p->name());
+              $failover .= physicalFailover($dbc, $expando, $service);
+                $failback .= physicalFailback($dbc, $expando, $service);
+            }
+            if( ($dbc->dbServerType() eq 'hana') && ($skiphana == 0) ) {
+                $comment .= "# " . $dbc->sid() . " using switch for HANA\n";
+            } elsif($dbc->isPhysicalActiveRealtimeReplication()) {
+                $comment .= "# " . $dbc->sid() . " using switch for physical-active-realtime\n";
+            } elsif($dbc->isPhysicalActiveReplication()) {
+                $comment .= "# " . $dbc->sid() . " using switch for physical-active\n";
+            } elsif($dbc->isPhysicalReplication()) {
+                $comment .= "# " . $dbc->sid() . " using switch for 'plain' physical\n";
+            } else {
+                $comment .= "# " . $dbc->sid() . " using switch for 'logical'\n";
+            }
+        }
+
+        $comment .= "#\n\n";
+
+        next unless($validSid);
+        #generateDBFailoverStepsUnplanned($p);
+	#my $failOverInc = $odir ."/"."db_physical.mcl";
+        my $OUT;
+        if($failtype eq 'failover') {
+        open($OUT, ">$failOverInc") || die("Failed to open $failOverInc: $!");
+        print $OUT $comment;
+        print $OUT $failover;
+        close($OUT);
+        } elsif($failtype eq 'failback') {
+        open($OUT, ">$failBackInc") || die("Failed to open $failBackInc: $!");
+        print $OUT $comment;
+        print $OUT $failback;
+        close($OUT);
+        }
+        if($failtype eq 'failover') {
+          push @incs, $failOverInc;
+        } else {
+          push @incs, $failBackInc
+        }
+    }
+}
+
+sub generateDBFailoverStepsUnplanned {
+    my $p = shift;
+    my $pname = $p->name();
+    my $service = $p->service();
+    my $build = $p->buildName();
+    my $pre = "DB$pname";
+    my $group = "DBSWITCH";
+
+    my @allDbcs = dbConnectionsFromProducts($p);
+    my @dbcs;
+    my %seenSid;
+    foreach my $d (@allDbcs) {
+        next if($d->dbServerType eq 'hana'); # skip hana for unplanned for now
+        next if($seenSid{$d->sid()});
+        next unless($d->drDBPeer());
+        my ($p, $s) = sanitizeDBCs($d, $service);
+        next unless $s;
+        $seenSid{$s->sid()} = 1;
+        push(@dbcs, $s);
+    }
+
+    my $expando = "${pname}DB";
+    my $pr = defineExpando($expando, "DB Failover for $pname");
+    my $depends = databaseFailoverDepends();
+
+    $pr .= defineStep("1$pre", "Calculate Sync Times for $pname",
+        $depends, $expando, $group, undef, undef, undef);
+    $pr .= defineAction("Perl", undef,
+        "Database::rollbackTimeForProduct('$pname', '$service', '$build');",
+    );
+    $pr .= "\n";
+
+    foreach my $dbc (@dbcs) {
+        my $sid = $dbc->sid();
+        my $host = $dbc->host();
+        $depends = "1$pre";
+
+        $pr .= defineStep("2$sid", "Wait for $sid to catch up",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("Perl", undef,
+            "Database::waitForRollForward('$pname', '$service', '$build', undef, '$sid');",
+        );
+        $pr .= "\n";
+        $depends = "2$sid";
+
+        $pr .= defineStep("3$sid", "Cancel Managed Standby for $sid\@$host",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("Oracle", "$sid\@$host",
+            "\$ ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;",
+        );
+        $pr .= "\n";
+        $depends = "3$sid";
+
+        my $testVar = "${sid}ErrorsOnFinish";
+        $pr .= defineVariable($testVar, 0);
+        $pr .= "\n";
+
+        $pr .= defineStep("4$sid", "Finish Managed Standby for $sid\@$host",
+            $depends, $expando, $group, undef, undef, undef,
+            "StoreSuccess: $testVar\n",
+        );
+        $pr .= defineAction("Oracle", "$sid\@$host",
+            "\$ ALTER DATABASE RECOVER MANAGED STANDBY DATABASE FINISH;",
+            "SuccessString: Database altered",
+        );
+        $pr .= "\n";
+        $depends = "4$sid";
+
+        $pr .= defineStep("5${sid}a", "Verify $sid\@$host can be switched",
+            $depends, $expando, $group, undef, 5, 10,
+            "ExecuteIf: $testVar\n",
+        );
+        $pr .= defineAction("Oracle", "$sid\@$host",
+            "\$ SELECT SWITCHOVER_STATUS FROM V\$DATABASE;",
+            'SuccessString: (?:TO[_\s]PRIMARY|SESSIONS ACTIVE)',
+        );
+        $pr .= "\n";
+        $depends = "5${sid}a";
+
+        $pr .= defineStep("6${sid}a", "Initiate Switchover of $sid\@$host",
+            $depends, $expando, $group, undef, undef, undef,
+            "ExecuteIf: $testVar\n",
+        );
+        $pr .= defineAction("Oracle", "$sid\@$host",
+            "\$ ALTER DATABASE COMMIT TO SWITCHOVER TO PRIMARY WITH SESSION SHUTDOWN;",
+        );
+        $pr .= "\n";
+
+        $depends = "4$sid";
+        $pr .= defineStep("6${sid}b", "Activate Physical Standby Database for $sid\@$host",
+            $depends, $expando, $group, undef, undef, undef,
+            "ExecuteUnless: $testVar\n",
+        );
+        $pr .= defineAction("Oracle", "$sid\@$host",
+            "\$ ALTER DATABASE ACTIVATE PHYSICAL STANDBY DATABASE;",
+        );
+        $pr .= "\n";
+
+        $depends = "6${sid}a 6${sid}b";
+
+        $pr .= defineStep("7$sid", "Open $sid\@$host",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("Oracle", "$sid\@$host",
+            "\$ ALTER DATABASE OPEN;",
+        );
+        $pr .= "\n";
+        $depends = "7$sid";
+
+        $pr .= defineStep("8$sid", "Restart $sid\@$host",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("Oracle", "$sid\@$host",
+            "\$ shutdown immediate;",
+            "\$ startup mount;",
+        );
+        $pr .= "\n";
+        $depends = "8$sid";
+
+        my $resetLogs = "";
+        if(scalar(@dbcs) > 1) {
+            #
+            # if product only has one DB, then no need to flashback
+            #
+            $pr .= defineStep("9$sid", "Flashback $sid\@$host",
+                $depends, $expando, $group, undef, undef, undef);
+            $pr .= defineAction("Perl", undef,
+                "Database::flashbackDatabase('$pname', '$service', '$build', undef, '$sid');",
+            );
+            $pr .= "\n";
+            $depends = "9$sid";
+            $resetLogs = " RESETLOGS";
+        }
+
+        $pr .= defineStep("10$sid", "Open resetlogs for $sid\@$host",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("Oracle", "$sid\@$host",
+            "\$ ALTER DATABASE OPEN$resetLogs;",
+        );
+        $pr .= "\n";
+        $depends = "10$sid";
+    }
+
+    my $file = $odir . "/LU-" . $p->name() . "-$service.mcl\n";
+    print "\n === writing $file";
+    my $OUT;
+    open($OUT, "> $file");
+    print $OUT $pr;
+    close($OUT);
+    push @incs, $file;
+}
+
+sub databaseFailoverDepends {
+    return "consulSwitch group:hagrp-freeze-primary group:hagrp-freeze-secondary  group:DBBackup-Initial";
+    #
+    # if we were skipping DB backup, this depends on the DB backup depends
+    #
+    # return(takeDBBackupDepends());
+}
+
+sub databaseFailbackDepends {
+
+    return 'consulSwitch group:hagrp-freeze-primary group:hagrp-freeze-secondary  group:DBBackup-Initial';
+
+}
+
+sub physicalFailback {
+    my $dbc = shift;
+    my $expando = shift;
+    my $service = shift;
+
+    my ( $primary, $secondary ) = sanitizeDBCs($dbc, $service);
+
+    return( physicalSwitch( $secondary, $primary, $expando, 1 ) );
+}
+###################################
+sub generateSnapMirrorSteps {
+    my $service = shift;
+    my $pr = "";
+
+    my $mon = ariba::rc::InstalledProduct->new('mon', $service);
+    #my $nfs_filer = $mon->default('nfs.filer');
+    my $snapVols = snapVolumes();
+    my $depends = "consulSwitch";
+
+    my $expando = "snapMirror";
+    $pr .= defineExpando($expando, "Fail Over Snapmirrored Volumes");
+
+    my $group = "backup-primary-snapmirror";
+    $pr .= defineRunGroup($group, 1);
+
+    my $prefix = "L";
+    my $count = 1;
+
+    foreach my $vol (sort keys (%$snapVols)) {
+        (my $srcserver = $snapVols->{$vol}{'srcvol'}) =~ s/\:.*?$//igs;
+
+        $pr .= defineStep("${prefix}$count", "snap create $vol",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("NetworkDevice", $snapVols->{$vol}->{'srchost'},
+            "\$ snap create -vserver $srcserver -volume $vol -snapshot $vol-failover-${prefix}$count -foreground true",
+            "ErrorString: Snapshot already exists",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+    my @copyhosts = $mon->hostsForRoleInCluster('copyhost', 'secondary');
+    @copyhosts = $mon->hostsForRoleInCluster('monserver', 'secondary') unless(scalar(@copyhosts));
+    my $copyhost = shift(@copyhosts);
+    my @monservers = $mon->hostsForRoleInCluster('monserver', 'secondary');
+    my $monserver = shift(@monservers);
+    my $machine = ariba::Ops::Machine->new($copyhost);
+    my $drDatacenter = $machine->datacenter();
+
+    #$pr .= defineStep("LL", "disable cfengine/snapmirror on $monserver",
+    #    "group:$group", $expando, undef, undef, undef, undef);
+    #$pr .= defineAction("Shell", "mon$service\@$monserver",
+    #    "\$ sudo crontab -l | perl -pe 'if(m|cfengine/stage1|) { \$_ = \"# \$_\"; }' | sudo crontab",
+    #    "\$ sudo rm -f /netapp/*/etc/snapmirror.conf",
+    #);
+    $pr .= "\n";
+
+    $group = "update-snapmirror";
+    $pr .= defineRunGroup($group, 1);
+
+    $prefix = "M";
+    $count = 1;
+    $depends = "  group:backup-primary-snapmirror";
+        foreach my $vol (sort keys (%$snapVols)) {
+        #
+        # special -- mon volume has lots of changes and takes a long time
+        # to catch up... it's also non-critical, so we drop it.
+        #
+        #next if($vol =~ /^mon$service/);
+
+        my $host = $snapVols->{$vol}->{'dsthost'};
+        unless($host =~ /$drDatacenter/) {
+            #$host .= ".$drDatacenter.ariba.com";
+        }
+
+        my $volume = $snapVols->{$vol}->{dstvol};
+        $pr .= defineStep("${prefix}$count", "snapmirror update $volume",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("NetworkDevice", $host,
+            "\$ snapmirror update -destination-path $volume ",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+    $group = "verify-update-snapmirror";
+    $pr .= defineRunGroup($group, 1);
+        my $retries  = 20;
+        my $interval = 30;
+    $prefix = "VM";
+    $count = 1;
+    $depends = "group:update-snapmirror";
+
+    foreach my $vol (sort keys (%$snapVols)) {
+        #
+        # special -- mon volume has lots of changes and takes a long time
+        # to catch up... it's also non-critical, so we drop it.
+        #
+        #next if($vol =~ /^mon$service/);
+
+        my $host = $snapVols->{$vol}->{'dsthost'};
+        unless($host =~ /$drDatacenter/) {
+            #$host .= ".$drDatacenter.ariba.com";
+        }
+
+        my $volume = $snapVols->{$vol}->{dstvol};
+                chomp($volume);
+        $pr .= defineStep("${prefix}$count", "verify status is not transfer for $volume",
+            $depends, $expando, $group, undef, $retries, $interval);
+        $pr .= defineAction("NetworkDevice", $host,
+                        "\$ sleep 5",
+            "\$ snapmirror show -destination-path $volume -fields status  ",
+                        "SuccessString: Idle",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+    my $volList = join(',', sort(keys(%$snapVols)));
+
+
+    #
+    # Step "MM" here to check in sync status, depends on update-snapmirror
+    #
+    #$pr .= defineStep("MM", "Check Snapmirror Sync Status",
+    #    "group:$group", $expando, undef, undef, 5, 10);
+    #$pr .= defineAction("Perl", undef,
+    #    "SnapMirror::checkSyncStatus('$service','$volList','$drDatacenter','\${TMID}','failover')",
+    #);
+    #$pr .= "\n";
+
+
+
+    $depends = "  group:verify-update-snapmirror";
+    $group = "snapmirror-quiesce";
+    $prefix = "SQ";
+    $count = 1;
+
+    $pr .= defineRunGroup($group, 1);
+
+    #
+    # Snapmirror Quiesce commands here
+    #
+    foreach my $vol (sort keys (%$snapVols)) {
+        my $host = $snapVols->{$vol}->{'dsthost'};
+        unless($host =~ /$drDatacenter/) {
+            #$host .= ".$drDatacenter.ariba.com";
+        }
+         my $volume = $snapVols->{$vol}->{dstvol};
+         chomp($volume);
+        $pr .= defineStep("${prefix}$count", "snapmirror quiesce $volume",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("NetworkDevice", $host,
+            "\$ snapmirror quiesce -destination-path $volume",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+
+    #
+    #Verify snap mirror quiesce
+    #
+    $group = "verify-snapmirror-quiesce";
+    $pr .= defineRunGroup($group, 1);
+        my $retries  = 20;
+        my $interval = 10;
+    $prefix = "VSQ";
+    $count = 1;
+    $depends = "  group:snapmirror-quiesce";
+
+
+    foreach my $vol (sort keys (%$snapVols)) {
+        #
+        # special -- mon volume has lots of changes and takes a long time
+        # to catch up... it's also non-critical, so we drop it.
+        #
+        #next if($vol =~ /^mon$service/);
+
+        my $host = $snapVols->{$vol}->{'dsthost'};
+        unless($host =~ /$drDatacenter/) {
+            #$host .= ".$drDatacenter.ariba.com";
+        }
+
+        my $volume = $snapVols->{$vol}->{dstvol};
+                chomp($volume);
+        $pr .= defineStep("${prefix}$count", "verify status changed to quiesce for $volume",
+            $depends, $expando, $group, undef, $retries, $interval);
+        $pr .= defineAction("NetworkDevice", $host,
+                        "\$ sleep 5",
+            "\$ snapmirror show -destination-path $volume -fields status  ",
+                        "SuccessString: Quiesced",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+
+    ###############################
+
+    $depends = "  group:verify-snapmirror-quiesce";
+    $group = "snapmirror-break";
+    $prefix = "N";
+    $count = 1;
+
+    $pr .= defineRunGroup($group, 1);
+
+    #
+    # Snapmirror break commands here
+    #
+    foreach my $vol (sort keys (%$snapVols)) {
+        my $host = $snapVols->{$vol}->{'dsthost'};
+        unless($host =~ /$drDatacenter/) {
+            $host .= ".$drDatacenter.ariba.com";
+        }
+        my $volume = $snapVols->{$vol}->{dstvol};
+        chomp($volume);
+        $pr .= defineStep("${prefix}$count", "snapmirror break $volume",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("NetworkDevice", $host,
+            "\$ snapmirror break -destination-path $volume",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+    #
+    #Verify snapmirror break
+    #
+    $group = "verify-snapmirror-break";
+    $pr .= defineRunGroup($group, 1);
+        my $retries  = 20;
+        my $interval = 10;
+    $prefix = "VSB";
+    $count = 1;
+    $depends = "  group:snapmirror-break";
+
+    foreach my $vol (sort keys (%$snapVols)) {
+        #
+        # special -- mon volume has lots of changes and takes a long time
+        # to catch up... it's also non-critical, so we drop it.
+        #
+        #next if($vol =~ /^mon$service/);
+
+        my $host = $snapVols->{$vol}->{'dsthost'};
+        unless($host =~ /$drDatacenter/) {
+            #$host .= ".$drDatacenter.ariba.com";
+        }
+
+        my $volume = $snapVols->{$vol}->{dstvol};
+                chomp($volume);
+        $pr .= defineStep("${prefix}$count", "verify status changed to broken-off for $volume",
+            $depends, $expando, $group, undef, $retries, $interval);
+        $pr .= defineAction("NetworkDevice", $host,
+                        "\$ sleep 5",
+            "\$ snapmirror show -destination-path $volume -fields state  ",
+                        "SuccessString: Broken-off",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+
+
+    #################################################
+
+    $depends = "  group:$group";
+    $group = "snapmirror-resync";
+    $prefix = "O";
+    $count = 1;
+
+    $pr .= defineRunGroup($group, 1);
+
+    #
+    # Snapmirror resync commands here
+    #
+    foreach my $vol (sort keys (%$snapVols)) {
+        my $host = $snapVols->{$vol}->{'srchost'};
+        my $drHost = $snapVols->{$vol}->{'dsthost'};
+        unless($drHost =~ /$drDatacenter/) {
+             #$drHost .= ".$drDatacenter.ariba.com";
+        }
+        my $volume = $snapVols->{$vol}->{'srcvol'};
+        my $nvolume = $snapVols->{$vol}->{'dstvol'};
+        chomp($volume);
+        chomp($nvolume);
+        $pr .= defineStep("${prefix}$count", "snapmirror resync for $volume",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("NetworkDevice", $host,
+            "\$ snapmirror resync -destination-path  $volume -source-path $nvolume -force",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+              ######################verify snapmirror resync update#######
+  $depends = "group:$group";
+ $group = "verify-resync-update-snapmirror";
+    $pr .= defineRunGroup($group, 1);
+        my $retries  = 20;
+        my $interval = 30;
+    $prefix = "VRU";
+    $count = 1;
+
+    foreach my $vol (sort keys (%$snapVols)) {
+        #
+        # special -- mon volume has lots of changes and takes a long time
+        # to catch up... it's also non-critical, so we drop it.
+        #
+        #next if($vol =~ /^mon$service/);
+
+        my $host = $snapVols->{$vol}->{'srchost'};
+        unless($host =~ /$drDatacenter/) {
+            #$host .= ".$drDatacenter.ariba.com";
+        }
+
+        my $volume = $snapVols->{$vol}->{srcvol};
+                chomp($volume);
+        $pr .= defineStep("${prefix}$count", "verify status is not transfer for $volume",
+            $depends, $expando, $group, undef, $retries, $interval);
+        $pr .= defineAction("NetworkDevice", $host,
+                        "\$ sleep 5",
+            "\$ snapmirror show -destination-path $volume -fields status  ",
+                        "SuccessString: Idle",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+      ##############################################
+
+
+    $depends = "group:$group";
+    $group = "snapmirror-modify";
+    $prefix = "SM";
+    $count = 1;
+
+    $pr .= defineRunGroup($group, 1);
+
+    foreach my $vol (sort keys (%$snapVols)) {
+        my $host = $snapVols->{$vol}->{'srchost'};
+        unless($host =~ /$drDatacenter/) {
+            #$host .= ".$drDatacenter.ariba.com";
+        }
+        my $volume = $snapVols->{$vol}->{'srcvol'};
+        chomp($volume);
+
+        $pr .= defineStep("${prefix}$count", "snapmirror modify $volume",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("NetworkDevice", $host,
+            "\$ snapmirror modify -destination-path $volume -schedule 1hourly ",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+     ##############################################
+    $depends = "  group:snapmirror-resync";
+    $group = "copy-from-shared-fs";
+
+    $pr .= defineRunGroup($group, 10);
+
+    my $title = "copy-from-shared-fs an";
+    my $command = "\$ /home/an$service/bin/copy-from-shared-fs an -once -debug";
+    unless(ariba::rc::InstalledProduct->isInstalled('an',$service)) {
+        $title = "placeholder for copy-from-shared-fs";
+        $command = "\$ echo This is needed for the dependancy tree";
+    }
+    $pr .= defineStep("P1", $title,
+        $depends, $expando, $group, undef, undef, undef);
+    $pr .= defineAction("Shell", "an$service\@$copyhost",
+        $command,
+    );
+    $pr .= "\n";
+
+    my $mclfile = $odir."/P-failoverSnapMirror.mcl";
+    my $OUT;
+    open($OUT, "> $mclfile") || die("Failed to open $mclfile: $!");
+    print $OUT $pr;
+    close($OUT);
+    return $mclfile;
+    #######copied from CN
+}
+
+sub generateSnapMirrorStepsFailback {
+    my $service = shift;
+    my $pr = "";
+
+    my $mon = ariba::rc::InstalledProduct->new('mon', $service);
+    #my $nfs_filer = $mon->default('nfs.filer');
+    my $snapVols = snapVolumes();
+    my $depends = "consulSwitch";
+
+    my $expando = "snapMirror";
+    $pr .= defineExpando($expando, "Fail Over Snapmirrored Volumes");
+
+    my $group = "backup-secondary-snapmirror";
+    $pr .= defineRunGroup($group, 1);
+
+    my $prefix = "L";
+    my $count = 1;
+
+        foreach my $vol (sort keys (%$snapVols)) {
+        chomp($vol);
+        (my $srcserver = $snapVols->{$vol}{'dstvol'}) =~ s/\:.*?$//igs;
+	chomp($srcserver);
+        $pr .= defineStep("${prefix}$count", "snap create $vol",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("NetworkDevice", $snapVols->{$vol}->{'dsthost'},
+            "\$ snap create -vserver $srcserver -volume $vol -snapshot $vol-failback-${prefix}$count -foreground true",
+            "ErrorString: Snapshot already exists",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+    my @copyhosts = $mon->hostsForRoleInCluster('copyhost', 'primary');
+    @copyhosts = $mon->hostsForRoleInCluster('monserver', 'primary') unless(scalar(@copyhosts));
+    my $copyhost = shift(@copyhosts);
+    my @monservers = $mon->hostsForRoleInCluster('monserver', 'primary');
+    my $monserver = shift(@monservers);
+    my $machine = ariba::Ops::Machine->new($copyhost);
+    my $drDatacenter = $machine->datacenter();
+
+    #$pr .= defineStep("LL", "disable cfengine/snapmirror on $monserver",
+    #    "group:$group", $expando, undef, undef, undef, undef);
+    #$pr .= defineAction("Shell", "mon$service\@$monserver",
+    #    "\$ sudo crontab -l | perl -pe 'if(m|cfengine/stage1|) { \$_ = \"# \$_\"; }' | sudo crontab",
+    #    "\$ sudo rm -f /netapp/*/etc/snapmirror.conf",
+    #);
+    $pr .= "\n";
+
+    $group = "update-snapmirror";
+    $pr .= defineRunGroup($group, 1);
+
+    $prefix = "M";
+    $count = 1;
+    $depends = "  group:backup-secondary-snapmirror";
+
+    foreach my $vol (sort keys (%$snapVols)) {
+
+        #
+        # special -- mon volume has lots of changes and takes a long time
+        # to catch up... it's also non-critical, so we drop it.
+        #
+        #next if($vol =~ /^mon$service/);
+
+        my $host = $snapVols->{$vol}->{'srchost'};
+        unless($host =~ /$drDatacenter/) {
+            #$host .= ".$drDatacenter.ariba.com";
+        }
+
+        my $volume = $snapVols->{$vol}->{srcvol};
+        chomp($volume);
+        $pr .= defineStep("${prefix}$count", "snapmirror update $volume",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("NetworkDevice", $host,
+            "\$ snapmirror update -destination-path $volume ",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+      $group = "verify-update-snapmirror";
+    $pr .= defineRunGroup($group, 1);
+        my $retries  = 20;
+        my $interval = 30;
+    $prefix = "VM";
+    $count = 1;
+    $depends = "group:update-snapmirror";
+
+    foreach my $vol (sort keys (%$snapVols)) {
+        #
+        # special -- mon volume has lots of changes and takes a long time
+        # to catch up... it's also non-critical, so we drop it.
+        #
+        #next if($vol =~ /^mon$service/);
+
+        my $host = $snapVols->{$vol}->{'srchost'};
+        unless($host =~ /$drDatacenter/) {
+            #$host .= ".$drDatacenter.ariba.com";
+        }
+
+        my $volume = $snapVols->{$vol}->{srcvol};
+                chomp($volume);
+        $pr .= defineStep("${prefix}$count", "verify status is not transfer for $volume",
+            $depends, $expando, $group, undef, $retries, $interval);
+        $pr .= defineAction("NetworkDevice", $host,
+                        "\$ sleep 5",
+            "\$ snapmirror show -destination-path $volume -fields status  ",
+                        "SuccessString: Idle",
+        );
+        $pr .= "\n";
+
+        $count++;
+    }
+    my $volList = join(',', sort(keys(%$snapVols)));
+
+    #
+    # Step "MM" here to check in sync status, depends on update-snapmirror
+    #
+    #$pr .= defineStep("MM", "Check Snapmirror Sync Status",
+    #    "group:$group", $expando, undef, undef, 5, 10);
+    #$pr .= defineAction("Perl", undef,
+    #    "SnapMirror::checkSyncStatus('$service','$volList','$drDatacenter','\${TMID}','failover')",
+    #);
+    #$pr .= "\n";
+
+
+
+    $depends = "  group:update-snapmirror";
+    $group = "snapmirror-quiesce";
+    $prefix = "SQ";
+    $count = 1;
+
+    $pr .= defineRunGroup($group, 1);
+
+    #
+    # Snapmirror Quiesce commands here
+    #
+    foreach my $vol (sort keys (%$snapVols)) {
+        my $host = $snapVols->{$vol}->{'srchost'};
+        unless($host =~ /$drDatacenter/) {
+            #$host .= ".$drDatacenter.ariba.com";
+        }
+         my $volume = $snapVols->{$vol}->{srcvol};
+         chomp($volume);
+        $pr .= defineStep("${prefix}$count", "snapmirror quiesce $volume",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("NetworkDevice", $host,
+            "\$ snapmirror quiesce -destination-path $volume",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+
+
+    #
+    #Verify snap mirror quiesce
+    #
+    $group = "verify-snapmirror-quiesce";
+    $pr .= defineRunGroup($group, 1);
+        my $retries  = 20;
+        my $interval = 10;
+    $prefix = "VSQ";
+    $count = 1;
+    $depends = "  group:snapmirror-quiesce";
+    foreach my $vol (sort keys (%$snapVols)) {
+        #
+
+        # special -- mon volume has lots of changes and takes a long time
+        # to catch up... it's also non-critical, so we drop it.
+        #
+        #next if($vol =~ /^mon$service/);
+
+        my $host = $snapVols->{$vol}->{'srchost'};
+        unless($host =~ /$drDatacenter/) {
+            #$host .= ".$drDatacenter.ariba.com";
+        }
+
+        my $volume = $snapVols->{$vol}->{srcvol};
+                chomp($volume);
+        $pr .= defineStep("${prefix}$count", "verify status changed to quiesce for $volume",
+            $depends, $expando, $group, undef, $retries, $interval);
+        $pr .= defineAction("NetworkDevice", $host,
+                        "\$ sleep 5",
+            "\$ snapmirror show -destination-path $volume -fields status  ",
+                        "SuccessString: Quiesced",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+
+    ###############################
+
+
+    $depends = "  group:verify-snapmirror-quiesce";
+    $group = "snapmirror-break";
+    $prefix = "N";
+    $count = 1;
+
+    $pr .= defineRunGroup($group, 1);
+
+    #
+    # Snapmirror break commands here
+    #
+    foreach my $vol (sort keys (%$snapVols)) {
+        my $host = $snapVols->{$vol}->{'srchost'};
+        unless($host =~ /$drDatacenter/) {
+            #$host .= ".$drDatacenter.ariba.com";
+        }
+        my $volume = $snapVols->{$vol}->{srcvol};
+
+        $pr .= defineStep("${prefix}$count", "snapmirror break $volume",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("NetworkDevice", $host,
+            "\$ snapmirror break -destination-path $volume",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+       #
+
+    #Verify snapmirror break
+    #
+    $group = "verify-snapmirror-break";
+    $pr .= defineRunGroup($group, 1);
+        my $retries  = 20;
+        my $interval = 10;
+    $prefix = "VSB";
+    $count = 1;
+    $depends = "  group:snapmirror-break";
+
+    foreach my $vol (sort keys (%$snapVols)) {
+        #
+        # special -- mon volume has lots of changes and takes a long time
+        # to catch up... it's also non-critical, so we drop it.
+        #
+        #next if($vol =~ /^mon$service/);
+
+        my $host = $snapVols->{$vol}->{'srchost'};
+        unless($host =~ /$drDatacenter/) {
+            #$host .= ".$drDatacenter.ariba.com";
+        }
+
+        my $volume = $snapVols->{$vol}->{srcvol};
+                chomp($volume);
+        $pr .= defineStep("${prefix}$count", "verify status changed to quiesce for $volume",
+            $depends, $expando, $group, undef, $retries, $interval);
+        $pr .= defineAction("NetworkDevice", $host,
+                        "\$ sleep 5",
+            "\$ snapmirror show -destination-path $volume -fields state  ",
+                        "SuccessString: Broken-off",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+
+
+    $depends = "  group:$group";
+    $group = "snapmirror-resync";
+    $prefix = "O";
+    $count = 1;
+
+    $pr .= defineRunGroup($group, 1);
+
+    #
+    # Snapmirror resync commands here
+    #
+    foreach my $vol (sort keys (%$snapVols)) {
+        my $host = $snapVols->{$vol}->{'dsthost'};
+
+        my $drHost = $snapVols->{$vol}->{'srchost'};
+        unless($drHost =~ /$drDatacenter/) {
+            #$drHost .= ".$drDatacenter.ariba.com";
+        }
+
+        my $volume = $snapVols->{$vol}->{'dstvol'};
+        my $nvolume = $snapVols->{$vol}->{'srcvol'};
+        chomp($volume);
+        chomp($nvolume);
+        $pr .= defineStep("${prefix}$count", "snapmirror resync for $volume",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("NetworkDevice", $host,
+            "\$ snapmirror resync -destination-path  $volume -source-path $nvolume -force",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+               ######################verify snapmirror resync update#######
+ $depends = "group:$group";
+ $group = "verify-resync-update-snapmirror";
+    $pr .= defineRunGroup($group, 1);
+        my $retries  = 20;
+        my $interval = 30;
+    $prefix = "VRU";
+    $count = 1;
+
+    foreach my $vol (sort keys (%$snapVols)) {
+        #
+        # special -- mon volume has lots of changes and takes a long time
+        # to catch up... it's also non-critical, so we drop it.
+        #
+        #next if($vol =~ /^mon$service/);
+
+        my $host = $snapVols->{$vol}->{'dsthost'};
+        unless($host =~ /$drDatacenter/) {
+            #$host .= ".$drDatacenter.ariba.com";
+        }
+
+        my $volume = $snapVols->{$vol}->{dstvol};
+                chomp($volume);
+        $pr .= defineStep("${prefix}$count", "verify status is not transfer for $volume",
+            $depends, $expando, $group, undef, $retries, $interval);
+        $pr .= defineAction("NetworkDevice", $host,
+                        "\$ sleep 5",
+            "\$ snapmirror show -destination-path $volume -fields status  ",
+                        "SuccessString: Idle",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+      ##############################################
+
+
+
+    $depends = "  group:snapmirror-resync";
+    $group = "snapmirror-modify";
+    $prefix = "SM";
+    $count = 1;
+
+    $pr .= defineRunGroup($group, 1);
+
+    foreach my $vol (sort keys (%$snapVols)) {
+        my $host = $snapVols->{$vol}->{'dsthost'};
+        unless($host =~ /$drDatacenter/) {
+            #$host .= ".$drDatacenter.ariba.com";
+        }
+        my $volume = $snapVols->{$vol}->{'dstvol'};
+        chomp($volume);
+
+        $pr .= defineStep("${prefix}$count", "snapmirror modify $volume",
+            $depends, $expando, $group, undef, undef, undef);
+        $pr .= defineAction("NetworkDevice", $host,
+            "\$ snapmirror modify -destination-path $volume -schedule 1hourly",
+        );
+        $pr .= "\n";
+        $count++;
+    }
+
+
+    $depends = "  group:snapmirror-resync";
+    $group = "copy-from-shared-fs";
+
+    $pr .= defineRunGroup($group, 10);
+
+    my $title = "copy-from-shared-fs an";
+    my $command = "\$ /home/an$service/bin/copy-from-shared-fs an -once -debug";
+    unless(ariba::rc::InstalledProduct->isInstalled('an',$service)) {
+        $title = "placeholder for copy-from-shared-fs";
+        $command = "\$ echo This is needed for the dependancy tree";
+    }
+    $pr .= defineStep("P1", $title,
+        $depends, $expando, $group, undef, undef, undef);
+
+    $pr .= defineAction("Shell", "an$service\@$copyhost",
+        $command,
+    );
+    $pr .= "\n";
+
+    my $mclfile = $odir."/P-failbackSnapMirror.mcl";
+    my $OUT;
+    open($OUT, "> $mclfile") || die("Failed to open $mclfile: $!");
+    print $OUT $pr;
+    close($OUT);
+    return $mclfile;
+}
+
+	
+###################################
+
+
+sub snapVolumes {
+       my $mon = ariba::rc::InstalledProduct->new ('mon');
+       my $cfg = $mon->installDir.'/config/snapmirror.conf';
+	open my $in, "<", "$cfg" or die "\n no snapmirror.conf";
+	my @lines = <$in>;
+	close $in;
+	my $snap;
+	foreach my $li(@lines){
+		next if($li =~ /^\#/ || $li =~ m/^$/);
+                #print "**$li\n";
+		my @temp = split /\,/, $li;
+		$snap->{$temp[0]}->{srchost} = $temp[1];
+		$snap->{$temp[0]}->{srcvol} = $temp[2];
+		$snap->{$temp[0]}->{dsthost} = $temp[3];
+		$snap->{$temp[0]}->{dstvol} = $temp[4];
+		
+	}
+	return $snap;
+}
+
+sub generateStartAppSteps {
+    my $service = shift;
+    my $ps = 'primary';
+    my $sec =  'secondary';
+    my $gname = 'stop-mon-primary';
+    if($failtype eq 'failback') {
+	$sec = 'primary';
+	$ps = 'secondary';
+        $gname = 'stop-mon-secondary';
+    }
+    my $pr = "";
+    my $depends = 'consulSwitch'.' '."group:hagrp-startdg-$ps";
+
+    my $expando = "StartApps";
+    $pr .= defineExpando($expando, "Start Applications");
+
+
+    $pr .= generateControlDeploymentSteps($service, "Q", "stop", "$ps", $expando, "$gname", $depends, '+^(?:mon|.*ws)$', '-skipProductionWarning');
+
+     my $start_mon_depends = ($failtype eq 'failback') ? 'stop-mon-secondary' : 'stop-mon-secondary';
+
+    $pr .= generateControlDeploymentSteps($service, "R", "start", "$sec", $expando, 'start-apps', "consulSwitch group:$start_mon_depends", '-ws$');
+
+    $depends = 'consulSwitch group:hagrp-online-primary';
+      if($failtype eq 'failback') {
+          $depends = "consulSwitch group:hagrp-online-secondary";
+       }
+    my $pfil = pageFilters($service, "T", "remove", "$ps", "RemovePageFilter", 'remove-pagefilter', $depends);
+    open my $in, "<", "$pfil";
+    my @lins= <$in>;
+    close $in;
+    $pr .= join "", @lins;
+    my $mclfile = $odir . "/S-stop-start-mon.mcl";
+    my $OUT;
+    open($OUT, "> $mclfile") || die("Failed to open $mclfile: $!");
+    print $OUT $pr;
+    close($OUT);
+    return $mclfile
+
+}
+
+sub generateConsulSteps {
+    my $service = shift;
+    my $pr = '';
+    my $depends = "group:Route53";
+    my $expando = "Consul";
+    $pr .= defineExpando($expando,"Consul Failover");
+    my $group = 'Consul';
+    my $cluster = 'secondary';
+    my $maxprocesscount = 1;
+    $pr .= defineRunGroup($group,$maxprocesscount);
+    my $primary;# = 'cobalt-infra1.eu1-ms.ariba.com';
+    my $secondary;# = 'cobalt-infra1.eu2-ms.ariba.com';
+    my $mon = ariba::rc::InstalledProduct->new ('mon', $service);
+    $primary = $mon->default('Ops.Consul.ConsulPrimary');
+    $secondary = $mon->default('Ops.Consul.ConsulDr');
+       if($failtype eq 'failback') {
+           my $rtmp;
+           $rtmp = $secondary;
+           $secondary = $primary;
+           $primary = $rtmp;
+       }
+      my $res;
+      my $cons_cmd = "'my \$res = `curl -Ss http://".$primary.":8500/v1/kv/cobalt/cluster/status`;print \$1 if(\$res =~ /Value\":\"(\\S+\?)\".*/);' | base64 -d "; 
+      $pr .= defineStep('consulStatus',"Confirm consul status on $primary is active",$depends,$expando,$group,undef,undef,undef);
+      $pr .= defineAction("Shell",undef,"\$ perl -e $cons_cmd ",'SuccessString: active',);
+
+      $pr .= defineStep('consulSwitch', "Make $primary standby", 'consulStatus',$expando,$group,undef,undef,undef);
+      $pr .= defineAction("Shell",undef, 
+                     "\$ curl -Ss -X PUT -d 'standby' http://$primary:8500/v1/kv/cobalt/cluster/status",
+                     "\$ sleep 60",
+                     "\$ perl -e $cons_cmd" , "SuccessString: standby",);
+
+     $cons_cmd = "'my \$res = `curl -Ss http://".$secondary.":8500/v1/kv/cobalt/cluster/status`;print \$1 if(\$res =~ /Value\":\"(\\S+\?)\".*/);' | base64 -d "; 
+     $pr .= defineStep('consulStatusSecondary', "Confirm consul status on $secondary is standby", 'consulSwitch group:DBSWITCH group:copy-from-shared-fs', $expando,$group,undef,undef,undef);
+     $pr .= defineAction("Shell",undef,"\$  perl -e $cons_cmd ", 'SuccessString: standby',);
+     $pr .= defineStep('consulSwitchSecondary', "Make $secondary active", 'consulStatusSecondary',$expando,$group,undef,undef,undef);
+     $pr .= defineAction("Shell",undef,
+                     "\$ curl -Ss -X PUT -d 'active' http://$secondary:8500/v1/kv/cobalt/cluster/status",
+                     "\$ sleep 60",
+                     "\$  perl -e $cons_cmd ", "SuccessString: active",);
+
+     my $mcl = "$odir/consul.mcl";
+
+     open my $OUT, ">", $mcl or die "\n cannot open $mcl";
+     print $OUT $pr;
+     close($OUT);
+
+    return $mcl;
+
+}
+
+sub generateRoute53Steps {
+	my $service = shift;
+	my $pr = '';
+	my $depends = "SANITY group:set-pagefilter";
+	my $expando = "Route53";
+	$pr .= defineExpando($expando,"Network Failover");
+	my $group = 'Route53';
+	my $cluster = 'secondary';	
+	my $host = ariba::Ops::NetworkUtils::hostname();
+	my $currentMachine = ariba::Ops::Machine->new($host);
+	my $dc =$currentMachine->datacenter();
+         my ($utilserver,$copyhost,$script,$cfg) = getRoute53Init($dc,$service,$cluster);
+         print "route53 config is $cfg\n";
+	open my $in, "<", "$cfg" or die "\n no route53.conf";
+        my @lines = <$in>;
+        close $in;
+        my $maxprocesscount = scalar @lines + 1;
+          $maxprocesscount >= 10 ? $maxprocesscount = 10 : $maxprocesscount;
+         $pr .= defineRunGroup($group,$maxprocesscount);
+        my $zonecount = 1;
+        my $stref = '';
+        $pr .= getRoute53Signature($dc,$depends,$expando,$group,$service,$cluster,$zonecount,\$stref);
+        foreach my $conf(@lines) {
+        next if ($conf =~ m/^\#/ || $conf =~ m/^$/);
+	chomp ($conf);
+	my ($awskey,$hzn,$dns,$primary,$secondary) = split /\,/,$conf;
+        if($failtype eq 'failback') {
+           my $rtmp;
+           $rtmp = $secondary;
+           $secondary = $primary;
+           $primary = $rtmp;
+        }
+my @actions = ("\$ sleep 30","\$ $script -hostedZoneName \"$hzn\" -mainDNS \"$dns\" -primary \"$secondary\" -secondary \"$primary\" -awsKey \"$awskey\" -sign \"\$\{signature\}\"");
+         my $sn = \$stref;
+         my $depends = $$sn;
+         my $sname = 'DNSswitch'.$zonecount;
+                $pr .= defineStep($sname, "DNS switch from $primary to $secondary",
+                $depends, $expando, $group, undef, undef, undef
+        );
+
+        $pr .= defineAction("Shell", "mon$service\@$utilserver",
+            @actions,'SuccessString: succeeded',
+        );
+        $zonecount++;
+      
+       }
+
+       my $mcl = "$odir/route53.mcl";
+
+       open my $OUT, ">", $mcl or die "\n cannot open $mcl";
+       print $OUT $pr;
+       close($OUT);
+
+       return $mcl;
+	
+	
+}
+
+sub getRoute53Signature {
+        my $dc = shift;
+        my $depends = shift;
+        my $expando = shift;
+        my $group = shift;
+        my $service = shift;
+        my $cluster = shift;
+        my $zonecount = shift;
+        my $stepname = shift;
+        my ($utilserver,$copyhost,$script) = getRoute53Init($dc,$service,$cluster);
+        my $pr = '';
+        $$stepname = 'Route'.$zonecount;
+        $pr .= defineStep($$stepname, "Get Signature",
+                $depends, $expando, $group, undef, undef, undef
+        );
+
+        $pr =~ s/Get Signature\n/Get Signature\nStore: signature\n/;
+        my @actions = ("\$ $script -getSign");
+        $pr .= defineAction("Shell", "mon$service\@$copyhost",
+            @actions,'SuccessString: \w+',
+        );
+
+}
+
+sub getRoute53Init {
+    my $dc = shift;
+    my $service = shift;
+    my $cluster = shift;
+        my $mon = ariba::rc::InstalledProduct->new('mon', $service);
+        my @copyhosts = $mon->hostsForRoleInCluster('copyhost', $cluster);
+          my @utilhosts = $mon->hostsForRoleInCluster('smtp-server',$cluster);
+          my $utilserver = shift(@utilhosts);
+         print "util hosts:".$utilserver."\n";
+         @copyhosts = $mon->hostsForRoleInCluster('monserver', $cluster) unless(scalar(@copyhosts));
+                   my $copyhost = shift(@copyhosts);
+        my $script = $mon->installDir() . "/bin/route53_failover.pl";
+        my $cfg = $mon->installDir()."/config/route53.conf";
+        return ($utilserver, $copyhost, $script, $cfg);
+
+}
+
+sub generateSplunkSteps{
+	my $service = shift;
+        my $expando = "WaitStepsForSplunk";
+        my $pr = defineExpando($expando, "Wait Step for splunk failover");
+        $pr .= defineStep("SplunkWait", "SplunkWait",
+            "group:Route53", $expando, undef, undef, undef, undef);
+        $pr .= defineAction("Wait", undef, "Wait Step for splunk failover");
+	my $region = shift;
+        my $mon = ariba::rc::InstalledProduct->new('mon', $service);
+        my $script = $mon->installDir() . "/bin/common/splunk_failure_mcl_gen";
+	my $res = `$script  -region $region`;
+	my $sfile;
+        if($failtype eq 'failover'){
+          $sfile = '/tmp/cobalt-failover/splunk_dr_failover.mcl'; 
+        }else {
+          $sfile = '/tmp/cobalt-failback/splunk_dr_failback.mcl';
+        }
+        (my $path = $script)=~s/\/splunk_failure_mcl_gen//i;
+         $path = `pwd`;
+         chomp($path);
+         my $file = basename($sfile);
+         $path .= '/'.$file;
+         ($failtype eq 'failover') ? `cp $path /tmp/cobalt-failover/` : `cp $path /tmp/cobalt-failback/`;
+        my $tmp = $sfile.'.tmp';
+        open(my $fh, "<", $sfile);
+        open(my $fy, ">", $tmp);
+        while(<$fh>) {
+          if($_ =~ m/user\=monprod.*?ms/i) {
+             print $fy $_;
+             print $fy "\n\n$pr\n\n";
+          }elsif($_ =~ m/(Title: configure and start the standby master node|Title: configure and start the master node)/i) {
+             print $fy $_;
+             print $fy "Depends: SplunkWait\n";
+           } else {
+          print $fy $_; 
+           }
+        }
+          close($fh);
+          close($fy);
+         chdir("/tmp"); 
+         unlink "$sfile";    
+         `mv $tmp $sfile`;
+	return $sfile;
+	
+}
+
+sub generateControlDeploymentSteps {
+    my $service = shift;
+    my $prefix = shift;
+    my $action = shift;
+    my $cluster = shift;
+    my $expando = shift;
+    my $group = shift;
+    my $depends = shift;
+    my $regex = shift;
+    my $extraArgs = shift || "";
+    my $count = 1;
+
+    my $mon = ariba::rc::InstalledProduct->new('mon', $service);
+    my @copyhosts = $mon->hostsForRoleInCluster('copyhost', $cluster);
+    @copyhosts = $mon->hostsForRoleInCluster('monserver', $cluster) unless(scalar(@copyhosts));
+    my $copyhost = shift(@copyhosts);
+
+    my $pr = "";
+
+    my $maxParallel = 20;
+    $maxParallel = 4 if($service eq 'lab');
+
+    $pr .= defineRunGroup($group,$maxParallel);
+
+    my @products = productsList($service);
+    foreach my $p (@products) {
+        #
+        # XXX -- for now we are not failing over ASP products
+        #
+        next if($p->isASPProduct());
+
+        my $name = $p->name();
+        my $build = $p->buildName();
+        my $install_dir = $p->installDir();
+	next if($name ne 'mon');
+
+        if($regex && $regex =~ /^-/) {
+            my $cmp = $regex; $cmp =~ s/^-//;
+            next if($name =~ /$cmp/);
+        } elsif($regex) {
+            my $cmp = $regex; $cmp =~ s/^\+//;
+            next unless($name =~ /$cmp/);
+        }
+         if ($name =~ m/^mon/i && $cluster eq 'primary' && $action eq 'stop') {
+             $depends = "group:hagrp-startdg-$cluster consulSwitchSecondary";
+         
+         }
+
+         if ($name =~ m/^mon/i && $cluster eq 'secondary' && $action eq 'start') {
+             $depends = 'group:stop-mon-primary';
+         }
+
+        $pr .= defineStep("${prefix}$count", "$action $name in $cluster",
+                $depends, $expando, $group, undef, undef, undef
+        );
+        my @actions = (
+            "\$ $install_dir/bin/control-deployment -force  -cluster $cluster $name $service $action -buildname $build $extraArgs",
+        );
+	
+        if($action eq 'stop/start') {
+            @actions = (
+                "\$ $install_dir/bin/control-deployment  -force -cluster $cluster $name $service stop -buildname $build $extraArgs",
+                "\$ $install_dir/bin/control-deployment  -force -cluster $cluster $name $service start -buildname $build $extraArgs",
+            );
+
+        }
+        $pr .= defineAction("Shell", "mon$service\@$copyhost",
+            @actions
+        );
+            
+        $pr .= "\n";
+
+        $count++;
+    }
+
+    if($count == 1) {
+        #
+        # we need to put a step in the group for the dependancy tree
+        #
+	if($0 =~/failback/) {
+		$depends .= ' group:repush-apps';
+	}
+        $pr .= defineStep("${prefix}$count", "Empty Set for $group",
+            $depends, $expando, $group, undef, undef, undef
+        );
+        $pr .= defineAction("Shell", undef,
+            "\$ echo OK",
+        );
+        $pr .= "\n";
+    }
+
+    return($pr);
+
+}
+
+sub hanaFailover {
+    my $dbc = shift;
+    my $expando = shift;
+    my $service = shift;
+
+    my ( $primary, $secondary ) = sanitizeDBCs($dbc, $service);
+
+    return( hanaSwitch($primary, $secondary, $expando, $service) );
+}
+
+sub hanaFailback {
+    my $dbc = shift;
+    my $expando = shift;
+    my $service = shift;
+
+    my ( $primary, $secondary ) = sanitizeDBCs($dbc, $service);
+
+    return( hanaSwitch($secondary, $primary, $expando, $service, 1) );
+}
+
+sub hanaSwitch {
+    my $fromDbc = shift;
+    my $toDbc = shift;
+    my $expando = shift;
+    my $service = shift;
+    my $failback = shift || 0;
+    my $depends = databaseFailoverDepends();
+    $depends = databaseFailbackDepends() if($failback);
+    my $group = "DBSWITCH";
+    my $primaryHost = $fromDbc->host();
+    my $drHost = $toDbc->host();
+    my $shortDrHost = $drHost;
+    $shortDrHost =~ s/^([^\.]+)\..*/$1/;
+    my $sid = $fromDbc->sid();
+    my $admuser = lc($sid) . "adm";
+    my $hanapathid = uc($sid);
+
+    my $pre = $fromDbc->sid();
+ 
+    my $mon = ariba::rc::InstalledProduct->new();
+      my $user = 'mon'.$service;
+      my $pass = ariba::rc::Passwords::lookup($user); 
+      my $remote = $primaryHost;
+        my $command = qq(sudo su - $admuser -c \"/usr/sap/$hanapathid/HDB00/exe/hdbnsutil -sr_state\");
+        my $sshCmd = "ssh -o StrictHostKeyChecking=no $user\@$remote '$command'";
+        my @output;
+        my $ret = ariba::rc::Utils::executeRemoteCommand($sshCmd,$pass,0,undef,undef,\@output);
+       chomp(@output);
+       my $sitename;
+      foreach (@output) {
+        $_ = $_.'^^';
+        ($sitename) = ($_  =~ m/site name:\s+(.*?)\^\^/igs);
+        last if $sitename;
+     }
+    my $ret = "";
+    my $i = 1;
+    my $step = "$i$pre";
+    
+    $ret .= defineStep($step, "Verify replication of $sid on active cluster",
+            $depends, $expando, $group, undef, undef, undef
+    );
+    $ret .= defineAction("Shell", "mon$service\@$primaryHost",
+        "\$ sudo su - $admuser -c  \'hdbsql -U COPS  -d systemdb -m -g NULL -A -j -x  'select case when (select to_char(seconds_between(shipped_log_position_time, last_log_position_time)) from m_service_replication) <11 then 'TRUE' else 'FALSE'  end from dummy'\'",
+         "SuccessString: 1",
+    ) . "\n";
+    $depends = $step;
+    $i++;
+    $step = "$i$pre";
+    $ret .= defineStep($step, "DBA - Takeover $sid on $drHost",
+            $depends, $expando, $group, undef, undef, undef
+    );
+    $ret .= defineAction("Shell", "mon$service\@$drHost",
+        "\$ sudo su - $admuser -c 'hdbnsutil -sr_takeover'",
+    ) . "\n";
+
+    $depends = $step;
+    $i++;
+    $step = "$i$pre";
+    $ret .= defineStep($step, "DBA - Verify takeover of $sid on $drHost",
+            $depends, $expando, $group, undef, undef, undef
+    );
+    $ret .= defineAction("Shell", "mon$service\@$drHost",
+        "\$ sudo su - $admuser -c \"hdbsql -U COPS -m -g NULL -A -j -x \'select user() from dummy\'\"",
+        "SuccessString: SYSTEM",
+    ) . "\n";
+    $depends = $step;
+    $i++;
+    $step = "$i$pre";
+    $ret .= defineStep($step, "offline $sid on $primaryHost",
+            $depends, $expando, $group, undef, undef, undef
+    );
+    $ret .= defineAction("Shell", "mon$service\@$primaryHost",
+        "\$ sudo su - $admuser -c  \'sapcontrol -nr 00 -function StopSystem HDB 1500 1200\'",
+        "\$ sudo su - $admuser  -c \'sapcontrol -nr 00 -function WaitforStopped 1500 0\'",
+        "SuccessString: SYSTEM",
+    ) . "\n";
+
+         $depends = $step;
+    $i++;
+    $step = "$i$pre";
+    $ret .= defineStep($step, "Wait for shutdown  $sid on $primaryHost",
+            $depends, $expando, $group, undef, undef, undef
+    );
+    $ret .= defineAction("Shell", "mon$service\@$primaryHost",
+        "\$ sudo su - $admuser -c  \'sapcontrol -nr 00 -function GetProcessList ; echo \"EXITCODE=\"$?\'",
+        "SuccessString: EXITCODE=4",
+    ) . "\n";
+
+       $depends = $step;
+    $i++;
+    $step = "$i$pre";
+    $ret .= defineStep($step, "Establish replication of $sid",
+            $depends, $expando, $group, undef, undef, undef
+    );
+    $ret .= defineAction("Shell", "mon$service\@$primaryHost",
+        "\$ sudo su - $admuser -c  \'hdbnsutil -sr_register --remoteHost=$drHost --remoteInstance=00 --replicationMode=async --operationMode=logreplay_readaccess --name=$sitename\'",
+    ) . "\n";
+
+           $depends = $step;
+    $i++;
+    $step = "$i$pre";
+    $ret .= defineStep($step, "Start $sid on $primaryHost",
+            $depends, $expando, $group, undef, undef, undef
+    );
+    $ret .= defineAction("Shell", "mon$service\@$primaryHost",
+        "\$ sudo su - $admuser -c  \'sapcontrol -nr 00 -function StartSystem HDB\'",
+         "\$ sudo su - $admuser -c  \'sapcontrol -nr 00 -function WaitforStarted 1500 0\'",
+    ) . "\n";
+
+                $depends = $step;
+    $i++;
+    $step = "$i$pre";
+    $ret .= defineStep($step, "Wait for Startup of $sid on $primaryHost",
+            $depends, $expando, $group, undef, undef, undef
+    );
+    $ret .= defineAction("Shell", "mon$service\@$primaryHost",
+        "\$ sudo su - $admuser -c  \'sapcontrol -nr 00 -function GetProcessList ; echo \"EXITCODE=\"$?\'",
+         "SuccessString: EXITCODE=3",
+    ) . "\n";
+ 
+
+
+                $depends = $step;
+    $i++;
+    $step = "$i$pre";
+    $ret .= defineStep($step, "Verify replication of  $sid",
+            $depends, $expando, $group, undef, undef, undef
+    );
+    $ret .= defineAction("Shell", "mon$service\@$drHost",
+        "\$ sudo su - $admuser -c  \'hdbsql -U COPS  -d systemdb -m -g NULL -A -j -x  'select host,VOLUME_ID,SECONDARY_HOST,REPLICATION_STATUS,LAST_LOG_POSITION,SHIPPED_LOG_POSITION from M_SERVICE_REPLICATION order by host,VOLUME_ID\'",
+         "ErrorString: (ERROR|UNKNOWN)",
+    ) . "\n";
+
+
+
+    return($ret);
+}

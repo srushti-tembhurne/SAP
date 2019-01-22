@@ -1,0 +1,15 @@
+#! /bin/bash
+set -x
+
+for mail_file in `find /home/svcprod/s4/mail/misc/ -newer /home/svcprod/s4/mail/misc/starttime -a ! -newer /home/svcprod/s4/mail/misc/endtime`
+
+do
+        /home/svcprod/s4/bin/mailcode/mail-filter -f /home/svcprod/s4/config/s4.filter -logdir /home/svcprod/s4/logs < $mail_file
+        if [ $? -ne 0 ] ; then
+                echo "$mail_file" >> "/var/tmp/failed_mail.txt.$$"
+        fi
+        echo "$mail_file processed. `date`" >> "/var/tmp/processed_mail.txt.$$"
+	sleep 5
+done
+
+

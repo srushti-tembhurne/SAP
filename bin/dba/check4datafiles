@@ -1,0 +1,98 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+
+use File::Basename;
+use Data::Dumper;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::OracleClient;
+
+my $program = basename ($0);
+
+sub usage
+{
+    my $errorMsg = shift;
+
+    print "USAGE:  $program -host <abc.xxx.ariba.com -product <product> -tablespace <tablespacename>\n";
+
+    print "\n\t$errorMsg\n" if $errorMsg;
+
+    exit 0;
+}
+
+my ($productName, $tablespace, $host);
+
+while (my $arg = shift(@ARGV))
+{
+    if ($arg =~ /^-product$/) {$productName = shift(@ARGV); next;}
+    if ($arg =~ /^-tablespace$/) {$tablespace = shift(@ARGV); next;}
+    if ($arg =~ /^-host$/) {$host = shift(@ARGV); next;}
+    if ($arg =~ /^-(h|help)$/) {usage;}
+    usage("Unknown arg: $arg");
+}
+
+# We need all arguments to run.
+usage ("Missing required arguments, -product, -tablespace, -host")
+    unless $productName and $tablespace and $host;
+
+my $me          = ariba::rc::InstalledProduct->new();
+my $service     = $me->service();
+my $cluster     = $me->currentCluster();
+my $product     = ariba::rc::InstalledProduct->new ($productName, $service);
+my @connections = ariba::Ops::DBConnection->connectionsFromProducts($product);
+
+my $dbuser = "system";
+my $dbpass = $me->default("dbainfo.$dbuser.password");
+
+my $sql = q(select * from (
+                            select a.file_name, to_char (b.creation_time, 'YYYY/MM/DD  HH24:MI:SS')
+                            from dba_data_files a, v$datafile b
+                            where a.file_id = b.file# and tablespace_name = ?
+                            order by b.creation_time desc
+                          )
+            where rownum < 3;
+);
+
+# Single time print a "header" to remind user the output is a filename and file creation timestamp in 24H format.
+print "Filename                                        File creation timestamp (24H)\n";
+print "="x79, "\n";
+
+# Only need to connect to the db server (one time) using supplied host name, etc.  Need to a "dbc" to extract
+# some additional information, such as SID.  Just have to figure out how ;<
+
+for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections))
+{
+    # skip if not oracle
+    next if ($dbc->dbServerType() ne ariba::Ops::DBConnection->oracleDBServerType());
+
+    my $dbsid = $dbc->sid();
+    # skip dev databases not maintained by ops
+    next if $dbsid =~ /^(h|l|s|n)o/i;
+    next if $dbsid =~ /^jdbctest$/i;  # well-known sid used for jdbc testing
+
+    my $product     = $dbc->product();
+    my $productName = $product->name();
+    my $host        = $dbc->host();
+    my $type        = $dbc->type();
+
+    next unless $product->currentCluster () eq 'primary';
+
+    $dbsid = uc $dbsid;
+
+    my $oracleClient = ariba::Ops::OracleClient->new($dbuser, $dbpass, $dbsid, $host);
+    $oracleClient->connect (240, 4);
+
+    my $results = [];
+    $oracleClient->executeSqlWithTimeout ($sql, 240, $results, [$tablespace]);
+
+    next unless @$results;
+    foreach my $result (@$results)
+    {
+        print "$result\n";
+    }
+}

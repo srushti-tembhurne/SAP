@@ -1,0 +1,922 @@
+#!/usr/local/bin/perl 
+#
+# $Id:$
+#
+# A script to allow downloading or grepping of logs. This uses log-viewer
+# screen scraping to figure out logs to download. For production, you will
+# first need to safeguard in (if not running this on a production machine)
+#
+#
+
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../bin";
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::ArchivedProduct;
+use File::Path;
+use POSIX ();
+use ariba::Ops::Startup::Apache;
+use ariba::rc::Globals;
+use ariba::rc::Utils;
+use ariba::Ops::Machine;
+use ariba::Ops::Constants;
+use ariba::Ops::ServiceController;
+use IO::Zlib;
+use Date::Parse;
+use ariba::monitor::TlsSecurityUtil;
+
+require "geturl";
+
+my $defaultLogRoot = "$ENV{'HOME'}/logs";
+
+my $LISTING_FETCH_TIMEOUT = 300;
+my $FILE_FETCH_TIMEOUT    = 1500;
+
+my $OK              = 1;
+my $CONNECT_TIMEOUT = -1;
+my $CONNECT_ERROR   = -2;
+
+my $debug = 0;
+my $CRONLOGS;
+my $CRONDIR;
+
+#Apache Access log
+#220.227.147.152 18474 47636626681120 [25/Jan/2016:00:00:00 -0800] "POST /service/transaction/cxml.asp HTTP/1.1" 200 11723 "-" "Jakarta Commons-HttpClient/3.0-rc4" 63118 TLSv1 AES128-SHA 128 NONE service.ariba.com
+#Balance Log
+#10.163.1.178 20816 1243076928 [25/Jan/2016:00:04:12 -0800] "GET /internal/phpinfo.php HTTP/1.0" 200 60380 "community/community_front_door" "geturl/85" 9449 svcload4auc.lab1.ariba.com - 2 1
+#Error Log
+#[Mon Jan 25 02:56:44.894411 2016] [proxy:error] [pid 20816:tid 1452874048] AH00959: ap_proxy_connect_backend disabling worker for (10.163.1.221) for 2700s
+#mod_jk log
+#[Mon Jan 25 00:00:14.234212 2016] [info]  ajp_connect_to_endpoint::jk_ajp_common.c (889): Failed opening socket to (10.163.1.160:20024) with (errno=111)
+#deflate log
+#[Mon Jan 25  0:01:02 2016] [GET /notfound.html ] 200 (Out/In: -/- -%) 738[Content-Type]=[text/html] -
+#regexes to pull timestamps
+my $AACCESSREGEX  = qr(\[(\d+)\/(\w{3})\/(\d+):(\d+):(\d+):(\d+)\s+(?:.*)\]);
+my $ABALANCEREGEX = $AACCESSREGEX;
+my $AERRORREGEX   = qr(\[(?:\w{3})\s+(\w{3})\s+(\d+)\s+(\d+):(\d+):(\d+)\..+?\s+(\d{4})\]);
+my $AMODJKREGEX   = $AERRORREGEX;
+my $ADEFLATEREGEX = qr(\[(?:\w{3})\s+(\w{3})\s+(\d+)\s+(\d+):(\d+):(\d+)\s+(\d+)\]);
+
+my $AWINDOW = 25 * 60 * 60;    #extra window for pulling correct contents in case of Apache
+
+sub fetch {
+
+    my $output                = shift;
+    my $logsToFetch           = shift;
+    my $outLogDir             = shift;
+    my $lastModifiedRequested = shift;
+    my $wantedString          = shift;
+    my $caseInsensitive       = shift;
+    my $displayFileNames      = shift;
+    my $displayLineNums       = shift;
+    my $productName           = shift;
+    my $logFilesFetched       = shift;
+    my $mode                  = shift;
+    my $startUTime            = shift;
+    my $endUTime              = shift;
+    my $getGZ                 = shift;
+    my $force                 = shift;
+
+    my @output = @$output;
+    if ($CRONLOGS) {
+        $outLogDir = "$CRONDIR";
+    }
+
+    my $fetchCount = 0;
+
+    @output = reverse @output;
+    for my $line (@output) {
+        #
+        # If this is not the file we want skip
+        #
+        if ( $logsToFetch && $line !~ m|$logsToFetch| ) {
+            next;
+        }
+
+        my $size;
+        my $dateStamp;
+        my $tailURL;
+        my $logfileURL;
+
+#10  Tue Oct 25 07:00:57  <a href="http://app102.snv.ariba.com:61502/tail/keepRunning-UI-1156133@app102.pid/s4/100">tail</a>  <a href="http://app102.snv.ariba.com:61502/cat/keepRunning-UI-1156133@app102.pid/s4">keepRunning-UI-1156133@app102.pid</a>
+#1708271  Wed Oct 26 07:00:56  <a href="http://app102.snv.ariba.com:61502/tail/keepRunning-UI-1156133@app102-6594.1/s4/100">tail</a>  <a href="http://app102.snv.ariba.com:61502/cat/keepRunning-UI-1156133@app102-6594.1/s4">keepRunning-UI-1156133@app102-6594.1</a>
+
+#843103  Tue Sep 12 16:29:25  No tail  <a href="http://robin.ariba.com:61503/cat/s4/archivedLogs/2006/09/12/keepRunning-SVUI-516135@ostrich-27297.1.gz">keepRunning-SVUI-516135@ostrich-27297.1.gz</a>
+#9109182  Tue Sep 12 16:28:57  No tail  <a href="http://robin.ariba.com:61503/cat/s4/archivedLogs/2006/09/12/keepRunning-GlobalTask-2036142@cardinal-4993.3.gz">keepRunning-GlobalTask-2036142@cardinal-4993.3.gz</a>
+        if ( $line =~ m/No tail/ ) {
+
+            if ( $line =~ /^\s*(\d+)\s*(.+?)\s*No tail\s*<a href="(\S+)"/ ) {
+                $size       = $1;
+                $dateStamp  = $2;
+                $logfileURL = $3;
+            }
+        }
+        else {
+            if ( $line =~ /^\s*(\d+)\s*(.+?)\s*<a href="(\S+)".*<a href="(\S+)"/ ) {
+                $size       = $1;
+                $dateStamp  = $2;
+                $logfileURL = $4;
+                $logfileURL = $3 if $getGZ;
+            }
+        }
+
+        next unless ($logfileURL);
+
+        my $serviceHostDir = '';
+
+        if ( $mode eq 'Apache' ) {
+            if ( $logfileURL =~ m|^(.*)/([^/]+)/([^/]+)$| ) {
+                $serviceHostDir = $2;
+                print "\nserviceHostdir1=$serviceHostDir\n" if $debug;
+            }
+        }
+
+        my @resultSplit = split( /\//, $logfileURL );
+        my $outLogName = $resultSplit[-1];
+
+        if ( $mode eq 'Apache' ) {
+            $serviceHostDir .= "/$resultSplit[2]";
+            print "\nserviceHostdir1=$serviceHostDir\n" if $debug;
+        }
+
+        if ( $mode eq 'Regular' ) {
+
+            my $productFromUrl = $logfileURL;
+            $productFromUrl =~ m#cat/[^/]+/([^/]+)/#;
+            $productFromUrl = $1;
+
+            if ( $productFromUrl && ( $productName ne $productFromUrl ) ) {
+                $outLogName = $productFromUrl;
+            }
+
+        }
+
+        # it's handled above for apache case
+        # for other cases, we also need distinguish between hosts
+        if ( $mode ne 'Apache' ) {
+            if ( $logfileURL =~ /^http:\/\/(.*?)\// ) {
+                $serviceHostDir = $1;
+            }
+        }
+
+        # We don't care about the .pid file.
+        if ( !$outLogName || $outLogName =~ m|\.pid$| ) {
+            next;
+        }
+
+        print "\nfinal serviceHostDir=$serviceHostDir outLogDir=$outLogDir \n" if $debug;
+        ariba::rc::Utils::mkdirRecursively("$outLogDir/$serviceHostDir");
+
+        #
+        # do not process files more than once (archived
+        # perf and metrics logs can be seen from all
+        # app servers)
+        #
+
+        my $checkPath = $outLogName;
+        $checkPath = "$serviceHostDir/$checkPath" if ($serviceHostDir);
+
+        if ( $logFilesFetched->{$checkPath} ) {
+            print "  Don't need to download [$checkPath]: skip it...\n" if $debug;
+            next;
+        }
+
+        $logFilesFetched->{$checkPath} = 1;
+
+        #
+        # convert human readable date into ctime
+        # and check the lastupdated time, if asked
+        #
+        my $fileTime = dateStampToTime($dateStamp);
+
+        if ( $dateStamp && $lastModifiedRequested ) {
+
+            # how long ago was file modified?
+            # if it was modified a long time ago
+            # skip it
+            if ( $fileTime < $lastModifiedRequested ) {
+                print "Skipping $logfileURL because fileTime < lastModified\n" if $debug;
+                next;
+            }
+        }
+
+        if ( $startUTime && $fileTime < $startUTime ) {
+            print "Skipping $logfileURL because fileTime < startTime\n" if $debug;
+            next;
+        }
+        if ( $endUTime && $fileTime > $endUTime && $mode ne 'Apache' ) {
+            print "Skipping $logfileURL because fileTime > endTime\n" if $debug;
+            next;
+        }
+        next if ( $endUTime && $fileTime > ( $endUTime + $AWINDOW ) );
+
+        my $outLogPath = "$outLogDir/$serviceHostDir/$outLogName";
+
+        $fetchCount++;
+
+        # if we've already downloaded this file (because process-logs
+        # crashed or couldn't continue), skip it this time if size match
+        if ( -f $outLogPath ) {
+
+            my $existingSize = -s $outLogPath;
+            if ( $size == $existingSize && !$force ) {
+                print "Skipping $outLogName because we already got that one\n" if $debug;
+                next;
+            }
+        }
+
+        if ($serviceHostDir) {
+            print "  Fetching $serviceHostDir/$outLogName [$logfileURL]\n";
+        }
+        elsif ($CRONLOGS) {
+            print " Fetching $CRONDIR [$logfileURL]\n";
+        }
+        else {
+            print "  Fetching $outLogName [$logfileURL]\n";
+        }
+
+        # skip out if we just want to test what would get downloaded
+        if ( $debug > 1 ) {
+            next;
+        }
+
+        if ( $getGZ && $outLogPath !~ /\.gz$/ ) {
+            $logfileURL =~ s|/cat/|/catgz/|;
+            $outLogPath .= ".gz";
+        }
+
+        eval { geturl( "-e", "-q", "-timeout", $FILE_FETCH_TIMEOUT, $logfileURL, $outLogPath ); };
+
+        if ( !-f "$outLogPath" ) {
+            warn "Couldn't save to $outLogPath : $!";
+            next;
+        }
+
+        if ( $size > 0 && ( !-s "$outLogPath" ) ) {
+            warn
+"Couldn't save to $outLogPath : File size is different than original one. It probably comes from a download issue or no space left on device";
+            next;
+        }
+
+        utime( $fileTime, $fileTime, $outLogPath );
+
+        next unless ($wantedString);
+
+        print "Searching for [$wantedString]...\n";
+
+        if ( $outLogName =~ m/\.gz$/ ) {
+            tie *LOG, 'IO::Zlib', $outLogPath, "rb";
+        }
+        else {
+            open( LOG, $outLogPath ) or die $!;
+        }
+
+        my $lineNum = 0;
+        while ( my $logLine = <LOG> ) {
+            $lineNum++;
+
+            if ( $caseInsensitive && $logLine !~ /$wantedString/io ) {
+                next;
+            }
+            if ( $logLine !~ /$wantedString/o ) {
+                next;
+            }
+
+            if ( $mode eq 'Apache' ) {
+
+                #extract time stamp and compare with specified time frame
+                my ( $mthday, $mthname, $year, $hr, $mm, $ss );
+                my $tmstring = "WDAY Oct 29 00:00:00 2005";    #this is the format
+                if ( $outLogName =~ /access/ ) {
+                    next
+                      unless ( ( $mthday, $mthname, $year, $hr, $mm, $ss ) = ( $logLine =~ m/$AACCESSREGEX/ ) );
+                }
+                elsif ( $outLogName =~ /balancer/ ) {
+                    next
+                      unless ( ( $mthday, $mthname, $year, $hr, $mm, $ss ) = ( $logLine =~ m/$ABALANCEREGEX/ ) );
+                }
+                elsif ( $outLogName =~ /error/ ) {
+                    next
+                      unless ( ( $mthname, $mthday, $hr, $mm, $ss, $year ) = ( $logLine =~ m/$AERRORREGEX/ ) );
+                }
+                elsif ( $outLogName =~ /modjk/ ) {
+                    next
+                      unless ( ( $mthname, $mthday, $hr, $mm, $ss, $year ) = ( $logLine =~ m/$AMODJKREGEX/ ) );
+                }
+                elsif ( $outLogName =~ /deflate/ ) {
+                    next
+                      unless ( ( $mthname, $mthday, $hr, $mm, $ss, $year ) = ( $logLine =~ m/$ADEFLATEREGEX/ ) );
+                }
+                else {
+                    next;
+                }
+                $tmstring = "WDAY $mthname $mthday $hr:$mm:$ss $year";
+                my $entryTimestamp = dateStampToTime($tmstring);
+
+                next if ( $lastModifiedRequested && $entryTimestamp < $lastModifiedRequested );
+                next if ( $startUTime            && $entryTimestamp < $startUTime );
+                last if ( $endUTime              && $entryTimestamp > $endUTime );
+            }
+
+            if ($displayFileNames) {
+                print "$outLogName\n";
+                last;
+            }
+            elsif ($displayLineNums) {
+                print "$outLogName:$lineNum $logLine";
+            }
+            else {
+                print $logLine;
+            }
+        }
+
+        close(LOG);
+        untie *LOG if ( $outLogName =~ m/\.gz$/ );
+
+    }
+
+    return $fetchCount;
+
+}
+
+sub fetchListing {
+    my $url            = shift;
+    my $outputArrayRef = shift;
+
+    my @errors = ();
+    eval {
+        geturl( "-e", "-q", "-errors", \@errors, "-timeout", $LISTING_FETCH_TIMEOUT, "-results", $outputArrayRef,
+            $url );
+    };
+
+    if ( $#$outputArrayRef == 11 && $$outputArrayRef[9] =~ />SAFEGUARD \d+.\d+ running on ([^<]+)</ ) {
+        print "\n";
+        die "Error: please log into safeguard\@$1\n";
+    }
+
+    if (@errors) {
+        if ( $errors[0] =~ /timed out/ ) {
+            print "timed out connecting to $url\n";
+            return $CONNECT_TIMEOUT;
+        }
+        else {
+            print "Error connecting to $url: " . join( "\n", @errors ) if (@errors);
+            return $CONNECT_ERROR;
+        }
+    }
+
+    return $OK;
+}
+
+sub allLogsURLsForProductAndURL {
+    my $product = shift;
+    my $url     = shift;
+
+    my $productName = $product->name();
+
+    # We want to remove the dash in the matching pattern
+    # Ex: http://app103.snv.ariba.com:61502/lspat/UI-11610040/s4
+    $url =~ s|-([^\/]+\/$productName$)|$1|;
+
+    return ($url);
+}
+
+sub listLogURLsForProduct {
+
+    my $product   = shift;
+    my $mode      = shift;
+    my $community = shift;
+    my $allLogs   = shift;
+    my $cluster   = shift;
+
+    my @instances = $product->appInstancesInCluster($cluster);
+
+    my %listUrls = ();
+
+    # Loop over all instances for the product and
+    # retrieve their log-viewer urls.
+    for my $instanceObj (@instances) {
+
+        my $url;
+
+        if ( $mode eq 'Regular' ) {
+            $url = $instanceObj->logURL();
+        }
+        elsif ( $mode eq 'Archived' ) {
+            $url = $instanceObj->archivedLogsURL();
+        }
+        elsif ( $mode eq 'System' ) {
+            $url = $instanceObj->systemLogsURL();
+        }
+
+        if ($community) {
+
+            my $communityPattern = $community;
+
+            # The default community is an undef value
+            $communityPattern = undef if ( lc($community) eq 'default' );
+
+            my $instanceCommunity = $instanceObj->community();
+
+            next
+              if ( defined($instanceCommunity)
+                && defined($communityPattern)
+                && ( $instanceCommunity ne $communityPattern ) );
+            next if ( !$instanceCommunity && $communityPattern );
+            next if ( $instanceCommunity  && !$communityPattern );
+
+        }
+        else {
+
+            if ( $url =~ m/\?.*$/ ) {
+                $url =~ s|\?.*$||;
+            }
+            else {
+                $url =~ s|(lspat[^/]*/)[^/]*/|$1/|;
+            }
+        }
+
+        if ($allLogs) {
+            for my $logUrl ( allLogsURLsForProductAndURL( $product, $url ) ) {
+
+                $listUrls{$logUrl} = 1;
+            }
+        }
+
+        $listUrls{$url} = 1;
+    }
+
+    return keys(%listUrls);
+}
+
+sub _downloadGeneric {
+    my $product               = shift;
+    my $outLogDir             = shift;
+    my $wantedString          = shift;
+    my $displayFileNames      = shift;
+    my $displayLineNums       = shift;
+    my $caseInsensitive       = shift;
+    my $lastModifiedRequested = shift;
+    my $logsToFetch           = shift;
+    my $community             = shift;
+    my $allLogs               = shift;
+    my $startUTime            = shift;
+    my $endUTime              = shift;
+    my $getGZ                 = shift;
+    my $force                 = shift;
+    my $cluster               = shift;
+    my $mode                  = shift;
+
+    my $fetchCount = 0;
+
+    my %logFilesFetched = ();
+
+    print "$mode logs :\n";
+    my %urlsStatusHash = map { $_ => 1 } listLogURLsForProduct( $product, $mode, $community, $allLogs, $cluster );
+
+    my $MAX_RETRIES = 3;
+
+    while ( keys %urlsStatusHash ) {
+        my @listUrls = keys %urlsStatusHash;
+        for my $listUrl (@listUrls) {
+            my @output = ();
+            my @errors = ();
+
+            print "taking a look at $mode logs: [$listUrl]\n";
+            if ($CRONLOGS) {
+                if ( $listUrl =~ /(app\d+)/ ) {
+                    ariba::rc::Utils::mkdirRecursively("$outLogDir/$1");
+                    $CRONDIR = "$outLogDir/$1";
+                }
+            }
+
+            my $fetchResult = fetchListing( $listUrl, \@output );
+            if ( $fetchResult eq $OK ) {
+                delete $urlsStatusHash{$listUrl};
+            }
+            elsif ( $fetchResult eq $CONNECT_TIMEOUT ) {
+
+                $urlsStatusHash{$listUrl} += 1;
+
+                if ( $urlsStatusHash{$listUrl} > $MAX_RETRIES ) {
+                    print "Giving up on $listUrl";
+                    delete $urlsStatusHash{$listUrl};
+                }
+                else {
+                    print "Will retry $listUrl\n";
+                }
+                next;
+
+            }
+            else {
+                print "Skipping $listUrl\n";
+                delete $urlsStatusHash{$listUrl};
+                next;
+            }
+
+            $fetchCount += fetch(
+                \@output,         $logsToFetch,      $outLogDir,        $lastModifiedRequested,
+                $wantedString,    $caseInsensitive,  $displayFileNames, $displayLineNums,
+                $product->name(), \%logFilesFetched, $mode,             $startUTime,
+                $endUTime,        $getGZ,            $force
+            );
+        }
+    }
+    return $fetchCount;
+}
+
+# This handle everything related to Archived logs
+sub downloadArchivedLogs {
+    return _downloadGeneric( @_, 'Archived' );
+}
+
+# This handle everything related to Apache logs
+#
+# FIXME this should use _downloadGeneric function to utilize the
+# retry mechanism, but should be ok for the time being as apache
+# logs don't usually time out.
+#
+sub downloadApacheLogs {
+    my $product               = shift;
+    my $outLogDir             = shift;
+    my $wantedString          = shift;
+    my $displayFileNames      = shift;
+    my $displayLineNums       = shift;
+    my $caseInsensitive       = shift;
+    my $lastModifiedRequested = shift;
+    my $logsToFetch           = shift;
+    my $startUTime            = shift;
+    my $endUTime              = shift;
+    my $getGZ                 = shift;
+    my $force                 = shift;
+
+    my $fetchCount = 0;
+
+    my $cluster = $product->currentCluster();
+
+    my %urlsFetched;
+    my %logFilesFetched = ();
+
+    print "Apache logs :\n";
+
+    # arguments to pass for calculating urls
+    my %args = ();
+    my $port = $product->default('WebServerHTTPPort');
+    $args{port} = $port;
+    $args{product} = $product;
+
+    my @roles = ( 'adminserver', 'webserver', 'ss-adminserver', 'ss-webserver' ); 
+    for my $role (@roles) {
+        $args{role} = $role;
+        my @hosts = $product->hostsForRoleInCluster( $role, $cluster );
+
+        for my $host (@hosts) {
+            $args{host} = $host;
+            # get the urls
+            my @urls = ();
+            # pass in address of array of urls to have returned
+            $args{urls_ref} = \@urls;
+            logViewerUrlsForProductRoleHostPort(\%args);
+
+            foreach my $url (@urls) {
+                print "\napacheUrl for host $host is $url \n" if $debug;
+                #
+                # Do not process logs from same host more than once.
+                #
+                next if ( $urlsFetched{$url} );
+                $urlsFetched{$url} = 1;
+
+                print "taking a look at apache logs: [$url]\n";
+
+                my @outputApache = ();
+
+                fetchListing( $url, \@outputApache );
+
+                $fetchCount += fetch(
+                \@outputApache,   $logsToFetch,      $outLogDir,        $lastModifiedRequested,
+                $wantedString,    $caseInsensitive,  $displayFileNames, $displayLineNums,
+                $product->name(), \%logFilesFetched, 'Apache',          $startUTime,
+                $endUTime,        $getGZ,            $force
+                );
+            }
+        }
+    }
+}
+
+sub downloadRegularLogs {
+    return _downloadGeneric( @_, 'Regular' );
+}
+
+sub downloadSystemLogs {
+    return _downloadGeneric( @_, 'System' );
+}
+
+sub main {
+    my ( $productName, $serviceName, $customerName, $wantedString, $saveLogs );
+
+    my $displayFileNames = 0;
+    my $displayLineNums  = 0;
+    my $caseInsensitive  = 0;
+    my $useApache        = 0;
+    my $useArchive       = 0;
+    my $useSystem        = 0;
+    my $logRoot          = $defaultLogRoot;
+    my $logsToFetch;
+    my $lastUpdated;
+    my ( $startDateString, $endDateString );
+    my ( $startUTime,      $endUTime );
+    my $community  = undef;
+    my $allLogs    = 0;
+    my $force      = 0;
+    my $getGZ      = 0;
+    my $fetchCount = 0;
+    my $buildname;
+    my $cluster;
+
+    while ( my $arg = shift(@ARGV) ) {
+        if ( $arg =~ /^-h/ )             { usage(); }
+        if ( $arg =~ /^-d(ebug)?/i )     { ++$debug; next; }
+        if ( $arg =~ /^-product/i )      { $productName = shift(@ARGV); }
+        if ( $arg =~ /^-service/i )      { $serviceName = shift(@ARGV); }
+        if ( $arg =~ /^-buildname/i )    { $buildname = shift(@ARGV); }
+        if ( $arg =~ /^-customer/ )      { $customerName = shift(@ARGV); }
+        if ( $arg =~ /^-logName/i )      { $logsToFetch = shift(@ARGV); }
+        if ( $arg =~ /^-cluster/i )      { $cluster = shift(@ARGV); }
+        if ( $arg =~ /^-save/i )         { $saveLogs = 1; }
+        if ( $arg =~ /^-anCronLogs/i )   { $CRONLOGS = 1; }
+        if ( $arg =~ /^-logRoot/i )      { $logRoot = shift(@ARGV); }
+        if ( $arg =~ /^-grep/i )         { $wantedString = shift(@ARGV); }
+        if ( $arg =~ /^-apache/i )       { $useApache = 1; }
+        if ( $arg =~ /^-archive/i )      { $useArchive = 1; }
+        if ( $arg =~ /^-system/i )       { $useSystem = 1; }
+        if ( $arg =~ /^-l$/i )           { $displayFileNames = 1; }
+        if ( $arg =~ /^-n$/i )           { $displayLineNums = 1; }
+        if ( $arg =~ /^-i$/i )           { $caseInsensitive = 1; }
+        if ( $arg =~ /^-community/i )    { $community = shift(@ARGV); }
+        if ( $arg =~ /^-lastModified/i ) { $lastUpdated = shift(@ARGV); }
+        if ( $arg =~ /^-start(date)?/i ) { $startDateString = shift(@ARGV); }
+        if ( $arg =~ /^-end(date)?/i )   { $endDateString = shift(@ARGV); }
+        if ( $arg =~ /^-force/i )        { $force = 1; next; }
+        if ( $arg =~ /^-gz/i )           { $getGZ = 1; next; }
+    }
+
+    if ( !$productName || !$serviceName ) {
+        usage();
+    }
+
+    if ( !$saveLogs && !$wantedString && !$CRONLOGS ) {
+        print "No action specified, need to either specify -save or -grep\n";
+    }
+
+    if ( $lastUpdated && ( $startDateString || $endDateString ) ) {
+        print("-lastModified and -startDate / -endDate are mutually exclusive\n");
+        usage();
+    }
+
+    if ( ( $endDateString && !$startDateString ) || ( !$endDateString && $startDateString ) ) {
+        print("Need to specify both -startDate and -endDate\n");
+        usage();
+    }
+
+    if ($startDateString) {
+        $startUTime = Date::Parse::str2time($startDateString);
+        usage("Error parsing $startDateString") unless ($startUTime);
+    }
+
+    if ($endDateString) {
+        $endUTime = Date::Parse::str2time($endDateString);
+        usage("Error parsing $endDateString") unless ($endUTime);
+    }
+
+    # We don't want to exclude metrics-, jgroups- and metrics- files
+    if ($community) {
+        $allLogs = 1;
+    }
+
+    my $product;
+
+    if ( ariba::rc::Globals::isSharedServiceProduct($productName) && $customerName ) {
+        print "$productName is a Shared Service, so the customer name is useless.\n";
+        $customerName = undef;
+    }
+
+    if ( ariba::rc::InstalledProduct->isInstalled( $productName, $serviceName, undef, $customerName ) ) {
+        $product = ariba::rc::InstalledProduct->new( $productName, $serviceName, undef, $customerName );
+    }
+    elsif ( ariba::rc::ArchivedProduct->isArchived( $productName, $serviceName, $buildname, $customerName ) ) {
+        $product = ariba::rc::ArchivedProduct->new( $productName, $serviceName, $buildname, $customerName );
+        $product->setClusterName('primary');
+    }
+
+    unless ($product) {
+        print "Did not find $productName/$serviceName installed or archived\n";
+        exit 0;
+    }
+
+    $cluster = $product->currentCluster() unless $cluster;
+
+    if ( ariba::Ops::ServiceController::isProductionServicesOnly($serviceName) ) {
+        my $host     = ariba::Ops::Machine->new();
+        my $hostname = $host->hostname();
+        if (   $product->servesRoleInCluster( $hostname, 'monitor', $cluster )
+            || $product->servesRoleInCluster( $hostname, 'monserver', $cluster ) )
+        {
+            print "ERROR: process-logs may not be run from a production monitoring host.\n";
+            exit 1;
+        }
+    }
+
+    #
+    # Log directory
+    #
+    my $outLogDir = "$logRoot/$productName";
+    $outLogDir .= "/$customerName" if ($customerName);
+
+    my $timeStamp = POSIX::strftime( "%Y%m%d", localtime( time() ) );
+    $outLogDir .= "/$timeStamp";
+    mkpath($outLogDir) unless -d $outLogDir;
+
+    #
+    # Honor last modified time?
+    #
+    my $lastModifiedRequested;
+    $lastModifiedRequested = time() - $lastUpdated * 3600 if ($lastUpdated);
+
+    #
+    # Saving logs?
+    #
+    if ($saveLogs) {
+        print "Will save logs in: $outLogDir\n";
+    }
+
+    #
+    # grepping logs?
+    #
+    if ($wantedString) {
+        print "Will grep logs for: [$wantedString]\n";
+    }
+
+    # We processed Apache Logs if requested
+    $fetchCount += downloadApacheLogs(
+        $product,         $outLogDir,       $wantedString,          $displayFileNames,
+        $displayLineNums, $caseInsensitive, $lastModifiedRequested, $logsToFetch,
+        $startUTime,      $endUTime,        $getGZ,                 $force
+    ) if ($useApache);
+
+    # We processed Archived Logs if requested
+    $fetchCount += downloadArchivedLogs(
+        $product,         $outLogDir,             $wantedString, $displayFileNames, $displayLineNums,
+        $caseInsensitive, $lastModifiedRequested, $logsToFetch,  $community,        $allLogs,
+        $startUTime,      $endUTime,              $getGZ,        $force,            $cluster
+    ) if ($useArchive);
+
+    # We processed System Logs if requested
+    $fetchCount += downloadSystemLogs(
+        $product,         $outLogDir,             $wantedString, $displayFileNames, $displayLineNums,
+        $caseInsensitive, $lastModifiedRequested, $logsToFetch,  $community,        $allLogs,
+        $startUTime,      $endUTime,              $getGZ,        $force,            $cluster
+    ) if ($useSystem);
+
+    # We processed Regulars Logs
+    $fetchCount += downloadRegularLogs(
+        $product,         $outLogDir,             $wantedString, $displayFileNames, $displayLineNums,
+        $caseInsensitive, $lastModifiedRequested, $logsToFetch,  $community,        $allLogs,
+        $startUTime,      $endUTime,              $getGZ,        $force,            $cluster
+    );
+
+    rmtree($outLogDir) unless $saveLogs;
+
+    if ( $fetchCount == 0 ) {
+        print "No logs found, maybe you need to specify -system or -archive?\n";
+    }
+}
+
+sub dateStampToTime {
+    my $date = shift;
+    my $time;
+
+    my ( $sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst ) = localtime( time() );
+    my %months = (
+        'Jan', 0, 'Feb', 1, 'Mar', 2, 'Apr', 3, 'May', 4,  'Jun', 5,
+        'Jul', 6, 'Aug', 7, 'Sep', 8, 'Oct', 9, 'Nov', 10, 'Dec', 11,
+    );
+
+    # Tue Oct 25 07:00:57 2007
+    my ( $weekDay, $month, $monthDay, $clock, $yearMod ) = split( /\s+/, $date );
+    my ( $h, $m, $s ) = split( /:/, $clock );
+
+    $year = $yearMod - 1900 if ($yearMod);
+
+    $time = POSIX::mktime( $s, $m, $h, $monthDay, $months{$month}, $year );
+
+    return $time;
+}
+
+sub usage {
+    print "Usage: $0\n";
+    print "\n";
+    print "  -product <productName>\n";
+    print "  -service <serviceName>\n";
+    print "  [-customer <customerName>]\n";
+    print "  [-buildname <buildname>]\n";
+    print "  [-cluster <cluster>]\n";
+    print "\n";
+    print "  [-h] this help message\n";
+    print "\n";
+    print "  <-save>\n";
+    print "     Will save logs to <logrootdir>/<prod>/<timestamp>\n";
+    print "\n";
+    print "  <-grep <regex>>\n";
+    print "     Will grep for regex\n";
+    print "\n";
+    print "  <-apache>\n";
+    print "     Will also use Apache logs\n";
+    print "\n";
+    print "  <-archive>\n";
+    print "     Will also use Archived logs\n";
+    print "\n";
+    print "  <-system>\n";
+    print "     Will also use System (jgroups, perf, AuditLog, etc) logs\n";
+    print "\n";
+    print "  [-logRoot <logrootdir>]\n";
+    print "     honored only for -save, it specifies an alternate logRooDir\n";
+    print "     (default is $defaultLogRoot) to save logs to.\n";
+    print "\n";
+    print "  [-l|-n|-i]\n";
+    print "     honored for -grep, it controls printing of filenames,\n";
+    print "     line numbers or case insenstivity\n";
+    print "\n";
+    print "  [-logName <regex>]\n";
+    print "     only process log files matching regex\n";
+    print "\n";
+    print "  [-lastModified <timeInHours>]\n";
+    print "     only process files modified in last <timeInHours> hrs\n";
+    print "\n";
+    print "  [-startDate <MM/DD/YYYY[:HH:MM:SS]>]\n";
+    print "     only process files modified after the date/time given\n";
+    print "     the time portion is optional, defaulting to 00:00 (the very begining of the day)\n";
+    print "\n";
+    print "  [-endDate <MM/DD/YYYY[:HH:MM:SS]>]\n";
+    print "     only process files modified before the date/time given\n";
+    print "     the time portion is optional, defaulting to 00:00 (the very begining of the day)\n";
+    print "\n";
+    print "  [-community <community>]\n";
+    print "     only looks for log from the community <community>\n";
+    print "     Note: use 'default' as the community value for logs in the default community\n";
+    print "\n";
+    print "  [-force]\n";
+    print "     download logs even if they've been downloaded before and the size matches what's on the remote end\n";
+    print "\n";
+    print "  [-gz]\n";
+    print "     Zip the log files before transferring them from the remote host for.  Greatly improves run time.\n";
+    print "\n";
+    print "Examples:\n\n";
+    print " Download all an prod Supplier logs:\n";
+    print "  $0 -product an -service prod -logName Supplier -save\n";
+    print "\n";
+    print " Grep s4 prod logs that got modified in last 3 hours for ERROR\n";
+    print "  $0 -product s4 -service prod -grep ERROR -lastModified 3\n";
+    print "\n";
+    print " Download s4 prod logs from 4/12, save to /var/tmp/s4-logs:\n";
+    print "  $0 -product s4 -service prod -logRoot /var/tmp/s4-logs -save -startDate 4/11/2009 -endDate 4/12/2009\n";
+    print " -- or --\n";
+    print
+"  $0 -product s4 -service prod -logRoot /var/tmp/s4-logs -save -startDate 4/11/2009:00:00 -endDate 4/11/2009:23:59\n";
+    print "\n";
+    print "Notes:\n";
+    print " If you are trying to get to production logs from one of the\n";
+    print " machine in corp, you will first need to safeguard in from the\n";
+    print " machine you are invoking this from. Your safeguard access must\n";
+    print " allow you the following permission:\n";
+    print " 'Production keepRunning logs via web interface'\n";
+
+    exit;
+}
+
+# return log urls for a product/role/port
+sub logViewerUrlsForProductRoleHostPort {
+
+    my( $args_ref ) = @_;
+
+    my $logViewerPort = ariba::Ops::Constants->logViewerPort();
+
+    my @service_hosts;
+
+    ariba::monitor::TlsSecurityUtil::get_access_log_dirs( $args_ref->{product}, \@service_hosts );
+
+    foreach my $service_host (@service_hosts) {
+        my $apacheUrl = 'http://' . $args_ref->{host} . ":$logViewerPort/lspatapache/" . ariba::Ops::Startup::Apache::logDirForRoleHostPort($args_ref->{role}, $service_host, $args_ref->{port});
+
+        my $logdir = ariba::Ops::Startup::Apache::apacheLogDir();
+        $apacheUrl =~ s#$logdir/##;
+        $apacheUrl =~ s#([^:])\/\/#$1\/#g;
+
+        push @{$args_ref->{urls_ref}}, $apacheUrl;
+    }
+}
+
+main();

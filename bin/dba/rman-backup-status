@@ -1,0 +1,157 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use Pod::Usage;
+use Getopt::Long;
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+use ariba::monitor::BackupUtils;
+use ariba::rc::Utils;
+use ariba::rc::Passwords;
+use ariba::rc::CipherStore;
+use Parallel::ForkManager;
+use ariba::Ops::DatacenterController;
+use ariba::Ops::Utils;
+use Data::Dumper;
+
+my $debug = 0;
+
+my $sendEmail = 0;
+my $sendPage  = 0;
+
+GetOptions(
+    "debug|d+" => \$debug,
+    "e"        => \$sendEmail,
+    "p"        => \$sendPage,
+);
+
+my $mon = ariba::rc::InstalledProduct->new();
+
+my $service = $mon->service();
+
+my $cluster = $mon->currentCluster();
+
+my @products = ariba::rc::InstalledProduct->installedProductsList($service);
+
+my $email = $mon->default('notify.email');
+
+my @dbConnections =
+  ariba::Ops::DBConnection->connectionsFromProducts(@products);
+
+my $systemUser = "system";
+
+my $systemPass = $mon->default("dbainfo.$systemUser.password");
+
+my ( $productName, $product, $instance, $host, $vhost ) = 0;
+
+my $MAX_PROCESSES = 5;
+
+my $pm = Parallel::ForkManager->new($MAX_PROCESSES);
+
+my @uniquedbcs =
+  ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbConnections);
+
+@uniquedbcs =
+  grep { $_->dbServerType() eq ariba::Ops::DBConnection->oracleDBServerType() }
+  @uniquedbcs;
+
+@uniquedbcs = grep { !$_->isDR() } @uniquedbcs;
+
+my %bc_status;
+
+my @query_array;
+
+$pm->run_on_finish(
+    sub {
+        my $returnref = $_[5];
+        push( @query_array, $returnref );
+    }
+);
+
+foreach my $dbc (@uniquedbcs) {
+    my $pid = $pm->start and next;
+    my $qref = rmanDiskBackupStatus($dbc);
+    $pm->finish( 0, $qref );
+}
+
+$pm->wait_all_children;
+
+my %queries;
+
+foreach my $qd (@query_array) {
+    foreach my $sid ( keys %$qd ) {
+        foreach my $p ( keys %{ $qd->{$sid} } ) {
+
+            $queries{"Age of weekly full backup for [$sid] $p"} = {
+                crit              => "answer >= 7",
+                info              => "answer < 7",
+                uiHint            => "$sid/$p",
+                perl              => sub { return $qd->{$sid}{"$p"}{'DB'}; },
+                correctiveActions => [
+                    Ops => 'Contact DBA',
+                ],
+            };
+
+            $queries{"Age of archive log backups for [$sid] $p"} = {
+                crit   => "answer >= 0.5",
+                info   => "answer < 0.5",
+                uiHint => "$sid/$p",
+                perl   => sub { return $qd->{$sid}{"$p"}{'ARCHIVELOG'}; },
+                correctiveActions => [
+                    Ops => 'Contact DBA',
+                ],
+            };
+            my %influx_data = (
+                measurement => 'rman_backup_age',
+                tags => { product => $p, service => $service, sid => $sid },
+                data => {
+                    WeeklyFullBackupAge => $qd->{$sid}{"$p"}{'DB'} || -1,
+                    ArchiveLogBackupAge => $qd->{$sid}{"$p"}{'ARCHIVELOG'}
+                      || -1
+                }
+            );
+            eval {
+                my $statsd_line =
+                  ariba::Ops::Utils::generateStatsDLine( \%influx_data );
+                print "$statsd_line\n" if ($debug);
+                ariba::Ops::Utils::sendToStatsD($statsd_line) if ($statsd_line);
+            };
+
+        }
+    }
+}
+
+my $qm = ariba::monitor::QueryManager->newWithDetails( "Rman backup status",
+    $mon->name(), $mon->service(), $mon->customer(), \%queries );
+$qm->processQueriesUsingServer( $debug, $email, $sendEmail, $sendPage );
+
+sub rmanDiskBackupStatus {
+    my $dbc         = shift;
+    my $productName = $dbc->product()->name();
+    my $instance    = uc( $dbc->sid() );
+    my $vhost       = $dbc->host();
+    my $oc = ariba::Ops::OracleClient->new( $systemUser, $systemPass, $instance,
+        $vhost );
+    $oc->connect();
+    my @results;
+    my $archive_sql =
+q`select round(sysdate - max(END_TIME),2) from v$RMAN_BACKUP_JOB_DETAILS where INPUT_TYPE='ARCHIVELOG'  and  status='COMPLETED'`;
+    my $archive_result = $oc->executeSql($archive_sql);
+    my $full_sql =
+q`select round(sysdate - max(END_TIME),2)  from v$RMAN_BACKUP_JOB_DETAILS where INPUT_TYPE='DB FULL'  and  status='COMPLETED'`;
+    my $full_result = $oc->executeSql($full_sql);
+    $oc->disconnect();
+    my $dhash = {};
+    $dhash->{$instance}{$productName}{'DB'}         = $full_result;
+    $dhash->{$instance}{$productName}{'ARCHIVELOG'} = $archive_result;
+    return ($dhash);
+
+}
+

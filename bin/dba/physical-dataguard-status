@@ -1,0 +1,343 @@
+#!/usr/local/bin/perl -w
+
+###############################################################################
+# $Id: //ariba/services/monitor/bin/dba/physical-dataguard-status#15 $
+# $HeadURL:$
+#
+# Copyright (c) 2013 Ariba
+#
+# physical-dataguard-status - Monitor Physical Dataguard
+#
+###############################################################################
+
+=head1 NAME
+
+physical-dataguard-status - Monitor Physical Dataguard
+
+=head1 SYNOPSIS
+
+physical-dataguard-status [options]
+
+=head1 OPTIONS
+
+=over
+
+=item B<-help|-h>
+
+Print this usage information and exit.
+
+=item B<-debug|-d>
+
+Enable debugging output / dryrun
+
+=item B<-e>
+
+Enable sending of emails
+
+=item B<-p>
+
+Enable sending of pages
+
+=item B<-product> productName
+
+Run for this product, can be specified multiple times
+
+=back
+
+=head1 DESCRIPTION
+
+C<physical-dataguard-status> - Monitor the status of Physical Dataguard
+
+=cut
+
+=author
+
+Nathan Sullivan C<< <nsullivan@ariba.com> >>
+
+=head1 LICENSE
+
+Copyright 2013 Ariba
+
+=cut
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use Pod::Usage;
+use Getopt::Long;
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+use ariba::monitor::BackupUtils;
+
+my $debug = 0;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my @productNames;
+
+    GetOptions(
+        "help|h" => sub { pod2usage(1); },
+        "debug|d+" => \$debug,
+        "e" => \$sendEmail,
+        "p" => \$sendPage,
+        "product=s" => \@productNames,
+    );
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $cluster = $mon->currentCluster();
+    my $systemUser = "system";
+    my $systemPass = $mon->default("dbainfo.$systemUser.password");
+
+    my @products;
+    my $product_name_str;
+    foreach my $productName (@productNames) {
+        push(@products, ariba::rc::InstalledProduct->installedProductsList($mon->service(), $productName));
+        $product_name_str .= $productName;
+    }
+
+    exit(0) unless(@products);
+
+    my $lockFile = "/tmp/physical-dataguard-status-$product_name_str";
+    exit(0) unless (dmail::LockLib::requestlock($lockFile));
+
+    my @dbConnections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+
+    my $email = $mon->default('notify.email');
+
+    foreach my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbConnections)) {
+        next if ( $dbc->isDR() || ($dbc->dbServerType() ne ariba::Ops::DBConnection->oracleDBServerType()) );
+        next unless scalar($dbc->peers()); # no peers == no dataguard, skip
+        next unless $dbc->isPhysicalReplication(); # only physical DG
+
+        my %queries;
+        my $drHost = $dbc->drDBPeer()->host();
+        my $virtualHost = $dbc->host();
+        my $instance = uc($dbc->sid());
+        my $productName = $dbc->product()->name();
+
+        my $backupHostname = $dbc->product()->activeHostForVirtualHostInCluster($virtualHost, $cluster);
+        my $inBackup;
+        eval {
+            $inBackup = ariba::monitor::BackupUtils::backupIsRunning(
+                product => $productName,
+                service => $mon->service(),
+                hostname => $backupHostname
+            );
+        };
+        if($@) {
+            $inBackup = 0;
+            warn "backupIsrunning threw: $@";
+        }
+        my $shipWarn = 15*60;
+        $shipWarn = 5*60 if $dbc->isPhysicalActiveRealtimeReplication();
+        my $shipCrit = 30*60;
+        $shipCrit = 20*60 if $dbc->isPhysicalActiveRealtimeReplication();
+        my $applyWarn = 30*60;
+        my $applyCrit = 60*60;
+        my $totalWarn = 30*60;
+        my $totalCrit = 60*60;
+        my $newCrit =  'ORA-';
+
+        $queries{"Physical Dataguard shipping lag for [$instance] on $drHost"} = {
+            info => 1,
+            description => 'Amount of data generated on primary but not yet shipped to DR in seconds', 
+            crit => "answer =~ /$newCrit/",
+            uiHint => $instance,
+            correctiveActions => [
+                Ops => 'Contact DBA', 
+                DBA => 'Fix it',
+            ],
+            timeout => 120,
+            format => '%d secs',
+            recordMaxResults => 51840,
+            sql => q`select(next_time_onpri-next_time_ondr)*86400
+                     from
+                     (select  max(sequence#) max_seq_onpri, max(next_time) next_time_onpri
+                     from v$archived_log val, v$database vdb
+                     where val.resetlogs_change# = vdb.resetlogs_change#
+                     group by thread# order by 1),
+                     (select  max(sequence#) max_seq_ondr, max(next_time) next_time_ondr
+                     from v$archived_log@dg_standby val, v$database@dg_standby vdb
+                     where val.resetlogs_change# = vdb.resetlogs_change#
+                     group by thread# order by 1)`,
+        };
+
+        $queries{"Physical Dataguard apply lag for [$instance] on $drHost"} = {
+            info => 1,
+            description => 'Amount of data received by DR but not yet applied in seconds',
+            crit => "answer =~ /$newCrit/",
+            uiHint => $instance,
+            correctiveActions => [
+                Ops => 'Contact DBA', 
+                DBA => 'Fix it',
+            ],
+            timeout => 120,
+            format => '%d secs',
+            recordMaxResults => 51840,
+            sql => q`select
+                     extract(day from to_dsinterval(value)) * 86400 +
+                     extract(hour from to_dsinterval(value)) * 3600 +
+                     extract(minute from to_dsinterval(value)) * 60 +
+                     extract(second from to_dsinterval(value))
+                     from v$dataguard_stats@dg_standby
+                     where name = 'apply lag'`,
+        };
+
+        $queries{"Physical Dataguard total lag for [$instance] on $drHost"} = {
+            warn => "answer > $totalWarn",
+            crit => "answer > $totalCrit && previousAnswer > $totalCrit || answer =~ /$newCrit/",
+            description => 'How far behind DR is from primary in seconds',
+            uiHint => $instance,
+            correctiveActions => [
+                Ops => 'Contact DBA', 
+                DBA => 'Fix it',
+            ],
+            timeout => 120,
+            format => '%d secs',
+            recordMaxResults => 51840,
+            sql => q`select (primary_date-standby_date) * 86400
+                     from
+                     (select cast(scn_to_timestamp(current_scn) as date) primary_date
+                     from v$database) primary_date,
+                     (select  cast(scn_to_timestamp(current_scn) as date) standby_date
+                     from v$database@dg_standby)`,
+        };
+ 
+        $queries{"Physical Dataguard quantity of unapplied logs for [$instance] on $drHost"} = {
+            info => 1,
+            description => 'Amount of unapplied redo in GB',
+            crit => "answer =~ /$newCrit/",
+            uiHint => $instance,
+            timeout => 120,
+            format => '%.2f GB',
+            recordMaxResults => 51840,
+            sql => q`select max(unapp_redo) from 
+                     (select round((sum(blocks*block_size)/1024/1024/1024),2) unapp_redo
+                     from v$archived_log@dg_standby where archived='YES' and applied='NO'
+                     and registrar='RFS'
+                     and sequence# > (select max(sequence#) from
+                     v$archived_log@dg_standby where archived='YES' and applied='YES')
+                     union
+                     select 0 unapp_redo from dual)`,
+
+        };
+            
+        $queries{"Physical Dataguard average apply rate for [$instance] on $drHost"} = {
+            info => 1,
+            description => 'Average apply rate, can be used to calculate how fast we can roll forward',
+            crit => "answer =~ /$newCrit/",
+            uiHint => $instance,
+            timeout => 120,
+            recordMaxResults => 51840,
+            format => '%.2f GB/hour',
+            sql => q`select avg(sofar) from v$recovery_progress@dg_standby
+                     where item='Active Apply Rate'`,
+        };
+ 
+        $queries{"Physical Dataguard time to apply for [$instance] on $drHost"} = {
+            info => 1,
+            description => 'Approximate time to roll-forward all unapplied logs in seconds',
+            uiHint => $instance,
+            timeout => 120,
+            recordMaxResults => 51840,
+            format => '%d secs',
+            sql => q`select round(unapplied_redo/apply_rate,2)
+                     from (select max(unapp_redo) unapplied_redo from
+                     (select sum(blocks*block_size)/1024 unapp_redo
+                     from v$archived_log@dg_standby where archived='YES' and applied='NO'
+                     and registrar='RFS' and sequence# > (select max(sequence#) from
+                     v$archived_log@dg_standby where archived='YES' and applied='YES')
+                     union
+                     select 0 unapp_redo from dual)),
+                     (select avg(sofar) apply_rate from v$recovery_progress@dg_standby
+                     where item='Active Apply Rate')`,
+        };
+
+        my $mode = "MANAGED";
+        $mode = "MANAGED REAL TIME APPLY" if $dbc->isPhysicalActiveRealtimeReplication();
+        my $crit = "answer ne '$mode'";
+        $crit = undef if $inBackup;
+
+        $queries{"Physical Dataguard recovery mode for [$instance] on $drHost"} = {
+            info => 1,
+            description => 'The recovery mode of the standby DB',
+            crit => "answer =~ /$newCrit/",
+            uiHint => $instance,
+            correctiveActions => [
+                Ops => 'Contact DBA', 
+                DBA => 'Fix it',
+            ],
+            timeout => 120,
+            sql => q`select recovery_mode from v$archive_dest_status where type='PHYSICAL'`,
+        };
+ 
+        my $warn = 'answer ne "No Gap"';
+        $warn = undef if $inBackup;
+        $queries{"Physical Dataguard gap status for [$instance] on $drHost"} = {
+            info => 1,
+            description => 'Log gap status, or Recovery Not Running if DR is not running',
+            crit => "answer =~ /$newCrit/",
+            uiHint => $instance,
+            correctiveActions => [
+                Ops => 'Contact DBA', 
+                DBA => 'Fix it',
+            ],
+            timeout => 120,
+            sql => q`select (case
+                     when is_running = 'RUNNING' then
+                     (case when status = 'WAIT_FOR_GAP' then 'Gap Waiting for Log '||sequence#
+                     else 'No Gap' end)
+                     else 'Recovery not Running' end) "Gap status" from
+                     (select '1' joinit, status, sequence#, process
+                     from v$managed_standby@dg_standby
+                     where process like 'MRP%') a,
+                     (select '1' joinit, decode(count(*),0,'NOTRUNNING','RUNNING') is_running
+                     from v$managed_standby@dg_standby
+                     where process like 'MRP%') b
+                     where a.joinit (+)=b.joinit`,
+        };
+
+        $crit = 'numrows == 0 || answer eq "UNUSED" || answer eq "ERROR" || answer eq "WAIT_FOR_GAP"';
+        $crit = undef if $inBackup;
+        $queries{"Physical Dataguard DR apply status for [$instance] on $drHost"} = {
+            info => 1,
+            description => 'Current status of the apply process',
+            crit => "answer =~ /$newCrit/",
+            uiHint => $instance,
+            correctiveActions => [
+                Ops => 'Contact DBA', 
+                DBA => 'Fix it',
+            ],
+            timeout => 180,
+            sql => q`select status from v$managed_standby@dg_standby where process='MRP0'`,
+        };
+
+        $queries{"Physical Dataguard archive destination errors for [$instance] on $virtualHost"} = {
+            info => 1,
+            description => 'Errors for the archive destination',
+            crit => "answer =~ /$newCrit/",
+            uiHint => $instance,
+            correctiveActions => [
+                Ops => 'Contact DBA',
+                DBA => 'Fix it',
+            ],
+            timeout => 120,
+            sql => q`select error from v$archive_dest_status where dest_id=2`,
+        };    
+
+        my $qm = ariba::monitor::QueryManager->newWithDetails('physical-dataguard-status', $productName, $mon->service(), undef, \%queries);
+        $qm->setSQLConnectInfo($systemUser, $systemPass, $instance, $virtualHost);
+        $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+    }
+    dmail::LockLib::releaselock($lockFile);
+}
+
+main(@ARGV);
+
+__END__

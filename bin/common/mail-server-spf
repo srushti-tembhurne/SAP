@@ -1,0 +1,369 @@
+#!/usr/local/bin/perl
+# $Id: //ariba/services/monitor/bin/common/mail-server-spf#1 $
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use Net::IPv4Addr qw(:all);
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::monitor::QueryManager;
+use ariba::Ops::ServiceController;
+use ariba::Ops::Utils;
+use Data::Dumper;
+use JSON;
+use Getopt::Long;
+use Pod::Usage;
+
+my $debug     = 0;
+my $sendEmail = 0;
+my $sendPage  = 0;
+my $help      = 0;
+my $test      = 0;
+my $cfgfile;
+my $lookupcmd = ariba::Ops::Utils::findSysCmd("host") || "/usr/bin/host";
+
+use constant {
+    # query names and descriptions
+    COLLECT_DATA => [
+        " Query DNS",
+        " Query DNS for mail server spf configuration"
+    ],
+    SPF_CONFIG   => [
+        " spf ip4 configuration",
+        "Validate SPF ip4 blocks exists and match the configured number of blocks"
+        ],
+    SPF_IP4_BLOCKS      => [
+        " valid spf ip4 blocks",
+        "Check the validity of the SPF ip4 blocks"
+        ],
+    IP4_ADDRESS => [
+        " ip addresses are in ranges",
+        "Validate that the mail server ip addresses are in the configured SPF block ranges"
+        ],
+    IP_REVERSE => [
+        " ip reverse lookup",
+        "The reverse lookup of the ip address is same as the mail server"
+        ],
+
+    # data used repeatedly
+    KEY_SPF_RECORD => "record",
+    KEY_SPF_IP4_BLOCKS => "ip4_blocks",
+};
+
+sub main {
+
+    #process the command line options
+    GetOptions(
+        "debug"  => \$debug,
+        "eMail"  => \$sendEmail,
+        "page"   => \$sendPage,
+        "test"   => \$test,
+        "cfg=s"  => \$cfgfile,
+        "help|?" => \$help,
+    ) or pod2usage(2);
+
+    pod2usage(1) if $help;
+
+    #-----------------------------------------------------------------
+    # this is intended to be run on mon server in prod only
+    my $me = ariba::rc::InstalledProduct->new();
+    die "No installed product" unless $me;
+
+    my $installdir = $me->installDir();
+    my $email      = $me->default('notify.email');
+    my $service    = $me->service();
+
+    my $productName = ariba::Ops::ServiceController::MailServiceProdName();
+
+    #-----------------------------------------------------------------
+    # get the configuration for the mail servers
+    $cfgfile = "$installdir/etc/mail-servers.json" unless $cfgfile;
+
+    my $fh;
+    open( $fh, "<", $cfgfile )
+      or die "Can't open configuration file $cfgfile: $!\n";
+    my @lines   = <$fh>;
+    my $jsonStr = join( '', @lines );
+    my $cfg     = JSON::decode_json($jsonStr);
+    close($fh);
+
+    my $mslist = $cfg->{"mail-server"};
+    if ( $test ) {
+        $mslist = $cfg->{"test"}->{"mail-server"};
+    }
+
+    #-----------------------------------------------------------------
+    # cycle through the list of mail servers and create the mointor queries
+    my $queries = {};
+
+    foreach my $ms ( keys %{$mslist} ) {
+        next if $mslist->{$ms}->{'skip'};
+
+        my $bcount = $mslist->{$ms}->{"spf1-ip4-blocks-required"};
+        if ( $debug || $test ) {
+            print "\n-------------$ms-------------------\n";
+            print "$ms spf ip4 blocks needed: $bcount\n";
+        }
+
+        my $uiHint = "$ms";
+        my $crit   = 0;
+        my $result = "";
+
+        # query on succes or failure for retrieving dns
+        # information, spf, dns ip and reverse
+        # first spf, ip addresses from dns and reverse lookup
+        my ($spf_conf, $spf_record, $spf_ip4_blocks);
+        my $ms_ips;
+        eval {
+            if ($test) {
+                $spf_ip4_blocks = $mslist->{$ms}->{"spf-ip4-blocks"};
+                $spf_record = $mslist->{$ms}->{"spf-record"};
+                $ms_ips = $mslist->{$ms}->{"ip-addresses"};
+            }
+            else {
+                $spf_conf = retrieveSpfConf($ms);
+                $spf_ip4_blocks = $spf_conf->{KEY_SPF_IP4_BLOCKS};
+                $spf_record = $spf_conf->{KEY_SPF_RECORD};
+                $ms_ips = retrieveMailserverIps($ms);
+            }
+        };
+        if ($@) {
+            my $result = $@;
+            $queries->{$ms . COLLECT_DATA->[0]} = {
+                description => COLLECT_DATA->[1],
+                uiHint => "$uiHint",
+                crit   => 1,
+                result => $result,
+                perl => "return \"$result\"",
+            };
+            undef $@;
+            next;
+        }
+
+        if ( $test || $debug ) {
+            print "SPF record ip4 blocks: @$spf_ip4_blocks\n";
+            print "DNS ip address: @$ms_ips\n";
+        }
+
+        # check number of ip4 blocks in spf configuration
+        # and compare with the configuration
+        $result = "good";
+        if ( !$spf_ip4_blocks ) {
+            $result = "no ip4 blocks configured with spf";
+            $crit   = 1;
+        }
+        elsif ( scalar(@$spf_ip4_blocks) < $bcount ) {
+            $result = "number of ip4 configured with spf is not enough";
+            $crit   = 1;
+        }
+        $queries->{$ms . SPF_CONFIG->[0]} = {
+            description => SPF_CONFIG->[1],
+            uiHint => "$uiHint",
+            crit   => $crit,
+            result => "$result",
+            perl => "return \"$result\"",
+        };
+
+        # valid spf ip4 blocks
+        $result = "yes";
+        $crit   = 0;
+        for ( my $i = 0 ; $i < scalar(@$spf_ip4_blocks) ; $i++ ) {
+            eval { ipv4_parse( $spf_ip4_blocks->[$i] ); };
+            if ($@) {
+                $result = "not all ips are valid addresses $@";
+                $crit   = 1;
+                undef $@;
+                last;
+            }
+        }
+        $queries->{$ms . SPF_IP4_BLOCKS->[0]} = {
+            description => SPF_IP4_BLOCKS->[1],
+            uiHint => "$uiHint",
+            crit   => $crit,
+            result => "$result",
+            perl => "return \"$result\"",
+        };
+
+        # valid ip in ip4 blocks
+        # the ips from dns should be valid addresses, no check on that.
+        $crit   = 0;
+        $result = "yes";
+        my @ips_not_in_range = ();
+        for ( my $i = 0 ; $i <= $#$ms_ips ; $i++ ) {
+            next
+              if ( grep { ipv4_in_network( $_, $ms_ips->[$i] ) }
+                @$spf_ip4_blocks );
+            push @ips_not_in_range, $ms_ips->[$i];
+        }
+        if (@ips_not_in_range) {
+            $crit   = 1;
+            $result = "ips not in range: @ips_not_in_range";
+        }
+        $queries->{$ms . IP4_ADDRESS->[0]} = {
+            description => IP4_ADDRESS->[1],
+            uiHint      => "$uiHint",
+            crit        => $crit,
+            result      => "$result",
+            perl        => "return \"$result\"",
+        };
+
+        # reverse ip lookup and verification
+        # for each ips, reverse looks to make sure they are same the
+        # the mail server name
+        #   name = $ms?
+        $crit   = 0;
+        $result = "good";
+        my @bad_ips = ();
+        foreach my $ip (@$ms_ips) {
+            my $sname = `$lookupcmd $ip | grep "domain name pointer"`;
+            if ( $sname =~ /domain name pointer\s+(.*)\.$/ ) {
+                if ( $1 ne $ms ) {
+                    push @bad_ips, $ip;
+                }
+            }
+            else {
+                push @bad_ips, $ip;
+            }
+        }
+        if ( @bad_ips ) {
+            $crit = 1;
+            $result = "Verification failure: @bad_ips";
+        }
+        $queries->{$ms . IP_REVERSE->[0]} = {
+            description => IP_REVERSE->[1],
+            uiHint      => "$uiHint",
+            crit        => $crit,
+            result      => "$result",
+            perl        => "return \"$result\"",
+        };
+
+        # done validation. no error with data retrieving during the process.
+        $result = "success ($spf_record)";
+        $queries->{$ms . COLLECT_DATA->[0]} = {
+            description => COLLECT_DATA->[1],
+            uiHint      => "$uiHint",
+            crit        => 0,
+            result      => "$result",
+            perl        => "return \"$result\"",
+        };
+
+        print "\n-------------$ms-------------------\n" if ( $test || $debug );
+    }
+
+
+    #create QueryManager object and process queries
+    my $qmName = "Mail-Server-SPF";
+    my $qm =
+      ariba::monitor::QueryManager->newWithDetails( $qmName, $productName,
+        $service, undef, $queries );
+    $qm->processQueriesUsingServer( $debug, $email, $sendEmail, $sendPage );
+
+    exit 0;
+}
+
+main(@ARGV);
+
+#-----------------------------------------------------------------
+
+sub retrieveSpfConf {
+    my $ms = shift;
+
+    print "\nSPF Record for $ms: --------\n" if $debug;
+
+    my $spf_conf = { KEY_SPF_RECORD => "", KEY_SPF_IP4_BLOCKS => []};
+
+    return $spf_conf unless $ms;
+
+    # lookup up spf record 
+    my $cmd    = "$lookupcmd -t txt $ms | grep spf1";
+    my $output = `$cmd`;
+
+    my $ecode   = $?;
+    my $cmdcode = ( $? >> 8 );
+
+    if ( $ecode || $cmdcode ) {
+        die "Error retrieving SPF record via $cmd";
+    }
+
+    print "$output\n" if $debug && $output;
+
+    if ($output) {
+        if ( $output =~ /text.*?\"(.*)\"/ ) {
+            $spf_conf->{KEY_SPF_RECORD} = $1;
+        } 
+        while ( $output =~ /ip4:([^\s]+)\s+/g ) {
+            push @{$spf_conf->{KEY_SPF_IP4_BLOCKS}}, $1;
+        }
+    }
+
+    if ( $debug ) {
+        print "spf record: " . $spf_conf->{KEY_SPF_RECORD} . "\n";
+        print join( "\n", "Extracted ip blocks for $ms:", @{$spf_conf->{KEY_SPF_IP4_BLOCKS}}, "\n" )
+    }
+
+    return $spf_conf;
+}
+
+sub retrieveMailserverIps {
+    my $ms = shift;
+
+    my $ips = [];
+
+    print "\nDNS records for $ms: --------\n" if $debug;
+
+    return $ips unless $ms;
+
+    # look up dns ips for the given mail server
+    my $cmd    = "$lookupcmd $ms";
+    my $output = `$cmd`;
+
+    my $ecode   = $?;
+    my $cmdcode = ( $? >> 8 );
+
+    if ( $ecode || $cmdcode ) {
+        die "Error retrieving SPF record via $cmd";
+    }
+
+    print "$output\n" if $debug && $output;
+
+    if ($output) {
+        my @lines = split( /\n/, $output );
+        for ( my $i = 0 ; $i < scalar(@lines) ; $i++ ) {
+            if ( $lines[$i] =~ /$ms has address (.*)/ ) {
+                push @$ips, $1;
+            }
+        }
+    }
+
+    print join( "\n", "ips for $ms", @$ips, "\n" ) if $debug;
+
+    return $ips;
+}
+
+=pod
+
+=head1 NAME
+
+mail-server-spf
+
+=head1 SYNOPSIS
+
+mail-server-spf [-d] [-e] [-p] [-cfg <cfgfile>]
+
+    -d: debug
+    -e: send email for alerts
+    -p: send page for alerts
+    -cfg: alternative json configuration file
+
+=head1 DESCRIPTION
+
+This is script for monitoring all aspects of mail server spf configurations.
+The mail server configuration is in a json file under etc
+but an alternative configuration file can  be specified on command line
+
+=cut

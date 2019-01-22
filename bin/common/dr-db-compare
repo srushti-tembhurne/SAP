@@ -1,0 +1,1245 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/dr-db-compare#26 $
+
+use strict;
+use FindBin;
+
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+use ariba::Ops::DatabaseManager::BerkeleyDB;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Passwords;
+use ariba::rc::Utils;
+use Digest::MD4;
+use Term::ReadKey;
+use ariba::Ops::SharedMemoryChild;
+use IO::Tee;
+use IO::File;
+use dmail::LockLib;
+
+my $threadCount = 0;
+my $maxThreads = 1;
+my $queriesPerThread = 15;
+
+# Process ID
+my $pid = 0;
+
+my $lockFile = "/tmp/dr-db-compare";
+
+# Size of shared memory segments used by each sub-process in KB
+my $smSize = 800;
+
+my $outputLogDir = "";
+
+my @multiplexedOutputs = (new IO::Tee(\*STDOUT));
+my $tee = $multiplexedOutputs[0];
+
+
+my %blobTableMapOrig = (
+
+	'an' => {
+		'community' => {
+			 'CATALOG_BLOB'          => 'CONTENT',
+			 'CXML_BLOB'             => 'CONTENT',
+			 'CXML_DOCUMENT_BLOB'    => 'CONTENT',
+			 'EDI_DOCUMENT_CONTENT'  => 'CONTENT',
+			 'FAX_ATTACHMENT'        => 'CONTENT',
+			 'MAIL'                  => 'CONTENT',
+			 'NOTIFICATION'          => 'CONTENT',
+			 'PENDING_MESSAGE'       => 'MESSAGE',
+		},
+		'directory' => {
+			 'BULK_REG_BLOB'         => 'CONTENT',
+			 'CERT_BLOB'             => 'CONTENT',
+			 'LETTER_TEMPLATE'       => 'CONTENTS',
+		},
+	},
+
+	'fx' => {
+		'MAIL'			=> 'CONTENT',
+	},
+);
+
+$| = 1;
+
+my $debug = 0;
+
+sub usage {
+	print "Usage: $0 (-full | -fast | -extra) ([-product an|buyer|s2] [-customer] | -c) [options] <filename>]\n";
+	print "\t-d                 activates debug mode.\n";
+
+	print "\nUse one or more of the following:\n";
+	print "\t-fast              does row count compare.\n";
+	print "\t-full              does row count and blob MD5 compare.\n";
+	print "\t-extra <filename>  does extra comparisons for AN. It needs a list of tables to compare\n";
+
+	print "\nProvide Connection information:\n";
+	print "\t-customer <name>   run for asp customer <name>.\n";
+	print "\t-product <prod>    run for product <prod> (may be used multiple times).\n";
+	print "\t-c                 will ask to the user to provide connection information.\n";
+
+	print "\nAdvanced Options:\n";
+	print "\t-ignore <filename> Provide a file containing a list of tables to ignore.\n";
+	print "\t-max-threads       <number> set the maximum number of thread the program will use.\n";
+	print "\t-sm-size <number>  set the size of shared memory segments used by each sub-process in KB.\n";
+
+	print "\nTypical usage:\n";
+	print "$0 -fast -product s2 -customer ops\n";
+
+	exit;
+}
+
+
+sub main {
+
+	my $full = 0;
+	my $fast = 0;
+	my $extra = 0;
+	my @ignoreFiles;
+	my @includeFiles;
+	my $customConnection = 0;
+	my @customConnDataPrim ;
+	my @customConnDataSec;
+	
+	my %blobTableMap;
+	my @requestedProducts;
+	my $customer;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-full$/o) {	$full = 1; };
+		if ($arg =~ /^-product/o) { push(@requestedProducts, shift(@ARGV));};
+		if ($arg =~ /^-customer/o) { $customer = shift(@ARGV); next; }
+		if ($arg =~ /^-fast$/o) { $fast  = 1; };
+		if ($arg =~ /^-d/o) { $debug++; };
+		if ($arg =~ /^-c$/o) {$customConnection = 1;};
+		if ($arg =~ /^-ignore/o) {push(@ignoreFiles, shift(@ARGV)); next;};
+		if ($arg =~ /^-extra/o) {$extra = 1; next;};
+		if ($arg =~ /^-include/o) {push(@includeFiles, shift(@ARGV)); next;};
+		if ($arg =~ /^-max-threads/o) {$maxThreads = shift(@ARGV); print "Maximum Number of threads : [$maxThreads]\n"; next;};
+		if ($arg =~ /^-sm-size/o) {$smSize = shift(@ARGV); print "Size of each shared memory segment : [$smSize]\n"; next;};
+		if ($arg =~ /^-logDir/io) {$outputLogDir = shift(@ARGV); next;};
+	}
+
+	if ($outputLogDir) {
+		$outputLogDir = "$outputLogDir/" unless ($outputLogDir =~ m|/$|);
+
+		unless (-d $outputLogDir) {
+			unless(ariba::rc::Utils::mkdirRecursively($outputLogDir)) {
+				print "Couldn't create logs directory $outputLogDir : $!\n";
+				exit(-1);
+			}
+		}
+	}
+
+	if (!$full and !$fast and !$extra) {
+		usage();
+	}
+
+	my $me 	= ariba::rc::InstalledProduct->new();
+	ariba::rc::Passwords::initialize($me->service());
+	my $cluster  = "primary"; # XXX unused, quick fix for now
+
+	my @productsToCompare;
+
+	for my $pname (@requestedProducts) {
+		if (ariba::rc::InstalledProduct->isInstalled($pname, $me->service(), undef, $customer)) {
+			push (@productsToCompare, ariba::rc::InstalledProduct->new($pname, $me->service(), undef, $customer));
+		} else {
+			usage("$pname is not installed!\n");
+		}
+	}
+
+	my @tablesToIgnore;
+	foreach my $ignoreFile (@ignoreFiles) {
+		push(@tablesToIgnore, parseFile($ignoreFile));
+	}
+
+	my @tablesToInclude;
+	foreach my $includeFile (@includeFiles) {
+		push(@tablesToInclude, parseFile($includeFile));
+	}
+
+	my ($drHost, $drUser, $drSId,$drPwd);
+	my ($pHost, $pUser, $pSId,$pPwd);
+	
+	if ($customConnection) {
+		($pHost, $pUser, $pSId,$pPwd) =	promptCustomConnection('primary');
+		safeMTPrint( "\n");
+		($drHost, $drUser, $drSId,$drPwd) =	promptCustomConnection('dr');
+	}
+
+	if ($customConnection) {
+		@customConnDataPrim = ($pUser, $pPwd, $pSId, $pHost);
+		@customConnDataSec  = ($drUser, $drPwd, $drSId, $drHost);
+	}
+
+	my $start = time();
+	my $numErrors = 0;
+	$numErrors += countCompare($me,$cluster, \@customConnDataPrim, \@customConnDataSec, \@tablesToIgnore, \@tablesToInclude, \@productsToCompare) if ($full or $fast);
+
+	if ($full) {
+		my %blobTableMap;
+		foreach my $product (@productsToCompare) {
+			my $key = $product->name();
+			$blobTableMap{$key} = $blobTableMapOrig{$key} if (exists $blobTableMapOrig{$key});
+		}
+				  
+		$numErrors += blobCompare($me,$cluster, \@customConnDataPrim, \@customConnDataSec, \@tablesToIgnore, \%blobTableMap);
+	}
+
+	$numErrors += MTextraCompare($me,$cluster, \@customConnDataPrim, \@customConnDataSec, \@tablesToIgnore, \@tablesToInclude) if ($extra);
+	my $end = time();
+
+	print "Finshed with requested compares\n";
+
+	foreach my $localTee (@multiplexedOutputs) {
+		print $localTee "\nElapsed Global Time: ", $end - $start, " secs\n";
+		if ($numErrors) {
+			print $localTee "There were $numErrors error(s) globally.\n";
+		}
+	}
+}
+
+sub MTextraCompare {
+
+	my ($me,$cluster, $customConnectionDataPrimRef, $customConnectionDataSecRef, $tablesToIgnoreRef, $tablesToIncludeRef) = @_;
+
+
+	my $numErrors = 0;
+
+	my @dbcs;
+	if ( (@$customConnectionDataPrimRef) && (@$customConnectionDataSecRef) ) {
+
+		push (@dbcs, [$customConnectionDataPrimRef, $customConnectionDataSecRef]);
+
+	} else {
+
+		my $product = ariba::rc::InstalledProduct->new( "an", $me->service() );
+		my $name  = $product->name();
+		my @dbconnections = ariba::Ops::DBConnection->connectionsForProductOfDBType($product, ariba::Ops::DBConnection->typeMain());
+
+		return $numErrors unless ( (scalar @dbconnections > 0) || (@$customConnectionDataPrimRef && @$customConnectionDataSecRef));
+
+		for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSidAndSchema(@dbconnections))	{
+			my $mainDBC = $dbc;
+			my $drDBC = $dbc->drDBPeer();
+
+			unless ($drDBC) {
+				safeMTPrint( "\n", prettyPID(), "ERROR : No dr connection for connection {user:",$mainDBC->user(),", sid: ",$mainDBC->sid(),", host: ",$mainDBC->host()," ] }\n");
+				$numErrors++;
+				next;
+			}
+
+			my @primConn = ($mainDBC->user(), $mainDBC->password(), $mainDBC->sid(), $mainDBC->host());
+			my @secConn = ($drDBC->user(), $drDBC->password(), $drDBC->sid(), $drDBC->host());
+
+			safeMTPrint( prettyPID() , "DEBUG: Add connections : Source [user = ", $mainDBC->user(), " / sid = ", $mainDBC->sid()  ," / host = ", $mainDBC->host(), "] -> Target [user = ", $drDBC->user()," / sid = ", $drDBC->sid() ," / host = ", $drDBC->host(), " ]\n") if $debug;
+
+			push (@dbcs, [\@primConn, \@secConn]);
+		}
+	}
+
+	foreach my $dbc (@dbcs) {
+		my @conn = @$dbc;
+
+		my @tablesToIgnore  = @$tablesToIgnoreRef;
+		my @tablesToInclude = @$tablesToIncludeRef;
+
+		safeMTPrint( "\n",prettyPID(),"Doing extra comparisons for schema $conn[0][0] ($conn[0][3])\n");
+
+		$tee->flush;
+		my $logFilename = $conn[0][0] . "-extra-" . $conn[0][3] . "-" . $conn[1][3] . "-" . time() . ".log";
+		my $out = new IO::File(">$outputLogDir$logFilename");
+
+		unless ($out)	 {
+			print "Can't write to file $outputLogDir$logFilename, $!\n";
+			print "Make sure you are running from a directory that is writable or use -logdir.\n";
+			exit(-1);
+		}
+
+		my $newTee =  new IO::Tee(\*STDOUT, $out);
+
+		$tee = $newTee;
+		push (@multiplexedOutputs, $out);
+
+		
+		unless ( (@$customConnectionDataPrimRef) && (@$customConnectionDataSecRef) ) {
+			my $schema = $conn[0][0];
+			@tablesToInclude  = grep {/^\s*$schema\./i} @$tablesToIncludeRef;
+			@tablesToIgnore  = grep {/^\s*$schema\./i} @$tablesToIgnoreRef;
+		}
+
+
+		my $firstCodeRef = sub {return MTextraCompareFirstPass($conn[0], $conn[1], \@tablesToIgnore, \@tablesToInclude);};
+		my $secondCodeRef = sub {return MTextraCompareSecondPass($conn[0], $conn[1], \@tablesToIgnore, \@tablesToInclude);};
+
+		if (maxThreadCount() > 1) {
+			addThread($firstCodeRef);
+
+			#
+			# If we reached the limit of number of maximum process allowed, wait
+			# for one to finish, before allowing the next one to be launched
+			#
+			$numErrors += waitForThreads(threadCount() - maxThreadCount() + 1);
+			
+
+			addThread($secondCodeRef);
+
+			$numErrors += waitForThreads(threadCount() - maxThreadCount() + 1);
+		} else {
+
+			$numErrors += &$firstCodeRef();
+
+			$numErrors += &$secondCodeRef();
+
+		}
+	}
+
+	$numErrors += waitForThreads();
+
+	safeMTPrint( "\n". prettyPID() ."Done with extra compare.\n");
+
+	return $numErrors;
+}
+
+sub MTextraCompareFirstPass {
+	my $customConnectionDataPrimRef = shift;
+	my $customConnectionDataSecRef = shift;
+	my $tablesToIgnoreRef = shift;
+	my $tablesToIncludeRef = shift;
+
+	my $primaryOracleClient = ariba::Ops::OracleClient->new(@$customConnectionDataPrimRef);
+	my $secondaryOracleClient = ariba::Ops::OracleClient->new(@$customConnectionDataSecRef);
+
+	$primaryOracleClient->connect()   || die $primaryOracleClient->error();
+
+	$secondaryOracleClient->connect() || die $secondaryOracleClient->error();
+
+	my $numError = extraCompareFirstPass($primaryOracleClient, $secondaryOracleClient, $tablesToIgnoreRef, $tablesToIncludeRef);
+
+	$primaryOracleClient->disconnect();
+	$secondaryOracleClient->disconnect();
+	
+	return $numError;
+}
+
+
+sub MTextraCompareSecondPass {
+	my $customConnectionDataPrimRef = shift;
+	my $customConnectionDataSecRef = shift;
+	my $tablesToIgnoreRef = shift;
+	my $tablesToIncludeRef = shift;
+
+	my $primaryOracleClient = ariba::Ops::OracleClient->new(@$customConnectionDataPrimRef);
+	my $secondaryOracleClient = ariba::Ops::OracleClient->new(@$customConnectionDataSecRef);
+
+	$primaryOracleClient->connect()   || die $primaryOracleClient->error();
+
+	$secondaryOracleClient->connect() || die $secondaryOracleClient->error();
+
+	my $numError = extraCompareSecondPass($primaryOracleClient, $secondaryOracleClient, $tablesToIgnoreRef, $tablesToIncludeRef);
+
+	$primaryOracleClient->disconnect();
+	$secondaryOracleClient->disconnect();
+
+	return $numError;
+}
+
+sub extraCompareFirstPass {
+	my ($primaryOracleClient, $secondaryOracleClient, $tablesToIgnoreRef, $tablesToIncludeRef) = @_;
+
+	my @tablesToIgnore  = @$tablesToIgnoreRef;
+	my @tablesToInclude = @$tablesToIncludeRef;
+
+	my $primaryDBH   = $primaryOracleClient->handle();
+	my $secondaryDBH = $secondaryOracleClient->handle();
+
+	my %primaryResults;
+	my %secondaryResults;
+	
+	my $numErrors = 0;
+
+	safeMTPrint( prettyPID(),"  checking sequences...\n");
+
+	my $query = "select SEQUENCE_OWNER,SEQUENCE_NAME,LAST_NUMBER,INCREMENT_BY, MAX_VALUE from dba_sequences where SEQUENCE_OWNER = '" . uc($primaryOracleClient->user()) . "'";
+	
+	safeMTPrint( prettyPID(),"  DEBUG: Working on query [$query]...\n") if $debug;		
+	safeMTPrint( prettyPID(),"  DEBUG: Working on source database\n") if $debug;
+	my $primarySTH = $primaryDBH->prepare($query);
+
+	unless($primarySTH) {
+		$numErrors++;
+		safeMTPrint( "\n",prettyPID(),"  ERROR: Couldn't prepare the sequence query for primary... Skip it.\n");
+		return $numErrors;
+	}
+	
+	$primarySTH->execute();	
+
+	safeMTPrint( prettyPID(), "  DEBUG: Finishing querying source database\n") if $debug;
+
+	while (my ($owner, $name, $lastNumber, $incrementBy, $max) = $primarySTH->fetchrow_array()) {
+		$primaryResults{"$owner.$name.$incrementBy.$max"} = $lastNumber; 
+	}
+	
+	safeMTPrint( prettyPID(),"  DEBUG: Working on target database\n") if $debug;
+	my $secondarySTH = $secondaryDBH->prepare($query);
+	unless($secondarySTH) {
+		$numErrors++;
+		safeMTPrint( "\n", prettyPID(), "  ERROR: Couldn't prepare the sequence query for secondary... Skip it.\n");
+		return $numErrors;
+	}
+	$secondarySTH->execute();	
+	safeMTPrint( prettyPID(), "  DEBUG: Finishing querying target database\n") if $debug;
+
+	while (my ($sOwner, $sName, $sLastNumber, $sIncrementBy, $sMax) = $secondarySTH->fetchrow_array()) {
+		$secondaryResults{"$sOwner.$sName.$sIncrementBy.$sMax"} = $sLastNumber; 
+	}
+
+	safeMTPrint( compareTables(\%primaryResults, \%secondaryResults));
+	safeMTPrint( prettyPID(), "  done checking sequences...\n");
+
+	return $numErrors;
+}		  
+		  
+	
+
+sub compareTables {
+	my $tablePrimRef = shift;
+	my $tableSecRef = shift;
+
+	my $numErrors = 0;
+
+	safeMTPrint( "\n", prettyPID(), "  DEBUG: Analyzing primary database...\n") if $debug;
+	foreach my $primelem (keys(%$tablePrimRef)) {
+		if (exists $$tableSecRef{$primelem}) {
+			if ($$tablePrimRef{$primelem} > $$tableSecRef{$primelem}) {
+				$numErrors++;
+				safeMTPrint(  prettyPID(), "    ERROR: Sequence number is greater in the primary database for [$primelem] : Source = $$tablePrimRef{$primelem}  >  Target = $$tableSecRef{$primelem}\n");
+			}
+		} else {
+			$numErrors++;
+			safeMTPrint( prettyPID(), "    ERROR: Sequence for $primelem does not exist in secondary database\n");
+		}
+	}
+
+	safeMTPrint( "\n");
+
+	safeMTPrint( prettyPID(), "  DEBUG: Analyzing secondary database...\n") if ($debug);
+	foreach my $secondelem (keys(%$tableSecRef)) {
+		unless (exists $$tablePrimRef{$secondelem}) {
+			$numErrors++;
+			safeMTPrint( prettyPID(), "    ERROR: Sequence for $secondelem does not exist in primary database\n");
+		}
+	}
+	return $numErrors;
+}
+
+sub extraCompareSecondPass {
+	my ($primaryOracleClient, $secondaryOracleClient, $tablesToIgnoreRef, $tablesToIncludeRef) = @_;
+
+	my @tablesToIgnore  = @$tablesToIgnoreRef;
+	my @tablesToInclude = @$tablesToIncludeRef;
+
+
+	my $primaryDBH   = $primaryOracleClient->handle();
+	my $secondaryDBH = $secondaryOracleClient->handle();
+
+	my $numErrors = 0;
+	safeMTPrint( prettyPID(), "  checking db objects, columns, lobs, indexes, triggers and constraints...\n");
+
+	unless(scalar(@tablesToInclude)) {
+		my $sql = "select table_name from user_tables";
+		my $sth = $primaryDBH->prepare($sql);
+
+		unless($sth) {
+			$numErrors++;	  
+			safeMTPrint( "\n", prettyPID(), "ERROR: Couldn't prepare preliminary query for the second pass... Skip it.\n");
+			return $numErrors;
+		}
+		$sth->execute();
+
+		while(my $row = $sth->fetchrow_hashref()) {
+			my $table  = $row->{'TABLE_NAME'};
+			push (@tablesToInclude, $table);
+		}
+	
+	}	
+	
+	my %tablesToIgnore;
+
+	map {$_ =~ s/\w+\.//} @tablesToIgnore;
+	map {$_ =~ s/\w+\.//} @tablesToInclude;
+	map {$tablesToIgnore{$_}++} @tablesToIgnore;
+
+	my @tablesToUse;
+	map{push(@tablesToUse, $_) unless (exists($tablesToIgnore{$_}))} @tablesToInclude;
+
+	my $tableList;
+	$tableList = "('". join("','", @tablesToUse) . "')" if (scalar(@tablesToUse));
+
+	my %primaryResults;
+	my %secondaryResults;
+
+	# 1st pass
+	#
+	#	if CONTRAINT_NAME begins with "SYS_" => Skip JUST the column CONSTRAINT_NAME
+	#
+	# select Owner, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, SEARCH_CONDITION, STATUS From DBA_CONSTRAINTS where Owner like 'ANLIVE%';
+
+	my @queries = ("Select Owner||'.'||TABLE_NAME||'.'||column_Name From DBA_tab_columns Where Owner||'.'||Table_Name in $tableList order by table_name, column_name",
+						"Select Owner||'.'||table_name||'.'||index_Name||'.'||STATUS From DBA_indexes Where table_Owner||'.'||Table_Name in $tableList order by 1",
+						"Select Owner||'.'||TABLE_NAME||'.'||column_Name From DBA_lobs Where Owner||'.'||Table_Name in $tableList order by 1",
+						"Select Owner||'.'||TABLE_NAME||'.'||TRIGGER_NAME||'.'||STATUS From DBA_TRIGGERS Where table_Owner||'.'||Table_Name in $tableList order by 1",
+						"select Owner, TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE, SEARCH_CONDITION, STATUS From DBA_CONSTRAINTS where Owner||'.'||Table_Name in $tableList",
+						"select object_type, count(*)  from user_objects group by object_type",
+						"select object_name, object_type, status from user_objects",
+						"select constraint_name, table_name, constraint_type, status, VALIDATED from
+user_constraints",
+						);
+	my @checkType = ("columns", "indexes", "lobs", "triggers", "constraints", "num objects of type", "object status", "validated constraints");
+
+	for (my $i = 0; $i < @queries; $i++) {
+		my $query = $queries[$i];
+		my $check = $checkType[$i];
+
+		safeMTPrint( prettyPID(), "    checking [$check]...\n");
+		safeMTPrint( prettyPID(), "  DEBUG: Working on query : [$query]... \n") if $debug;							
+
+		my $primarySTH = $primaryDBH->prepare($query);
+
+		unless($primarySTH) {
+			$numErrors++;
+			safeMTPrint( "\n", prettyPID(), "  ERROR: Couldn't prepare $check check [$query] for source. Skip it.\n");
+			next $numErrors;
+		}
+	
+		$primarySTH->execute();
+		while (my @resultsp = $primarySTH->fetchrow_array()) {
+			my $resultp = join('.', @resultsp);
+			$resultp =~ s/\.SYS_([^\.])*\./\.SYS_\./;
+			$primaryResults{$resultp}++; 
+		}
+
+		my $secondarySTH = $secondaryDBH->prepare($query);
+		unless($secondarySTH) {
+			$numErrors++;
+			safeMTPrint( "\n", prettyPID(), "  ERROR: Couldn't prepare $check check [$query] for target. Skip it.\n");
+			next;
+		}
+	  	$secondarySTH->execute();	
+		while (my @resultss  = $secondarySTH->fetchrow_array()) {
+			my $results = join('.', @resultss);
+			$results =~ s/\.SYS_([^\.])*\./\.SYS_\./;
+			$secondaryResults{$results}++;
+		}
+	
+		foreach my $prow (keys(%primaryResults)) {
+			unless (($primaryResults{$prow} == $secondaryResults{$prow})) {
+				$numErrors++;
+				safeMTPrint( prettyPID(), "  ERROR: [$check check] $prow: Source [$primaryResults{$prow}] != Target [", ((exists $secondaryResults{$prow})?$secondaryResults{$prow}:"Undefined"),"] \n");
+		 	}
+		}
+	
+		foreach my $srow (keys(%secondaryResults)) {
+			unless (exists ($primaryResults{$srow})){
+				$numErrors++;
+				safeMTPrint( prettyPID(), "  ERROR: [$check check] $srow missing on Source.\n");
+			}
+		}
+
+		safeMTPrint( prettyPID(), "    done checking [$check]...\n");
+	}
+
+	safeMTPrint( prettyPID(), "  done checking db objects, columns, lobs, indexes, triggers and constraints...\n");
+
+	return $numErrors;
+}
+
+
+sub countCompare {
+	my ($me,$cluster, $customConnectionDataPrimRef, $customConnectionDataSecRef, $tablesToIgnoreRef, $tablesToIncludeRef, $requestedProductsRef) = @_;
+
+	my $numErrors;
+
+	if (@$customConnectionDataPrimRef && @$customConnectionDataSecRef) {
+		$numErrors = countCompareFromCustomCDB ($customConnectionDataPrimRef, $customConnectionDataSecRef, $tablesToIgnoreRef, $tablesToIncludeRef);
+	} else {
+		$numErrors = countCompareEveryProducts ($me,$cluster, $tablesToIgnoreRef, $tablesToIncludeRef, $requestedProductsRef);
+	}
+
+	return $numErrors;
+
+}
+
+
+sub countCompareEveryProducts {
+	my ($me,$cluster, $tablesToIgnoreRef, $tablesToIncludeRef, $requestedProductsRef) = @_;
+
+	my @tablesToIgnore  = @$tablesToIgnoreRef;
+
+	my $numErrors = 0;
+	# round one, fight!
+
+	for my $product ( @$requestedProductsRef ) {
+	
+		my $prodId = $product->name();
+		$prodId .= "/".$product->customer() if $product->customer();
+
+		my @dbconnections = ariba::Ops::DBConnection->connectionsForProductOfDBType($product, ariba::Ops::DBConnection->typeMain());
+
+		next unless (scalar @dbconnections > 0) ;
+
+		safeMTPrint("\n", prettyPID(), "Doing rowcount for $prodId\n");
+
+		for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSidAndSchema(@dbconnections))
+		{
+			my $mainDBC = $dbc;
+			my $drDBC = $dbc->drDBPeer();
+
+			unless ($drDBC) {
+				safeMTPrint( "\n", prettyPID(), "ERROR : No dr connection for connection {user:",$mainDBC->user(),", sid: ",$mainDBC->sid(),", host: ",$mainDBC->host()," ] }\n");
+				$numErrors++;
+				next;
+			}
+
+			my @primConn = ($mainDBC->user(), $mainDBC->password(), $mainDBC->sid(), $mainDBC->host());
+			my @secConn = ($drDBC->user(), $drDBC->password(), $drDBC->sid(), $drDBC->host());
+
+			my $schema = $mainDBC->user();
+			my @tablesToInclude  = grep {/^\s*$schema\./i} @$tablesToIncludeRef;
+			my @tablesToIgnore  = grep {/^\s*$schema\./i} @$tablesToIgnoreRef;
+			
+			
+			$numErrors += countCompareCore(\@primConn, \@secConn, \@tablesToIgnore, \@tablesToInclude);
+		}
+
+		safeMTPrint( prettyPID(), "Done with rowcount compare for $prodId\n");
+	}
+
+	safeMTPrint( prettyPID(), "Done with rowcount compare\n");
+
+	return $numErrors;
+}
+
+
+sub countCompareFromCustomCDB {
+	my ($customConnectionDataPrimRef, $customConnectionDataSecRef, $tablesToIgnoreRef, $tablesToIncludeRef) = @_;
+
+	my @tablesToIgnore  = @$tablesToIgnoreRef;
+	
+	return 0 unless (@$customConnectionDataPrimRef && @$customConnectionDataSecRef);
+
+	safeMTPrint( "\n",prettyPID(),"Doing rowcount for the custom connection dictionary\n");
+
+	my $numErrors = countCompareCore($customConnectionDataPrimRef, $customConnectionDataSecRef, $tablesToIgnoreRef,  $tablesToIncludeRef);
+
+	safeMTPrint( prettyPID(), "Done with rowcount compare for custom connection dictionary\n");
+
+	return $numErrors;
+
+}
+
+sub countCompareCore {
+
+	my $customConnectionDataPrimRef = shift;
+	my $customConnectionDataSecRef = shift;
+	my $tablesToIgnoreRef = shift;
+	my $tablesToIncludeRef = shift;
+ 
+	my $primaryOracleClient = ariba::Ops::OracleClient->new(@$customConnectionDataPrimRef);
+	my $secondaryOracleClient = ariba::Ops::OracleClient->new(@$customConnectionDataSecRef);
+
+	$primaryOracleClient->connect()   || die $primaryOracleClient->error();
+	$secondaryOracleClient->connect() || die $secondaryOracleClient->error();
+
+	my @tablesToIgnore  = @$tablesToIgnoreRef;
+	my @tablesToInclude = @$tablesToIncludeRef;
+
+	map {$_ =~ s/\w+\.//} @tablesToIgnore;
+
+	my $primaryDBH   = $primaryOracleClient->handle();
+	my $secondaryDBH = $secondaryOracleClient->handle();
+
+	$tee->flush;
+	my $logFilename = $customConnectionDataPrimRef->[0] . "-fast-" . $customConnectionDataPrimRef->[3] . "-" . $customConnectionDataSecRef->[3] . "-" . time() . ".log";
+	my $out = new IO::File(">$outputLogDir$logFilename");
+
+	unless ($out)	 {
+		print "Can't write to file $outputLogDir$logFilename, $!\n";
+		print "Make sure you are running from a directory that is writable or use -logdir.\n";
+		exit(-1);
+	}
+
+	my $newTee =  new IO::Tee(\*STDOUT, $out);
+	$tee = $newTee;
+	push (@multiplexedOutputs, $out);
+
+	my $tableList;
+	my %tempTableList;
+
+	if (scalar(@tablesToInclude)) {
+		map {$_ =~ s/\w+\.//} @tablesToInclude;
+		map {$tempTableList{$_}++} @tablesToInclude;
+		@tablesToInclude = keys(%tempTableList);
+		$tableList = "('". join("','", @tablesToInclude) . "')";
+		$tableList = "and user_cons_columns.table_name in " . $tableList;
+	}
+
+	my $sql = "select user_cons_columns.table_name,user_cons_columns.column_name,user_constraints.constraint_name from user_cons_columns, user_constraints where user_constraints.constraint_type = 'P' $tableList and  user_cons_columns.table_name      = user_constraints.table_name and user_cons_columns.constraint_name = user_constraints.constraint_name and (user_cons_columns.table_name) in (select user_cons_columns.table_name from user_cons_columns, user_constraints where user_constraints.constraint_type  = 'P' and user_cons_columns.table_name      = user_constraints.table_name and user_cons_columns.constraint_name = user_constraints.constraint_name group by user_cons_columns.table_name having count(user_cons_columns.table_name) < 2) order by user_cons_columns.table_name";
+
+	safeMTPrint( prettyPID(), "DEBUG: Retrieving the list of tables through the query [$sql]\n") if ($debug > 1);
+
+	my $sth   = $primaryDBH->prepare($sql);
+
+	unless($sth) {
+		safeMTPrint( "\n", prettyPID(), "ERROR: Couldn't prepare the preliminary query for the first pass... Skip it.\n");
+		return;
+	}
+	$sth->execute();
+
+	safeMTPrint( "\n\n", prettyPID(), "DEBUG: ****** Checking rowcount on tables with primary keys ********\n\n") if $debug;
+	# 1st pass
+	my @queries;
+	my $totalTablesFPass = 0;
+
+	my $numErrors = 0;
+
+	while(my $row = $sth->fetchrow_hashref()) {
+
+		my $table  = $row->{'TABLE_NAME'};
+		my $column = $row->{'COLUMN_NAME'};
+		my $primaryKeyConstraint = $row->{'CONSTRAINT_NAME'};
+
+		next if (isTableInList($table, @tablesToIgnore));
+
+		delete $tempTableList{$table};
+		$totalTablesFPass++;
+		#my $query = "select /*+parallel ($table 3) */ count($column) from $table";
+		my $query = "select /*+ index_ffs(a $primaryKeyConstraint) */ count($column) from $table a";
+
+		push (@queries, [$query, $table, $column]);
+	}
+
+	$numErrors += launchQueries(\@queries, $customConnectionDataPrimRef, $customConnectionDataSecRef);
+
+	$sth->finish();
+	$numErrors += waitForThreads();
+
+
+	# 2nd pass gets any tables we didn't above.
+	$tableList = undef;
+	my $totalTablesSPass = 0;
+
+	safeMTPrint( "\n\n", prettyPID(), "DEBUG: ****** Checking rowcount on tables without primary keys ********\n\n") if $debug;
+
+	my @secondPassQueries;
+
+	if (scalar(keys(%tempTableList))) {
+		@secondPassQueries = map{ ["select count(*) from $_", $_, '*'] unless (isTableInList($_, @tablesToIgnore)) } sort(keys(%tempTableList));
+		$totalTablesSPass = scalar(@secondPassQueries);
+	} else {
+		$sql = "select table_name from user_tables minus (select table_name from user_constraints where constraint_type='P') order by table_name";
+
+		safeMTPrint( prettyPID(), "DEBUG: Retrieving the list of tables through the query [$sql]\n" ) if ($debug > 1);
+		$sth = $primaryDBH->prepare($sql);
+	
+		unless($sth) {
+			$primaryOracleClient->connect()   || die $primaryOracleClient->error();
+			$secondaryOracleClient->connect() || die $secondaryOracleClient->error();
+	
+			$primaryDBH   = $primaryOracleClient->handle();
+			$secondaryDBH = $secondaryOracleClient->handle();
+	
+			$sth = $primaryDBH->prepare($sql);
+		}
+	
+		unless($sth) {
+			safeMTPrint( "\n", prettyPID(), "ERROR: Couldn't prepare query [$sql] for getting tables with no primary keys. Skip it.\n");
+			return;
+		}
+		$sth->execute();
+	
+
+		while(my $row = $sth->fetchrow_hashref()) {
+			my $table  = $row->{'TABLE_NAME'};
+	
+			next if (isTableInList($table, @tablesToIgnore));
+	
+			my $query = "select count(*) from $table";
+			$totalTablesSPass++;
+
+			push (@secondPassQueries, [$query, $table, '*']);
+		}
+	}
+
+	$numErrors += launchQueries(\@secondPassQueries, $customConnectionDataPrimRef, $customConnectionDataSecRef);
+
+	$sth->finish();
+
+	$primaryOracleClient->disconnect();
+	$secondaryOracleClient->disconnect();
+
+	$numErrors += waitForThreads();
+
+	safeMTPrint ("\n", prettyPID(), "=========================================================\n");
+	safeMTPrint (prettyPID(), "||Checked tables with primary key    : [$totalTablesFPass]\n");
+	safeMTPrint (prettyPID(), "||Checked tables without primary key : [$totalTablesSPass]\n");
+	safeMTPrint (prettyPID(), "||ERROR: Found $numErrors error(s)\n");
+	safeMTPrint (prettyPID(), "=========================================================\n\n");
+
+	return $numErrors;
+}	
+
+sub launchQueries {
+	my $queriesRef = shift;
+	my $customConnectionDataPrimRef = shift;
+	my $customConnectionDataSecRef = shift;
+
+	my @queries = @$queriesRef;
+	my $numErrors = 0;
+
+	while (my @subQueries = splice(@queries, 0, $queriesPerThread)) {	
+		
+		my $codeRef = sub {
+			my $primaryOracleClient = ariba::Ops::OracleClient->new(@$customConnectionDataPrimRef);
+			my $secondaryOracleClient = ariba::Ops::OracleClient->new(@$customConnectionDataSecRef);
+
+			$primaryOracleClient->connect()   || die $primaryOracleClient->error();
+			$secondaryOracleClient->connect() || die $secondaryOracleClient->error();
+
+			my $primaryDBH   = $primaryOracleClient->handle();
+			my $secondaryDBH = $secondaryOracleClient->handle();
+
+			my $localErrorCount = 0;
+			while( my $q = shift @subQueries) {
+				my @data = @$q;
+				$localErrorCount += doCountQuery($primaryDBH, $secondaryDBH,$data[0],$data[1], $data[2]);
+			}
+
+			$primaryOracleClient->disconnect();
+			$secondaryOracleClient->disconnect();
+
+			return $localErrorCount;
+		};
+
+		if (maxThreadCount() > 1) {
+			addThread($codeRef);
+
+			#
+			# If we reached the limit of number of maximum process allowed, wait
+			# for one to finish, before allowing the next one to be launched
+			#
+			$numErrors += waitForThreads(threadCount() - maxThreadCount() + 1);
+		} else {
+			$numErrors += &$codeRef();
+		}
+	}
+
+	return $numErrors;
+}
+
+
+sub doCountQuery {
+	my ($primaryDBH, $secondaryDBH, $query, $table, $column) = @_;
+
+	my $primarySTH = $primaryDBH->prepare($query);
+	my $numErrors = 0;
+
+	unless($primarySTH) {
+		$numErrors++;
+		safeMTPrint( "\n", prettyPID(), "ERROR: Couldn't prepare query [$query] for primary... Skip it.\n\n");
+		return $numErrors;
+	}
+
+	if ($debug > 1) {
+			  safeMTPrint( prettyPID(), "DEBUG: Executing query [$query] on source\n");
+	} else {
+			  safeMTPrint( prettyPID(), "  $table [source]\n");
+	}
+	$primarySTH->execute();	
+	my $primaryCount = $primarySTH->fetchrow_array();
+	safeMTPrint( prettyPID(), "DEBUG: Executing query [$query] on source done !\n") if ($debug > 1);
+
+	my $secondarySTH = $secondaryDBH->prepare($query);
+	
+	unless($secondarySTH) {
+		$numErrors++;
+		safeMTPrint( "\n",prettyPID(),"ERROR: Couldn't prepare query [$query] for secondary... Skip it.\n\n");
+		$primarySTH->finish();
+		return $numErrors;
+	}
+
+	if ($debug > 1) {
+			  safeMTPrint( prettyPID(), "DEBUG: Executing query [$query] on target\n");
+	} else {
+			  safeMTPrint( prettyPID(), "  $table [target]\n");
+	}
+	$secondarySTH->execute();	
+	safeMTPrint( prettyPID(), "DEBUG: Executing query [$query] on target done !\n") if ($debug > 1);
+
+	my $secondaryCount = $secondarySTH->fetchrow_array();
+
+	if ($primaryCount != $secondaryCount) {
+		$numErrors++;
+		safeMTPrint( prettyPID(), "ERROR: count()'s don't match for table [$table]! Source [$primaryCount] -> Target [$secondaryCount]\n");
+	}
+
+	$primarySTH->finish();
+	$secondarySTH->finish();
+
+	return $numErrors;
+}
+
+sub blobCompare {
+	my ($me,$cluster, $customConnectionDataPrimRef, $customConnectionDataSecRef, $tablesToIgnoreRef, $blobTableMapRef) = @_;
+
+	my @tablesToIgnore  = @$tablesToIgnoreRef;
+	my %blobTableMap = %$blobTableMapRef;
+	my $numErrors = 0;
+
+  	map {$_ =~ s/\w+\.//} @tablesToIgnore;
+
+	my $bdbHandle;
+	if (maxThreadCount() == 1) {
+		# store the checked rows
+		ariba::Ops::DatabaseManager::BerkeleyDB->setDir('/var/tmp');
+		ariba::Ops::DatabaseManager::BerkeleyDB->unsetDuplicate();
+
+		$bdbHandle = ariba::Ops::DatabaseManager::BerkeleyDB->handle('blob-compare');
+	}
+
+
+	safeMTPrint( "\n\n");
+	while (my ($name,$partitionedData) = each %blobTableMap) {
+
+		my $product  = ariba::rc::InstalledProduct->new($name, $me->service());
+		my @communityIds = $product->communityIdsForProduct();
+
+		for my $community ( undef, @communityIds) {
+			my @dbcs;			  
+
+			my @dbconnections = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndInCommunity($product, ariba::Ops::DBConnection->typeMain(), $community);
+
+			if (@$customConnectionDataSecRef && @$customConnectionDataSecRef) {
+				push (@dbcs, [$customConnectionDataPrimRef, $customConnectionDataSecRef]);
+			} else {
+				for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSidAndSchema(@dbconnections))
+				{
+					my $mainDBC = $dbc;
+					my $drDBC = $dbc->drDBPeer();
+
+					unless ($drDBC) {
+						safeMTPrint( "\n", prettyPID(), "ERROR : No dr connection for connection {user:",$mainDBC->user(),", sid: ",$mainDBC->sid(),", host: ",$mainDBC->host()," ] }\n");
+						$numErrors++;
+						next;
+					}
+
+					my @primConn = ($mainDBC->user(), $mainDBC->password(), $mainDBC->sid(), $mainDBC->host());
+					my @secConn = ($drDBC->user(), $drDBC->password(), $drDBC->sid(), $drDBC->host());
+					push (@dbcs, [\@primConn, \@secConn]);
+	
+				}
+			}
+
+			for my $dbc (@dbcs) {
+				my @conn = @$dbc;
+
+				my $tableData = $partitionedData;
+
+				if (@communityIds) {
+					if ($community) {
+						$tableData = $partitionedData->{'community'};
+					} else {
+						$tableData = $partitionedData->{'directory'};
+					}
+				}
+
+				while (my ($table,$column) = each %{$tableData}) {
+
+					next if (isTableInList($table, @tablesToIgnore));
+
+					my $codeRef = sub { 
+						return blobCoreMT($conn[0], $conn[1], $name, $table, $column, $bdbHandle);
+					};
+
+					if (maxThreadCount() > 1) {
+						addThread($codeRef);
+
+						#
+						# If we reached the limit of number of maximum process allowed, wait
+						# for one to finish, before allowing the next one to be launched
+						#
+						$numErrors += waitForThreads(threadCount() - maxThreadCount() + 1);
+					} else {
+						$numErrors += &$codeRef();
+					}
+				}
+				$numErrors += waitForThreads();
+			}
+		}
+	}
+
+	safeMTPrint( prettyPID(), "Done with blob compare.\n");
+
+	return $numErrors;
+}
+
+sub blobCoreMT {
+
+	my ($customConnectionDataPrimRef, $customConnectionDataSecRef, $name, $table, $column, $bdbHandle) = @_;
+
+	my $primaryOracleClient = ariba::Ops::OracleClient->new(@$customConnectionDataPrimRef);
+	my $secondaryOracleClient = ariba::Ops::OracleClient->new(@$customConnectionDataSecRef);
+
+	$primaryOracleClient->connect()   || die $primaryOracleClient->error();
+	$secondaryOracleClient->connect() || die $secondaryOracleClient->error();
+
+	my $primaryDBH   = $primaryOracleClient->handle();
+	my $secondaryDBH = $secondaryOracleClient->handle();
+
+	my $numErrors = 0;
+
+
+	safeMTPrint( prettyPID(), "DEBUG: Checking blob table [$name:$table]\n") if ($debug);
+	#print $tee "%d rows. \n", $primaryDBH->do("SELECT count(ID) FROM $table");
+
+	my $secondarySTH = $secondaryDBH->prepare("SELECT $column FROM $table WHERE ID = ?");
+	my $primarySTH = $primaryDBH->prepare("SELECT ID, $column FROM $table");
+					
+	unless($primarySTH) {
+		$numErrors++;
+		safeMTPrint( "\n",prettyPID(),"ERROR: Source -> Couldn't prepare blob query [$table.$column]... Skip it.\n\n");
+		return $numErrors;
+	}
+
+	unless($secondarySTH) {
+		$numErrors++;
+		safeMTPrint( "\n",prettyPID(),"ERROR: Target -> Couldn't prepare query [$table.$column]... Skip it.\n\n");
+		return $numErrors;
+	}
+
+
+	$primarySTH->execute();
+
+	my $counter = 0;
+
+	# compare source and dest
+	while (my $primaryRow = $primarySTH->fetchrow_hashref()) {
+
+		my $primaryID = $primaryRow->{'ID'};
+
+		if (maxThreadCount() == 1) {
+
+			# skip if we've seen it, and it's good.
+			$bdbHandle->db_get("$name:$table:$primaryID", my $storedHash);
+			next if defined $storedHash;
+		}
+
+		$secondarySTH->execute( $primaryID );
+		my $secondaryRow = $secondarySTH->fetchrow_hashref();
+
+		$counter++;
+
+		unless (defined $primaryRow->{$column}) {
+			$numErrors++;
+			safeMTPrint( "\t",prettyPID(),"ERROR: Source -> Could not retrieve column on row: $primaryID column: [$column] on $name:$table. Skipping.\n");
+			return $numErrors;
+		}
+
+		unless (defined $secondaryRow->{$column}) {
+			$numErrors++;
+			safeMTPrint( "\t",prettyPID(),"ERROR: Target -> could not retrieve column on row: $primaryID column: [$column] on $name:$table. Skipping.\n");
+			return $numErrors;
+		}
+
+		my $hash1  = Digest::MD4->hexhash( $primaryRow->{$column} );
+		my $hash2  = Digest::MD4->hexhash( $secondaryRow->{$column} );
+
+		unless (defined $hash1) {
+			$numErrors++;
+			safeMTPrint( "\t",prettyPID(),"ERROR: Source -> Could not create a hexhash! On row: $primaryID column: [$column] on $name:$table. Skipping.\n");
+			return $numErrors;
+		}
+
+		unless (defined $hash1) {
+			$numErrors++;
+			safeMTPrint( "\t",prettyPID(),"ERROR: Target -> Could not create a hexhash! On row: $primaryID column: [$column] on $name:$table. Skipping.\n");
+			return $numErrors;
+		}
+
+		if ($hash1 ne $hash2) {
+			$numErrors++;
+			safeMTPrint( prettyPID(), "ERROR: Blob mismatch! Table: [$table] ID: [$primaryID] : Source MD4: [$hash1] -> Dest MD4: [$hash2]\n");
+
+		} else {
+
+			if (maxThreadCount() == 1) {
+				# so we can restart
+				$bdbHandle->db_put("$name:$table:$primaryID", 1);
+			}
+		}
+
+		if ($counter != 0 and ($counter % 2000) == 0) {
+			safeMTPrint( prettyPID(), "DEBUG: Checked $counter rows.\n") if ($debug);
+		}
+	}
+
+	safeMTPrint( prettyPID(), "DEBUG: Checked $counter total rows.\n") if ($debug);
+
+	$primarySTH->finish();
+	$secondarySTH->finish();
+	$primaryOracleClient->disconnect();
+	$secondaryOracleClient->disconnect();
+
+	if (maxThreadCount() == 1) {
+		$bdbHandle->db_sync();
+	}
+
+	return $numErrors;
+}
+
+
+
+sub isTableInList {
+	my $table = shift;
+	my @tables = @_;
+
+	return scalar(grep {/$table/} @tables);
+}
+
+sub parseFile {
+	my $filename = shift;
+	my @tableList;
+
+	open(FILE, $filename) || safeMTPrint (prettyPID(), "ERROR : File $filename could not be opened\n");
+	while(my $line = <FILE>) {
+		next if ($line =~ m/^\s*#/);
+		$line =~ s/\s+$//;
+		push(@tableList, $line) if ($line =~ m/\w/);
+	}
+
+	return @tableList;
+}
+
+sub promptCustomConnection {
+	my $type = shift;
+
+	my ($host, $user, $sId,$pwd);
+		  
+	print $tee "\nEnter $type database hostname: ";
+	chomp($host = ReadLine(0));
+	
+	print $tee "\nEnter $type database user name: ";
+	chomp($user = ReadLine(0));
+	
+	print $tee "\nEnter $type database server ID: ";
+	chomp($sId = ReadLine(0));
+	
+	$pwd = promptPassword ("$type database");
+
+	return ($host, $user, $sId,$pwd);
+}
+
+sub promptPassword {
+	my $pwdType = shift;
+
+	my $newPassword;
+	my $checkNewPassword;
+
+	# Get the password(s) from the user.
+	ReadMode('noecho');
+
+	do {
+
+		print $tee "\nEnter $pwdType password: ";
+		chomp($newPassword = ReadLine(0));
+	
+		print $tee "\nRe-enter $pwdType password: ";
+		chomp($checkNewPassword = ReadLine(0));
+
+		
+		if ($checkNewPassword ne $newPassword) {
+			print $tee "\nThis does not match.\n";
+		}
+
+	} while ($checkNewPassword ne $newPassword);
+
+
+	ReadMode('normal');
+	
+	return $newPassword;
+
+}
+
+sub threadCount {
+	return $threadCount;
+}
+
+sub maxThreadCount {
+	return $maxThreads;
+}
+
+# called with the number of threads to wait for
+# will return immediately on 0
+# will wait for all remaining threads on undef
+#
+sub waitForThreads {
+	my $count = shift;
+
+	my $numErrors = 0;
+
+	return $numErrors if defined ($count) && $count < 1;
+
+	my @kids = ariba::Ops::SharedMemoryChild->waitForChildren($count);
+	$threadCount -= scalar(@kids);
+
+	foreach my $kid (@kids){
+		$numErrors += $kid->returnValue();
+	}
+
+	return $numErrors;
+}
+
+sub addThread {
+	my $coderef = shift;
+	#
+	# create and launch the child process, store the output in shared mem
+	#
+	#
+	my $size = $smSize * 1024; #allow upto 800KB of output
+	my $child = ariba::Ops::SharedMemoryChild->new($coderef, $size);
+	$child->run();
+
+	++$threadCount;
+	++$pid;
+}
+
+
+sub safeMTPrint {
+
+	if (!dmail::LockLib::requestlock($lockFile, 15)) {
+		print $tee "Couldn't get the lock to say : [@_]\n";
+		return;
+	}
+
+	print $tee @_;
+	dmail::LockLib::releaselock($lockFile);
+}
+
+sub getPID {
+
+	return $pid;
+}
+
+sub prettyPID {
+	return "[Thread: " . getPID() . "] ";
+}
+
+main();
+
+__END__

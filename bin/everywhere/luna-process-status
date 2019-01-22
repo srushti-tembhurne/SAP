@@ -1,0 +1,156 @@
+#!/usr/local/bin/perl -w
+
+# $Id: $
+
+use strict;
+use FindBin;
+use Data::Dumper;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Machine;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -s    Service
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $service;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-s$/o) { $service = shift;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+    usage( "Service is a required argument" ) unless $service;
+
+    my $me       = ariba::rc::InstalledProduct->new('an', $service);
+    my $cluster  = $me->currentCluster();
+
+    my @monhosts = $me->hostsForRoleInCluster( 'monitor', $cluster );
+    die "Error reading mon host for $service ...\n" unless ( scalar @monhosts );
+    my $monhost = $monhosts[0];
+
+    my $mon      = ariba::rc::InstalledProduct->new('mon', $service);
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my %queries;
+
+    my $serverProc   = $me->default( 'lumira.monitoring.srsserver.instancename' ) || 'NONE';
+    my $dirAgentProc = $me->default( 'lumira.monitoring.srsagents.SRSAgent-Dir.instancename'  ) || 'NONE';
+    my $supAgentProc = $me->default( 'lumira.monitoring.srsagents.SRSAgent-Sup1.instancename' ) || 'NONE';
+    my $buyAgentProc = $me->default( 'lumira.monitoring.srsagents.SRSAgent-Buy1.instancename' ) || 'NONE';
+
+    print "Server Proc          : $serverProc\n" if $debug > 1;
+    print "Server Dir Agent     : $dirAgentProc\n" if $debug > 1;
+    print "Server Supplier Agent: $supAgentProc\n" if $debug > 1;
+    print "Server Buyer Agent   : $buyAgentProc\n" if $debug > 1;
+
+    my %typeMap = (
+        'Server' => {
+            'role' => 'srs-server',
+            'proc' => $serverProc,
+            'regex' => "ps -ef | grep $serverProc | grep -v 'RUN_$serverProc' | grep -v isql | grep -v grep | wc -l",
+        },
+        'Directory Agent'  => {
+            'role' => 'srs-agent-dir',
+            'proc' => $dirAgentProc,
+            'regex' => "ps -ef | grep $dirAgentProc | grep -v grep | grep java | wc -l",
+        },
+        'Supplier Community Agent'  => {
+            'role' => 'srs-agent-sup1',
+            'proc' => $supAgentProc,
+            'regex' => "ps -ef | grep $supAgentProc | grep -v grep | grep java | wc -l",
+        },
+        'Buyer Community Agent'  => {
+            'role' => 'srs-agent-buy1',
+            'proc' => $buyAgentProc,
+            'regex' => "ps -ef | grep $buyAgentProc | grep -v grep | grep java | wc -l",
+        },
+    );
+
+    TYPE:
+    foreach my $type ( keys %typeMap ){
+        ## Check host is in the appropriate role
+        my @hosts = $me->hostsForRoleInCluster( $typeMap{$type}->{'role'}, $cluster );
+        print "Checking hosts for '$type'\n" if $debug > 1;
+
+        next TYPE unless ( grep /$hostname/, @hosts );
+        print "'$hostname' is in '$typeMap{$type}->{'role'}', continuing\n" if $debug > 1;
+
+        $queries{"SRS $type Status ('$hostname')"} = {
+            crit    => "answer ne 'OK'",
+            perl    => sub { return main::checkStatus( $typeMap{$type} , $type); },
+            ticketOwner => 'unassigned-sre',
+            severity    => 1,
+            ticketOnWarnOpenAfterMinutes => 1,
+            description => "Monitor the SRS $type", 
+            recordDataType=> "gauge",
+            recordItem => "answer",
+            recordDataUnits => "$type processes",
+            recordMaxResults => 35040, ## 4 (runs/hour) * 24 (hours/day) * 365 (days/year) - runs every 15 minutes. save 12 months
+            correctiveActions => [
+                Ops => 'Make SRS Server and SRS Agent logs available to Engineering',
+                Engr => 'Fix the issue found by monitoring',
+            ],
+        };
+    }
+
+    my $email = $mon->default('notify.email');
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('srs-status', $me->name(), $me->service(), $me->customer(), \%queries);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monhost);
+}
+
+sub checkStatus {
+    my $map = shift;
+    my $type = shift; 
+    my $ret = 'OK';
+
+    print "Looking for process '$map->{'proc'}'\n" if $debug > 1;
+    print "Running: '$map->{'regex'}'\n" if $debug > 1;
+
+    ## Count the number of processes containing the keyword from the DD we stored in the map
+    ## Proc::ProcessTable would probably be better than shelling out here but we have issues
+    ##   with the version we have.  This is more stable at the moment.
+    my $result = `$map->{'regex'}`;
+
+    if($type eq 'Server') {
+         $ret = 'Error' unless ( $result == 2 );
+    } else {
+         $ret = 'Error' unless ( $result == 1 );
+    }
+    
+    return $ret;
+}
+
+main(@ARGV);
+
+__END__
+

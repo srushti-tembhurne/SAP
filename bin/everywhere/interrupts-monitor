@@ -1,0 +1,78 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::PageUtils;
+use ariba::Ops::Machine;
+
+my $debug = 0;
+
+
+sub usage {
+	my $error = shift;
+	print "Error: $error\n" if $error;
+	print "Usage: $0\n";
+	print "       [-d] Debug\n";
+	print "       [-e] Send email\n";
+	print "       [-p] Send page\n";
+
+	exit(1);
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my($intr, %queries, $dummy, @extras);
+	while(my $arg = shift @ARGV) {
+		if($arg eq "-d") { $debug++; next; }
+		if($arg eq "-e") { $sendEmail = 1; next; }
+		if($arg eq "-p") { $sendPage = 1; next; }
+		usage("Unknown arg: $arg");
+	}
+
+	my $machine = ariba::Ops::Machine->new();
+	my $hostname = $machine->hostname();
+	my $datacenter = $machine->datacenter();
+	my @products = ariba::rc::InstalledProduct->installedProductsList($machine->service());
+	my $me = $products[0];
+	exit(0) unless $me;
+	exit(0) unless $machine->os() eq "redhat";
+	my $monserver = ariba::Ops::PageUtils::monitorServer($me);
+	
+	my $email = $me->default('ops.notify.email') || $me->default('notify');
+	my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+	open(STAT, "/proc/stat") or die "Could not open /proc/stat\n";
+
+	while(my $line = <STAT>) {
+		next if $line !~ m/^intr/;
+		($dummy, $intr, @extras) = split(/\s+/, $line);
+	}
+
+	close(STAT);
+
+	%queries = ();
+
+	$queries{"$hostname Interrupts"} = {
+		'recordMaxResults' => 110000,
+		'recordDataType' => 'counter',
+		'recordDataUnits' => 'per sec',
+		'info' => 1,
+		'perl' => "return $intr",
+	};
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails("interrupts-from-$hostname", $tab, $me->service(), $me->customer(), \%queries);
+	$qm->setUiHint("ignore");
+	$qm->setUiManager('interrupts');
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monserver);
+}
+
+main();

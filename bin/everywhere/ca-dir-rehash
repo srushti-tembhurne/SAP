@@ -1,0 +1,49 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/everywhere/ca-dir-rehash#10 $
+# c_rehash using
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+
+use ariba::Ops::Constants;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Utils;
+
+# Add logging
+use Log::Log4perl qw(get_logger :levels);
+use Log::Log4perl::Level;
+
+# Link a certificate to its subject name hash value, each hash is of
+# the form <hash>.<n> where n is an integer. If the hash value already exists
+# then we need to up the value of n, unless its a duplicate in which
+# case we skip the link. 
+sub main {
+    $main::quiet = 1;
+ 
+    # set bin dir
+    my $bindir = '/usr/local/ariba/bin';
+
+    # set logging settings
+    Log::Log4perl->init("$bindir/log4perl.conf");
+    my $log = Log::Log4perl->get_logger("certs");
+    $log->level($WARN);
+
+    # get directory to process
+    my $certDir = $ARGV[0] || ariba::Ops::Constants->caCertDir() || die "Need a directory with PEM files! $!";
+
+    # generate old hashes
+    my $old_cmd = "$bindir/ariba-rehash -dir $certDir -old";
+    my @output;
+    unless ( ariba::rc::Utils::executeLocalCommand($old_cmd, undef, \@output, undef, undef, undef, undef) ) {
+        $log->logdie("Unable to create old cert hashes" . join("\n", @output) );
+    }
+    # generate new hashes
+    my $new_cmd = "$bindir/ariba-rehash -dir $certDir";
+    unless ( ariba::rc::Utils::executeLocalCommand($new_cmd, undef, \@output, undef, undef, undef, undef) ) {
+        $log->logdie("Unable to create new cert hashes" . join("\n", @output) );
+    }
+}
+
+main();

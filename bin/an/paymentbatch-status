@@ -1,0 +1,145 @@
+#!/usr/local/bin/perl -w
+
+###############################################################################
+# $Id: //ariba/services/monitor/bin/an/paymentbatch-status#4 $
+# $HeadURL:$
+#
+# Copyright (c) 2016 Ariba
+#
+# paymentbatch-status - Monitor PaymentBatch
+#
+###############################################################################
+
+=head1 NAME
+
+paymentbatch-status - Monitor PaymentBatch
+
+=head1 SYNOPSIS
+
+paymentbatch-status [options]
+
+=head1 OPTIONS
+
+=over
+
+=item B<-help|-h>
+
+Print this usage information and exit.
+
+=item B<-debug|-d>
+
+Enable debugging output / dryrun
+
+=item B<-e>
+
+Enable sending of emails
+
+=item B<-p>
+
+Enable sending of pages
+
+=back
+
+=head1 DESCRIPTION
+
+C<paymentbatch-status> - Monitor the status of PaymentBatch
+
+=cut
+
+=author
+
+Saran Thiyagarajan<< saran.thiyagarajan@sap.com >>
+
+=head1 LICENSE
+
+Copyright 2016 Ariba
+
+=cut
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use Pod::Usage;
+use Getopt::Long;
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    GetOptions(
+        "help|h" => sub { pod2usage(1); },
+        "debug|d+" => \$debug,
+        "e" => \$sendEmail,
+        "p" => \$sendPage,
+    );
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $an = ariba::rc::InstalledProduct->new("an", $mon->service());
+    my $cluster = $mon->currentCluster();
+    my $email = $mon->default('notify.email');
+    my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+    my $communitiesList = join(", ", ( grep { ( $_ % 2 ) == 0 } @communityIds ) );
+
+    my %queries = ();
+
+
+    $queries{"Payment Batch in Failed Status"} = {
+        crit     => "numrows > 0",
+        description => 'Payment Batch in Failed Status', 
+        severity => 1,
+        sql => q`select oj.ANID, pb.batch_id, pb.created, pb.detail_status_code from payment_batch pb inner join org oj on oj.id = pb.org inner join payment_method pm on pm.id = pb.payment_method where pb.status='error' and pm.name='aribapay' and (pb.created > trunc(sysdate,'dd')- 30 ) and oj.deployment = 'Production'`,
+
+    };
+
+    $queries{"Payment_Batch_without_Status_Update"} = {
+        crit    => "numrows > 0",
+        description => 'Payment_Batch_without_Status_Update',
+        severity => 1,
+        sql => q`select p.batch_id, p.created, oj.anid, p.batch_size from payment_batch p inner join org oj on oj.id = p.org inner join payment_method pm on pm.id = p.payment_method where p.status='sent' and pm.name='aribapay' and (p.created > trunc(sysdate,'dd')- 30 ) and oj.deployment = 'Production'`,
+    };
+
+    $queries{"Remittances in Temporary Error State"} = {
+        warn    => "numrows > 0",
+        description => 'Number of remittances in Temporary Error State',
+        severity => 1,
+        runForCommunities => $communitiesList,
+        sql => q`select oj1.anid, oj2.anid, p.payment_number, p.detail_status_code, cd.created, cd.document_status from cxml_document cd, org_join oj1, org_join oj2, payment_remittance p inner join payment_method_join pm on pm.id=p.payment_method where cd.id=p.GENERIC_DOCUMENT and cd.document_status='Failed' and p.detail_status_code like '4%' and pm.name='aribapay' and oj1.id=cd.from_org and oj2.id=cd.to_org and cd.document_type='PaymentRemittanceRequest' and (cd.created > trunc(sysdate,'dd')- 30 ) and oj1.deployment = 'Production'  and oj2.deployment = 'Production'`,
+		};
+
+#Commenting out below sql query is causing the script to fail
+#    $queries{"Remittances_with_No_Status_Updates"} = {
+#      crit    => "numrows > 0",
+#      description => 'Remittances_with_No_Status_Updates',
+#      severity => 1,
+#      runForCommunities => $communitiesList,
+#      sql => q`select oj1.anid, oj2.anid, p.payment_number, cd.created, cd.document_status from cxml_document cd, org_join oj1, org_join oj2, payment_remittance p inner join payment_method_join pm on pm.id=p.payment_method where cd.id=p.GENERIC_DOCUMENT and cd.document_status not in ('Failed', 'Paid') and pm.name='aribapay' and oj1.id=cd.from_org and oj2.id=cd.to_org and cd.document_type='PaymentRemittanceRequest' and sysdate > cd.document_date  and (cd.created > trunc(sysdate,'dd')- 30 ) and oj1.deployment = 'Production'  and oj2.deployment = 'Production'`,
+#     };
+
+    $queries{"Missing_PRSUR_2001_for_community"} = {
+        warn    => "numrows > 0",
+        description => 'Missing_PRSUR_2001_for_community',
+        severity => 1,
+        runForCommunities => $communitiesList,
+        sql => q`select oj1.anid, oj2.anid, p.payment_number, cd.created, cd.document_status from cxml_document cd, org_join oj1, org_join oj2, payment_remittance p inner join payment_method_join pm on pm.id=p.payment_method where cd.id=p.GENERIC_DOCUMENT and cd.document_status = 'Sent' and p.detail_status_code is NULL and pm.name='aribapay' and oj1.id=cd.from_org and oj2.id=cd.to_org and cd.document_type='PaymentRemittanceRequest' and ( cd.created > trunc(sysdate,'dd')- 30 ) and oj1.deployment = 'Production'  and oj2.deployment = 'Production'`,
+    };
+
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('paymentbatch', $an->name(), $mon->service(), undef, \%queries);
+    my $dbc = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndSchemaId ( $an, ariba::Ops::DBConnection->typeMain() );
+    $qm->setSQLConnectInfoFromDBConnection($dbc);
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);
+
+__END__

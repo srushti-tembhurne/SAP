@@ -1,0 +1,100 @@
+#!/usr/local/bin/perl
+
+use strict;
+
+use LWP;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::ProductStatus;
+use ariba::monitor::StatusPage;
+use ariba::monitor::QueryManager;
+use ariba::Ops::Constants;
+use ariba::Ops::Utils;
+use ariba::Ops::NetworkUtils;
+
+sub main {
+	my $count=0;
+	my $debug = 0;
+	my $email = 0;
+	my $page = 0;
+	my $tmpFile = "/tmp/.check-primary-monserver";
+
+	while (my $arg = shift) {
+		if($arg =~ /^-d/) { $debug = 1; next; }
+		if($arg =~ /^-e/) { $email = 1; next; }
+		if($arg =~ /^-p/) { $page = 1; next; }
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $monserver = ($me->hostsForRoleInCluster('monserver','primary'))[0];
+	my $url = sprintf('https://%s:8443/cgi-bin/object-server?type=status-for-product', $monserver);
+    my $userAgent = LWP::UserAgent->new (ssl_opts => {SSL_verify_mode => 0,
+                                                      verify_hostname => 0,});
+    my $request = HTTP::Request->new (GET => $url);
+    my $response = $userAgent->request ($request);
+    $response->is_success or die "ERROR:  Request failed for '$url':  ", $response->message (), "\n";
+    my $status = $response->content ();
+
+	my @objects = ariba::Ops::PageRequest->createObjectsFromString($status);
+
+	my $previousAnswer;
+	if(open(F,"< $tmpFile")) {
+		$previousAnswer = <F>;
+		chomp($previousAnswer);
+		close(F);
+	}
+
+	my $answer;
+	if($previousAnswer && $previousAnswer ne "ok") {
+		$answer = "not ok";
+	} else {
+		$answer = "sick";
+	}
+	foreach my $o (@objects) {
+		$count++ if(ref($o));
+	}
+	$answer = "ok" if($count >= 10);
+
+	if(!$debug && open(F,"> $tmpFile")) {
+		print F $answer,"\n";
+		close(F);
+	}
+
+	my %q;
+	$q{'health of primary monserver'} = {
+		'perl' => sub { return $answer; },
+		'info' => "answer eq 'ok'",
+		'warn' => "answer eq 'sick' || !answer",
+		'crit' => "answer eq 'not ok'",
+	};
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails("monserver-status", $me->name(), $me->service(), undef, \%q);
+
+	$qm->run();
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	
+	if($debug) {
+		$qm->displayToStdout();
+	} else {
+		$qm->checkStatus();
+		foreach my $q ($qm->queries()) {
+			if($q->status() eq 'crit' && $previousAnswer eq 'sick') {
+				if($page) {
+					my $to = ariba::Ops::Constants::failsafePagerAddressForService($me->service());
+					my $body = "$hostname is unable to contact object server on $monserver.\n\nIs $monserver down?";
+					my $subject = "$hostname unable to contact $monserver";
+					my $cc = $me->default('notify.email');
+					ariba::Ops::Utils::email($to, $subject, $body, $cc);
+				}
+			}
+		}
+		$qm->appendToServer($monserver);
+		$qm->archiveResultsOnServer();
+	}
+
+}
+
+main(@ARGV);

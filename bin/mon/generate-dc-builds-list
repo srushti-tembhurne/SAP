@@ -1,0 +1,91 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/mon/generate-dc-builds-list#3 $
+#
+# Check for all installed products in the current service
+#   and save the product, buildname information to a file which
+#   will be read by check-dc-builds. Currenlty we are only running
+#   this for production services to compare deployed builds
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ServiceController;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $service = $mon->service();
+    my $machine = ariba::Ops::Machine->new();
+    my @products = ariba::rc::InstalledProduct->installedProductsList($service);
+    my $buildsFile = "/tmp/$service/mon/current-builds.log";
+
+    print "Saving currently deployed $service builds information to $buildsFile\n" if $debug;
+
+    open(LOG, ">", $buildsFile) || die "Could not open $buildsFile, $!\n";
+    #
+    # Format of current-builds.log:
+    # <product>,<build>
+    # where build is the currenlty deployed build in that service
+    #
+    saveBuildFile(\@products, $service);
+    close(LOG);
+}
+
+sub saveBuildFile {
+    my $products = shift; 
+    my $service = shift;
+    my ($productName, $productService, $buildName);
+
+    for my $product (@{$products}) {
+        $productName =  $product->name();
+        $productService = $product->service();
+
+        next unless $service eq $productService;
+        next if (ariba::rc::Globals::isASPProduct($productName));
+
+        $buildName = $product->buildName();
+        print "$productName,$buildName\n" if $debug;
+        print LOG $productName . "," . $buildName . "\n";
+    }
+}
+
+main(@ARGV);
+
+__END__

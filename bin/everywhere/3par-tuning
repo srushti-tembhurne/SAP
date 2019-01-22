@@ -1,0 +1,97 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/everywhere/3par-tuning#5 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::NetworkDeviceManager;
+use ariba::Ops::Machine;
+
+use constant CHUNKLETS_PER_GB	=> 4;	# Each chunklet is 256MB
+
+sub usage {
+	print "usage: $0 [-h|-d] -s <datacenter> [-v <vv>]\n",
+	      "		-h	This help message\n",
+	      "		-d	Turn on debugging\n",
+	      "		-s	datacenter (devlab|snv|bou)\n",
+	      "		-v	Optional VV name\n\n";
+	exit 1;
+}
+
+sub main{
+
+	my $debug=0;
+	my ($datacenter, $virtualVolume);
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug=1; next; }
+		if($arg =~ /^-h/o){ usage(); }
+		if($arg =~ /^-s/o){ $datacenter = shift @ARGV; next; }
+		if($arg =~ /^-v/o){ $virtualVolume = shift @ARGV; next; }
+		
+		usage();
+	}
+
+	my ($nm) = ariba::Ops::NetworkDeviceManager->newFromMachine($datacenter, 'inserv');
+
+	#
+	#
+	# 3PAR tuning monitoring
+	#
+	#
+	my %availableSpaceForVv = ();
+	my @vvs = ();
+	$virtualVolume = '*' unless ($virtualVolume);
+	@vvs = $nm->cmdShowvv($virtualVolume);
+
+	unless (@vvs) {
+		print "No VV's found matching [$virtualVolume]\n";
+		exit 1;
+	}
+
+	foreach my $vv ( sort @vvs ) {
+		next unless ($vv->type() =~ /base/i);
+		my $vvName = $vv->name();
+		my %shelfToChunkletMap = ();
+		my $totalChunklets = 0;
+
+		my @vvpds = $nm->cmdShowVvPd($vvName);
+		foreach my $vvpd ( @vvpds ) {
+			my $chunklets = $vvpd->usr();
+			my $pos = $vvpd->cage_pos();
+			my $shelf = (split(':', $pos))[0];
+			$shelfToChunkletMap{$shelf} += $chunklets;
+			$totalChunklets += $chunklets;
+		}
+
+		my $shelfCount = scalar keys %shelfToChunkletMap;
+		my $averageChunkletsPerShelf = int( $totalChunklets / $shelfCount );
+		my $availableChunkletsPostTuning = 0;
+
+		foreach my $shelf (sort keys %shelfToChunkletMap) {
+			my $shelfChunklets = $shelfToChunkletMap{$shelf};
+			print "Shelf $shelf has $shelfChunklets for $vv\n" if $debug;
+			if ($averageChunkletsPerShelf > $ shelfChunklets) {
+				$availableChunkletsPostTuning += ( $averageChunkletsPerShelf - $shelfChunklets);
+			}
+		}
+
+		my $availableGigPostTuning = $availableChunkletsPostTuning / CHUNKLETS_PER_GB;
+		$availableSpaceForVv{$vvName} = $availableGigPostTuning;
+	}
+
+	my @vvsSortedByAvailableSpaceAndName = map { $_->[0] }	# store the sorted VV name
+		sort { $b->[1] <=> $a->[1] }			# sort by space available post tuning
+		sort { $a->[0] cmp $b->[0] }			# sort by VV name
+		map { [ $_, $availableSpaceForVv{$_} ] }	# e.g. 0201-0, 50
+		keys %availableSpaceForVv;
+
+	foreach my $sortedVv ( @vvsSortedByAvailableSpaceAndName ) {
+		my $spaceAvailable = $availableSpaceForVv{$sortedVv};
+		print "${sortedVv}: $spaceAvailable GB available post-tuning\n";
+	}
+}
+
+main();

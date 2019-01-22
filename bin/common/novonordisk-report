@@ -1,0 +1,992 @@
+#!/usr/local/bin/perl -w
+
+use warnings;
+use strict;
+
+use FindBin;
+use Text::CSV_XS;
+
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../lib/perl";
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+use ariba::Ops::ServiceController;
+use ariba::rc::InstalledProduct;
+use MIME::Lite;
+use Carp;
+
+my $product;
+my $debug = 0;
+my $productName = "s4";
+my $connectionType = ariba::Ops::DBConnection->typeMain();
+my $destinationEmail;
+my $useTestRealm;
+my $service;
+
+sub main {
+	my $report = "/var/tmp/novonordisk-email-report.csv";
+
+        while(my $arg=shift(@ARGV)){
+                        if($arg =~ /^-d/o){ $debug++; }
+                        if($arg =~ /^-T/o){ $useTestRealm = 1; }
+        }
+
+        my $me = ariba::rc::InstalledProduct->new();
+        $service = $me->service();
+
+	if (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
+		$product = ariba::rc::InstalledProduct->new($productName, $service);
+	} else {
+		print "Could not build InstalledProduct for $productName, $service";
+		exit(1);
+	}
+
+	# For prod and dev services, use the 888 realm id
+	my ($documentId, $realmName);
+	if (ariba::Ops::ServiceController::isProductionServicesOnly($service) && $useTestRealm) {
+		$realmName = "novonordisk-T"; 
+		$documentId = "Doc13711326"# & all _PartitionNumber = 8920
+	} elsif (ariba::Ops::ServiceController::isProductionServicesOnly($service)) {
+		$realmName = "novonordisk";
+		$documentId = "Doc16129427";
+	} elsif ($service eq "hf") {
+		$realmName = "novonordisk";
+		$documentId = "Doc12517959";
+	} else {
+		print "$0 must be run in the hf or prod service";
+		exit(1);
+	}
+
+	my $realmId = realmIdForName($realmName);
+	my $connectionId = connectionIdForRealmId($realmId);
+	my @sqlOutput = runReportSql($connectionId, $realmId, $documentId);
+
+	my $csv = Text::CSV_XS->new();
+
+	my $reportFH;
+	open ($reportFH, ">$report") || Carp::croak "can't open $report: $!";
+
+	my @columnNames = ('Supplier Workspace',
+			    'Supplier ID',
+			    'Supplier Workspace Owner',
+			    'Date Updated',
+			    'Date Updated with Time',
+			    'Effective User',
+			    'Real User',
+			    'Dform Instance Title',
+			    'Dform Template Title',
+			    'Dform Field Name',
+			    'Java Classtype',
+			    'Old Value',
+			    'New Value');
+	$csv->print($reportFH, \@columnNames);
+	print $reportFH "\n";
+
+	for my $row (@sqlOutput) {
+		next unless $row;
+		my @fields = split(/\t/, $row); 
+        	$csv->print($reportFH, \@fields);
+		print $reportFH "\n";
+	}
+	close $reportFH || Carp::croak "can't close $report: $!";
+
+	if ( $debug ) {
+		print "report written to $report\n";
+	} else {
+		my $msg = MIME::Lite->new(
+				'From'     => "noreply\@ansmtp.ariba.com",
+				'To'       => "GSMGTSUPPORT\@novonordisk.com",
+				'Bcc'      => "rsteenbu\@ariba.com",
+				'Subject'  => "NovoNordisk ASL Changes Report",
+				'Data'     => "Report from Ariba attached.",
+				);
+        	$msg->attach(
+				'Type'  =>  'Text/CSV',
+				'Path'  =>  $report,
+				'Name'  =>  "NovoNordisk ASL Changes Report",
+			    );
+		eval { $msg->send() };
+		if ($@) {
+			Carp::croak "Failed to email report: $@"
+		}
+	}
+}
+
+sub runReportSql {
+	my $connectionId = shift;
+	my $realmId = shift;
+	my $documentId = shift;
+
+	my $sql = q`
+		SELECT DISTINCT Wor10.c1RPZF73_DfltStrngTrnsltn_Ti           AS sw,
+		  org_3.org_SystemID                                         AS supplierId,
+		  us_7.cus_UniqueName                                        AS swOwner,
+		  Pro1.sai_TimeUpdated                                       AS rawtimeupdated,
+		  TO_CHAR(Pro1.sai_TimeUpdated, 'Dy Mon-DD-YYYY HH24:MI:SS') AS timeupdated,
+		  us_2.cus_UniqueName                                        AS effectiveUser,
+		  CASE
+		        WHEN us_3.cus_UniqueName IS NOT NULL THEN            us_3.cus_UniqueName 
+		        ELSE us_3.RootId 
+		  END AS realUser,
+		  Doc4.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTitle,
+		  Doc5.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTemplateTitle,
+		  Cha12.clf_fieldname                                        AS fieldName,
+		  Cha12.clf_valueclass                                       AS classtype,
+		  TO_CHAR(Cha12.clf_oldlongvalue)                            AS oldValue,
+		  TO_CHAR(Cha12.clf_newlongvalue)                            AS newValue
+		FROM ProjectAuditInfoTab Pro1 
+		 LEFT OUTER JOIN us_UserTab us_3 on Pro1.sai_RealUser = us_3.RootId,
+		  ChangedLongFieldTab Cha12,
+		  DynamicFormDocumentTab Dyn7,
+		  DocumentTab Doc4,
+		  DynamicFormDocumentTab Dyn8,
+		  DocumentTab Doc5,
+		  WorkspaceTab Wor10,
+		  SupplierProjectTab Sup11,
+		  ProjectAddinTab Pro12,
+		  WorkspaceTab Wor6,
+		  us_UserTab us_7,
+		  us_UserTab us_2,
+		  us_OrganizationTab org_3 
+		WHERE Sup11.sp_Supplier = org_3.rootId
+		AND Sup11.rootId         = Wor10.rootId
+		AND Pro1.sai_EffectiveUser = us_2.rootId
+		AND Dyn8.rootId            = Doc5.rootId
+		AND Dyn7.rootId            = Doc4.rootId
+		AND Pro1.sai_Changes       = Cha12.lvId
+		AND Pro1.rootId            = Cha12.rootId
+		AND Wor10.rootId           = Doc4.doc_ParentWorkspace
+		AND Wor10.ws_ProjectAddin  = Pro12.rootId
+		AND (Doc5.doc_NextVersion   IS NULL
+		AND Doc5.doc_ParentDocument  = Wor6.rootId
+		AND Wor6.ws_InternalId       = 'SYS0012'
+		AND Doc5.doc_InternalId      = 'XX'
+		AND Doc5.doc_NextVersion    IS NULL
+		AND Doc4.doc_NextVersion    IS NULL
+		AND Dyn7.dcfd_TypeName       = Dyn8.dcfd_TypeName
+		AND Doc4.doc_InternalId     <> Doc5.doc_InternalId
+		AND Pro1.sai_ContextObject   = Sup11.rootId
+		AND Cha12.clf_OldClusterRoot = Dyn7.rootId
+		AND Pro1.sai_PartitionNumber   = XX
+		AND SYSDATE + 25200/86400 - Pro1.sai_TimeUpdated BETWEEN 0 AND 7
+		AND Pro12.pta_IsTest           = 0)
+		AND (Pro1.sai_Active           = 1)
+		AND (Pro1.sai_PurgeState       = 0)
+		AND (Pro1.sai_PartitionNumber   = XX)
+		AND (Doc4.doc_Active           = 1)
+		AND (Doc4.doc_PurgeState       = 0)
+		AND (Doc4.doc_PartitionNumber   = XX)
+		AND (Doc5.doc_Active           = 1)
+		AND (Doc5.doc_PurgeState       = 0)
+		AND (Doc5.doc_PartitionNumber   = XX)
+		AND (Wor10.ws_Active           = 1)
+		AND (Wor10.ws_PurgeState       = 0)
+		AND (Wor10.ws_PartitionNumber   = XX)
+		AND (Wor6.ws_Active            = 1)
+		AND (Wor6.ws_PurgeState        = 0)
+		AND (Wor6.ws_PartitionNumber   = XX)
+		AND (us_2.cus_Active           = 1)
+		AND (us_2.cus_PurgeState       = 0)
+		AND (us_2.cus_PartitionNumber   = XX)
+		AND (Pro12.pta_Active          = 1)
+		AND (Pro12.pta_PurgeState      = 0)
+		AND (Pro12.pta_PartitionNumber   = XX)
+		AND (us_7.cus_Active           = 1)
+		AND (us_7.cus_PurgeState       = 0)
+		AND (us_7.cus_PartitionNumber   = XX)
+		AND (org_3.org_Active = 1) 
+		AND (org_3.org_PurgeState = 0) 
+		AND (org_3.org_PartitionNumber = XX) 
+		AND Wor10.ws_Owner             = us_7.rootId
+		UNION ALL 
+		SELECT DISTINCT Wor10.c1RPZF73_DfltStrngTrnsltn_Ti           AS sw,
+		  org_3.org_SystemID                                         AS supplierId,
+		  us_7.cus_UniqueName                                        AS swOwner,
+		  Pro1.sai_TimeUpdated                                       AS rawtimeupdated,
+		  TO_CHAR(Pro1.sai_TimeUpdated, 'Dy Mon-DD-YYYY HH24:MI:SS') AS timeupdated,
+		  us_2.cus_UniqueName                                        AS effectiveUser,
+		  CASE
+		        WHEN us_3.cus_UniqueName IS NOT NULL THEN            us_3.cus_UniqueName 
+		        ELSE us_3.RootId 
+		  END AS realUser,
+		  Doc4.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTitle,
+		  Doc5.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTemplateTitle,
+		  Cha12.cdf_fieldname                                        AS fieldName,
+		  Cha12.cdf_valueclass                                       AS classtype,
+		  TO_CHAR(Cha12.cdf_olddatevalue)                             AS oldValue,
+		  TO_CHAR(Cha12.cdf_newdatevalue)                             AS newValue
+		FROM ProjectAuditInfoTab Pro1 
+		 LEFT OUTER JOIN us_UserTab us_3 on Pro1.sai_RealUser = us_3.RootId,
+		  ChangedDateFieldTab Cha12,
+		  DynamicFormDocumentTab Dyn7,
+		  DocumentTab Doc4,
+		  DynamicFormDocumentTab Dyn8,
+		  DocumentTab Doc5,
+		  WorkspaceTab Wor10,
+		  SupplierProjectTab Sup11,
+		  ProjectAddinTab Pro12,
+		  WorkspaceTab Wor6,
+		  us_UserTab us_7,
+		  us_UserTab us_2,
+		  us_OrganizationTab org_3 
+		WHERE Sup11.sp_Supplier = org_3.rootId 
+		AND Sup11.rootId         = Wor10.rootId
+		AND Pro1.sai_EffectiveUser = us_2.rootId
+		AND Dyn8.rootId            = Doc5.rootId
+		AND Dyn7.rootId            = Doc4.rootId
+		AND Pro1.sai_Changes       = Cha12.lvId
+		AND Pro1.rootId            = Cha12.rootId
+		AND Wor10.rootId           = Doc4.doc_ParentWorkspace
+		AND Wor10.ws_ProjectAddin  = Pro12.rootId
+		AND (Doc5.doc_NextVersion   IS NULL
+		AND Doc5.doc_ParentDocument  = Wor6.rootId
+		AND Wor6.ws_InternalId       = 'SYS0012'
+		AND Doc5.doc_InternalId      = 'XX'
+		AND Doc5.doc_NextVersion    IS NULL
+		AND Doc4.doc_NextVersion    IS NULL
+		AND Dyn7.dcfd_TypeName       = Dyn8.dcfd_TypeName
+		AND Doc4.doc_InternalId     <> Doc5.doc_InternalId
+		AND Pro1.sai_ContextObject   = Sup11.rootId
+		AND Cha12.cdf_OldClusterRoot = Dyn7.rootId
+		AND Pro1.sai_PartitionNumber = XX
+		AND SYSDATE + 25200/86400 - Pro1.sai_TimeUpdated BETWEEN 0 AND 7
+		AND Pro12.pta_IsTest           = 0)
+		AND (Pro1.sai_Active           = 1)
+		AND (Pro1.sai_PurgeState       = 0)
+		AND (Pro1.sai_PartitionNumber = XX)
+		AND (Doc4.doc_Active           = 1)
+		AND (Doc4.doc_PurgeState       = 0)
+		AND (Doc4.doc_PartitionNumber = XX)
+		AND (Doc5.doc_Active           = 1)
+		AND (Doc5.doc_PurgeState       = 0)
+		AND (Doc5.doc_PartitionNumber = XX)
+		AND (Wor10.ws_Active           = 1)
+		AND (Wor10.ws_PurgeState       = 0)
+		AND (Wor10.ws_PartitionNumber = XX)
+		AND (Wor6.ws_Active            = 1)
+		AND (Wor6.ws_PurgeState        = 0)
+		AND (Wor6.ws_PartitionNumber   = XX)
+		AND (us_2.cus_Active           = 1)
+		AND (us_2.cus_PurgeState       = 0)
+		AND (us_2.cus_PartitionNumber = XX)
+		AND (Pro12.pta_Active          = 1)
+		AND (Pro12.pta_PurgeState      = 0)
+		AND (Pro12.pta_PartitionNumber = XX)
+		AND (us_7.cus_Active           = 1)
+		AND (us_7.cus_PurgeState       = 0)
+		AND (us_7.cus_PartitionNumber = XX)
+		AND (org_3.org_Active = 1) 
+		AND (org_3.org_PurgeState = 0) 
+		AND (org_3.org_PartitionNumber = XX) 
+		AND Wor10.ws_Owner             = us_7.rootId
+		UNION ALL 
+		SELECT DISTINCT Wor10.c1RPZF73_DfltStrngTrnsltn_Ti           AS sw,
+		  org_3.org_SystemID                                         AS supplierId,
+		  us_7.cus_UniqueName                                        AS swOwner,
+		  Pro1.sai_TimeUpdated                                       AS rawtimeupdated,
+		  TO_CHAR(Pro1.sai_TimeUpdated, 'Dy Mon-DD-YYYY HH24:MI:SS') AS timeupdated,
+		  us_2.cus_UniqueName                                        AS effectiveUser,
+		  CASE
+		        WHEN us_3.cus_UniqueName IS NOT NULL THEN            us_3.cus_UniqueName 
+		        ELSE us_3.RootId 
+		  END AS realUser,
+		  Doc4.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTitle,
+		  Doc5.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTemplateTitle,
+		  Cha12.cls_fieldname                                        AS fieldName,
+		  Cha12.cls_valueclass                                       AS classtype,
+		  TO_CHAR(Cha12.cls_oldlongstringvalue)                      AS oldValue,
+		  TO_CHAR(Cha12.cls_newlongstringvalue)                      AS newValue
+		FROM ProjectAuditInfoTab Pro1 
+		 LEFT OUTER JOIN us_UserTab us_3 on Pro1.sai_RealUser = us_3.RootId,
+		  ChangedLongStringFieldTab Cha12,
+		  DynamicFormDocumentTab Dyn7,
+		  DocumentTab Doc4,
+		  DynamicFormDocumentTab Dyn8,
+		  DocumentTab Doc5,
+		  WorkspaceTab Wor10,
+		  SupplierProjectTab Sup11,
+		  ProjectAddinTab Pro12,
+		  WorkspaceTab Wor6,
+		  us_UserTab us_7,
+		  us_UserTab us_2,
+		  us_OrganizationTab org_3 
+		WHERE Sup11.sp_Supplier = org_3.rootId 
+		AND Sup11.rootId         = Wor10.rootId
+		AND Pro1.sai_EffectiveUser = us_2.rootId
+		AND Dyn8.rootId            = Doc5.rootId
+		AND Dyn7.rootId            = Doc4.rootId
+		AND Pro1.sai_Changes       = Cha12.lvId
+		AND Pro1.rootId            = Cha12.rootId
+		AND Wor10.rootId           = Doc4.doc_ParentWorkspace
+		AND Wor10.ws_ProjectAddin  = Pro12.rootId
+		AND (Doc5.doc_NextVersion   IS NULL
+		AND Doc5.doc_ParentDocument  = Wor6.rootId
+		AND Wor6.ws_InternalId       = 'SYS0012'
+		AND Doc5.doc_InternalId      = 'XX'
+		AND Doc5.doc_NextVersion    IS NULL
+		AND Doc4.doc_NextVersion    IS NULL
+		AND Dyn7.dcfd_TypeName       = Dyn8.dcfd_TypeName
+		AND Doc4.doc_InternalId     <> Doc5.doc_InternalId
+		AND Pro1.sai_ContextObject   = Sup11.rootId
+		AND Cha12.cls_OldClusterRoot = Dyn7.rootId
+		AND Pro1.sai_PartitionNumber   = XX
+		AND SYSDATE + 25200/86400 - Pro1.sai_TimeUpdated BETWEEN 0 AND 7
+		AND Pro12.pta_IsTest           = 0)
+		AND (Pro1.sai_Active           = 1)
+		AND (Pro1.sai_PurgeState       = 0)
+		AND (Pro1.sai_PartitionNumber   = XX)
+		AND (Doc4.doc_Active           = 1)
+		AND (Doc4.doc_PurgeState       = 0)
+		AND (Doc4.doc_PartitionNumber   = XX)
+		AND (Doc5.doc_Active           = 1)
+		AND (Doc5.doc_PurgeState       = 0)
+		AND (Doc5.doc_PartitionNumber   = XX)
+		AND (Wor10.ws_Active           = 1)
+		AND (Wor10.ws_PurgeState       = 0)
+		AND (Wor10.ws_PartitionNumber   = XX)
+		AND (Wor6.ws_Active            = 1)
+		AND (Wor6.ws_PurgeState        = 0)
+		AND (Wor6.ws_PartitionNumber   = XX)
+		AND (us_2.cus_Active           = 1)
+		AND (us_2.cus_PurgeState       = 0)
+		AND (us_2.cus_PartitionNumber   = XX)
+		AND (Pro12.pta_Active          = 1)
+		AND (Pro12.pta_PurgeState      = 0)
+		AND (Pro12.pta_PartitionNumber   = XX)
+		AND (us_7.cus_Active           = 1)
+		AND (us_7.cus_PurgeState       = 0)
+		AND (us_7.cus_PartitionNumber   = XX)
+		AND (org_3.org_Active = 1) 
+		AND (org_3.org_PurgeState = 0) 
+		AND (org_3.org_PartitionNumber = XX) 
+		AND Wor10.ws_Owner             = us_7.rootId
+		UNION ALL 
+		SELECT DISTINCT Wor10.c1RPZF73_DfltStrngTrnsltn_Ti           AS sw,
+		  org_3.org_SystemID                                         AS supplierId,
+		  us_7.cus_UniqueName                                        AS swOwner,
+		  Pro1.sai_TimeUpdated                                       AS rawtimeupdated,
+		  TO_CHAR(Pro1.sai_TimeUpdated, 'Dy Mon-DD-YYYY HH24:MI:SS') AS timeupdated,
+		  us_2.cus_UniqueName                                        AS effectiveUser,
+		  CASE
+		          WHEN us_3.cus_UniqueName IS NOT NULL THEN          us_3.cus_UniqueName 
+		          ELSE us_3.RootId 
+		  END AS realUser,
+		  Doc4.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTitle,
+		  Doc5.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTemplateTitle,
+		  Cha12.cmf_fieldname                                        AS fieldName,
+		  Cha12.cmf_valueclass                                       AS classtype,
+		  TO_CHAR(Cha12.cmf_oldmoneyvalue)                           AS oldValue,
+		  TO_CHAR(Cha12.C11L7JXF_AMNT_NE)                            AS newValue
+		FROM ProjectAuditInfoTab Pro1 
+		 LEFT OUTER JOIN us_UserTab us_3 on Pro1.sai_RealUser = us_3.RootId,
+		  ChangedMoneyFieldTab Cha12,
+		  DynamicFormDocumentTab Dyn7,
+		  DocumentTab Doc4,
+		  DynamicFormDocumentTab Dyn8,
+		  DocumentTab Doc5,
+		  WorkspaceTab Wor10,
+		  SupplierProjectTab Sup11,
+		  ProjectAddinTab Pro12,
+		  WorkspaceTab Wor6,
+		  us_UserTab us_7,
+		  us_UserTab us_2,
+		  us_OrganizationTab org_3 
+		WHERE Sup11.sp_Supplier = org_3.rootId 
+		AND Sup11.rootId         = Wor10.rootId
+		AND Pro1.sai_EffectiveUser = us_2.rootId
+		AND Dyn8.rootId            = Doc5.rootId
+		AND Dyn7.rootId            = Doc4.rootId 
+		AND Pro1.sai_Changes       = Cha12.lvId
+		AND Pro1.rootId            = Cha12.rootId
+		AND Wor10.rootId           = Doc4.doc_ParentWorkspace
+		AND Wor10.ws_ProjectAddin  = Pro12.rootId
+		AND (Doc5.doc_NextVersion   IS NULL
+		AND Doc5.doc_ParentDocument  = Wor6.rootId
+		AND Wor6.ws_InternalId       = 'SYS0012'
+		AND Doc5.doc_InternalId      = 'XX'
+		AND Doc5.doc_NextVersion    IS NULL
+		AND Doc4.doc_NextVersion    IS NULL
+		AND Dyn7.dcfd_TypeName       = Dyn8.dcfd_TypeName
+		AND Doc4.doc_InternalId     <> Doc5.doc_InternalId
+		AND Pro1.sai_ContextObject   = Sup11.rootId
+		AND Cha12.cmf_OldClusterRoot = Dyn7.rootId
+		AND Pro1.sai_PartitionNumber   = XX
+		AND SYSDATE + 25200/86400 - Pro1.sai_TimeUpdated BETWEEN 0 AND 7
+		AND Pro12.pta_IsTest           = 0)
+		AND (Pro1.sai_Active           = 1)
+		AND (Pro1.sai_PurgeState       = 0)
+		AND (Pro1.sai_PartitionNumber   = XX)
+		AND (Doc4.doc_Active           = 1)
+		AND (Doc4.doc_PurgeState       = 0)
+		AND (Doc4.doc_PartitionNumber   = XX)
+		AND (Doc5.doc_Active           = 1)
+		AND (Doc5.doc_PurgeState       = 0)
+		AND (Doc5.doc_PartitionNumber   = XX)
+		AND (Wor10.ws_Active           = 1)
+		AND (Wor10.ws_PurgeState       = 0)
+		AND (Wor10.ws_PartitionNumber   = XX)
+		AND (Wor6.ws_Active            = 1)
+		AND (Wor6.ws_PurgeState        = 0)
+		AND (Wor6.ws_PartitionNumber   = XX)
+		AND (us_2.cus_Active           = 1)
+		AND (us_2.cus_PurgeState       = 0)
+		AND (us_2.cus_PartitionNumber   = XX)
+		AND (Pro12.pta_Active          = 1)
+		AND (Pro12.pta_PurgeState      = 0)
+		AND (Pro12.pta_PartitionNumber   = XX)
+		AND (us_7.cus_Active           = 1)
+		AND (us_7.cus_PurgeState       = 0)
+		AND (us_7.cus_PartitionNumber   = XX)
+		AND (org_3.org_Active = 1) 
+		AND (org_3.org_PurgeState = 0) 
+		AND (org_3.org_PartitionNumber = XX) 
+		AND Wor10.ws_Owner             = us_7.rootId  
+		UNION ALL 
+		SELECT DISTINCT Wor10.c1RPZF73_DfltStrngTrnsltn_Ti           AS sw,
+		  org_3.org_SystemID                                         AS supplierId,
+		  us_7.cus_UniqueName                                        AS swOwner,
+		  Pro1.sai_TimeUpdated                                       AS rawtimeupdated,
+		  TO_CHAR(Pro1.sai_TimeUpdated, 'Dy Mon-DD-YYYY HH24:MI:SS') AS timeupdated,
+		  us_2.cus_UniqueName                                        AS effectiveUser,
+		  CASE
+		          WHEN us_3.cus_UniqueName IS NOT NULL THEN          us_3.cus_UniqueName 
+		          ELSE us_3.RootId 
+		  END AS realUser,
+		  Doc4.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTitle,
+		  Doc5.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTemplateTitle,
+		  Cha12.csf_fieldname                                        AS fieldName,
+		  Cha12.csf_valueclass                                       AS classtype,
+		  CASE
+		    WHEN trim(us_8.cus_UniqueName) IS NOT NULL THEN us_8.cus_UniqueName
+		    WHEN trim(com_1.C51HU6Z_PRMRYSTRNG_NA) IS NOT NULL THEN com_1.C51HU6Z_PRMRYSTRNG_NA
+		    WHEN trim(org_1.C1Y7POAV_PRMRYSTRNG_NA) IS NOT NULL THEN org_1.C1Y7POAV_PRMRYSTRNG_NA
+		    WHEN trim(reg_1.DCRG_REGION) IS NOT NULL THEN reg_1.DCRG_REGION
+		    WHEN trim(pro_1.CL31OOH_PRMRYSTRNG_NA) IS NOT NULL THEN pro_1.CL31OOH_PRMRYSTRNG_NA
+		    WHEN trim(dep_1.DCCL_DESCRIPTION) IS NOT NULL THEN dep_1.DCCL_DESCRIPTION
+		    ELSE Cha12.csf_oldstringvalue
+		  END AS oldValue,
+		  CASE
+		    WHEN trim(us_9.cus_UniqueName) IS NOT NULL THEN us_9.cus_UniqueName
+		    WHEN trim(com_2.C51HU6Z_PRMRYSTRNG_NA) IS NOT NULL THEN com_2.C51HU6Z_PRMRYSTRNG_NA
+		    WHEN trim(org_2.C1Y7POAV_PRMRYSTRNG_NA) IS NOT NULL THEN org_2.C1Y7POAV_PRMRYSTRNG_NA
+		    WHEN trim(reg_2.DCRG_REGION) IS NOT NULL THEN reg_2.DCRG_REGION
+		    WHEN trim(pro_2.CL31OOH_PRMRYSTRNG_NA) IS NOT NULL THEN pro_2.CL31OOH_PRMRYSTRNG_NA
+		    WHEN trim(dep_2.DCCL_DESCRIPTION) IS NOT NULL THEN dep_2.DCCL_DESCRIPTION
+		    ELSE Cha12.csf_newstringvalue
+		  END AS newValue
+		FROM ProjectAuditInfoTab Pro1 
+		 LEFT OUTER JOIN us_UserTab us_3 on Pro1.sai_RealUser = us_3.RootId,
+		  ChangedStringFieldTab Cha12
+		LEFT OUTER JOIN us_UserTab us_8
+		ON trim(REGEXP_REPLACE(regexp_substr(Cha12.csf_oldstringvalue, '^\[BaseId \d* [^ ]* '),'^\[BaseId \d* ','')) = us_8.rootId
+		LEFT OUTER JOIN us_UserTab us_9
+		ON trim(REGEXP_REPLACE(regexp_substr(Cha12.csf_newstringvalue, '^\[BaseId \d* [^ ]* '),'^\[BaseId \d* ','')) = us_9.rootId
+		LEFT OUTER JOIN commodityCodeTab com_1
+		ON trim(REGEXP_REPLACE(regexp_substr(Cha12.csf_oldstringvalue, '^\[BaseId \d* [^ ]* '),'^\[BaseId \d* ','')) = com_1.rootId
+		LEFT OUTER JOIN commodityCodeTab com_2
+		ON trim(REGEXP_REPLACE(regexp_substr(Cha12.csf_newstringvalue, '^\[BaseId \d* [^ ]* '),'^\[BaseId \d* ','')) = com_2.rootId
+		LEFT OUTER JOIN us_organizationtab org_1
+		ON trim(REGEXP_REPLACE(regexp_substr(Cha12.csf_oldstringvalue, '^\[BaseId \d* [^ ]* '),'^\[BaseId \d* ','')) = org_1.rootId
+		LEFT OUTER JOIN us_OrganizationTab org_2
+		ON trim(REGEXP_REPLACE(regexp_substr(Cha12.csf_newstringvalue, '^\[BaseId \d* [^ ]* '),'^\[BaseId \d* ','')) = org_2.rootId
+		LEFT OUTER JOIN RegionTab reg_1
+		ON trim(REGEXP_REPLACE(regexp_substr(Cha12.csf_oldstringvalue, '^\[BaseId \d* [^ ]* '),'^\[BaseId \d* ','')) = reg_1.rootId
+		LEFT OUTER JOIN RegionTab reg_2
+		ON trim(REGEXP_REPLACE(regexp_substr(Cha12.csf_newstringvalue, '^\[BaseId \d* [^ ]* '),'^\[BaseId \d* ','')) = reg_2.rootId
+		LEFT OUTER JOIN ProductTab pro_1
+		ON trim(REGEXP_REPLACE(regexp_substr(Cha12.csf_oldstringvalue, '^\[BaseId \d* [^ ]* '),'^\[BaseId \d* ','')) = pro_1.rootId
+		LEFT OUTER JOIN ProductTab pro_2
+		ON trim(REGEXP_REPLACE(regexp_substr(Cha12.csf_newstringvalue, '^\[BaseId \d* [^ ]* '),'^\[BaseId \d* ','')) = pro_2.rootId
+		LEFT OUTER JOIN DepartmentTab dep_1
+		ON trim(REGEXP_REPLACE(regexp_substr(Cha12.csf_oldstringvalue, '^\[BaseId \d* [^ ]* '),'^\[BaseId \d* ','')) = dep_1.rootId
+		LEFT OUTER JOIN DepartmentTab dep_2
+		ON trim(REGEXP_REPLACE(regexp_substr(Cha12.csf_newstringvalue, '^\[BaseId \d* [^ ]* '),'^\[BaseId \d* ','')) = dep_2.rootId,
+		  DynamicFormDocumentTab Dyn7,
+		  DocumentTab Doc4,
+		  DynamicFormDocumentTab Dyn8,
+		  DocumentTab Doc5,
+		  WorkspaceTab Wor10,
+		  SupplierProjectTab Sup11,
+		  ProjectAddinTab Pro12,
+		  WorkspaceTab Wor6,
+		  us_UserTab us_7,
+		  us_UserTab us_2,
+		  us_OrganizationTab org_3 
+		WHERE Sup11.sp_Supplier = org_3.rootId 
+		AND Sup11.rootId         = Wor10.rootId 
+		AND Pro1.sai_EffectiveUser = us_2.rootId
+		AND Dyn8.rootId            = Doc5.rootId
+		AND Dyn7.rootId            = Doc4.rootId 
+		AND Pro1.sai_Changes       = Cha12.lvId
+		AND Pro1.rootId            = Cha12.rootId
+		AND Wor10.rootId           = Doc4.doc_ParentWorkspace
+		AND Wor10.ws_ProjectAddin  = Pro12.rootId
+		AND (Doc5.doc_NextVersion   IS NULL
+		AND Doc5.doc_ParentDocument  = Wor6.rootId
+		AND Wor6.ws_InternalId       = 'SYS0012'
+		AND Doc5.doc_InternalId      = 'XX'
+		AND Doc5.doc_NextVersion    IS NULL
+		AND Doc4.doc_NextVersion    IS NULL
+		AND Dyn7.dcfd_TypeName       = Dyn8.dcfd_TypeName
+		AND Doc4.doc_InternalId     <> Doc5.doc_InternalId
+		AND Pro1.sai_ContextObject   = Sup11.rootId
+		AND Cha12.csf_OldClusterRoot = Dyn7.rootId
+		AND Pro1.sai_PartitionNumber   = XX
+		AND SYSDATE + 25200/86400 - Pro1.sai_TimeUpdated BETWEEN 0 AND 7
+		AND Pro12.pta_IsTest           = 0)
+		AND (Pro1.sai_Active           = 1)
+		AND (Pro1.sai_PurgeState       = 0)
+		AND (Pro1.sai_PartitionNumber   = XX)
+		AND (Doc4.doc_Active           = 1)
+		AND (Doc4.doc_PurgeState       = 0)
+		AND (Doc4.doc_PartitionNumber   = XX)
+		AND (Doc5.doc_Active           = 1)
+		AND (Doc5.doc_PurgeState       = 0)
+		AND (Doc5.doc_PartitionNumber   = XX)
+		AND (Wor10.ws_Active           = 1)
+		AND (Wor10.ws_PurgeState       = 0)
+		AND (Wor10.ws_PartitionNumber   = XX)
+		AND (Wor6.ws_Active            = 1)
+		AND (Wor6.ws_PurgeState        = 0)
+		AND (Wor6.ws_PartitionNumber   = XX)
+		AND (us_2.cus_Active           = 1)
+		AND (us_2.cus_PurgeState       = 0)
+		AND (us_2.cus_PartitionNumber   = XX)
+		AND (Pro12.pta_Active          = 1)
+		AND (Pro12.pta_PurgeState      = 0)
+		AND (Pro12.pta_PartitionNumber   = XX)
+		AND (us_7.cus_Active           = 1)
+		AND (us_7.cus_PurgeState       = 0)
+		AND (us_7.cus_PartitionNumber   = XX)
+		AND (org_3.org_Active = 1) 
+		AND (org_3.org_PurgeState = 0) 
+		AND (org_3.org_PartitionNumber = XX) 
+		AND Wor10.ws_Owner             = us_7.rootId
+		UNION ALL 
+		SELECT DISTINCT Wor10.c1RPZF73_DfltStrngTrnsltn_Ti           AS sw,
+		  org_3.org_SystemID                                         AS supplierId,
+		  us_7.cus_UniqueName                                        AS swOwner,
+		  Pro1.sai_TimeUpdated                                       AS rawtimeupdated,
+		  TO_CHAR(Pro1.sai_TimeUpdated, 'Dy Mon-DD-YYYY HH24:MI:SS') AS timeupdated,
+		  us_2.cus_UniqueName                                        AS effectiveUser,
+		  CASE
+		          WHEN us_3.cus_UniqueName IS NOT NULL THEN          us_3.cus_UniqueName 
+		          ELSE us_3.RootId 
+		  END AS realUser,
+		  Doc4.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTitle,
+		  Doc5.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTemplateTitle,
+		  Cha12.cif_fieldname                                        AS fieldName,
+		  Cha12.cif_valueclass                                       AS classtype,
+		  TO_CHAR(Cha12.cif_oldintvalue)                             AS oldValue,
+		  TO_CHAR(Cha12.cif_newintvalue)                             AS newValue
+		FROM ProjectAuditInfoTab Pro1 
+		LEFT OUTER JOIN us_UserTab us_3 ON Pro1.sai_RealUser = us_3.RootId,
+		  ChangedIntFieldTab Cha12,
+		  DynamicFormDocumentTab Dyn7,
+		  DocumentTab Doc4,
+		  DynamicFormDocumentTab Dyn8,
+		  DocumentTab Doc5,
+		  WorkspaceTab Wor10,
+		  SupplierProjectTab Sup11,
+		  ProjectAddinTab Pro12,
+		  WorkspaceTab Wor6,
+		  us_UserTab us_7,
+		  us_UserTab us_2,
+		  us_OrganizationTab org_3 
+		WHERE Sup11.sp_Supplier = org_3.rootId 
+		AND Sup11.rootId         = Wor10.rootId
+		AND Pro1.sai_EffectiveUser = us_2.rootId
+		AND Dyn8.rootId            = Doc5.rootId
+		AND Dyn7.rootId            = Doc4.rootId
+		AND Pro1.sai_EffectiveUser = us_2.rootId
+		AND Pro1.sai_RealUser      = us_3.rootId
+		AND Pro1.sai_Changes       = Cha12.lvId
+		AND Pro1.rootId            = Cha12.rootId
+		AND Wor10.rootId           = doc4.doc_ParentWorkspace
+		AND Wor10.ws_ProjectAddin  = Pro12.rootId
+		AND (Doc5.doc_NextVersion   IS NULL
+		AND Doc5.doc_ParentDocument  = Wor6.rootId
+		AND Wor6.ws_InternalId       = 'SYS0012'
+		AND Doc5.doc_InternalId      = 'XX'
+		AND Doc5.doc_NextVersion    IS NULL
+		AND Doc4.doc_NextVersion    IS NULL
+		AND Dyn7.dcfd_TypeName       = Dyn8.dcfd_TypeName
+		AND Doc4.doc_InternalId     <> Doc5.doc_InternalId
+		AND Pro1.sai_ContextObject   = Sup11.rootId
+		AND Cha12.cif_OldClusterRoot = Dyn7.rootId
+		AND Pro1.sai_PartitionNumber   = XX
+		AND SYSDATE + 25200/86400 - Pro1.sai_TimeUpdated BETWEEN 0 AND 7
+		AND Pro12.pta_IsTest           = 0)
+		AND (Pro1.sai_Active           = 1)
+		AND (Pro1.sai_PurgeState       = 0)
+		AND (Pro1.sai_PartitionNumber   = XX)
+		AND (Doc4.doc_Active           = 1)
+		AND (Doc4.doc_PurgeState       = 0)
+		AND (Doc4.doc_PartitionNumber   = XX)
+		AND (Doc5.doc_Active           = 1)
+		AND (Doc5.doc_PurgeState       = 0)
+		AND (Doc5.doc_PartitionNumber   = XX)
+		AND (Wor10.ws_Active           = 1)
+		AND (Wor10.ws_PurgeState       = 0)
+		AND (Wor10.ws_PartitionNumber   = XX)
+		AND (Wor6.ws_Active            = 1)
+		AND (Wor6.ws_PurgeState        = 0)
+		AND (Wor6.ws_PartitionNumber   = XX)
+		AND (us_2.cus_Active           = 1)
+		AND (us_2.cus_PurgeState       = 0)
+		AND (us_2.cus_PartitionNumber   = XX)
+		AND (Pro12.pta_Active          = 1)
+		AND (Pro12.pta_PurgeState      = 0)
+		AND (Pro12.pta_PartitionNumber   = XX)
+		AND (us_7.cus_Active           = 1)
+		AND (us_7.cus_PurgeState       = 0)
+		AND (us_7.cus_PartitionNumber   = XX)
+		AND (org_3.org_Active = 1) 
+		AND (org_3.org_PurgeState = 0) 
+		AND (org_3.org_PartitionNumber = XX) 
+		AND Wor10.ws_Owner             = us_7.rootId
+		UNION ALL 
+		SELECT DISTINCT Wor10.c1RPZF73_DfltStrngTrnsltn_Ti           AS sw,
+		  org_3.org_SystemID                                         AS supplierId,
+		  us_7.cus_UniqueName                                        AS swOwner,
+		  Pro1.sai_TimeUpdated                                       AS rawtimeupdated,
+		  TO_CHAR(Pro1.sai_TimeUpdated, 'Dy Mon-DD-YYYY HH24:MI:SS') AS timeupdated,
+		  us_2.cus_UniqueName                                        AS effectiveUser,
+		  CASE
+		          WHEN us_3.cus_UniqueName IS NOT NULL THEN          us_3.cus_UniqueName 
+		          ELSE us_3.RootId 
+		  END AS realUser,
+		  Doc4.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTitle,
+		  Doc5.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTemplateTitle,
+		  Cha12.cdbf_fieldname                                       AS fieldName,
+		  Cha12.cdbf_valueclass                                      AS classtype,
+		  TO_CHAR(Cha12.cdbf_newdoublevalue)                         AS oldValue,
+		  TO_CHAR(Cha12.cdbf_olddoublevalue)                         AS newValue
+		FROM ProjectAuditInfoTab Pro1
+		LEFT OUTER JOIN us_UserTab us_3 ON Pro1.sai_RealUser = us_3.RootId,
+		  ChangedDoubleFieldTab Cha12,
+		  DynamicFormDocumentTab Dyn7,
+		  DocumentTab Doc4,
+		  DynamicFormDocumentTab Dyn8,
+		  DocumentTab Doc5,
+		  WorkspaceTab Wor10,
+		  SupplierProjectTab Sup11,
+		  ProjectAddinTab Pro12,
+		  WorkspaceTab Wor6,
+		  us_UserTab us_7,
+		  us_UserTab us_2,
+		  us_OrganizationTab org_3 
+		WHERE Sup11.sp_Supplier = org_3.rootId 
+		AND Sup11.rootId         = Wor10.rootId
+		AND Pro1.sai_EffectiveUser = us_2.rootId
+		AND Dyn8.rootId            = Doc5.rootId
+		AND Dyn7.rootId            = Doc4.rootId
+		AND Pro1.sai_Changes       = Cha12.lvId
+		AND Pro1.rootId            = Cha12.rootId
+		AND Wor10.rootId           = Doc4.doc_ParentWorkspace
+		AND Wor10.ws_ProjectAddin  = Pro12.rootId
+		AND (Doc5.doc_NextVersion    IS NULL
+		AND Doc5.doc_ParentDocument   = Wor6.rootId
+		AND Wor6.ws_InternalId        = 'SYS0012'
+		AND Doc5.doc_InternalId       = 'XX'
+		AND Doc5.doc_NextVersion     IS NULL
+		AND Doc4.doc_NextVersion     IS NULL
+		AND Dyn7.dcfd_TypeName        = Dyn8.dcfd_TypeName
+		AND Doc4.doc_InternalId      <> Doc5.doc_InternalId
+		AND Pro1.sai_ContextObject    = Sup11.rootId
+		AND Cha12.cdbf_OldClusterRoot = Dyn7.rootId
+		AND Pro1.sai_PartitionNumber   = XX
+		AND SYSDATE + 25200/86400 - Pro1.sai_TimeUpdated BETWEEN 0 AND 7
+		AND Pro12.pta_IsTest           = 0)
+		AND (Pro1.sai_Active           = 1)
+		AND (Pro1.sai_PurgeState       = 0)
+		AND (Pro1.sai_PartitionNumber   = XX)
+		AND (Doc4.doc_Active           = 1)
+		AND (Doc4.doc_PurgeState       = 0)
+		AND (Doc4.doc_PartitionNumber   = XX)
+		AND (Doc5.doc_Active           = 1)
+		AND (Doc5.doc_PurgeState       = 0)
+		AND (Doc5.doc_PartitionNumber   = XX)
+		AND (Wor10.ws_Active           = 1)
+		AND (Wor10.ws_PurgeState       = 0)
+		AND (Wor10.ws_PartitionNumber   = XX)
+		AND (Wor6.ws_Active            = 1)
+		AND (Wor6.ws_PurgeState        = 0)
+		AND (Wor6.ws_PartitionNumber   = XX)
+		AND (us_2.cus_Active           = 1)
+		AND (us_2.cus_PurgeState       = 0)
+		AND (us_2.cus_PartitionNumber   = XX)
+		AND (Pro12.pta_Active          = 1)
+		AND (Pro12.pta_PurgeState      = 0)
+		AND (Pro12.pta_PartitionNumber   = XX)
+		AND (us_7.cus_Active           = 1)
+		AND (us_7.cus_PurgeState       = 0)
+		AND (us_7.cus_PartitionNumber   = XX)
+		AND (org_3.org_Active = 1) 
+		AND (org_3.org_PurgeState = 0) 
+		AND (org_3.org_PartitionNumber = XX) 
+		AND Wor10.ws_Owner             = us_7.rootId
+		UNION ALL 
+		SELECT DISTINCT Wor10.c1RPZF73_DfltStrngTrnsltn_Ti           AS sw,
+		  org_3.org_SystemID                                         AS supplierId,
+		  us_7.cus_UniqueName                                        AS swOwner,
+		  Pro1.sai_TimeUpdated                                       AS rawtimeupdated,
+		  TO_CHAR(Pro1.sai_TimeUpdated, 'Dy Mon-DD-YYYY HH24:MI:SS') AS timeupdated,
+		  us_2.cus_UniqueName                                        AS effectiveUser,
+		  CASE
+		          WHEN us_3.cus_UniqueName IS NOT NULL THEN          us_3.cus_UniqueName 
+		          ELSE us_3.RootId 
+		  END AS realUser,
+		  Doc4.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTitle,
+		  Doc5.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTemplateTitle,
+		  Cha12.cbdf_fieldname                                       AS fieldName,
+		  Cha12.cbdf_valueclass                                      AS classtype,
+		  TO_CHAR(Cha12.cbdf_oldbigdecimalvalue)                     AS oldValue,
+		  TO_CHAR(Cha12.cbdf_newbigdecimalvalue)                     AS newValue
+		FROM ProjectAuditInfoTab Pro1
+		LEFT OUTER JOIN us_UserTab us_3 ON Pro1.sai_RealUser = us_3.RootId,
+		  ChangedBigDecimalFieldTab Cha12,
+		  DynamicFormDocumentTab Dyn7,
+		  DocumentTab Doc4,
+		  DynamicFormDocumentTab Dyn8,
+		  DocumentTab Doc5,
+		  WorkspaceTab Wor10,
+		  SupplierProjectTab Sup11,
+		  ProjectAddinTab Pro12,
+		  WorkspaceTab Wor6,
+		  us_UserTab us_7,
+		  us_UserTab us_2,
+		  us_OrganizationTab org_3 
+		WHERE Sup11.sp_Supplier = org_3.rootId 
+		AND Sup11.rootId         = Wor10.rootId
+		AND Pro1.sai_EffectiveUser = us_2.rootId
+		AND Dyn8.rootId            = Doc5.rootId
+		AND Dyn7.rootId            = Doc4.rootId
+		AND Pro1.sai_Changes       = Cha12.lvId
+		AND Pro1.rootId            = Cha12.rootId
+		AND Wor10.rootId           = Doc4.doc_ParentWorkspace
+		AND Wor10.ws_ProjectAddin  = Pro12.rootId
+		AND (Doc5.doc_NextVersion    IS NULL
+		AND Doc5.doc_ParentDocument   = Wor6.rootId
+		AND Wor6.ws_InternalId        = 'SYS0012'
+		AND Doc5.doc_InternalId       = 'XX'
+		AND Doc5.doc_NextVersion     IS NULL
+		AND Doc4.doc_NextVersion     IS NULL
+		AND Dyn7.dcfd_TypeName        = Dyn8.dcfd_TypeName
+		AND Doc4.doc_InternalId      <> Doc5.doc_InternalId
+		AND Pro1.sai_ContextObject    = Sup11.rootId
+		AND Cha12.cbdf_OldClusterRoot = Dyn7.rootId
+		AND Pro1.sai_PartitionNumber   = XX
+		AND SYSDATE + 25200/86400 - Pro1.sai_TimeUpdated BETWEEN 0 AND 7
+		AND Pro12.pta_IsTest           = 0)
+		AND (Pro1.sai_Active           = 1)
+		AND (Pro1.sai_PurgeState       = 0)
+		AND (Pro1.sai_PartitionNumber   = XX)
+		AND (Doc4.doc_Active           = 1)
+		AND (Doc4.doc_PurgeState       = 0)
+		AND (Doc4.doc_PartitionNumber   = XX)
+		AND (Doc5.doc_Active           = 1)
+		AND (Doc5.doc_PurgeState       = 0)
+		AND (Doc5.doc_PartitionNumber   = XX)
+		AND (Wor10.ws_Active           = 1)
+		AND (Wor10.ws_PurgeState       = 0)
+		AND (Wor10.ws_PartitionNumber   = XX)
+		AND (Wor6.ws_Active            = 1)
+		AND (Wor6.ws_PurgeState        = 0)
+		AND (Wor6.ws_PartitionNumber   = XX)
+		AND (us_2.cus_Active           = 1)
+		AND (us_2.cus_PurgeState       = 0)
+		AND (us_2.cus_PartitionNumber   = XX)
+		AND (Pro12.pta_Active          = 1)
+		AND (Pro12.pta_PurgeState      = 0)
+		AND (Pro12.pta_PartitionNumber   = XX)
+		AND (us_7.cus_Active           = 1)
+		AND (us_7.cus_PurgeState       = 0)
+		AND (us_7.cus_PartitionNumber   = XX)
+		AND (org_3.org_Active = 1) 
+		AND (org_3.org_PurgeState = 0) 
+		AND (org_3.org_PartitionNumber = XX) 
+		AND Wor10.ws_Owner             = us_7.rootId
+		UNION ALL 
+		SELECT DISTINCT Wor10.c1RPZF73_DfltStrngTrnsltn_Ti           AS sw,
+		  org_3.org_SystemID                                         AS supplierId,
+		  us_7.cus_UniqueName                                        AS swOwner,
+		  Pro1.sai_TimeUpdated                                       AS rawtimeupdated,
+		  TO_CHAR(Pro1.sai_TimeUpdated, 'Dy Mon-DD-YYYY HH24:MI:SS') AS timeupdated,
+		  us_2.cus_UniqueName                                        AS effectiveUser,
+		  CASE
+		          WHEN us_3.cus_UniqueName IS NOT NULL THEN          us_3.cus_UniqueName 
+		          ELSE us_3.RootId 
+		  END AS realUser,
+		  Doc4.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTitle,
+		  Doc5.c1E0UMQ5_DfltStrngTrnsltn_Ti                          AS dformTemplateTitle,
+		  Cha12.cbf_fieldname                                        AS fieldName,
+		  Cha12.cbf_valueclass                                       AS classtype,
+		  CASE
+		    WHEN Cha12.cbf_oldbooleanvalue=1
+		    THEN 'true'
+		    ELSE 'false'
+		  END AS oldValue,
+		  CASE
+		    WHEN Cha12.cbf_newbooleanvalue=1
+		    THEN 'true'
+		    ELSE 'false'
+		  END AS newValue
+		FROM ProjectAuditInfoTab Pro1
+		LEFT OUTER JOIN us_UserTab us_3 ON Pro1.sai_RealUser = us_3.RootId,
+		  ChangedBooleanFieldTab Cha12,
+		  DynamicFormDocumentTab Dyn7,
+		  DocumentTab Doc4,
+		  DynamicFormDocumentTab Dyn8,
+		  DocumentTab Doc5,
+		  WorkspaceTab Wor10,
+		  SupplierProjectTab Sup11,
+		  ProjectAddinTab Pro12,
+		  WorkspaceTab Wor6,
+		  us_UserTab us_7,
+		  us_UserTab us_2,
+		  us_OrganizationTab org_3 
+		WHERE Sup11.sp_Supplier = org_3.rootId 
+		AND Sup11.rootId         = Wor10.rootId
+		AND Pro1.sai_EffectiveUser = us_2.rootId
+		AND Dyn8.rootId            = Doc5.rootId
+		AND Dyn7.rootId            = Doc4.rootId
+		AND Pro1.sai_Changes       = Cha12.lvId
+		AND Pro1.rootId            = Cha12.rootId
+		AND Wor10.rootId           = Doc4.doc_ParentWorkspace
+		AND Wor10.ws_ProjectAddin  = Pro12.rootId
+		AND (Doc5.doc_NextVersion   IS NULL
+		AND Doc5.doc_ParentDocument  = Wor6.rootId
+		AND Wor6.ws_InternalId       = 'SYS0012'
+		AND Doc5.doc_InternalId      = 'XX'
+		AND Doc5.doc_NextVersion    IS NULL
+		AND Doc4.doc_NextVersion    IS NULL
+		AND Dyn7.dcfd_TypeName       = Dyn8.dcfd_TypeName
+		AND Doc4.doc_InternalId     <> Doc5.doc_InternalId
+		AND Pro1.sai_ContextObject   = Sup11.rootId
+		AND Cha12.cbf_OldClusterRoot = Dyn7.rootId
+		AND Pro1.sai_PartitionNumber   = XX
+		AND SYSDATE + 25200/86400 - Pro1.sai_TimeUpdated BETWEEN 0 AND 7
+		AND Pro12.pta_IsTest           = 0)
+		AND (Pro1.sai_Active           = 1)
+		AND (Pro1.sai_PurgeState       = 0)
+		AND (Pro1.sai_PartitionNumber   = XX)
+		AND (Doc4.doc_Active           = 1)
+		AND (Doc4.doc_PurgeState       = 0)
+		AND (Doc4.doc_PartitionNumber   = XX)
+		AND (Doc5.doc_Active           = 1)
+		AND (Doc5.doc_PurgeState       = 0)
+		AND (Doc5.doc_PartitionNumber   = XX)
+		AND (Wor10.ws_Active           = 1)
+		AND (Wor10.ws_PurgeState       = 0)
+		AND (Wor10.ws_PartitionNumber   = XX)
+		AND (Wor6.ws_Active            = 1)
+		AND (Wor6.ws_PurgeState        = 0)
+		AND (Wor6.ws_PartitionNumber   = XX)
+		AND (us_2.cus_Active           = 1)
+		AND (us_2.cus_PurgeState       = 0)
+		AND (us_2.cus_PartitionNumber   = XX)
+		AND (Pro12.pta_Active          = 1)
+		AND (Pro12.pta_PurgeState      = 0)
+		AND (Pro12.pta_PartitionNumber   = XX)
+		AND (us_7.cus_Active           = 1)
+		AND (us_7.cus_PurgeState       = 0)
+		AND (us_7.cus_PartitionNumber   = XX)
+		AND (org_3.org_Active = 1) 
+		AND (org_3.org_PurgeState = 0) 
+		AND (org_3.org_PartitionNumber = XX)
+		AND Wor10.ws_Owner             = us_7.rootId
+		ORDER BY 4 DESC
+	`;
+
+	$sql =~ s/(doc_InternalId\s+=\s+)\'XX\'/$1\'$documentId\'/g;
+	$sql =~ s/(_PartitionNumber\s+=\s+)XX/${1}${realmId}0/g;
+
+	#FIXME
+	#$sql = q`select * from RealmTab`;
+	#$connectionId = 0; 
+
+	my @output = _runSql($connectionId, $sql);
+
+	return @output;
+}
+
+sub realmIdForName {
+	my $realmName = shift;
+
+	my $sql = "SELECT ID FROM REALMTAB WHERE NAME = '$realmName';";
+
+	my ($realmId) = _runSql(0, $sql);
+
+	return $realmId;
+}
+
+sub connectionIdForRealmId {
+	my $realmId = shift;
+	
+	my $sql = "SELECT DATABASESCHEMA FROM SCHEMATYPEMAPTAB WHERE REALMID = '$realmId' AND SCHEMATYPE = 'Transactional';";
+
+	my ($schema) = _runSql(0, $sql);
+	my $schemaId = ariba::Ops::DBConnection::_schemaIdForConnectionDict($schema);
+
+	return $schemaId;
+}
+
+sub _runSql {
+	my $connectionId = shift;
+	my $sql = shift;
+
+	my $connection = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndSchemaId($product, $connectionType, $connectionId);
+	my $oc = ariba::Ops::OracleClient->newFromDBConnection($connection);
+
+	$oc->setDebug(1) if $debug >= 2;
+	if ( !$oc->connect() ) {
+		myexit("Connection to " . $connection->user() . "\@" . $connection->sid() . " failed: [" .  $oc->error() . "].");
+	}
+
+	my @output = $oc->executeSql($sql);
+	if ($oc->error()) {
+		myexit("Failed to run sql: " . $oc->error());
+
+	}
+	$oc->disconnect();
+
+	return @output;
+}
+
+sub myexit {
+	my $error = shift;
+
+	if ($debug) {
+		print "$error\n";
+		exit(1);
+	} 
+
+	my $msgBody = "$0 failed to generated CSV report for novonordisk\n" .
+		      "Error Message from script is: \n" .
+		      "$error\n\n" .
+		      "Work with Dan Reid <dreid\@ariba.com> to get the report out manually once\n" .
+		      "the issue has been resolved\n";
+				
+	# FIXME: put current date/time in msg subject to generate a new ticket
+
+	my $dateString = localtime();
+
+	my $msg = MIME::Lite->new(
+			'From'     => "noreply\@ansmtp.ariba.com",
+			'To'       => "ask_ops\@ariba.com",
+			'Subject'  => "novonordisk-report failed at $dateString",
+			'Body'     => $msgBody,
+			);
+
+	eval { $msg->send() };
+	if ($@) {
+		Carp::croak "Failed to email report: $@"
+	}
+
+}
+
+main();

@@ -1,0 +1,78 @@
+#!/usr/local/bin/perl
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use LWP;
+use File::Basename;
+my $filename = basename($0);
+my $RUN_LOCK_FILE = '/tmp/$filename';
+
+sub usage{
+    my $error = shift;
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h] [-prod prodname]
+
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode.
+    -h        Shows this help.
+    -prod     product name.
+
+USAGE
+    print "(error) $error\n" if ($error);
+    exit();
+}
+
+sub main {
+    my ($debug, $sendEmail, $sendPage, $productName);
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-prod$/o) { $productName = shift;   next; }
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $service = $me->service();
+    my $customer = $me->customer () || undef;
+    my %queries = ();
+    my ($mdsname,@output);
+    my $count = 2;
+    my $time = 60;
+    my @links = split (" ", $me->default("monitoring.MDS.urls"));
+    my $url_no = scalar @links;
+    my $timer = $time/($url_no*$count);
+    my $port = $me->default("monitoring.MDS.port");
+    for (my $i=1; $i<=2; $i++){
+        for (my $j=0; $j<= $#links; $j++){
+            my $path = $links[$j];
+	    my $url = "$path";
+	    ($mdsname) = $path =~/.+mds\d\-(\w+)\d\./;
+            next if($mdsname =~/mdssearch/);
+	    my $browser = LWP::UserAgent->new;    
+            my $response = $browser->get( $url );
+            $browser->timeout(5);
+	    my $status = $response->status_line;
+	    $queries{$url} = {
+                info => 'answer !~/(500)|(503)/',
+                warn => 'answer =~/404/',
+                crit => 'answer =~/(500)|(503)/',
+                perl => sub {return $status},
+                uiHint => "MDS Urls/",
+            };
+	    sleep($timer) if ($i != $count && $j != $#links );
+        }
+    }
+    my $email = $me->default('notify.email');
+    my $qm = ariba::monitor::QueryManager->newWithDetails("MDS-MONITORING",$productName,$service,$customer,\%queries);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+    dmail::LockLib::releaselock($RUN_LOCK_FILE);
+}
+main(@ARGV);
+
+

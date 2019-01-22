@@ -1,0 +1,98 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/common/oracle-multipath-status#1 $
+
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use ariba::rc::CipherStore;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use dmail::LockLib;
+
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode.
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $debug = 0;
+    my $lockFile = "/tmp/oracle-multipath-status.lock";
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    exit(0) unless (dmail::LockLib::requestlock($lockFile));
+
+    my $me = ariba::rc::InstalledProduct->new() ;
+    my $service = $me->service();
+    my $cipher = ariba::rc::CipherStore->new($service);
+    my $user = "mon$service";
+    my $password = $cipher->valueForName($user);
+    my %queries;
+    my $product_oracle_role = 'product-db-server';
+    my @oracle_hosts;
+    push(@oracle_hosts,$me->hostsForRoleInCluster($product_oracle_role, 'primary' ));
+    my $host_luninfo;
+
+    for my $oracle_host(@oracle_hosts) {
+        my $cmd = "ssh $user\@$oracle_host 'sudo \/sbin\/vxdmpadm getdmpnode all'";
+        my @output;
+        ariba::rc::Utils::executeRemoteCommand( $cmd, $password, 0, undef, undef, \@output );
+        @output = grep{$_ !~ m/(?:^\s|^\=|^NAME)/}@output;
+              
+         for my $line(@output) {
+             next if $line =~ m/^\W+/;
+             my ($lun,$disabled) = (split(/\s+/, $line))[0,5];
+             if ($lun) {
+             $queries{"Number of paths disabled for $lun on $oracle_host"} = {
+               crit    => 'answer > 0',
+               warn    => 'answer =~ /failure/i',
+               perl    => sub { 
+                                return $disabled;
+                               },
+               description => "Running '$cmd'",
+               uiHint => $oracle_host,
+                correctiveActions => [
+                Ops => 'Contact System Admin Team',
+             ],
+            };
+           }
+          }
+    }
+
+
+    my $email = $me->default('notify.email');
+    my $qm = ariba::monitor::QueryManager->newWithDetails("Oracle multipath status", $me->name(), $me->service(), $me->customer(), \%queries);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+    dmail::LockLib::releaselock($lockFile);
+}
+main();

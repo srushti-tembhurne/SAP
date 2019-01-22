@@ -1,0 +1,109 @@
+#!/usr/local/bin/perl -w
+
+#
+# Purge monitoring data for the specified product
+#
+# $Id: //ariba/services/monitor/bin/uninstall-monitoring-for-product#6 $
+# Last modified by $Author: bob.mcgowan $ on $Date: 2016/08/01 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::misc;
+use ariba::rc::InstalledProduct;
+use File::Path;
+
+my $debug;
+
+#
+# Parse @ARGV; invoke purgeDataForProduct() if everything's okay:
+#
+sub main {
+	my $prodName;
+	my $customer;
+
+	while ( my $arg = shift @ARGV ) {
+		if ( $arg =~ /-product/ ) { $prodName = shift @ARGV; }
+		elsif ( $arg =~ /-customer/ ) { $customer = shift @ARGV; }
+		elsif ( $arg =~ /-d/ ) { $debug = 1; }
+		elsif ( $arg =~ /-h/ ) { usage(); }
+	}
+
+	usage('No product specified') if !defined($prodName);
+
+	#
+	# Determine what service we're running in:
+	#
+	my $me = ariba::rc::InstalledProduct->new();
+
+	my $product = ariba::rc::InstalledProduct->new(
+		$prodName, $me->service(), undef, $customer
+	);
+
+	#
+	# Check for a valid product. Display warning and usage, if needed:
+	#
+	if ( !defined($product) ) {
+		my $custText = defined($customer) ? " for $customer" : '';
+
+		usage($prodName . $custText . ' is not currently installed');
+	} elsif ( $product->isASPProduct() && !defined($customer) ) {
+		usage('-customer <name> is required for ASP products!');
+	}
+
+	purgeDataForProduct($product);
+}
+
+#
+# For the received InstalledProduct instance, delete the corresponding
+# storage areas for Query, QueryManager, and CircularDB.
+#
+sub purgeDataForProduct {
+	my $product = shift;
+
+	#
+	# Any directories in this array will be recursively unlinked:
+	#
+	my @dirsToPurge = (
+		ariba::monitor::misc::queryStorageDir(),
+		ariba::monitor::misc::queryManagerStorageDir(),
+		ariba::monitor::misc::circularDBDir(),
+	);
+
+	#
+	# For each element in @dirsToPurge, append product [and customer]
+	# name, then rmtree the directory:
+	#
+	for my $dir ( @dirsToPurge ) {
+		$dir .= "/" . $product->name();
+		$dir .= "/" . $product->customer() if $product->isASPProduct();
+
+		print "Executing rmtree($dir)...\n";
+
+		rmtree($dir) if -e $dir;
+	}
+}
+
+sub usage {
+	my $reason = shift;
+
+	warn "Error: $reason\n" if defined($reason);
+
+	print "Usage: uninstall-monitoring-for-product\n";
+	print "	-product <aes|an|ibx|etc>\n";
+	print "	[-customer <customername>] (only required for ASP products)\n";
+	print "	[-h] (show this help screen)\n";
+	print "	[-d] (run in debug mode)\n\n";
+
+	print "This program is invoked by 'stopsvc -uninstall', while monitoring is in\n";
+	print "a stopped state.\n\n";
+
+	print "DO NOT RUN THIS PROGRAM unless you really, really know what you're doing.\n\n";
+
+	exit(1);
+}
+
+main();

@@ -1,0 +1,158 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/ws/transform-weblog#2 $
+# 
+# Tranforms web logs prior to being passed to webalizer
+# Poor performance - needs to be written in C.
+#
+# Example:
+# The GroupAgent and HideAgent in webalizer.conf should be removed prior to running.
+#
+# export outdir=~/tmp/webalizer-08-29 && mkdir $outdir && /home/mondev/bin/linux/zmergelog web29/access.2010.08.29.gz web29/access.2010.08.23.gz web29/access.2010.08.24.gz web29/access.2010.08.25.gz web29/access.2010.08.26.gz web29/access.2010.08.27.gz web29/access.2010.08.28.gz | ~/ariba/services/monitor/bin/ws/transform-weblog | /home/mondev/bin/linux/webalizer -n service.ariba.com -c ~/ariba/services/monitor/config/webalizer.conf -o $outdir;
+
+use strict;
+
+my $debug = 0;
+
+# Use array as the order is important
+my @browserMatches = (
+	'iPhone'		=> 'iPhone',
+	'iPad'			=> 'iPad',
+	'BlackBerry'	=> 'BlackBerry',
+	'Android'		=> 'Android',
+	'MSIE 8'		=> 'Internet Explorer 8',
+	'MSIE 7'		=> 'Internet Explorer 7',
+	'MSIE 6'		=> 'Internet Explorer 6',
+	'MSIE'			=> 'Internet Explorer',
+	'Firefox/3.6'	=> 'Firefox 3.6',
+	'Firefox/3.5'	=> 'Firefox 3.5',
+	'Firefox/3'		=> 'Firefox 3',
+	'Firefox/2'		=> 'Firefox 2',
+	'Firefox/1'		=> 'Firefox 1',
+	'Firefox'		=> 'Firefox',
+	'Chrome/6'		=> 'Chrome 6',
+	'Chrome/5'		=> 'Chrome 5',
+	'Chrome/4'		=> 'Chrome 4',
+	'Chrome/3'		=> 'Chrome 3',
+	'Chrome/2'		=> 'Chrome 2',
+	'Chrome/1'		=> 'Chrome 1',
+	'Chrome/0'		=> 'Chrome 0',
+	'Chrome'		=> 'Chrome',
+	'Safari/531'	=> 'Safari 4',
+	'Safari/530'	=> 'Safari 4',
+	'Safari/528'	=> 'Safari 4',
+	'Safari/526'	=> 'Safari 4',
+	'Safari/525'	=> 'Safari 3',
+	'Safari/523'	=> 'Safari 3',
+	'Safari/522'	=> 'Safari 3',
+	'Safari'		=> 'Safari',
+	'AppleWebKit'	=> 'Safari',
+	'Version/10.'	=> 'Opera 10',
+	'Opera/9'		=> 'Opera 9',
+	'Opera/8'		=> 'Opera 8',
+	'Opera/7'		=> 'Opera 7',
+	'Opera/6'		=> 'Opera 6',
+	'Opera/5'		=> 'Opera 5',
+	'Opera'			=> 'Opera',
+	'Java'			=> 'Java',
+	'Jakarta Commons-HttpClient'	=> 'Jakarta Commons-HttpClient',
+	'BW-HTTPClient'	=> 'BW-HTTPClient',
+	'Biz-HTTPClient'	=> 'Biz-HTTPClient',
+	'IPNet-HTTPClient'	=> 'IPNet-HTTPClient',
+	'RPT-HTTPClient'	=> 'RPT-HTTPClient',
+	'TALWinInetHTTPClient'	=> 'TALWinInetHTTPClient',
+	'WinHttp'			=> 'WinHttp',
+	'libwww'			=> 'libwww',
+	'curl'				=> 'curl',
+	'Python-urllib'		=> 'Python-urllib',
+	'Googlebot'			=> 'Googlebot',
+	'msnbot'			=> 'MSN Bot',
+	'Yahoo! Slurp'		=> 'Yahoo! Slurp',
+	'Moozilla'			=> 'Moozilla',
+	'Lotus-Notes'		=> 'Lotus-Notes',
+	'Microsoft Outlook'	=> 'Microsoft Outlook',
+	'OutlookConnector'	=> 'Microsoft Outlook',
+	'Thunderbird'		=> 'Thunderbird',
+	'BizTalk'			=> 'BizTalk',
+	'Netcool'			=> 'Netcool',
+	'haboob'			=> 'haboob',
+	'Feedfetcher-Google'=> 'Feedfetcher-Google',
+	'SeaMonkey'			=> 'SeaMonkey',
+	'Netscape'			=> 'Netscape',
+	'Mozilla/4.06 [en] (WinNT; I)'	=> 'Cisco CSS (Load Balancer)',
+	'Mozilla/4.0 [en] (WinNT; I)'	=> 'CXML Agents',
+	'geturl'			=> 'geturl (Monitoring)',
+);
+
+my @osMatches = (
+	'Linux'	=> 'Linux',
+	'Mac'	=> 'Mac',
+	'Win'	=> 'Windows'
+);
+
+# Returns the line after transforming
+sub transform {
+	my $line = shift; 
+
+	# Match for user agent for now so we have a fast regex.
+	if ($line =~ /^([^"]+ ".+" \d+ [-\d]+ ".*") "(.+)" (\d+ .+)$/o) {
+		my $prefix = $1;
+		my $userAgent = $2;
+		my $suffix = $3;
+	
+		print "User Agent: [$userAgent]\n" if ($debug);	
+		$userAgent = shortAgentNameFromUserAgent($userAgent);
+		print "New User Agent: [$userAgent]\n" if ($debug);	
+
+		$line = "$prefix \"$userAgent\" $suffix\n";
+	} elsif ($debug) {
+		print "Failed to parse: [$line]\n";
+	}
+
+	return $line;
+}
+
+# Returns OS and browser name/version from raw user agent from access log
+sub shortAgentNameFromUserAgent {
+	my $userAgent = shift; 
+
+	my $shortAgentName = valueForMatchStringInArray($userAgent, @browserMatches);
+
+	# Only append OS info if matched, otherwise return original user agent.
+	if ($shortAgentName) {
+		if (my $os = valueForMatchStringInArray($userAgent, @osMatches)) {
+			$shortAgentName .= " ($os)";
+		}
+	} else {
+		$shortAgentName = $userAgent;
+	}
+			
+	return $shortAgentName;
+}
+
+sub valueForMatchStringInArray {
+	my $key = shift;
+	my @array = @_;
+
+	while (my $match = shift(@array)) {
+		my $value = shift(@array);
+		if (index($key, $match) >= 0) {
+			return $value;
+		}
+	}
+
+	return;
+}
+
+sub main {
+	while (my $arg = shift) {
+		if ($arg =~ /-d/) { $debug++; }
+	}
+
+	while (my $line = <STDIN>) {
+		$line = transform($line);
+		print $line;
+	}
+}
+
+main(@ARGV);

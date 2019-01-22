@@ -1,0 +1,17 @@
+#!/usr/local/bin/perl
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+use ariba::rc::InstalledProduct;
+use ariba::monitor::DowntimeTransaction;
+
+sub main {
+	my $me = ariba::rc::InstalledProduct->new();
+
+	ariba::monitor::DowntimeTransaction->replayTransactions($me);
+}
+
+main(@ARGV);

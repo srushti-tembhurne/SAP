@@ -1,0 +1,208 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/on-call/list-contacts#15 $
+# List all contact info in the db as a cgi program or command line
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Constants;
+use ariba::Oncall::Display;
+use ariba::Oncall::Group;
+use ariba::Oncall::Person;
+
+sub main {
+    
+    my @people = ();
+    my $display = ariba::Oncall::Display->new();
+    
+    my (@names, $username, $vcf, $role, $groupName);
+
+    my %listGroups = (          #display ops and sysadmin contacts only 
+        'prodops'    => 1,
+        'dba'        => 1,
+        'arch'       => 1,    
+        'security'   => 1,
+        'network'    => 1,
+        'sysadmin'   => 1,
+        'ai'         => 1,
+        'sre'        => 1,
+        'deployment' => 1,
+        'mgmt'       => 1,
+        'projmgmt'   => 1,
+    );
+
+    if ($display->isHTML()) {
+        $username = $display->param('person');
+        $vcf = $display->param('vcf');
+        $groupName = $display->param('group');
+        $role = $display->param('role');
+    } else {
+        while (my $arg = shift(@ARGV)) {
+            if ($arg =~ /-role/) { $role = shift(@ARGV); next;}
+            if ($arg =~ /-group/) { $groupName = shift(@ARGV); next;}
+            if ($arg =~ /-vcf/) { $vcf = 1; next;}
+            push (@names, $arg);
+        }
+    }
+
+    $display->printHeaders();
+
+    if (@names) {
+        $username = join(" ", @names);
+    }
+
+    if (defined($vcf)) {
+        $display->setMimeType("text/x-vcard");
+        $display->setContentDisposition("attachment");
+        $display->setFileName("contacts.vcf");
+    }
+
+
+    if (defined($username)) {
+        if (ariba::Oncall::Person->objectWithNameExists($username)) {
+            my $person = ariba::Oncall::Person->new($username);
+            push(@people, $person);
+
+        } else {
+            for my $person (ariba::Oncall::Person->listObjects()) {
+                if ( lc($person->fullname()) =~ m/$username/ ) {
+                    push(@people, $person);
+                    #last;
+                }
+            }
+        } 
+        
+        unless (@people) {
+            print "No person with id $username found\n";
+            exit(1);
+        }
+
+    } else {
+        my $group = ariba::Oncall::Group->new("ex-employee");
+        @people = $group->peopleNotInGroup();
+    }
+
+    if (defined ($role) ) {
+        @people = grep { $_->role() eq $role } ariba::Oncall::Person->listObjects();
+    }
+
+    if (defined ($groupName) ) {
+        $groupName = lc($groupName);
+
+        my $group = ariba::Oncall::Group->new($groupName);
+        @people = $group->peopleInGroup() if $group;
+
+        unless (@people) {
+            # in addition to checking for P.O. instances with this name, 
+            # also check for groups with this name field
+            for my $group (ariba::Oncall::Group->listObjects()) {
+                if (lc($group->name()) eq $groupName) {
+                    @people = $group->peopleInGroup();
+                    #last;
+                }
+            }
+        }
+    }
+
+    if (defined ($vcf) ) {
+        foreach my $person (@people) {
+            my $vcard = $person->vcard();
+            print "$vcard\n";
+        }
+        return;
+    }
+
+    if ($display->isHTML()) {
+        print '<font size=5 face=Helvetica>Ariba Network Operations Staff <a href=list-contacts?vcf=1>Contact Information</a></font><br>';
+        print '<font size=3 face=Helvetica><a href="'.$display->scheduleLink().'">See Current on-call schedule</a></font><hr>';
+        print '<font size=4 face=Helvetica color="#ff0000"><b>NOTE: Accurate Dev\'s phone numbers should be obtained from <a href="https://devwiki.ariba.com/bin/view/Main/EngineeringContactInfo">DevWiki page</b></a></font><br><br>';
+        print '<font size=2 face=Helvetica>Send all long emails to <a href="mailto:' . 
+            ariba::Ops::Constants->operationsEmailAddress() . '">' . 
+            ariba::Ops::Constants->operationsEmailAddress() . '</a>.<br>';
+        print 'Send all pages to <a href="mailto:' . 
+            ariba::Ops::Constants->operationsPagerAddress() . '">' . 
+            ariba::Ops::Constants->operationsPagerAddress() . '</a>.<br></font>';
+    }
+
+    for my $person (sort byFullName @people) {
+
+        next unless ($person->group() && $listGroups{$person->group()->instance()});
+
+        next if $person->instance() =~ /(?:unassigned|ticketmaster)/;
+
+        my $fullname = $person->fullname();
+        my $username = $person->username();
+
+        printHeader(
+            $display, $fullname,
+#           "<a href=list-contacts?person=$username&vcf=1>$fullname</a>",
+            $person->department(),
+            $person->role(),
+        );
+#       print "<br><a href=/cgi-bin/list-contacts?person=$username&vcf=1>download vcard</a>\n";
+
+        for my $item (sort $person->attributes) {
+            next if $item =~ /^(?:fullname|username|department|role)$/;
+
+            printItem($display,$item,$person->attribute($item));
+        }
+    }
+}
+
+sub byFullName {
+    $a->fullname() cmp $b->fullname();
+}
+
+sub printHeader {
+    my ($display,$header,@caption) = @_;
+
+    my ($caption,$showCaption);
+
+    if (defined $caption[0] or defined $caption[1]) {
+
+        # this may be undefined sometimes.
+        $caption[0] = '' unless $caption[0];
+        $caption[1] = '' unless $caption[1];
+
+        $caption = join ' ', @caption;
+        $showCaption = 1;
+    }
+
+    if ($display->isHTML()) {
+        print "<br><font face=Helvetica>$header";
+        print " ($caption)" if $showCaption;
+        print "<br></font>\n";  
+    } else { 
+        print "\n$header";
+        print " ($caption)" if $showCaption;
+        print "\n";
+    }
+}
+
+sub printItem {
+    my ($display,$key,$value) = @_;
+
+    return unless defined $value;
+    return if $value =~ /^(?:none|na|\s*)$/;
+
+    # these are subobjects
+    if (ref($value) && ref($value) eq 'ariba::Oncall::Group') {
+        $value = $value->name() || '';
+    }
+
+    $key =~ s/-/ /go;
+
+    if ($display->isHTML()) {
+        print "<font size=-1 face=Helvetica>";
+        print "&nbsp;&nbsp;&nbsp;<b>$key:</b> $value<br>";
+        print "</font>\n";
+    } else {
+        print "    $key: $value\n";
+    }
+}
+
+main();
+
+__END__

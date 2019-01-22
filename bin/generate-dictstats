@@ -1,0 +1,172 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/tools/bin/generate-dictionary-stats $
+#
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../lib/perl";
+
+use File::Basename;
+use Expect;
+
+use ariba::rc::Globals;
+use ariba::rc::ArchivedProduct;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use ariba::Ops::DBConnection;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::OracleClient;
+
+my $vers = '1.1';
+my $haveTTY = (-t STDIN || -t STDOUT) ? 1 : 0;
+
+sub main {
+	my (@sqlplusArgs, $INSTALLDIR, $product, $service, $customer);
+	my $debug = 0;
+	my $isAspProduct = 0;
+
+	my $role = 'database';
+
+	my $connectionType;
+	my $connectionId;
+	my $sid;
+
+	while (my $arg = shift(@ARGV)) {
+		if (($arg eq '-d')||($arg =~ m/--debug(=(on|yes))?/)) {
+			$debug++;
+			print "Debug: Debugging turned on.\n";
+			if ($debug >= 2) {
+				$Expect::Log_Stdout=1;
+				$Expect::Exp_Internal=1;
+				$Expect::Debug=1;
+			}
+		} elsif ($arg =~ m/^-sid/i) {
+			$connectionId = shift(@ARGV);
+			next;
+		} elsif (!$product) {
+			$product = $arg;
+			$isAspProduct = ariba::rc::Globals::isASPProduct($product);
+			next;
+		} elsif (!$service) {
+			$service = $arg;
+			next;
+		} elsif ($isAspProduct && !$customer) {
+			$customer = $arg;
+			next;
+		} else {
+			push(@sqlplusArgs, $arg);
+			next;
+		}
+	}
+
+
+	usage("You must specify a product and service.") unless (($product)&&($service));
+	usage("You must specify a customer for asp product $product") if ($isAspProduct && !$customer);
+
+	my $self;
+	if (ariba::rc::InstalledProduct->isInstalled($product, $service, undef, $customer)) {
+		$self = ariba::rc::InstalledProduct->new($product, $service, undef, $customer);
+	} elsif (ariba::rc::ArchivedProduct->isArchived($product, $service, undef, $customer)) {
+		$self = ariba::rc::ArchivedProduct->new($product, $service, undef, $customer);
+	} else {
+		die "Error: Could not load product $product$service.\n";
+	}
+
+	if($haveTTY) {
+		ariba::rc::Passwords::initialize($service);
+	}
+
+	my $mon = ariba::rc::InstalledProduct->new('mon', $service);
+	my $sysDBUser = 'system';
+	my $sysDBPassword = $mon->default("dbainfo.$sysDBUser.password");
+
+
+	$connectionType = ariba::Ops::DBConnection->typeMainStarDedicated();
+	my @connections = ariba::Ops::DBConnection->connectionsForProductOfDBType($self, $connectionType);
+	my @sidConns = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections);
+	my $connection;
+	if($connectionId) {
+		foreach my $conn (@sidConns) {
+			if(uc($conn->sid()) eq uc($connectionId)) {
+				$connection = $conn;
+				last;
+			}
+		}
+		die "Error: Could not find connection to sid $connectionId of type $connectionType\n" unless @sidConns;
+	} else {
+		my $hostname = ariba::Ops::NetworkUtils::hostname();
+		foreach my $conn (@sidConns) {
+			my $host = $conn->host();
+			if ($host eq $hostname) {
+				$connection = $conn;
+				last;
+			}
+		}
+	}
+
+	unless( $connection) {
+		die "Error: Could not determine settings for $connectionType from product defaults.\n";
+	}
+
+	my $dbUsername = $sysDBUser;
+	my $dbPassword = $sysDBPassword;
+	my $dbServerid = $connection->sid();
+	my $dbServerHost = $connection->host();
+
+	my $oracleClient  = ariba::Ops::OracleClient->new($dbUsername, $dbPassword, $dbServerid, $dbServerHost);
+	$oracleClient->connect() || die "connect() failed ", $oracleClient->error(), "\n";
+
+	if ($debug) {
+		print "Debug: dbhost = $dbServerHost\n";
+		print "Debug:   user = $dbUsername\n";
+		print "Debug:    sid = $dbServerid\n";
+		print "Debug:   pass = ***********\n";
+
+		print "ORACLE_HOME = $ENV{'ORACLE_HOME'}\n";
+	}
+
+
+	my $envName = sharedLibEnvName();
+	$ENV{$envName} = "$ENV{'ORACLE_HOME'}/lib";
+	$ENV{'PATH'} = "$ENV{'ORACLE_HOME'}/bin:$ENV{'PATH'}";
+
+
+	my $connectString = ariba::rc::Utils::connectStringForSidOnHost($dbServerid, $dbServerHost);
+
+	my $command = "sqlplus";
+	my $statSql = $mon->installDir() . '/bin/dba/sql/dictstats/sv_sys_stats.sql';
+
+	unshift(@sqlplusArgs, "$dbUsername\@\"$connectString\"");
+	push(@sqlplusArgs, "\@$statSql");
+
+	print "command = $command ", join(" ", @sqlplusArgs), "\n" if ($debug);
+
+	my $sqlplus = Expect->spawn($command, @sqlplusArgs);
+	$sqlplus->expect(60,
+		'-re', 'Enter password: ', sub {
+			my $self = shift;
+			$self->log_stdout(0);
+			$self->send("$dbPassword\r");
+			$self->expect(0, '-re', "\r\n");
+			$self->log_stdout(1);
+			exp_continue();
+		},
+		);
+
+	$sqlplus->interact();
+	undef $sqlplus;
+	return;
+}
+
+sub usage {
+	print "Error: $_[0]\n" if $_[0];
+	print "usage: $0 (version $vers)\n";
+	print "          [-d] debug\n";
+	exit(1);
+
+}
+
+main();

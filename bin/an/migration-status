@@ -1,0 +1,337 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/an/migration-status#29 $
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../../lib";
+
+use ariba::monitor::OutageSchedule;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DBConnection; 
+use ariba::Ops::OracleClient;
+
+sub main {
+	my $debug = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $queries = {};
+	my $runDaily = 0;
+
+	my ( $hr, $min ) = (localtime(time()))[2,1];
+	if( $hr == 0 && $min < 15 ) {
+		$runDaily=1;
+	}
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ m/^-d/o) { $debug = 1; }
+		if ($arg =~ m/^-e/o) { $sendEmail = 1; }
+		if ($arg =~ m/^-p/o) { $sendPage = 1; }
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $service = $me->service();
+	my $an = ariba::rc::InstalledProduct->new('an', $service);
+
+	my $communitiesList;
+	my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+	my $hour = 1;
+
+	my $migDbc = ariba::Ops::DBConnection->connectionsForProductOfDBType($an, "main-migration");
+	unless($migDbc) {
+		print "Exiting -- no migration db\n" if($debug && -t STDOUT);
+		exit;
+	}
+	my $migOc = ariba::Ops::OracleClient->newFromDBConnection($migDbc);
+
+	my $mainDbc = ariba::Ops::DBConnection->connectionsForProductOfDBType($an, "main");
+	exit unless $mainDbc;
+	my $mainOc = ariba::Ops::OracleClient->newFromDBConnection($mainDbc);
+
+	my $email = $me->default('notify.email');
+
+	for my $communityId (@communityIds) {
+
+		$queries->{"Migration progress - incomplete tasks not updated in last $hour hour for community $communityId"} = {
+			info			=> "numrows == 0",
+			crit			=> "numrows > 0",
+			format			=> "id: %s, graph: %s, path %s",
+			uiHint			=> "community $communityId",
+			'outageSchedule'	=> ariba::monitor::OutageSchedule->new('daily 02:00-02:15'),
+			sql				=> qq`select id, graph, path 
+									from anlive$communityId.migration_insert_status 
+									where IS_COMPLETED = 0 and (sysdate - DBUPDATED)*24 > $hour AND id <= 8`,
+		};
+
+		if( ! $migOc->connect() ) {
+			my ($dbuser, $dbsid, $dbhost) = ($migDbc->user(), $migDbc->sid(), $migDbc->host());
+			$queries->{"Migration progress - task status for community $communityId"} = {
+				warn => 1,
+				perl => sub { return "Unable to connect to $dbuser\@$dbsid on $dbhost"; },
+				uiHint			=> "community $communityId",
+			};
+			next;
+		}
+
+		my $migStatusSql = "select distinct(i.id) from anlive$communityId.migration_insert_status i where i.IS_COMPLETED = 1";
+		my (@migrationStatusIDs) = $migOc->executeSql($migStatusSql);
+		my $migrationStatusIdsString = join(", ", map { "'$_'" } @migrationStatusIDs);
+
+		my $mainQueries = {};
+		$mainQueries->{"Migration progress - status for partition migration tasks"} = {
+			info			=> 1,
+			crit			=> "answer =~ /Failed/",
+			format			=> "task: %s, status %s",
+			runForCommunities => $communityId,
+			sql				=> qq`
+				select s.unique_name,
+					(case when q.status = 1 and exists
+					( select 1 from MIGRATION_TASKS_PARAMETERS p
+						where p.tasks = q.id and p.name = 'task_id' and
+						to_number(p.value) IN
+						('1','2','3','4','5','6','7','8','1000','1010' ) )
+					then 'Completed' when q.status = 2 then 'Processing'
+					when q.status = 3 then 'Timeout' else 'Failed' end)
+					status from mg_disp_queue q, schedule_tasks s
+					where q.item = s.id and s.name = 'ANPartitionMigrationTask';
+				`,
+		};
+
+		my $mainQM = ariba::monitor::QueryManager->newWithDetails('migration-status', 'an', $service, undef, $mainQueries);
+		ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $mainQM);
+		$mainQM->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+		#
+		# XXX -- this only works for 2 communities, but then, the SQL only does
+		# as well.
+		#
+		my $compare = (($communityId == 1) ? "<" : ">");
+		my $trunc = (($communityId == 1) ?
+			"trunc(last_id*100/final_id, 2)" :
+			"trunc((last_id-20000000000000000000000000)*100/(final_id-20000000000000000000000000), 2)");
+
+		my $maxSql = "select max(id) from cxml_document\@an$communityId where id $compare 20000000000000000000000000";
+
+		my $subSql = "select id,path,(case when is_completed=0 then 'processing' else 'completed' end) status,last_id,($maxSql) final_id from anlive$communityId.migration_insert_status where graph = 'ANCXMLDocument' order by id";
+
+		my $sql = "select id,path,status,last_id,final_id,$trunc Pct from ( $subSql )";
+
+		$queries->{"Migration progress - task status for community $communityId"} = {
+			info => 1,
+			sql => $sql,
+			format => "thread: %s  path: %s  status: %s  current: %s  total: %s  percent complete: %s",
+			uiHint			=> "community $communityId",
+			noRowCount => 1,
+		};
+
+	}
+
+	my $sql = "select 1 from all_tables where table_name='VER_PROGRESS' and owner='ANLIVE1'";
+	my (@rows) = $migOc->executeSql($sql);
+
+	if(@rows) {
+		$sql = "select 1 from mg_disp_queue\@an1 q, schedule_tasks\@an1 s where q.status = 4 and q.item = s.id and s.name = 'ANPartitionMigrationMonitorTask'";
+		(@rows) = $migOc->executeSql($sql);
+		my $error = $migOc->error();
+
+		$queries->{"Failed Verification Tasks"} = {
+			info => "numrows == 0",
+			crit => "numrows >= 1",
+			error => $error,
+			perl => sub { return $error || join("\n", @rows); },
+			uiHint => "Verification",
+		};
+
+		my %verItems;
+		my $verSql = "select COMMUNITY, TABLE_NAME, id from anlive1.VER_PROGRESS order by COMMUNITY, TABLE_NAME";
+		my (@tasks) = $migOc->executeSql($verSql);
+		my $error2 = $migOc->error();
+
+		for(my $i = 0; $i < scalar(@tasks); $i++) {
+			my ($comm, $table, $id) = split(/\t/,$tasks[$i]);
+			my $fixedId = $id;
+			$fixedId =~ s/.*(\d{6})$/$1/;
+
+			$queries->{"Current ID for $table:$comm"} = {
+				info => 1,
+				perl => sub { return $fixedId; },
+				recordMaxResults => 672,
+				recordDataType => "counter",
+				recordItem => "answer",
+				uiHint => "ignore",
+			};
+
+			$table =~ s/_\d+$//;
+			my $compare = (($comm == 1) ? "<" : ">");
+			my $trunc = (($comm == 1) ?
+			"trunc($id*100/final_id, 2)" :
+			"trunc(($id-20000000000000000000000000)*100/(final_id-20000000000000000000000000), 2)");
+			my $pctSql = "select $trunc from (select max(id) final_id from anlive$comm.$table where id $compare 20000000000000000000000000)";
+			my $percent = $migOc->executeSql($pctSql);
+
+			if($percent < 99.9) {
+				$verItems{"$table:$comm"} = 1;
+			}
+
+			$tasks[$i] .= "\t$percent";
+		}
+
+		my $resultStr = join("\n", @tasks);
+
+		$queries->{"Verification Task Progress"} = {
+			info => 1,
+			error => $error2,
+			noRowCount => 1,
+			perl => sub { return $error2 || $resultStr; },
+			format => "community: %s table_name: %s id: %s percent complete: %s",
+			uiHint => "Verification",
+		};
+
+		if( $runDaily ) {
+			$sql = "select community, table_name, count(*) errors from anlive1.ERROR_PROGRESS group by community, table_name";
+
+			$queries->{"Verification Task Errors"} = {
+				info => "numrows == 0",
+				warn => "numrows > 0",
+				crit => "numrows > 75000",
+				sql => $sql,
+				format => "community: %s table_name: %s count: %s",
+				uiHint => "Verification",
+				"hasErraticSchedule" => 1,
+			};
+		}
+		my @stuckVer;
+		foreach my $table (sort keys %verItems) {
+			my ($tbl, $comm) = split(/:/, $table);
+			my $cdbName = ariba::monitor::Query->generateInstanceName(
+				"Current ID for $tbl:$comm", "an", undef, undef
+			);
+			my $cdb = ariba::monitor::CircularDB->new($cdbName);
+			next unless($cdb);
+			my $lastChanged = $cdb->aggregateUsingFunctionForRecords("lastChanged", "+600");
+			if(defined($lastChanged)) {
+				my $ago;
+				if($lastChanged > 59) {
+					$ago = sprintf("%d hour%s, %d minute%s",
+						int($lastChanged/60),
+						(($lastChanged > 119) ? "s" : ""),
+						($lastChanged % 60),
+						((($lastChanged % 60) != 1) ? "s" : "" ));
+				} else {
+					$ago = sprintf("$lastChanged minute%s",
+						(($lastChanged != 1) ? "s" : ""));
+				}
+				my $str = "$tbl for community $comm last progress $ago ago.";
+				$str = "STALE: $str" if($lastChanged > 180);
+				$str =~ s/STALE/STUCK/ if($lastChanged > 360);
+				push(@stuckVer, $str);
+			}
+		}
+		if(scalar(@stuckVer)) {
+			my $stuckStr = join("\n", @stuckVer);
+			$queries->{"Last Progress for Verification Tasks"} = {
+				info => 1,
+				warn => "answer =~ /STALE/ or answer =~ /STUCK/",
+				#
+				# Don't crit until Yajun sorts out the stuck tasks
+				#
+				# crit => "answer =~ /STUCK/",
+				perl => sub { return $stuckStr },
+				uiHint => "Verification",
+				noRowCount => 1,
+			};
+		}
+	}
+
+	my %indexPctComplete;
+	my $MAX_INDEXES = 781;
+	my $INITIAL_INDEXES = 275;
+	my $NEW_INDEX_COUNT = $MAX_INDEXES - $INITIAL_INDEXES;
+
+	my $indSql = "select owner, count(*) from dba_indexes where owner like 'AN%' group by owner";
+	my (@indexes) = $migOc->executeSql($indSql);
+	my %communities;
+	foreach my $index (@indexes) {
+		my ($comm, $count) = split(/\t/,$index);
+		next if($comm eq "ANLIVE");
+		$queries->{"Number of indexes for community $comm"} = {
+			info => 1,
+			perl => sub { return $count; },
+			recordMaxResults => 672,
+			recordDataType => "counter",
+			recordItem => "answer",
+			uiHint => 'Index Creation/Index Counts',
+		};
+		$communities{$comm} = 1;
+		my $pct = ($count - $INITIAL_INDEXES) * 100 / $NEW_INDEX_COUNT;
+		$pct = int($pct*100)/100;
+		$indexPctComplete{$comm} = $pct;
+	}
+
+	my @indexStatus;
+	my $lowLastChanged = 9999999999;
+	foreach my $comm (sort keys %communities) {
+		my $cdbName = ariba::monitor::Query->generateInstanceName(
+			"Number of indexes for community $comm", "an", undef, undef
+		);
+		my $cdb = ariba::monitor::CircularDB->new($cdbName);
+		next unless($cdb);
+		my $lastChanged = $cdb->aggregateUsingFunctionForRecords("lastChanged", "+600");
+		if(defined($lastChanged)) {
+			my $ago;
+			if($lastChanged > 59) {
+				$ago = sprintf("%d hour%s, %d minute%s",
+					int($lastChanged/60),
+					(($lastChanged > 119) ? "s" : ""),
+					($lastChanged % 60),
+					((($lastChanged % 60) != 1) ? "s" : "" ));
+			} else {
+				$ago = sprintf("$lastChanged minute%s",
+					(($lastChanged != 1) ? "s" : ""));
+			}
+			my $pct = $indexPctComplete{$comm};
+			my $str;
+			if($pct == 100) {
+				$str = "Indexes for community $comm: $pct\% completed.";
+			} elsif ($pct == 0) {
+				$str = "Indexes for community $comm: not yet started.";
+			} else {
+				$str = "Indexes for community $comm: last progress $ago ago, $pct\% completed.";
+				$lowLastChanged = $ago if($lowLastChanged > $ago);
+			}
+			push(@indexStatus, $str);
+		}
+	}
+	$lowLastChanged = 0 if($lowLastChanged == 9999999999);
+	my ($warn, $crit) = (0,0);
+	$warn = 1 if($lowLastChanged > 240);
+	$crit = 1 if($lowLastChanged > 480);
+	if(scalar(@indexStatus)) {
+		my $indexStr = join("\n", @indexStatus);
+		$queries->{"Last Progress for Verification Tasks"} = {
+			info => 1,
+			# warn => "answer =~ /STALE/ or answer =~ /STUCK/",
+			#
+			# Don't crit until Yajun sorts out the stuck tasks
+			#
+			# crit => $crit,
+			warn => $warn,
+			perl => sub { return $indexStr },
+			uiHint => "Index Creation",
+			noRowCount => 1,
+		};
+	}
+	
+	my $migQM = ariba::monitor::QueryManager->newWithDetails('migration-status', 'an', $service, undef, $queries);
+
+	$migQM->setSQLConnectInfoFromDBConnection($migDbc);
+	$migQM->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+}
+
+main();
+

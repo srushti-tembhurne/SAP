@@ -1,0 +1,120 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/edi/queue-status#16 $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+use ariba::Ops::ProductAPIExtensions;
+
+my %queries = ();
+
+sub main{
+	my $debug = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; }
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $edi = ariba::rc::InstalledProduct->new("edi", $me->service());
+
+	my @queues=(
+		"edi_interchange_queue",
+		"edi_out_queue",
+		"edi_status_update_queue",
+		"edi_translation_queue",
+		"edi_trans_queue",
+		"mail_queue",
+	);
+
+	if ($edi->majorReleaseName() >= 2.0) {
+		push(@queues, 
+					"edi_fa_queue",
+					"edi_break_queue",
+			);
+	}
+
+	for my $queue (@queues){
+		my $hours = 2;
+		my $note = undef;
+		my $critRows = 10;
+		my $skipNotifications = 0;
+
+		my $warn = 30;
+		my $crit = 100;
+		my $stuckSql = "select id,item,status,(sysdate-status_changed)*24 stuck_time from $queue where status in ('Queued','Processing') and (sysdate-status_changed)*24 > $hours";
+		my $countSql = "select count(id) from $queue where status in ('Queued','Processing')";
+		
+		if ($queue eq 'edi_fa_queue') {
+			$warn = 1000;
+			$crit = 4000;
+		} elsif ($queue eq 'edi_out_queue') {
+			$warn = 100;
+			$crit = 150;
+		} elsif ($queue eq 'edi_interchange_queue') {
+			$warn = 40;
+		} elsif ($queue eq 'edi_status_update_queue') {
+			$warn = 250;
+			$crit = 400;
+			$critRows = 40;
+		} elsif ($queue eq 'edi_translation_queue') {
+			$warn = 300;
+			$crit = 3000;
+		} elsif ($queue eq 'edi_trans_queue') {
+			$warn=4000;
+			$crit=8000;
+			my $tm = time();
+			$stuckSql = "select /*+ INDEX(edi_trans_queue IND_AB537CA5_D5BE9811) */ id, item, decode(status, 1, 'Queued', 2, 'Processing', 'Unknown' || status),round(($tm - (status_changed/1000))/3600) stuck_time from $queue where status in (1, 2) and $tm - (status_changed/1000) > $hours * 3600";
+			$countSql = "select /*+ INDEX(edi_trans_queue IND_AB537CA5_D5BE9811) */ count(id) from $queue where status in (1,2)";
+		}
+		
+		$queries{"$queue: items stuck more than $hours hrs"}= 
+		{
+			  recordMaxResults => 20000,
+			  recordDataType=> "gauge",
+			  recordItem => "numrows",
+			  info => "numrows > -1",
+			  warn => "numrows > 0",
+			  crit => "numrows > $critRows",
+			  format => "$queue.id %d $queue.item %d  %s %d hours\n",
+
+			  note => $note,
+
+			  sql => $stuckSql,
+		};
+
+		$queries{"$queue: queue length (Queued, Processing)"}=
+		{
+			recordMaxResults => 20000,
+			recordDataType=> "gauge",
+			info => "answer > -1",
+			warn => "answer > $warn",
+			crit => "answer > $crit && previousAnswer > $crit",
+			skipNotifications => $skipNotifications,
+
+			sql => $countSql,
+		};
+	}
+
+	my $email = $me->default('notify.email');
+
+	my $q = ariba::monitor::QueryManager->newWithDetails(
+		"queue-status", "edi", $me->service, $me->customer(), \%queries
+	);
+
+	$q->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($edi));
+
+	$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

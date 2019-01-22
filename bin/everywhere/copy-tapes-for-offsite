@@ -1,0 +1,126 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/everywhere/copy-tapes-for-offsite#13 $
+#
+# This script makes offsite tape copies
+# Run syntax is copy-tapes-for-offsite <-d|-e|-p> <-primary|-secondary|-tertiary> <backup_name> <slot_number(s)>
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib qw(/usr/local/ariba/lib);
+
+use ariba::Ops::CFEngine::MonitoringGlueUtils;
+use ariba::Ops::Constants;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::NotificationRequest;
+use ariba::monitor::misc;
+use ariba::monitor::StatusPage;
+
+sub main {
+
+    my $debug     = 0;
+    my $sendEmail = 1;
+    my $sendPage  = 0;
+
+        my $fromDevice = 0; # source drive index
+        my $toDevice   = 1; # target drive index
+        my @backupSlots;    # command line parameters (backup name + slot number(s))
+        
+        while (my $arg = shift(@ARGV)) {
+                if ($arg =~ /^-d/o) { $debug++; };
+        if ($arg =~ /^-e/o) { $sendEmail = 1; };
+        if ($arg =~ /^-p/o) { $sendPage = 1; };
+
+                if ($arg =~ /^-primary/)   { $fromDevice = 0; $toDevice = 1; }; # use drive1 & drive2
+                if ($arg =~ /^-secondary/) { $fromDevice = 2; $toDevice = 3; }; # use drive3 & drive4
+        if ($arg =~ /^-tertiary/)  { $fromDevice = 4; $toDevice = 5; }; # use drive5 & drive6
+                if ($arg !~ /^-/o)         { push(@backupSlots, $arg); next; };
+        }
+
+    my $progName     = 'copy-tapes-for-offsite';
+    my $hostname     = ariba::Ops::NetworkUtils::hostname();
+    my $machine  = ariba::Ops::Machine->new($hostname);
+
+    # tape drives
+    my @tapeDevices  = ariba::monitor::misc::tapeRobotDevicesForDatacenter($machine->datacenter());
+
+    # ONSITE media pool
+    my $onsitePool = $backupSlots[0] . "_ONSITE";
+
+    # starting slot # of offsite tapes
+    my $targetSlot   = 1;
+    my %media        = ();
+
+    # NotificationRequest requires these.
+    my $server   = ariba::Ops::CFEngine::MonitoringGlueUtils::monitorServer($hostname);
+    my $product  = ariba::monitor::StatusPage::fakeProductNameForDatacenter($machine->datacenter());
+    my $service  = $machine->service(); # this is often wrong, but at least correct for prod
+    my $customer = undef;
+    my $to       = ariba::Ops::Constants->operationsEmailNotificationAddress();
+
+    # all media in ONSITE pool for the week
+    open(USEDMEDIA, "/opt/omni/bin/omnimm -list_pool $onsitePool -detail |") or die $!;
+
+    # Only get the name of the backup job.
+    while (my $line = <USEDMEDIA>) {
+
+        next unless $line =~ /$backupSlots[0]/;
+
+        $media{ (split(/\s+/, $line))[4] } = 1;
+    }
+
+    close(USEDMEDIA);
+
+    # Start the monitoring section.
+    my %queries = ();
+
+    for my $media (sort sortbyslot keys %media) {
+
+                # Start media replication & verify copy result
+                my @elements    = split(/_/, $media);
+
+        my ($srcSlot)   = $elements[3] =~ /^0*(\d+)$/;          # strip leading 0s from onsite slot
+                my $tgtSlot     = sprintf("%03d", $backupSlots[$targetSlot]);   # prepend leading 0s to offsite slot
+
+                my $targetLabel = join('_', ('OFF', $elements[1], $elements[2], $tgtSlot, $elements[4]));
+                my $targetPool  = join('_', ($elements[1], $elements[2], 'OFFSITE'));
+
+                print "Working on: Label: [$targetLabel] Pool: [$targetPool]\n" if $debug;
+
+                my $recycleResult = `/opt/omni/bin/omnimm -recycle $targetLabel`;
+
+                my $copyResult    = `/opt/omni/bin/omnimcopy -copy $tapeDevices[$toDevice] -slot $backupSlots[$targetSlot] -from $tapeDevices[$fromDevice] -src_slot $srcSlot -pool $targetPool -label $targetLabel -force -permanent`;
+
+        my $allResults = $recycleResult.$copyResult;
+
+        if ($allResults !~ /1 media out of 1 successfully copied/) {
+
+            # Send out a separate notificationRequest with more data.
+            my $subject = "Offsite copy, slot $srcSlot -> $backupSlots[$targetSlot] failed!";
+
+            my $notificationRequest = ariba::Ops::NotificationRequest->newWarn(
+                $progName, $product, $service, $customer, undef, $subject, $allResults, $to
+            );
+
+            $notificationRequest->setDebug($debug);
+            $notificationRequest->send();
+        }
+
+        $targetSlot++;
+    }
+}
+
+sub sortbyslot {
+        $a =~ /^.*_.*_.*_(\d+)_.*$/;    # ex. ON_AN_ORAFULL_100_WK1
+        my $slotA = $1;
+        $b =~ /^.*_.*_.*_(\d+)_.*$/;    # ex. ON_AN_ORAFULL_100_WK1
+        my $slotB = $1;
+        $slotA <=> $slotB;
+}
+
+main();
+
+__END__

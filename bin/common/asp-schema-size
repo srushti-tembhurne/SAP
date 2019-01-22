@@ -1,0 +1,63 @@
+#!/usr/local/bin/perl
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::rc::CipherStore;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+
+my $debug = 0;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while ( my $arg = shift ) {
+		if($arg =~ /^-d$/i) { $debug++; }
+		if($arg =~ /^-e$/i)  { $sendEmail=1; }
+		if($arg =~ /^-p$/i)  { $sendPage=1; }
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	# my $cipherStore = ariba::rc::CipherStore->new($me->service());
+
+	my @asp = ariba::rc::Globals::allASPProducts;
+
+	my $sql = "select sum(bytes)/1024/1024 from user_segments";
+	foreach my $prodName (@asp) {
+		my @products = ariba::rc::InstalledProduct->installedProductsList($me->service(),$prodName);
+
+		foreach my $product (@products) {
+			print "Product ", $product->name(), " Customer ", $product->customer(), "\n" if($debug);
+			my @connections = ariba::Ops::DBConnection->connectionsFromProducts($product);
+			my %q;
+                	for my $dbc ( ariba::Ops::DBConnection->uniqueConnectionsByHostAndSidAndSchema(@connections)) {
+				my $oc = ariba::Ops::OracleClient->newFromDBConnection($dbc);
+				$oc->connect() || next;
+
+				my @results;
+				$oc->executeSqlWithTimeout($sql, 15, \@results) || next;
+				my $result = shift(@results);
+
+				my $qName = "Size of Schema " . $dbc->user() . "\@" . $dbc->host() . " on SID " . $dbc->sid() . " MB";
+				$q{$qName} = {
+					recordDataType => "gauge",
+					recordDataUnits => "absolute",
+					recordMaxResults => 250000,
+					info => 1,
+					perl => sub { return "$result"; },	
+					customer => $product->customer(),
+				};
+
+			}
+			my $qm = ariba::monitor::QueryManager->newWithDetails("size-of-schema", $prodName, $me->service, $product->customer(), \%q);
+			$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+		}
+	}
+}
+
+main(@ARGV);
+

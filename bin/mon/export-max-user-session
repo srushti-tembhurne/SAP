@@ -1,0 +1,255 @@
+#!/usr/local/bin/perl -w
+
+use strict; 
+use lib "/usr/local/ariba/lib"; 
+
+use ariba::monitor::CircularDB; 
+use ariba::rc::InstalledProduct;
+use ariba::Ops::OracleClient; 
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DateTime;
+use Data::Dumper;
+use POSIX;
+
+my $debug = 0;
+my $MAX_DAYS = 365;
+
+sub usage {
+    my $error = shift; 
+    print <<USAGE;
+Usage: $0 <product> <daysToExport> [-realm <name>] [-multiple <num>] [-d|-h]
+Exports the maximum active user sessions for the given product and last number of days
+
+    <product>         Name of the product
+    <daysToExport>    Number of days of data to export
+
+    -realm <name>     Filter for the specified realm only. Otherwise, all realms will be exported. 
+                      This is useful when debugging to limit the data to just one realm.
+
+    -multiple <num>   Filters the data using the specified multiple. Defaults to 1 
+                      Filtering is done by discarding data values above the 75th and below the 25th
+                      percentile values after both values are adjusted with the difference of the 
+                      two values. 
+
+                      Ex. 25th = 4, 75th = 6, diff = 2 * multiple, then low filter = 2, and high filter = 8. 
+                      Any values below/above the low/high filter would be discarded.
+
+    -d                Enable debug mode
+    -h                Show this help 
+
+USAGE
+
+    print "(error) $error\n" if ( $error ); 
+
+    exit(2)
+
+}
+
+sub main {
+    my $product;
+    my $days;
+    my $filterRealm; 
+    my $filterMultiple = 1;
+
+    while ( my $arg = shift ) {
+        if ( $arg =~ /^-h/ )        { usage(); } 
+        if ( $arg =~ /^-d/ )        { $debug++;                   next; }
+        if ( $arg =~ /^-realm/ )    { $filterRealm = shift;       next; }
+        if ( $arg =~ /^-multiple/ ) { $filterMultiple = shift;    next; }
+        
+        if ( $arg !~ /^-/ ) {
+            if ( !$product ) { 
+                $product = $arg;
+            } elsif ( !$days ) { 
+                $days = $arg;
+            } else {
+                usage("Too many unnamed args: $arg"); 
+            }
+        }
+    }
+
+    usage("Must specify product") unless ( $product );
+    usage("Must specify number of days") unless ( $days ); 
+    usage("Number of days must be greater than 0 and less than or equal to $MAX_DAYS") unless ( $days > 0 && $days <= $MAX_DAYS ); 
+    usage("Filter multiple must be greater than 0") unless ( $filterMultiple > 0 );
+
+    my $endTime = time();
+    my $startTime = $endTime - $days * 24 * 60 * 60;
+
+    my $filename = $product . "-last" . $days . "Days-maxSessionsPerRealm.csv";
+
+    print "Exporting data with the following attributes:\n\n";
+    print "     Product: $product\n";
+    print "       Realm: $filterRealm\n" if ( $filterRealm );
+    print "  Start Time: " . localtime($startTime), "\n"; 
+    print "    End Time: " . localtime($endTime), "\n\n"; 
+
+    my @cdbs = ariba::monitor::CircularDB->listDBs($product, 'number_of_active_sessions'); 
+    my $totalCdbs = scalar(@cdbs);
+
+    print "Found $totalCdbs realms/cdbs to process\n";
+
+    open(my $fh, "> $filename") || die $!;
+    print $fh "Realm Name,Realm ID,Max Active Sessions In Last $days Days\n";
+
+    my %sumData;
+    my %realmSession;
+    my $cdbsProcessed = 0;
+    my %printedProgressPct; 
+
+    foreach my $cdb (@cdbs) {
+
+        $cdbsProcessed++;
+        my $pctProcessed = int($cdbsProcessed / $totalCdbs * 100);
+        if ( $pctProcessed && ($pctProcessed % 10 == 0) && !$printedProgressPct{$pctProcessed} ) {
+            print "Progress: $pctProcessed% completed\n"; 
+            $printedProgressPct{$pctProcessed} = 1; 
+        }
+
+        next unless ($cdb->name() =~ /^(.+) \(id (\d+)\)/);
+        my $realmName = $1;
+        my $realmId = $2;
+
+        next if ( $filterRealm && $filterRealm ne $realmName );
+
+        debug("Processing data for realm '$realmName'");
+
+        my @records = $cdb->readRecords($startTime, $endTime);
+        $cdb->_closeDB();
+        next unless (@records);
+
+        debug("Read ", scalar(@records), " reords from cdb");
+        
+        my $maxValue = 0; 
+        my $dailyMaxValue = 0;
+        my @values;
+        my $lastDay = -1;
+
+        foreach my $record (@records) { 
+            next unless (defined($record->[0]) && defined($record->[1]));
+            my ($sec, $min, $hour, $day, $month, $year) = localtime($record->[0]);
+            if ($sec > 30) {
+                $min++; 
+            }; 
+            $sec = 0; 
+            if ($min > 60) {
+                $min = 0; 
+                $hour++; 
+            } 
+            $record->[0] = mktime($sec, $min, $hour, $day, $month, $year);
+            $sumData{$record->[0]} += $record->[1];
+            $maxValue = $record->[1] if ($record->[1] > $maxValue);
+            $dailyMaxValue = $record->[1] if ($record->[1] > $dailyMaxValue);
+            if ($day && $lastDay && $lastDay != $day) {
+                push(@values, $dailyMaxValue);
+                $lastDay = $day;
+                debug("Daily Max Value for $month/$day: $dailyMaxValue", 2);
+                $dailyMaxValue = 0;
+            }
+        }
+
+        my $numOfValues = scalar(@values);
+        debug("Number of daily data points: $numOfValues");
+        debug("Max data point: $maxValue");
+
+        if ( $numOfValues > 10 ) { 
+            @values = sort { $a <=> $b } @values; 
+            my $lowerIndex = int(0.25 * $numOfValues); 
+            my $upperIndex = int(0.75 * $numOfValues); 
+            my $diff = $values[$upperIndex] - $values[$lowerIndex]; 
+            my $multi = $diff * $filterMultiple;
+            my $low = $values[$lowerIndex] - $multi; 
+            my $high = $values[$upperIndex] + $multi; 
+            $maxValue = 0; 
+            debug("Filtering data points with following criteria:\n" . 
+                "\t  Low Index: $lowerIndex\n" . 
+                "\t High Index: $upperIndex\n" . 
+                "\t  Low Value: " . $values[$lowerIndex] . "\n" . 
+                "\t High Value: " . $values[$upperIndex] . "\n" . 
+                "\t    LH Diff: $diff\n" . 
+                "\t   Multiple: $filterMultiple\n" . 
+                "\tMulti Value: $multi\n" . 
+                "\t Low Filter: $low\n" . 
+                "\tHigh Filter: $high");
+            debug("Data point values lower than $low or higher than $high will be discarded");
+            foreach my $value (@values) {
+                next if ($value > $high || $value < $low); 
+                $maxValue = $value if ($value > $maxValue);
+            }
+            debug("New max data point: $maxValue");
+        } 
+            
+        if (!$realmSession{$realmId} || $realmSession{$realmId} < $maxValue) {
+            $realmSession{$realmId}{'maxValue'} = $maxValue;
+            $realmSession{$realmId}{'realmName'} = $realmName;
+        }
+
+    }
+    print "Finished processing data\n\n";
+    print "Writing data to $filename\n";
+
+    foreach my $realmId (sort keys %realmSession ) {
+        my $realmName = $realmSession{$realmId}{'realmName'}; 
+        my $maxValue = $realmSession{$realmId}{'maxValue'};
+        print $fh "$realmName,$realmId,$maxValue\n";
+    }
+
+    close($fh);
+
+    my $cdbFileName = "$product-active-session.cdb";
+
+    print "Also, saving data to cdb /var/mon/circular-db/$cdbFileName\n";
+
+    my @records;
+    foreach my $time (sort(keys %sumData)) {
+        push(@records, [$time, $sumData{$time}]); 
+    }
+
+    my $cdb = ariba::monitor::CircularDB->new("$product-active-session.cdb", "Active Sessions for s4", 
+        1000000);
+    $cdb->writeRecords(@records); 
+
+    print "All done!\n";
+}
+
+sub debug {
+    my $msg = shift; 
+    my $level = shift || 1;
+
+    print "(debug) $msg\n" if ( $debug && $debug >= $level && $msg ); 
+}
+
+main(@ARGV)
+
+__END__
+
+if (0) {
+my $pi = ariba::rc::InstalledProduct->new($product, "prod"); 
+my $oc = ariba::Ops::OracleClient->new($pi->connectInfoForOracleClient()); 
+my @results;
+
+unless ($oc->connect && $oc->executeSqlWithTimeout("Select realmid, databaseschema from schematypemaptab where schematype = 'Transactional'", undef, \@results)) {
+    print "Failed to connect to ", $oc->user(), '@', $oc->sid(), '@', $oc->host(), "\n"; 
+    print "Error: ", $oc->error(), "\n";
+}
+
+my %schemaRealmCount;
+my %sidRealmCount;
+my %realmIdToSchemaId = map { 
+    my ($realmId, $schemaName) = split(/\s+/, $_); 
+    my ($schemaId) = ($schemaName =~ /(\d+)$/);
+    $schemaRealmCount{$schemaId}++;
+    $sidRealmCount{'tx1'}++ if ($schemaId < 13); 
+    $sidRealmCount{'tx2'}++ if ($schemaId >= 13);
+    $realmId => $schemaId; 	
+    } @results; 
+use Data::Dumper;
+my @sortedSchemaRealmCount = map {
+    "$_ => $schemaRealmCount{$_}"
+} sort keys(%schemaRealmCount);
+
+print Dumper(\%realmIdToSchemaId); 
+print Dumper(\@sortedSchemaRealmCount);
+print Dumper(\%sidRealmCount);
+die;
+}

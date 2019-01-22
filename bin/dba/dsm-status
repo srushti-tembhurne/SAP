@@ -1,0 +1,109 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/dba/dsm-status#2 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DatasetManager;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -prod product
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $productName;
+
+    while (my $arg = shift @ARGV) {
+        if ($arg =~ /^-h$/o)   { usage();         next; }
+        if ($arg =~ /^-d$/o)   { $debug++;        next; }
+        if ($arg =~ /^-e$/o)   { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o)   { $sendPage  = 1;  next; }
+        if ($arg =~ /^-prod/o) { $productName = shift(@ARGV); next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $service = $me->service();
+    my %queries;
+
+    unless (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
+        print "ERROR: $productName is not installed in $service\n";
+        exit(-1);
+    }
+
+    my $lock   = ariba::Ops::DatasetManager::Lock->newFromProductAndService($productName, $service);
+    my $ds     = $lock->dataset();
+    my $action = $lock->action();
+    my $status = $lock->status();
+    my $user   = $lock->user();
+    my $host   = $lock->host();
+
+    next unless $ds;
+
+    my $lockAttr = [$ds, $action, $status, $user, $host];
+
+    $queries{"Dataset Manager Restore Status for $productName $service"} = {
+        info    => "!defined(answer) || answer eq 'Finished'",
+        warn    => "answer eq 'Detached' || answer eq 'Running'", 
+        perl    => sub { return $status; },
+        uiHint  => "dataset manager status",
+        processAnswer => sub { getWarn($lockAttr) }, 
+        description => 'Dataset Manager status monitoring', 
+    };
+
+    my $email = $me->default('notify.email');
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails("dba", $productName, $service, undef, \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+sub getWarn {
+    my $lockAttr = shift;
+
+    my $ds     = $lockAttr->[0];
+    my $action = $lockAttr->[1];
+    my $status = $lockAttr->[2];
+    my $user   = $lockAttr->[3];
+    my $host   = $lockAttr->[4];
+
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+    my $results = $query->results();
+
+    if ($results =~ /(Detached|Running)/) {
+        my $warnMessage = "dsid $ds is $status owned by $user\@$host"; 
+        $query->setWarn(1);
+
+        return $warnMessage;
+    }
+
+    return $status;
+}
+
+main(@ARGV);
+
+__END__

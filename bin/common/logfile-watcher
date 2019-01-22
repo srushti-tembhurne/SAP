@@ -1,0 +1,203 @@
+#!/usr/local/bin/perl
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProcessTable;
+use ariba::Ops::CFEngine::MonitoringGlueUtils;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use Date::Calc qw(Today_and_Now);
+
+my $debug = 0;
+
+sub main {
+	my %logFiles = ();
+	my %truncatedFiles = ();
+	my %deletedFiles = ();
+	my $sleepDuration = 300;  # in seconds
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $machine  = ariba::Ops::Machine->new($hostname);
+	my $dataCenter = $machine->datacenter();
+
+	my %properties = (
+		'datacenter'       => $dataCenter,
+		'providesServices' => 'syslog',
+		'os'               => 'redhat',
+		'status'           => 'inservice',
+	);
+
+	exit unless ( $machine->hasProperties(%properties) );
+
+	my $server   = ariba::Ops::CFEngine::MonitoringGlueUtils::monitorServer($hostname);
+	my $product  = ariba::monitor::StatusPage::fakeProductNameForDatacenter($dataCenter);
+	my $service  = $machine->service();
+	my $customer = undef;
+	my %queries  = ();
+
+
+	while (1) {
+
+		# Update our list of logs to monitor.
+		updateMonitoredFileList(\%logFiles);
+
+		# Check for logs that were deleted.
+		updateDeletedFileList(\%logFiles, \%deletedFiles);
+
+		# Remove deleted files from the monitored list.
+		pruneFiles(\%logFiles, \%deletedFiles);
+
+		# Remove deleted files from the truncated list.
+		pruneFiles(\%truncatedFiles, \%deletedFiles);
+
+		# See if any files on the monitored list were truncated.
+		updateTruncatedFiles(\%logFiles, \%truncatedFiles);
+
+		# Update monitoring
+		$queries{"$hostname modified files"} = {
+			uiHint => "Syslog",
+			info => "numrows > -1",
+			warn => "numrows > 0", 
+			perl => sub { return join("\n",
+				modifiedFileAlerts(\%deletedFiles, \%truncatedFiles)
+			)},
+		};
+
+		my $q = ariba::monitor::QueryManager->newWithDetails(
+			"Modified File Status", $product, $service, $customer, \%queries
+		);
+
+		if ($debug) {
+			$q->displayToStdout();
+		}
+		else {
+			my $ret = $q->processQueriesUsingServer($debug, 'an_auto_sysadmin@ariba.com', 1, 0, $server);
+		}
+
+		sleep $sleepDuration;
+	}
+}
+
+sub updateMonitoredFileList {
+	my $filelist = shift;
+
+	# Keep track of the last seen file size and reset the current file size to -1.
+	foreach my $f ( keys %$filelist ) {
+		$filelist->{$f}->{'previousSize'} = $filelist->{$f}->{'currentSize'};
+		$filelist->{$f}->{'currentSize'} = -1;
+	}
+
+	my $cmd = '/usr/bin/find /var/log -type f -ls';
+	open(M, "$cmd |") or die "Unable to run command: $!";
+	while (my $line = <M>) {
+		chomp $line;
+
+		my ($inode, $blocks, $perms, $refs, $owner, $group, $size, $mon, $date, $time, $file) = split(/\s+/, $line);
+
+		# Acknowledge every file we see on this pass by setting it's value to its file size.
+		# Once this loop is done any file that still has a value of -1 was deleted.
+		$filelist->{$file}->{'currentSize'} = $size;
+		$filelist->{$file}->{'inode'} = $inode;
+	}
+	close(Z);
+}
+
+sub modifiedFileAlerts {
+	my $deletedFiles = shift;
+	my $truncatedFiles = shift;
+
+	my @alertSummary = ();
+
+	foreach my $f ( keys %$deletedFiles ) {
+		my $time = $deletedFiles->{$f}->{'time'};
+		my $inode = $deletedFiles->{$f}->{'inode'};
+		push(@alertSummary, "$f [${inode}] deleted around $time.");
+	}
+
+	foreach my $t ( keys %$truncatedFiles ) {
+		my $time = $truncatedFiles->{$t}->{'time'};
+		my $inode = $truncatedFiles->{$t}->{'inode'};
+		push(@alertSummary, "$t [${inode}] truncated around $time.");
+	}
+
+	return @alertSummary;
+}
+
+sub updateTruncatedFiles {
+	my $filelist = shift;
+	my $truncatedlist = shift;
+
+	foreach my $f ( keys %$filelist ) {
+		my $currentSize = $filelist->{$f}->{'currentSize'};
+		my $previousSize = $filelist->{$f}->{'previousSize'};
+
+		if ($previousSize > $currentSize) {
+			my ($year, $mon, $date, $hour, $min, $sec) = Today_and_Now();
+
+			# If this is in our log rotate window consider it rotated and don't care about an initial truncation.
+			unless ( inLogrotateWindow($hour, $min) ) {
+				$truncatedlist->{$f}->{'time'} = "$year/$mon/$date $hour:$min:$sec";
+				$truncatedlist->{$f}->{'inode'} = $filelist->{$f}->{'inode'};
+				logMsg(">>> TRUNCATED FILE: $f [" . $truncatedlist->{$f}->{'inode'} . "] truncated from $previousSize to $currentSize around " . $truncatedlist->{$f}->{'time'});
+			}
+		}
+	}
+}
+
+sub updateDeletedFileList {
+	my $filelist = shift;
+	my $deletedFiles = shift;
+
+	foreach my $f ( keys %$filelist ) {
+		if ( $filelist->{$f}->{'currentSize'} == -1 ) {
+			# Note the time when we notice a file has been deleted.
+			my ($year, $mon, $date, $hour, $min, $sec) = Today_and_Now();
+
+			# If this is our log rotate window don't consider it deleted and remove it from our list
+			if ( inLogrotateWindow($hour, $min) ) {
+				delete($filelist->{$f});
+			} else {
+				$deletedFiles->{$f}->{'time'} = "$year/$mon/$date $hour:$min:$sec";
+				$deletedFiles->{$f}->{'inode'} = $filelist->{$f}->{'inode'};
+				logMsg(">>> DELETED FILE: $f [" . $deletedFiles->{$f}->{'inode'} . "] deleted at " . $deletedFiles->{$f}->{'time'});
+			}
+		}
+	}
+}
+
+sub pruneFiles {
+	my $filelist = shift;
+	my $prunelist = shift;
+
+	# Prune deleted files from original list.
+	foreach my $prune ( keys %$prunelist ) {
+		delete($filelist->{$prune});
+	}
+}
+
+sub inLogrotateWindow {
+	my $hour = shift;
+	my $min = shift;
+
+	# We allow for file modifications 10 minutes on either side of midnight due to log rotation.
+	if (($hour == 23 and $min >= 50) or ($hour == 0 and $min <= 10)) {
+		return 1;
+	}
+
+	return 0;
+}
+
+sub logMsg {
+	my $msg = shift;
+	my $ts = scalar localtime;
+	open(LOG, ">>/var/log/modified-file-log");
+	print LOG "${ts}: $msg\n";
+	close(LOG);
+}
+
+main();

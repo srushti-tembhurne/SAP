@@ -1,0 +1,231 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/dba/db-perf#36 $
+#
+# This is a template with bunch of useful dba type queries.
+# New queries can be added, and cronjob setup to either display the results
+# to ops page or log it to a file.
+#
+# This script can be run as 'monprod' unix user.
+# It needs to know oracle users: sys, system and perfstat passwords.
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::OutageSchedule;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DBConnection;
+
+my $debug = 0;
+
+my %influx_data;
+$influx_data{measurement} = 'cookies_dba_db_perf';
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	my ($instance, $user, $pass, $array, @stats, @productNames);
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-prod/o) { $array = \@productNames; next; };
+		if ($arg =~ /^-q/o) { $array = \@stats; next; };
+		if ($arg =~ /^-e/o) { $sendEmail = 1; next; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; next; };
+		if ($arg =~ /^-d/o) { $debug = 1; next; };
+		if ($arg !~ /^-/o ) { push(@$array, $arg); next; };
+	}
+
+	my $me	          = ariba::rc::InstalledProduct->new();
+	my $hostname      = ariba::Ops::NetworkUtils::hostname();
+	my $cluster       = $me->currentCluster();
+	my $email         = $me->default('notify.dba');
+
+	my @products      = ();
+
+	if (@productNames) {
+
+		for my $productName (@productNames) {
+			push(@products, ariba::rc::InstalledProduct->installedProductsList($me->service(), $productName));
+		}
+
+	} else {
+		push(@products, ariba::rc::InstalledProduct->installedProductsList($me->service()));
+	}
+
+	my @dbcs          = ();
+	my @dbconnections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+
+	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbconnections)) {
+
+		my $type        = $dbc->type();
+		my $virtualHost = $dbc->host();
+
+		my $product     = $dbc->product();
+		my $activeHost  = $product->activeHostForVirtualHostInCluster($virtualHost, $cluster);
+
+		if (!$activeHost || $activeHost ne $hostname) {
+			next;
+		}
+
+		if (grep(/topio/, @stats) && $type eq ariba::Ops::DBConnection->typeReporting()) {
+			next;
+		}
+
+		push(@dbcs, $dbc);
+	}
+
+	return unless(@dbcs);
+
+	my $physicalDrOutage = ariba::monitor::OutageSchedule->new(
+		'daily 07:00-08:00',    # bcv-backup s4 snap
+		'daily 19:00-20:00',    # bcv-backup s4 snap
+		'thu 09:00-10:00',      # bcv-backup s4 incrementalPhysical
+	);	
+
+       my $lockfile = "/tmp/db-perf";
+       if (!dmail::LockLib::requestlock($lockfile,5)) {
+           print STDERR "can't grab lock $lockfile\n";
+           next;
+       }
+
+	for my $dbc (@dbcs) {
+
+		my $instance = uc($dbc->sid());
+		my $product = $dbc->product();
+		my $service = $product->service();
+
+		my %queries = ();
+
+		my $isPhysicalDr = $dbc->isDR() && $dbc->isPhysicalReplication();
+		my $drInScheduledOutage = $isPhysicalDr && $physicalDrOutage->isInScheduledOutage();
+
+		for my $stat (@stats) {
+
+			my $uiHint = $stat;
+			$uiHint =~ s/\_/ /g;
+
+			$user = "system";
+
+			$user = "sys" if ($isPhysicalDr);
+
+			if ($stat eq "isup") {
+
+				$queries{"DB [$instance] is up on $hostname for service $service"} = {
+					info => "numrows >= 1",
+					warn => 0, # Show warn during outage if error occurred.
+					crit => "numrows < 1",
+					noCritOnError => $drInScheduledOutage,
+					uiHint => $uiHint,
+					timeout => 30,
+					sql => q`select 'yes' xxx from dual`,
+				};
+
+			} elsif ($stat eq "topio") {
+
+				$queries{"DB topio [$instance] on $hostname for service $service"} = {
+					info => "numrows > -1",
+					warn => "numrows >= 1",
+					timeout => 30,
+					uiHint => $uiHint,
+					sql => q`execute get_top_io()`,
+				};
+
+			} elsif ($stat eq "backup_mode") {
+				
+				next if ($isPhysicalDr);
+
+				$queries{"Datafile(s) in backup mode on [$instance] on $hostname for service $service"} = {
+					info => "answer >= 0",
+					warn => "answer >= 10",
+					crit => "answer >= 30",
+					timeout => 120,
+					uiHint => $uiHint,
+					sql => q`select max(round((sysdate-time)*24*60,2)) max_minutes_in_backup_mode from  v$backup b, dba_data_files d where b.file#=d.file_id and b.status= 'ACTIVE'`,
+				};
+
+			} elsif ($stat eq "perf") {
+
+				$queries{"DB perf [$instance] on $hostname for service $service"} = {
+					info => "numrows > -1",
+					warn => "numrows >= 1",
+					timeout => 20*60,
+					uiHint => $uiHint,
+					sql => q`execute statspack.snap()`,
+				};
+
+				$user = "perfstat";
+
+			} elsif ($stat eq "analyze") {
+
+				$queries{"DB analyze [$instance] on $hostname for service $service"} = {
+					info => "numrows > -1",
+					warn => "numrows >= 1",
+					uiHint => $uiHint,
+					timeout => 120*60,
+					sql => q`execute analyze_user_schema`,
+				};
+			} elsif ($stat eq 'log_sequence') {
+				
+				next if ($isPhysicalDr);
+			
+				my $logSequenceQueryName = "Log Sequence# [$instance] on $hostname for service $service";	
+				$queries{$logSequenceQueryName} = {
+					info => 1,
+					uiHint => $uiHint,
+					recordMaxResults => 110000,
+					sql => q`select sequence# from v$log where status='CURRENT'`,
+				};
+
+				unless ($dbc->isDR()) {
+					my $cdbName = ariba::monitor::Query->generateInstanceName($logSequenceQueryName, $product->name());
+
+					$influx_data{tags} = { service => $service, sid => $instance, hostname => $hostname, product => $product->name() };
+					$queries{"Amount of redo generated in last hour [$instance] on $hostname for service $service"} = {
+						extractRecorded => "change($cdbName, 12)",
+					  	sql => q`SELECT round(sum((blocks*block_size)/(1073741824))) Size_GB FROM v$archived_log WHERE to_char(first_time,'dd-mon-yy hh24') = to_char(sysdate-1/24,'dd-mon-yy hh24') AND dest_id=1 GROUP BY to_char(first_time,'dd-mon-yy hh24')`,
+						format => '%.2f GB/hr',
+						uiHint => 'Redo Logs',
+						recordMaxResults => 110000,
+						description => 'The amount of redo logs generated in last hour. The redo logs are sent over to ' . 
+							'the secondary cluster via dataguard. Excessive amount of logs can break dataguard. The amount ' . 
+							'of logs generated is computed based on the Log Sequence# change in 1 hour times by 100 MB.',
+						correctiveActions => [
+							Ops => 'If amount of logs generated keeps increasing, it may be a problem once it reaches crit, watch closely when warn.' . 
+								'If crit, escalate to DBA.',
+							DBA => 'Watch closely to ensure high amount of generated logs do not break dataguard. Should investigate cause and work with Engineering to address.',
+						],
+					};
+				}
+			}
+
+			$pass = $me->default("dbainfo.$user.password");
+		}
+
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			"dba", $product->name(), $product->service(), undef, \%queries
+		);
+
+		$qm->setSQLConnectInfo($user, $pass, $instance, $hostname);
+
+		$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+		eval {
+			my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+			ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line );
+		};
+	}
+    dmail::LockLib::releaselock($lockfile);
+}
+
+
+main();
+
+__END__
+

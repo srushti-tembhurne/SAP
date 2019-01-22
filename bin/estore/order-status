@@ -1,0 +1,55 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/estore/order-status#3 $
+# $Author: bob.mcgowan $
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+use FindBin;
+use lib "$FindBin::Bin/../../tools/lib/perl";
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Query;
+
+sub main {
+	my $me = ariba::rc::InstalledProduct->new();
+	my $estore = ariba::rc::InstalledProduct->new('estore', $me->service());
+
+	my $email = $me->default('notify.email');
+
+	my $debug = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; }
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	my %q;
+
+	$q{"Orders failed to route to AN"} = {
+		sql => "select id, document_number from es_cxml_document where status='Failed' and document_type='PurchaseOrder'",
+		format => "ID:%d  Document Number:%s",
+		info => 1,
+		warn => "numrows > 0",
+		recordMaxResults => 20000,
+		recordItem => "numrows",
+	};
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails(
+		"order-status", "estore", $me->service, $me->customer(), \%q
+	);
+
+	my $dbc = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndSchemaId($estore, 'main-estorebuyer', 0);
+	$qm->setSQLConnectInfo($dbc->user(), $dbc->password(), $dbc->sid(), $dbc->host());
+
+	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

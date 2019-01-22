@@ -1,0 +1,475 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/queryd#47 $
+#
+# Program to vend access to monitoring
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::misc;
+use ariba::monitor::StatusPage;
+use File::Path;
+use File::Basename;
+use ariba::Ops::Utils;
+use Fcntl;
+use Socket;
+use POSIX qw(WNOHANG);
+
+# temporary, so we can measure QueryManager's lock contention
+use dmail::LockLib;
+
+my $debug = 0;
+my $defaultPort = ariba::monitor::misc::querydPort();
+
+# Number of seconds allowed when processing all commands from a single client.
+# Setting to 1 hour just to be lax / there is no need to be lower. 
+# Be careful not to set too low as multiple scripts writing to the same
+# query manager do lock for awhile, depending on how many of them.
+my $CLIENT_PROCESSING_TIMEOUT = 3600;       
+
+my $qm;
+
+sub logmsg {
+    my $date = scalar(localtime(time));
+    print STDERR "[",$date, "] ", @_;
+}
+
+sub sigchild {
+    wait();
+    $SIG{'CHLD'} = \&sigchild;
+}
+
+sub startServer {
+    my $port = shift;
+
+    $SIG{'PIPE'} = "IGNORE";
+    $SIG{'CHLD'} = "IGNORE";
+
+    my $backlog = 1024; # TMID: 7820, 8265
+
+    my $socket = IO::Socket::INET->new(Listen    => $backlog,
+                                          LocalAddr => '0.0.0.0',
+                                          LocalPort => $port,
+                                          Proto     => 'tcp',
+                      Reuse     => 1,
+                      Timeout   => 60 );
+
+
+    logmsg "listening on tcp port $port\n" if $debug;
+
+    return $socket;
+}
+
+sub command_short {
+    my $socket = shift;
+    my $tag = shift;
+
+    return "short command failed with args:" . join(" ", @_);
+}
+
+sub command_long {
+    my $socket = shift;
+    my $tag = shift;
+
+    my @data = readCommandData($socket);
+    return "read " . scalar(@data) . " lines of input";
+}
+
+sub command_readQueryManager {
+    my $socket = shift;
+    my $tag = shift;
+
+    
+    logmsg "$tag: command_readQueryManager() calling createObjectsFromStream()----\n" if $debug;
+    my @objects = ariba::monitor::QueryManager->createObjectsFromStream($socket);
+    logmsg "$tag: command_readQueryManager() finished createObjectsFromStream()----\n" if $debug;
+
+    $qm = $objects[0];
+
+    if ( defined($qm) ) {
+        $qm->recursiveSave();
+        if ( $debug ) {
+            logmsg "$tag: got the following from client----\n";
+            $qm->saveToStream(*STDERR, 1);
+            logmsg "$tag: --------------------------------\n";
+        }
+        return undef;
+    } else {
+        return "stream unparsable, bad input";  
+    }
+}
+
+sub command_readAppendQueryManager {
+    my $socket = shift;
+    my $tag = shift;
+
+    logmsg "$tag: command_readAppendQueryManager() calling createObjectsFromStream()----\n" if $debug;
+    my @objects = ariba::monitor::QueryManager->createObjectsFromStream($socket);
+    logmsg "$tag: command_readAppendQueryManager() finished createObjectsFromStream()----\n" if $debug;
+
+    $qm = $objects[0];
+
+    unless ( defined($qm) ) {
+        return "stream unparsable, bad input";  
+    }
+
+    # need to set the bogus qm to clean, otherwise it will be written out
+    # during recursiveSave
+    $qm->_clean();
+
+    my %newQueries;
+
+    if ( $debug ) {
+        logmsg "$tag: got the following from client++++\n";
+        $qm->saveToStream(*STDERR, 1);
+        logmsg "$tag: ++++++++++++++++++++++++++++++++\n";
+    }
+
+    unless($qm->lock()) {
+        logmsg "$tag: command_readAppendQueryManager() failed to acquire lock----\n" if $debug;
+		return undef; # don't flag an error here
+        # return "could not acquire lock to update queryManager for " . $qm->instance();
+    }
+
+    # save all the children
+    
+    for my $query ( $qm->queries() ) {
+        $query->recursiveSave();
+        $newQueries{$query->instance()} = $query;
+    }
+
+    # if the query manager doesn't exist on disk yet, we need to write this
+    # one out
+    $qm->_dirty();
+
+    logmsg "$tag: command_readAppendQueryManager() checking if objects exists on disk----\n" if $debug;
+
+    # check if $qm exists on disk, if yes, merge the list of queries
+    if ( ariba::monitor::QueryManager->_objectWithNameExistsInBackingStore($qm->instance()) ) {
+
+        my $uiManager = $qm->uiManager();
+
+        # smoke $qm from ariba::monitor::QueryManager cache
+        ariba::monitor::QueryManager->_removeObjectFromCache($qm);
+
+        # fetch the old $qm from disk
+        $qm = ariba::monitor::QueryManager->new( $qm->instance() );
+        $qm->setUiManager($uiManager) if ($uiManager);
+
+        if ( $debug ) {
+            logmsg "$tag: ----fetched from disk qm--------\n";
+            $qm->print(*STDERR);
+            logmsg "$tag: -------------------------------------\n";
+        }
+
+        # and mark all the other queries as skipNotifications(1), and make
+        # sure we do not record results (in cdb) for children that have
+        # already had their results recorded.
+
+        my @children = $qm->queries();
+        for my $child ( @children ) {
+            if ( defined($newQueries{$child->instance()}) ) {
+                delete( $newQueries{$child->instance()} );
+            } else {
+                $child->setSkipNotifications(1);
+                $child->setRecordMaxResults(0);
+            }
+        }
+
+        # at this point %queries only contains new queries
+
+        if ($debug) { 
+            for my $k ( values %newQueries ) {
+                logmsg "$tag: Will append ",$k->instance(), "\n";
+            }
+        }
+        
+        $qm->appendToQueries( values(%newQueries) );
+
+        if ( $debug ) {
+            logmsg "$tag: ----after append from qm--------\n";
+            $qm->print(*STDERR);
+            logmsg "$tag: -------------------------------------\n";
+        }
+
+         # fix our staleness and status
+         # assumes we aren't runInParallel()
+
+         my %status;
+         my $isStale = 0;
+         my $runTime = 0;
+         my $checkTime;
+
+         for my $query ( $qm->queries() ) {
+            $status{$query->status()}++;
+            $isStale = $isStale || $query->isStale();
+            $runTime += $query->runTime();
+            $checkTime = $query->checkTime() if (!$checkTime || $checkTime > $query->checkTime());
+         }
+
+        #
+        # if the qm is stale because all the queries in it are stale,
+        # its status was also updated by stale-markerd, leave it alone.
+        #
+        unless ( $isStale ) {
+            $qm->setStatus( ariba::monitor::StatusPage::computeStatus(\%status) );
+        }
+        
+        $qm->setIsStale($isStale);  
+        $qm->setRunTime($runTime);
+        $qm->setCheckTime($checkTime);
+        $qm->recomputeStatus();
+
+        logmsg "$tag: command_readAppendQueryManager() merging queries----\n" if $debug;
+        my @q = $qm->queries();
+        @q = sort { $a->queryName() cmp $b->queryName() } @q;
+        $qm->setQueries(@q);
+
+    }
+
+    my $name = $qm->name();
+    logmsg "$tag: command_readAppendQueryManager() going to save $name----\n" if $debug;
+    my $ret;
+    if ( $qm->save() ) {
+        logmsg "$tag: command_readAppendQueryManager() saved $name---\n" if $debug;
+    } else { 
+        logmsg "$tag: command_readAppendQueryManager() saving $name failed ----\n" if $debug;
+        $ret = "qm->save() failed";
+    }
+
+    $qm->unlock();
+
+    # now $qm is ready to have NotifyAboutStatus called
+    # and only the new ones will get notified
+
+    return $ret;
+}
+
+sub command_notifyForStatuses {
+    my $socket = shift;
+    my $tag = shift;
+    my $notifyEmailAddress = shift;
+    my $notifyForWarns = shift;
+    my $notifyForCrits = shift;
+
+    if ( defined($qm) ) {
+        $qm->notifyForStatuses($notifyEmailAddress, $notifyForWarns, $notifyForCrits);
+        return undef;
+    } else {
+        return "must do readQueryManager first to upload qm";
+    }
+}
+
+sub command_notifyAboutStatus {
+    my $socket = shift;
+    my $tag = shift;
+    my $warnEmail = shift;
+    my $critEmail = shift;
+
+    if ( defined($qm) ) {
+        $qm->notifyAboutStatus($warnEmail, $critEmail);
+        return undef;
+    } else {
+        return "must do readQueryManager first to upload qm";
+    }
+}
+
+sub command_archiveResults {
+        my $socket = shift;
+        my $tag = shift;
+
+        if ( defined($qm) ) {
+                $qm->archiveResults();
+                return undef;
+        } else {
+                return "must do readQueryManager first to upload qm";
+        }
+}
+
+sub command_setClientName {
+    my $socket = shift;
+    my $tag = shift;
+    my $remoteName = shift;
+
+    $0 .= $remoteName;
+    return undef;
+}
+
+sub readCommandData {
+    my $in = shift;
+
+    my @data;
+
+    while(my $line = <$in>){
+        chomp($line);
+        $line =~ s|\cM||o;
+
+        last if $line eq ".";
+
+        push(@data, $line);
+    }
+    return @data;
+}
+
+sub processCommands {
+    my $socket = shift;
+    my $tag = shift;
+
+    select($socket);
+    $|=1;
+
+    logmsg "\n\nconnection from $tag:\n\n" if $debug;
+    print $socket "ok: queryd welcomes you $tag\n";
+    $socket->flush();
+
+    # get command from client
+
+    logmsg "$tag: waiting for command from client\n" if $debug;
+
+    while( my $input = <$socket> ) {
+        chomp($input);
+        $input =~ s|\cM||o;
+
+        my $result = "command failed";
+
+        logmsg "$tag: got command \"$input\"\n" if $debug;
+
+        my ($command, @args) = split(/\s/, $input);
+
+        # call command
+        if ( $command eq "quit" ) {
+            print $socket "ok: goodbye\n";
+            return; 
+
+        } else {
+            my $sub = "command_$command";
+            no strict 'refs';
+            $@ = undef;
+            $result = eval "&\$sub(\$socket, \$tag, \@args);"
+        }
+
+        # return results
+
+        my $reply;
+        if ( $result ) {
+            $reply = "error: $result\n";
+        } else {
+            if ( $@ ) { 
+                # eval returned error, but
+                # we tell clients OK to protect against
+                # minor protocol mismatches when upgrading
+                my $evalError = $@;
+                chop($evalError);
+                $reply = "ok: $input [$evalError]\n";   
+            } else {
+                $reply = "ok: $input\n";    
+            }
+        }
+        print $socket $reply;   
+        logmsg "$tag: replied -- $reply" if $debug;
+
+        $socket->flush();
+        logmsg "$tag: waiting for command from client\n" if $debug;
+    }
+}
+
+sub usage {
+    print "queryd [-h] [-d] [-l filename] [port]\n";
+    print "   -h this help\n";
+    print "   -d debug\n";
+    print "   -l <filename> log debugging to this file\n";
+    print "   <port> use port instead of default port $defaultPort\n";
+    print "\n";
+    exit(1);
+}
+
+sub main {
+    my $port;
+    my $logfile;
+
+    while(my $arg=shift(@ARGV)){
+        if( $arg =~ /^-d/o ){ $debug = 1; next };
+        if( $arg =~ /^-l/o ){ $logfile = shift(@ARGV); next };
+        if( $arg =~ /^-h/o ){ usage(); };
+        if( $arg =~ /^\d+/o ){ $port = $arg; next };
+    }
+
+    $port = $defaultPort unless defined($port);
+
+
+    if ( defined($logfile) ) {
+        open(STDERR, "> $logfile") || die "can't log to $logfile: $!";
+    }
+
+    logmsg "starting with debugging enabled\n" if $debug;
+
+    my $serverSocket = startServer($port);
+
+    unless ( defined($serverSocket) ) {
+        die "couldn't get server socket: $!\n";
+    }
+
+    my $clients = 0;
+
+    local(*CLIENT);
+
+    while (1) {
+        $clients++;
+        logmsg "main loop $clients: calling accept()\n" if $debug;
+
+        #my ($client, $addr) = $serverSocket->accept();
+        my $client = *CLIENT;
+        my $addr = accept($client, $serverSocket);
+
+
+        logmsg "\n\nmain loop $clients: accept()'ed\n" if $debug;
+
+        next unless ($client);
+
+        my ($fromPort, $inetaddr) = unpack_sockaddr_in($addr);
+        my $fromAddr = inet_ntoa($inetaddr);
+
+        my $pid;
+        my $tag = "$clients=$fromAddr:$fromPort";
+
+        if ( ($pid = fork()) == 0 && defined($pid) ) {
+            $0 = "queryd $tag";
+
+            close($serverSocket);
+            
+            my $codeRef = sub { processCommands($client, $tag); };
+            
+            if ( ariba::Ops::Utils::runWithTimeout($CLIENT_PROCESSING_TIMEOUT, $codeRef) ) { 
+                logmsg "$tag: pid $$ exiting for client\n" if $debug;
+            } else {
+                logmsg "$tag: pid $$ timed out while processing commands after $CLIENT_PROCESSING_TIMEOUT sec(s)\n" if ( $debug );
+            }
+
+            close($client);
+            exit(1);
+        }
+
+        if ( defined($pid) ) {
+            logmsg "main loop $clients: forked pid $pid for client $tag\n" if $debug;
+        } else {
+            logmsg "main loop failed to fork child $tag!\n" if $debug;
+        }
+
+        logmsg "main loop $clients: calling waitpid(WNOHANG)\n" if $debug;
+        waitpid(-1, WNOHANG);
+
+
+        if ( ! $clients % 30 ) {
+            logmsg "LockLib request stats after $clients clients\n";
+            dmail::LockLib::printLockRequestStats(*STDERR);
+        }
+
+    }
+}
+
+main();

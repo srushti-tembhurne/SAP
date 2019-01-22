@@ -1,0 +1,338 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/everywhere/crontab-scrubber#8 $
+#
+# Script to go identify and optionally clean orphaned/old
+# automatically installed cronjobs 
+#
+
+use warnings;
+use strict;
+
+use FindBin;
+use lib (
+	"$FindBin::Bin/../lib/perl",
+	"$FindBin::Bin/../../lib/perl",
+	"$FindBin::Bin/../lib",
+	"$FindBin::Bin/../../lib",
+	"$FindBin::Bin/../../tools/lib/perl",
+	"$FindBin::Bin/../../../tools/lib/perl",
+	"$FindBin::Bin/../../tools/lib",
+	"$FindBin::Bin/../../../tools/lib",
+);
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use ariba::rc::Globals;
+use ariba::rc::CipherStore;
+
+use ariba::Ops::Constants;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Machine;
+
+use ariba::util::Crontab;
+use ariba::util::Cronjob;
+
+use ariba::Ops::ControlDeploymentHelper;
+
+
+my $EXIT_PROD_NOT_INSTALLED = 1;
+my $EXIT_OK = 0;
+my $EXIT_FOUND_BAD_CRONJOBS = 2;
+
+# my @CRON_USERS = qw(oracle root);
+
+sub main {
+
+	my ($pname, $service, $customer, $build);
+	my $cluster = 'primary';
+	my $remote;
+	my $datacenter;
+	my $fixit;
+	my $specificHosts;
+	my $monitor = 0;
+	my $debug = 0;
+	my $sendPage = 0;
+	my $sendEmail = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-cluster/i) { $cluster = shift(@ARGV); }
+		elsif ($arg =~ /^-datacenter/i) { $datacenter = shift(@ARGV); }
+		elsif ($arg =~ /^-h(ost)?/i) { $specificHosts = shift(@ARGV); }
+		elsif ($arg =~ /^-fix/i) { $fixit = 1; }
+		elsif ($arg =~ /^-product/i) { $pname = shift(@ARGV); }
+		elsif ($arg =~ /^-service/i) { $service = shift(@ARGV); }
+		elsif ($arg =~ /^-customer/i) { $customer = shift(@ARGV); }
+		elsif ($arg =~ /^-buildname/i ) { $build = shift(@ARGV); }
+		elsif ($arg =~ /^-remote/i) { $remote = 1; }
+		elsif ($arg =~ /^-monitor/i) { $monitor = 1; }
+		elsif ($arg =~ /^-d/i) { $debug = 1; }
+		elsif ($arg =~ /^-p/i) { $sendPage = 1; }
+		elsif ($arg =~ /^-e/i) { $sendEmail = 1; }
+		else {
+			print "unknown arg: $arg\n";
+			print "If you are trying to run this by hand, you probably want:\n\n
+";
+			print "/usr/local/ariba/bin/crontab-scrubber -service $service -product mon -datacenter $datacenter [-host \$hostname] -fix\n";
+			print "\n";
+			exit(-1);
+		}
+	}
+
+	if($monitor) {
+		eval { use ariba::monitor::QueryManager; };
+
+		$pname = "mon";
+		ariba::Ops::ControlDeploymentHelper->setQuiet(1) unless($debug);
+		ariba::Ops::ControlDeploymentHelper->setLogging(0);
+	}
+
+	#
+	# $product isn't actually used in remote mode, so don't load it up.
+	# (products aren't installed everywhere, so this can break otherwise)
+	#
+	my ($product, $email);
+	unless($remote) {
+		$product = ariba::rc::InstalledProduct->new($pname, $service, $build, $customer);
+		unless ($product) {
+			print "can't find installed $pname / $service\n";
+			exit($EXIT_PROD_NOT_INSTALLED);
+		}
+		$email = $product->default('ops.notify.email') || $product->default('notify');
+	}
+
+	my $server;
+	if($monitor && !$remote) {
+		$server = ($product->hostsForRoleInCluster('monserver', $product->currentCluster()))[0];
+		my $backupServer = ($product->hostsForRoleInCluster('backup-monserver', $product->currentCluster()))[0];
+
+		my $machine = ariba::Ops::Machine->new($server);
+		$datacenter = $machine->datacenter();
+		if($backupServer) {
+			$machine = ariba::Ops::Machine->new($backupServer);
+			if($machine && $machine->datacenter()) {
+				$datacenter .= "," . $machine->datacenter();
+			}
+		}
+	}
+
+	my $depUser = ariba::rc::Globals::deploymentUser($pname, $service);
+	my %usersHash = ();
+
+	my @pnames = ariba::rc::Globals::allProducts();
+
+	my @services;
+	if($monitor) {
+		@services = ( $service );
+	} else {
+		@services = ariba::rc::Globals::servicesForDatacenter($datacenter);
+	}
+
+	unless (@services) {
+		print "No services found that run in datacenter $datacenter\n";
+		exit($EXIT_PROD_NOT_INSTALLED);
+	}
+
+	unless($monitor) {
+		ariba::rc::Passwords::initialize($service);
+	}
+
+	my %rootProds;
+	foreach my $s (@services) {
+		foreach my $p (@pnames) {
+			my $user = ariba::rc::Globals::deploymentUser($p, $s);
+
+			push(@{$usersHash{$user}}, 
+				ariba::rc::InstalledProduct->installedProductsList($s, $p)
+			);
+			
+			push(@{$usersHash{'root'}}, 
+				ariba::rc::InstalledProduct->installedProductsList($s, $p)
+			);
+	
+			push(@{$usersHash{'oracle'}}, 
+				ariba::rc::InstalledProduct->installedProductsList($s, $p)
+			);
+		}
+	}
+
+	if ($remote) {
+		ariba::rc::Utils::refreshSudoPrompt($depUser) unless ariba::rc::Globals::isPersonalService($service);
+		my $exitStatus = $EXIT_OK;
+
+		my @users = keys %usersHash;
+		for my $user ( @users ) {
+			my $crontab = loadCrontab($user);
+
+			$exitStatus = processCrontab($crontab, $usersHash{$user}, $fixit) || $exitStatus;
+		}
+		exit($exitStatus);
+	}
+
+	my $master;
+	unless($monitor) {
+		$master = ariba::rc::Passwords::lookup('master');
+	}
+
+	my $maxParallelProcesses = 8;
+	ariba::Ops::ControlDeploymentHelper->setMaxParallelProcesses($maxParallelProcesses);
+
+	my $startTime = time();
+
+	my @hosts;
+
+	if ($specificHosts) {
+		@hosts = split(/,/, $specificHosts);
+
+	} elsif ($datacenter) {
+		@hosts = map { $_->hostname() } ariba::Ops::Machine->machinesWithProperties(
+				datacenter => $datacenter,
+				'!providesServices' => 'bastion',
+				providesServices => 'mon,app,db,backup,copyhost,storage,web',
+				# providesServices => 'mon,db,backup,copyhost,storage,web',
+				);
+
+	} else {
+		@hosts = $product->rolesManager()->hostsInCluster($cluster);
+	}
+
+	my @helpers;
+
+	my $cipherStore;
+	if($monitor) {
+		$cipherStore = ariba::rc::CipherStore->new( $service );
+	}
+
+	for my $host (@hosts) {
+
+		my $user = ariba::rc::Globals::deploymentUser($pname, $service);
+		my $password;
+		if($monitor) {
+			$password = $cipherStore->valueForName($user);
+		} else {
+			$password = ariba::rc::Passwords::lookup($user);
+		}
+
+		my $logName = "$host-crontab-scrubber";
+
+		my $prog = $0; $prog =~ s!.*/!!;
+		my $cmd = "/usr/bin/sudo " . $FindBin::Bin . "/$prog -remote -product $pname -service $service";
+		$cmd .= " -buildname $build" if $build;
+		$cmd .= " -customer $customer" if $customer;
+		$cmd .= " -datacenter $datacenter" if $datacenter;
+		$cmd .= " -fix" if $fixit;
+		$cmd .= " -monitor" if $monitor;
+		my @commands = ($cmd);
+
+		my $cdh = ariba::Ops::ControlDeploymentHelper->newUsingProductServiceAndCustomer($pname, $service, $customer);
+		$cdh->setTimeStarted($startTime);
+		$cdh->launchCommandsInBackground(
+				"crontab-scrub",
+				$user, 
+				$host, 
+				$logName, 
+				$password,
+				$master,
+				"crontab cleanup",
+				@commands
+
+				);
+		push(@helpers, $cdh);
+	}
+	ariba::Ops::ControlDeploymentHelper->waitForBackgroundCommands();
+
+	if($monitor) {
+		my $monResult = "";
+
+		foreach my $h (@helpers) {
+			my @output = $h->output();
+			foreach my $line (@output) {
+				next unless($line =~ /^ERR/);
+				$line =~ s/^ERR[^[]+//;
+				$monResult .= $line;
+			}
+		}
+
+		$monResult = "NONE" unless($monResult);
+
+		my %q;
+		$q{"Crontabs not matching installed builds"} = {
+			'info' => "answer eq 'NONE'",
+			'warn' => "answer ne 'NONE'",
+			'ticketOnWarnOpenAfterMinutes' => 1,
+			'openTicketInServices' => 'lab,btlb,beta,prod',
+			'perl' => sub { return $monResult; },
+		};
+
+
+		my $qm = ariba::monitor::QueryManager->newWithDetails('crontab status', 'mon', $service, undef, \%q);
+		$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $server);
+	}
+}
+
+sub loadCrontab {
+	my $user = shift;
+
+	my $crontab  = ariba::util::Crontab->new($user);
+
+	#my $itemCount = $crontab->readExistingCrontab();
+	return $crontab;
+
+}
+
+sub processCrontab {
+	my $crontab = shift;
+	my $productsRef = shift;
+	my $fixit = shift;
+
+	my $retVal = $EXIT_OK;
+
+	for my $product (@$productsRef) {
+		my $hostname = ariba::Ops::NetworkUtils::hostname();
+		my @names = $crontab->jobNames();
+
+		my $installDir = $product->installDir();
+		my $buildName = $product->buildName();
+		my $prodIdString = $product->name() . "/" . $product->service();
+		$prodIdString .= "/" . $product->customer() if $product->customer();
+
+		my $productRootDir = ariba::rc::Globals::rootDir($product->name(), $product->service(), $product->customer());
+
+		# print ">>> looking for jobs with [$productRootDir] and [$buildName]\n\n";
+		for my $name (@names) {
+
+			my $job = $crontab->jobWithName($name);
+
+			my $command = $job->command();
+
+			unless ($command =~ m!^$productRootDir/!) {
+				#print ">> $name not part of $prodIdString, skipping [$command] outside [$productRootDir]\n"; 
+				next;
+			}
+
+			my $jobBuild = $command;
+			$jobBuild =~ s!^$productRootDir/!!;
+			$jobBuild =~ s/\/.*$//;
+
+			unless ($jobBuild eq $buildName) {
+				my $user = $crontab->user() || $ENV{'USER'};
+				print "ERROR [$user\@$hostname] found non-matching job $name [$jobBuild]\n";
+				$retVal = $EXIT_FOUND_BAD_CRONJOBS;
+
+				if ($fixit) {
+					$crontab->removeJobWithName($name);
+					print "FIXING $name\n";
+				}
+			}
+
+		}
+	}
+
+	$crontab->commit() if ($fixit && $retVal eq $EXIT_FOUND_BAD_CRONJOBS);
+
+	return $EXIT_OK;
+}
+
+main();
+
+

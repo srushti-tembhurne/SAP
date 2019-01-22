@@ -1,0 +1,187 @@
+#!/usr/local/bin/perl
+
+use warnings;
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::monitor::OutageSchedule;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::Url;
+
+my $debug = 0;
+my $quiet = 0;
+
+my $connectionError;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $productName;
+
+	my %queries = ();
+
+	while(my $arg=shift(@ARGV)){
+			print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+			if($arg =~ /^-d/o){ $debug=1; }
+			if($arg =~ /^-e/o){ $sendEmail=1; };
+			if($arg =~ /^-p$/o){ $sendPage=1; };
+			if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+	}
+
+	my $mon = ariba::rc::InstalledProduct->new();
+	my $cluster = $mon->currentCluster();
+	my $service = $mon->service();
+
+	my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+
+	unless (@products) {
+		exit(0);
+	}
+
+	for my $product (@products) {
+
+		my @appInstances = grep { $_->isTomcatApp() } $product->appInstances();
+
+		my @postUpgradeErrors = ();
+		my @postUpgradeRunning = ();
+
+		ariba::Ops::Utils::fisherYatesShuffle(\@appInstances);
+
+		my $totalFetchTries = 0;
+
+		# need only one response per community; this 
+		# ignores default community
+		my @communityNames = $product->appInstanceManager()->communityNames();
+		my %communitiesDone = map { $_ => 0 } @communityNames;
+		my %statusByRealm = ();
+		my @status = ();
+
+		for my $instance (@appInstances) {
+
+			my $community = $instance->community() || 'system';
+			next if $communitiesDone{$community};
+
+			++$totalFetchTries;
+
+			my $xmlString;
+			unless ( fetchPostUpgradeStatus($instance, \$xmlString) ) {
+
+				last if $totalFetchTries >= 5;
+				next;
+			}
+			
+			combineUpgradeStatus($xmlString, \@status, $instance);
+
+			$communitiesDone{$community} = 1;
+		}
+
+		my $uiHint;
+
+		$queries{"$productName post-upgrade tasks with errors"} = {
+			recordMaxResults => 110000,
+			recordDataType => "gauge",
+
+			info => 1,
+			crit => "answer && answer =~ /Error/i",
+			ticketOnWarnOpenAfterMinutes => 1,
+
+			error => $connectionError,
+
+			uiHint => $uiHint,
+
+			perl => sub { join("\n", @status) }
+
+		};
+
+		my $email = $mon->default('notify.email');
+
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			"post-upgrade-tasks", $product->name(), $service, $product->customer(), \%queries
+		);
+
+		$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+	}
+}
+
+my %realmTaskStatusHash = ();
+
+sub combineUpgradeStatus {
+	my $xmlResultString = shift;
+	my $statusRef = shift;
+	my $instance = shift;
+
+# sample xml
+#<?xml version="1.0"?>
+#<PostUpgradeTaskStatus>
+#<TaskName>
+#RealmDirCleanupTask<Realms>
+#<Realm>
+#<Name>
+#System</Name>
+#<Status>
+#Error</Status>
+#</Realm>
+#</Realms>
+#</TaskName>
+#<TaskName>
+#PostMigrationTask<Realms>
+#<Realm>
+#<Name>
+#System</Name>
+#<Status>
+#Error</Status>
+#</Realm>
+#</Realms>
+#</TaskName>
+#</PostUpgradeTaskStatus>
+#
+	my $xmlParser = XML::Simple->new( ForceArray => [ 'Realm', 'TaskName', 'content' ], KeyAttr => { Realm => 'Name', TaskName => 'content' }, NormaliseSpace => 2 );
+
+	my $xmlResult = $xmlParser->XMLin($xmlResultString);
+
+	my @tasks = keys %{$xmlResult->{'TaskName'}};
+
+	for my $task (@tasks) {
+
+		my $realmsRef = $xmlResult->{'TaskName'}->{$task}->{'Realms'}->{'Realm'};
+
+		for my $realm (keys %$realmsRef) {
+
+			my $status = $realmsRef->{$realm}->{'Status'};
+			if (!defined $realmTaskStatusHash{$realm}->{$task}) {
+				push(@$statusRef, "Task $task in realm $realm has status: $status");
+				$realmTaskStatusHash{$realm}->{$task} = $status;
+			}
+		}
+
+	}
+}
+
+sub fetchPostUpgradeStatus {
+	my $instance = shift;
+	my $xmlStringRef = shift;
+
+	my $timeout = 6;
+
+	my $postUpgradeTaskStatusUrl = 
+		ariba::Ops::Url->new($instance->postUpgradeTaskStatusURL());
+	$postUpgradeTaskStatusUrl->setDebug($debug);
+
+	$$xmlStringRef = $postUpgradeTaskStatusUrl->request($timeout);
+
+	if ($postUpgradeTaskStatusUrl->error()) {
+		print "Error fetching task errors from ".$instance->workerName().":".$postUpgradeTaskStatusUrl->error()."\n" if $debug;
+		$connectionError = $postUpgradeTaskStatusUrl->error();
+		return;
+	}
+
+	return 1;
+}
+
+main();

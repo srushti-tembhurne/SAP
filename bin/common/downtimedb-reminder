@@ -1,0 +1,87 @@
+#!/usr/local/bin/perl -w
+#
+# $Id:$
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../../tools/lib/perl/";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Outage;
+use ariba::monitor::Ticketmaster;
+use ariba::Ops::DateTime;
+use ariba::Oncall::Schedule;
+
+sub main
+{
+    my $debug=0;
+
+    while(my $arg=shift(@ARGV)) {
+        if($arg =~ m/^-d/o) { $debug=1; }
+    }
+
+    my $eightHours = ariba::Oncall::Schedule->eightHours();
+
+    my $me = ariba::rc::InstalledProduct->new();
+
+    ariba::monitor::Outage->connect();
+
+    my ($s, $min, $h, $d, $mon, $y) = localtime();
+    my $schedule = ariba::Oncall::Schedule->new($mon+1, $y+1900);
+    my $shiftTime = $schedule->currShiftStartTime();
+    my $endDate = sprintf("%4d-%02d-%02d:%02d:%02d:%02d",
+                  $y+1900,$mon+1,$d,$shiftTime,0,0);
+    ($s, $min, $h, $d, $mon, $y) = localtime(time() + 86400*3);
+    my $dueDate = sprintf("%4d-%02d-%02d", $y+1900, $mon+1, $d);
+
+    ## see: perldoc Date::Calc
+    ## ? "($year,$month,$day, $hour,$min,$sec) = Add_Delta_DHMS($year,$month,$day, $hour,$min,$sec,
+    ##   $Dd,$Dh,$Dm,$Ds);"
+    ##   This function serves to add a days, hours, minutes and seconds offset to a given date and time,
+    ##   in order to answer questions like "today and now plus 7 days but minus 5 hours and then plus 30
+    ##   minutes, what date and time gives that?":
+    ##     ($y,$m,$d,$H,$M,$S) = Add_Delta_DHMS(Today_and_Now(), +7,-5,+30,0);
+
+    ## Since time() returns epoch time, this should be fine:
+    ($s, $min, $h, $d, $mon, $y) = localtime(time() - $eightHours);
+    if ( $shiftTime < 8 ){
+        if ( $d == 1 ){
+            ## First day of month, get last month's last day
+            if ( $mon == 1 ){
+                ## First month of year, get last year's last day
+                $mon = 12; 
+                $y--;
+            }
+            my $tmpSched = ariba::Oncall::Schedule->new( $mon, $y + 1900 );
+            $d = $tmpSched->{ 'days' };
+        }
+    }   
+    $shiftTime = $schedule->prevShiftStartTime();
+    my $startDate = sprintf("%4d-%02d-%02d:%02d:%02d:%02d",
+                $y+1900,$mon+1,$d,$shiftTime,0,1);
+
+    my @allOutages = ariba::monitor::Outage->entriesForDateRange($startDate, $endDate);
+    my @outages = ariba::monitor::Outage->unannotatedDowntimes(@allOutages);
+    exit(0) unless @outages;  # exit if there are no unannotated downtimes
+    my $text = ariba::monitor::Outage->outageSummary(@outages);
+
+    $text = "Please annotate these downtime DB entries from your shift.\nSee http://ops.ariba.com/documentation/prodops/common/downtime_db.shtml\n\n" . $text;
+
+    $text .= "\ntm-category: documentation\ntm-priority: medium\ntm-duedate: $dueDate\n";
+
+    if($debug) {
+        print "$text\n";
+    }
+
+    # We get the primary on-call for the start of the shift
+    my $primary = $schedule->primaryForNow();
+
+    my $displayDate = substr($startDate, 0, 10);
+
+    ariba::monitor::Ticketmaster::newTicket("downtime db annotations needed for $displayDate",
+                        $text, "dept_an_ops_prod\@ariba.com", $primary) unless $debug;
+    
+}
+
+main();

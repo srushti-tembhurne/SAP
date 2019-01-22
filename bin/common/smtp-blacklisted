@@ -1,0 +1,184 @@
+#!/usr/local/bin/perl -w
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+# This script checks several rbl lists if Ariba's smtp server is blacklisted
+
+# $Id: //ariba/services/monitor/bin/common/smtp-blacklisted#0 $
+
+use strict;
+use ariba::Ops::NetworkUtils;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Query;
+
+
+require "geturl";
+
+
+my $debug = 0;
+
+
+# Take an IP address like 127.0.0.1 and returned a revered version : 1.0.0.127
+sub reverseIPAddress {
+	my $ip = shift;
+
+	return join ('.', reverse split(/\./, $ip));
+}
+
+
+
+# The way to check if a host is in a RBL list is to try to resolve the name :
+#   reversed ip address of target host + RBL list address
+#
+# So for instance, if we want to check if smtp.ariba.com is in the rbl.com list we would try :
+#   - to resolve smtp.ariba.com to an ip address => 10.10.10.193
+#   - then we reverse this ip address => 193.10.10.10
+#   - and finally we would try to resolve the name 193.10.10.10.rbl.com (a success would mean this host is in this list)
+#
+sub checkRBLForRBLAndHost {
+	my $rbl = shift;
+	my $host = shift;
+	my @description = @_;
+
+	my $ip = $host;
+
+	$ip = ariba::Ops::NetworkUtils::hostToAddr($host) unless ($ip =~ m|^\d+\.\d+\.\d+\.\d+$|);
+
+	my $reversedIP = reverseIPAddress($ip);
+
+	my $rblEntry = "$reversedIP.$rbl";
+
+	my $returnString;
+
+	if ( $rblEntry eq ariba::Ops::NetworkUtils::hostToAddr($rblEntry) ) {
+
+		$returnString = undef;
+
+	} else {
+
+		$returnString =  'Yes.';
+
+		my $description = join(', ', @description);
+		$returnString .= ' This server is tracking "' . $description . '"' if ($description ne "");
+
+	}
+
+	return $returnString;
+}
+
+
+
+#
+# The config file contains a list of rbl listings along with theirs descriptions in the form :
+# <RBL list address> <Any whitespace character (space, tab, newline)> <Description/category>
+#
+# Description is not mandatory
+# A # at the very beginning of line would make this line ignored
+#
+sub parseConfigFile {
+	my $configFile = shift;
+
+	my %rblServers;
+
+	open (FILEIN, $configFile);
+
+	while (defined (my $line = <FILEIN>)) {
+
+		# First we clean all spaces at the beginning of a line
+		$line =~ s/^\s+//;
+
+		# Anything following a # is considered as a comment
+		$line =~ s/^\#.*$//;
+
+		# Removal of trailing whitespace characters
+		$line =~ s/\s+$//;
+
+		# Matching of the rbl list server and its description/category
+		my ($server, $category) = $line =~ m/^(\S+)\s*(.*)$/;
+
+		# A category might not exist
+		$category = $2 || ""; 
+
+
+		next unless defined ($server); # Skip the line if no server has been found
+
+
+		@{$rblServers{$server}} = () unless (exists $rblServers{$server});
+
+
+		# There could be several lines with the same server but not the same description/category. 
+		# We would like to display all these categories associated to one server
+		push( @{$rblServers{$server}}, $category);
+
+	}
+
+	close(FILEIN); 
+
+	return %rblServers;
+}
+
+
+
+sub usage {
+
+	print "Error: $_[0]\n" if $_[0];
+	print "usage: $0 \n";
+	print "          [-d] debug\n";
+	print "          -config <file containing the list of RBL servers>\n";
+	exit(1);
+
+}
+
+
+sub main {
+
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $configFile = 0;
+	
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; };
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+		if($arg =~ /^-config/o){ $configFile = shift(@ARGV); };
+	}
+
+	usage("Please, provide a configuration file") unless ($configFile);
+	
+
+	my $me = ariba::rc::InstalledProduct->new('mon');
+	my $email = $me->default('notify.email');
+
+	my $smtpServer =  $me->default('notify.pagers');
+	$smtpServer =~ s/.*@//;
+
+
+	my %rblServers = parseConfigFile($configFile);
+
+
+	my %query;
+
+	for my $server (keys(%rblServers)) {	
+		my $result = 
+		$query{"Is $smtpServer blacklisted by ${server}"} = {
+
+			'info' => "(! defined(answer)) || ( defined(answer) && answer eq '' )",
+			'warn' => "defined(answer) && (answer ne '') ",
+			'perl' => sub{ checkRBLForRBLAndHost($server, $smtpServer, @{$rblServers{$server}}); }
+	
+		};
+	}
+
+
+
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails("servers blacklisting us", $me->name(), $me->service(), $me->customer(), \%query);
+
+	$qm->processQueries($debug, $email, 0, 0);
+
+	
+}
+
+
+main();

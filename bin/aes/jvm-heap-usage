@@ -1,0 +1,206 @@
+#!/usr/local/bin/perl -w
+#
+# A monitoring script to monitor and graph size of vm as reported
+# by app instances.
+#
+# $Id: //ariba/services/monitor/bin/aes/jvm-heap-usage#16 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::Ops::Machine;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::misc;
+use ariba::monitor::QueryManager;
+use ariba::SNMP::Session;
+
+require "geturl";
+
+my $debug = 0;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+	my $product   = 'aes';
+
+	while (my $arg = shift(@ARGV)) {
+		if( $arg =~ /^-e/o ){ $sendEmail = 1; };
+		if( $arg =~ /^-p$/o ){ $sendPage = 1; };
+		if( $arg =~ /^-d/o ){ $debug = 1; };
+		if( $arg =~ /^-product/o ){ $product = shift(@ARGV); next; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my @products = ariba::rc::InstalledProduct->installedProductsList($me->service(), $product);
+
+	my $email = $me->default('notify.email');
+
+	# Loop over all the ASP products.
+	for my $product (@products) {
+		my $name = $product->name();
+		my $service = $product->service();
+
+		my $cluster = $product->currentCluster();
+		my $customer = $product->customer();
+		my $productName = $product->name();
+
+		my $baseMajorRelease = $product->baseMajorReleaseName();
+
+		my %queries;
+
+		my @instances = $product->appInstancesVisibleViaRoleInCluster("aes-webserver");
+		if (@instances) {
+			for my $instance (@instances) {
+				my $host = $instance->host();
+				my $port = $instance->port();
+
+				my $url = $instance->monitorStatsURL();
+
+				my $queryName = "$customer " . $instance->instanceName() . " jvm heap usage";
+
+					$queries{$queryName} = {
+						'recordMaxResults' => 52000,
+						'recordDataType' => "gauge",
+						'recordItem' => "answer",
+
+						'info' => "!answer or answer >= 0",
+						# See TMID 11733
+						#'warn' => "answer >= 95",
+						#'crit' => "answer >= 98",
+
+						'format' => "%.1f%%\n",
+						'customer' => $customer,
+
+						'perl' => "main::percentMemUsageFromUrl(\'$url\')",
+					};
+
+			}
+		} else {
+			for my $appType ( "sourcing" ) {
+				for my $host ( $product->hostsForRoleInCluster($appType, $cluster) ) {
+					my $port = $product->default('SERVER1_PORT');
+
+					my $url = "http://${host}:${port}/Sourcing/status";	
+
+					#XXXX this has a bug if there is more than one $appType server
+
+					my $queryName = "$customer $appType server jvm heap usage";
+
+					$queries{$queryName} = {
+						'recordMaxResults' => 52000,
+						'recordDataType' => "gauge",
+						'recordItem' => "answer",
+
+						'info' => "!answer or answer >= 0",
+						# See TMID 11733
+						#'warn' => "answer >= 95",
+						#'crit' => "answer >= 98",
+
+						'format' => "%.1f%%\n",
+						'customer' => $customer,
+
+						'perl' => "main::percentMemUsageFromUrl(\'$url\')",
+					};
+				}
+			}
+		}
+
+		for my $host ( $product->hostsForRoleInCluster('sourcingadmin', $cluster) ) {
+			my $port = $product->default('ADMIN_SNMP_PORT');
+			my $queryName = "$customer sourcingadmin server jvm heap usage";
+
+			$queries{$queryName} = {
+				'recordMaxResults' => 52000,
+				'recordDataType' => "gauge",
+				'recordItem' => "answer",
+
+				'info' => '!answer or answer =~ /^[\d\.]+$/ and answer >= 0',
+				'warn' => 'answer and answer !~ /^[\d\.]+$/',
+				# See TMID 11733
+				#'crit' => "answer >= 98",
+
+				'format' => "%s%%\n",
+				'customer' => $customer,
+				'timeout' => 10,
+
+				'perl' => "main::percentMemUsageFromSNMP(\'$host\',\'$port\')",
+			};
+		}
+
+		next unless(keys(%queries));
+
+		my $q = ariba::monitor::QueryManager->newWithDetails("jvm-heap-usage", 
+				$name, $service, $customer, \%queries);
+
+		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+sub percentMemUsageFromUrl
+{
+	my $url = shift;
+
+	my $timeout = 15;
+	my @output;
+
+	eval 'geturl("-e","-q","-timeout",$timeout,"-results",\@output,$url);';
+
+	my $memUsage;
+
+	if ($@) {
+		return $memUsage;
+	}
+
+	my $totalMem;
+	my $freeMem;
+	for my $line (@output) {
+		if ($line =~ m|<CurrentTotalMemory>(\d+)</CurrentTotalMemory>|o) {
+			$totalMem = $1;
+		}
+		if ($line =~ m|<CurrentFreeMemory>(\d+)</CurrentFreeMemory>|o) {
+			$freeMem = $1;
+		}
+
+		if (defined($totalMem) && defined($freeMem)) {
+			$memUsage = ( ($totalMem - $freeMem) / $totalMem ) * 100;
+			last;
+		}
+	}
+
+	return $memUsage;
+}
+
+sub percentMemUsageFromSNMP
+{
+	my $host = shift;
+	my $port = shift;
+
+	#http://e-docs.bea.com/wls/docs70/snmpman/index.html
+	#http://e-docs.bea.com/wls/docs70/snmp/snmpruntime.html#1031510
+
+	my $oidFree  = "1.3.6.1.4.1.140.625.340.1.25"; # jvmRuntimeHeapFreeCurrent
+	my $oidTotal = "1.3.6.1.4.1.140.625.340.1.30"; # jvmRuntimeHeapSizeCurrent
+
+	my $machine  = ariba::Ops::Machine->new($host);
+	my $snmp     = ariba::SNMP::Session->newFromMachine($machine);
+
+	$snmp->setTimeout(0);
+	$snmp->setGetNext(1);
+	$snmp->setPort($port);
+
+	my $memUsage;
+	my $totalMem = $snmp->valueForOidExpr($oidTotal);
+	my $freeMem  = $snmp->valueForOidExpr($oidFree);
+
+	if (defined($totalMem) && defined($freeMem)) {
+		$memUsage = sprintf("%.1f",
+			( ( $totalMem - $freeMem ) / $totalMem ) * 100
+		);
+	}
+
+	return $memUsage;
+}
+
+main();

@@ -1,0 +1,215 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/cleanup-query-managers#16 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+my $verbose = 0;
+
+sub usage {
+	print "Error: @_\n" if @_;
+	print "$0 [-all | -product <prod> [-customer <customer] | [-qm <qm-name>]] [-stale|-broke|-d|-h]\n",
+		"-product    all queries for this product\n",
+		"-customer   all qms for this customer (needs -product)\n",
+		"-qm         only target a specific qm (exclusive with -product)\n",
+		"-all        do all query managers\n",
+		"-stale      remove stale queries\n",
+		"-broken     remove possibly broken queries\n",
+		"-regex      remove queries based on provided regular expression for query name\n",
+		"-save_regex remove queries NOT matching the provided regular expression for query name (exclusive with -regex)\n",
+		"-d          turn on debug (don't do anything)\n",
+		"-v			 force verbose mode even if a terminal isn't detected\n",
+		"-h          print usage\n";
+	exit(0);
+}
+
+sub main {
+
+	my ($pname, $customer, $qmName, $alldatacenters);
+	my $cleanStale = 0;
+	my $cleanBroken = 0;
+	my $queryRegex = undef;
+	my $saveQueryRegex = undef;
+
+	my $all = 0;
+
+	while (my $arg = shift @ARGV) {
+		if ($arg =~ /^-d/o)        {$debug = 1; next;}
+		if ($arg =~ /^-v/o)        {++$verbose; next;}
+	
+		# qm selection criteria
+		if ($arg =~ /^-prod/o)        {$pname          = shift(@ARGV); next;}
+		if ($arg =~ /^-customer/o)    {$customer       = shift(@ARGV); next;}
+		if ($arg =~ /^-all/o)         {$all            = 1; next;}
+		if ($arg =~ /^-qm/o)          {$qmName         = shift(@ARGV); next;}
+
+		# culling criteria
+		if ($arg =~ /^-stale/o)      {$cleanStale  = 1; next;}
+		if ($arg =~ /^-broke/o)      {$cleanBroken = 1; next;}
+		if ($arg =~ /^-regex/o)      {$queryRegex = shift(@ARGV); next;}
+		if ($arg =~ /^-save_regex/o) {$saveQueryRegex = shift(@ARGV); next;}
+
+		if ($arg =~ /^-h/o)        {usage();}
+		usage("Unknown arg: $arg");
+	}
+
+	my $me	= ariba::rc::InstalledProduct->new();
+
+	my @qms = ();
+
+	$verbose = 1 if (-t STDIN && $verbose < 1);
+
+	if ($pname && $qmName) {
+		usage("Using -prod and -qm flags at the same time is ambiguous");
+	}
+
+	if ($all && ($qmName || $pname)) {
+		usage("Using -all in addition to -qm or -prod is ambiguous");
+	}
+
+	if (!$pname && !$qmName && !$all) {
+		print "No QMs specified, doing all datacenters\n" if ($verbose);
+		$alldatacenters = 1;
+	}
+
+	if ($queryRegex && $saveQueryRegex) {
+		usage("Using -regex and -save_regex flags at the same time is ambiguous");
+	}
+
+	if ($all) {
+		# do all QMs
+		for my $product (ariba::rc::InstalledProduct->installedProductsList()) {
+			push(@qms, ariba::monitor::QueryManager->instancesForProduct($product->name(), $product->customer()));
+		}
+		$alldatacenters = 1;
+	} elsif ($pname) {
+		push(@qms, ariba::monitor::QueryManager->instancesForProduct($pname, $customer));
+	} elsif ($qmName) {
+		unless (ariba::monitor::QueryManager->objectWithNameExists($qmName)) {
+			print "Could not load $qmName\n";
+			exit(1);
+		}
+		push(@qms, ariba::monitor::QueryManager->new($qmName));
+	} 
+	
+	if ($alldatacenters) { 
+		my @datacenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+
+
+		for my $datacenter (@datacenters) {
+			my $fakeProduct = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+			push(@qms, ariba::monitor::QueryManager->instancesForProduct($fakeProduct));
+		}
+
+		if (!$queryRegex) {
+			#generate regex 
+			my %hosts = ();
+
+			my %match = (
+					'datacenter' => join(",", @datacenters),
+					'status'     => 'outofservice,spare,ordered',
+					);
+
+			#
+			for my $machine (ariba::Ops::Machine->machinesWithProperties(%match)) {
+
+				my $hostname = $machine->hostname();
+
+				$hosts{$hostname}++;
+
+				print "Machine: $hostname is out of service.\n" if $verbose;
+			}
+
+			print "\n" if $verbose;
+
+			$queryRegex = '(?:' . join('|', keys %hosts) . ')' if scalar(%hosts);
+		}
+	}
+
+	for my $qm (@qms) {
+		unless ($qm->lock()) {
+			printf("\nFailed to update %s, couldn't grab lock\n\n", $qm->instance()) if $verbose;
+			next;
+		}
+		cleanupQm($qm, $queryRegex, $saveQueryRegex, $cleanStale, $cleanBroken);
+		$qm->unlock();
+	}
+}
+
+sub cleanupQm {
+		my $qm = shift;
+		my $queryRegex = shift;
+		my $saveQueryRegex = shift;
+		my $cleanStale = shift;
+		my $cleanBroken = shift;
+
+		my @oldQueries = $qm->queries();
+		my @newQueries = ();
+
+		print "Working on ", $qm->instance(), "\n" if ($verbose > 1);
+
+		for my $query (@oldQueries) {
+
+			my $instance = $query->instance();
+
+			if ((defined($queryRegex) && $instance =~ qr/$queryRegex/o)) { 
+				print "Removing instance: $instance from ", $qm->instance(), 
+					"\n\tdue to match on regex\n" if $verbose;
+				next;
+			}
+
+			if ($query->isStale() && (defined($saveQueryRegex) && $instance !~ qr/$saveQueryRegex/o)) { 
+				print "Removing instance: $instance from ", $qm->instance(), 
+					"\n\tdue to no match on regex\n" if $verbose;
+				next;
+			}
+
+			if (!-f $query->_backingStore()) {
+				print "Removing instance: $instance from ", $qm->instance(), 
+					"\n\tdue to non-existance of query\n" if $verbose;
+				next;
+			}
+
+			if ($cleanStale && $query->isStale()) {
+				print "Removing instance: $instance from ", $qm->instance(), 
+					"\n\tdue to staleness\n" if $verbose;
+				next;
+			}
+
+			if ($cleanBroken && !defined($query->fingerPrint())) {
+				print "Removing instance: $instance from ", $qm->instance(), 
+					"\n\tdue to brokenness\n" if $verbose;
+				next;
+			}
+
+			push @newQueries, $query;
+		}
+
+		if (!scalar(@newQueries)) { # if the new QM is empty, remove it entirely
+			printf("\nRemoving empty QueryManager: %s\n\n", $qm->instance()) if $verbose;
+			$qm->remove() unless $debug;
+
+		} elsif (scalar @newQueries != scalar @oldQueries) { # Don't save if there aren't any changes.
+			printf("\nWriting out updated QueryManager: %s\n\n", $qm->instance()) if $verbose;
+			$qm->setQueries(@newQueries) unless $debug;
+			$qm->recomputeStatus();
+			$qm->markStaleQueries(time());
+			$qm->save() unless $debug;
+
+		} else {
+			print "\nNo changes to QueryManager ", $qm->instance(), "\n\n" if $verbose > 1;
+		}
+}
+
+main();
+
+__END__

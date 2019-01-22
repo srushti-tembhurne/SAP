@@ -1,0 +1,396 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/everywhere/bcv-backup-hana#11 $
+#
+# This script is run as root cronjob on all db servers.
+# It creates backups of hana databases using 3par snap copy
+#
+#
+
+use strict;
+use FindBin;
+use lib qw(/usr/local/ariba/lib);
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../lib/perl";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::DBA::HanaSampleSQLQueries;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::DatabasePeers;
+use ariba::Ops::HanaControl;
+use ariba::Ops::FileSystemUtilsRPC;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkDeviceManager;
+use ariba::Ops::PageUtils;
+use ariba::rc::CipherStore;
+
+use Data::Dumper;
+use POSIX qw(strftime);
+
+## Shut other pieces up ...
+$main::quiet = 1;
+
+## Need strftime
+use POSIX;
+
+
+my $debug = 0;
+local $| = 1;
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h|-bcv] product service
+
+    -bcv  bcvid 1 for incrementalphysical, 2 for snap
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode.
+    -h    Shows this help.
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    my $productName;
+    my $service;
+    my $bcvid;
+    my @errors;
+    my $instance;
+    my $startTime;
+
+    $ENV{'TERM'} =  'vt100';
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if( $arg =~ /^-bcv$/o ){ $bcvid = shift; next; }; #we are throwing this value out for now, only bcv type 2 is used for hana now
+        unless($productName) { $productName = $arg; next; }
+        unless($service) { $service = $arg; next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    usage ("No product specified") unless($productName);
+    usage ("No service specified") unless($service);
+
+    my $mon = ariba::rc::InstalledProduct->new('mon', $service);
+    my $me = ariba::rc::InstalledProduct->new($productName, $service);
+    my $hostname   = ariba::Ops::NetworkUtils::hostname();
+
+
+    my $comment = "snapshot_" . strftime( "%m_%d_%Y_%H_%M_%S", localtime );
+
+    my %queries;
+
+
+    my @uniqueDbcs;
+    my $masterdbc;
+
+    if ($productName) {
+        my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+        exit(0) unless(@products);
+
+        my @connections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+        @uniqueDbcs = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections);
+    }
+
+    print "Got " . scalar @uniqueDbcs . " unique DBC's\n" if $debug;
+
+    my $volumeInfo;
+    my $user = "mon$service";
+    my $cipher = ariba::rc::CipherStore->new($service);
+    my $password = $cipher->valueForName($user);
+
+    ## We'll need to know where we're mounted across the cluster:
+    DBC:
+    foreach my $dbc ( @uniqueDbcs ){
+        next unless $dbc->dbServerType() eq ariba::Ops::DBConnection->hanaDBServerType();
+        #For HANA, BCV backup should be run only on primary
+        next if $dbc->isDR();
+
+        unless ( ariba::DBA::HanaSampleSQLQueries::amIMaster( $mon, $dbc, $hostname ) ){
+            print "$hostname Not running on Master node, exiting ...\n" if $debug;
+            exit;
+        }
+
+        print "$hostname is Master, continuing ...\n" if $debug;
+        $masterdbc = $dbc;
+        my $hc = ariba::Ops::HanaControl->newFromDbc( $dbc, 0 );
+        $hc->setDbFsInfo( $dbc, 0 );
+
+        SLAVE:
+        foreach my $slave ( $hc->slaveNodes() ){
+
+            my $checkHost = $slave->host();
+            if ( ariba::DBA::HanaSampleSQLQueries::amIStandby( $mon, $dbc, $checkHost ) ){
+                print "$checkHost is a Standby node, skipping ...\n" if $debug;
+                next SLAVE;
+            }
+
+            my $command = "ssh -l $user $checkHost 'mount | grep data'";
+            my @out;
+            ariba::rc::Utils::executeRemoteCommand($command, $password, 0, undef, undef, \@out);
+
+            foreach my $line ( @out ){
+                next unless $line =~ /data/;
+                $instance = uc($masterdbc->sid());
+                my ( $device, $on, $mount, $dummy ) = split /\s+/, $line;
+                my $wwn = $device;
+                ## $wwn = /dev/mapper/350002acb16aa0913, we want the 350002acb16aa0913
+                $wwn =~ s/.*\///;
+                $volumeInfo->{ $checkHost }->{ 'device' } = $device;
+                $volumeInfo->{ $checkHost }->{ 'mount'  } = $mount;
+                $volumeInfo->{ $checkHost }->{ 'wwn'    } = $wwn;
+            }
+        }
+    }
+    ## We're running on the Master node, add it's mount info to the hash:
+    my $mountInfo = `mount | grep data`;
+    my ( $device, $on, $mount, $dummy ) = split /\s+/, $mountInfo;
+    my $wwn = $device;
+    ## $wwn = /dev/mapper/350002acb16aa0913, we want the 350002acb16aa0913
+    $wwn =~ s/.*\///;
+    $volumeInfo->{ $hostname }->{ 'device' } = $device;
+    $volumeInfo->{ $hostname }->{ 'mount'  } = $mount;
+    $volumeInfo->{ $hostname }->{ 'wwn'    } = $wwn;
+
+    ## We need to translate this info to 3Par speak, need the LUN at least.
+    ## See this page for details:
+    ## https://wiki.ariba.com:8443/display/ENGDPTS/BCV+Backups+for+Hana
+    foreach my $host ( keys %{ $volumeInfo } ){
+        my $mount = $volumeInfo->{ $host }->{ 'mount'  };
+        my $command = "ssh -l $user $host 'sudo /usr/local/ariba/bin/filesystem-device-details -x $mount | grep -i inserv'";
+        my @out;
+
+        print "Running '$command' on '$host'\n" if $debug;
+        ariba::rc::Utils::executeRemoteCommand($command, $password, 0, undef, undef, \@out);
+        my $out;
+
+        LINE:
+        foreach my $line ( @out ){
+            next unless $line =~ /inserv/i;
+            $out = $line;
+            $out =~ s/Inserv:\s+//;
+            last LINE;
+        }   
+        $volumeInfo->{ $host }->{ 'inserv' } = $out if $out;
+        $command = "ssh -l $user $host 'sudo multipath -ll'";
+        print "Running '$command' on '$host'\n" if $debug;
+        ariba::rc::Utils::executeRemoteCommand($command, $password, 0, undef, undef, \@out);
+
+        ## multipath -ll output:
+        ## $VAR1 = [
+        ##   "0HZ0Eie3moqwIV2f",
+        ##   "350002acb16aa0913 dm-0 3PARdata,VV",
+        ##   "size=256G features='0' hwhandler='0' wp=rw",
+        ##   "`-+- policy='round-robin 0' prio=1 status=active",
+        ##   "  |- 1:0:0:0 sde 8:64  active ready running",
+        ##   "  `- 0:0:0:0 sda 8:0   active ready running",
+        ##   "350002acb16ad0913 dm-3 3PARdata,VV",
+        ##   "size=125G features='0' hwhandler='0' wp=rw",
+        ##   "`-+- policy='round-robin 0' prio=1 status=active",
+        ##   "  |- 0:0:0:1 sdb 8:16  active ready running",
+        ##   "  `- 1:0:0:1 sdf 8:80  active ready running"
+        ## ];
+        ## $VAR1 = [
+        ##   " 0HZ0Eie3moqwIV2f",
+        ##   "",
+        ##   "350002acb12270913 dm-2 3PARdata,VV",
+        ##   "size=256G features='0' hwhandler='0' wp=rw",
+        ##   "`-+- policy='round-robin 0' prio=1 status=active",
+        ##   "  |- 3:0:0:2 sdd 8:48  active ready running",
+        ##   "  `- 4:0:0:2 sdh 8:112 active ready running",
+        ##   "350002acb12290913 dm-3 3PARdata,VV",
+        ##   "size=125G features='0' hwhandler='0' wp=rw",
+        ##   "`-+- policy='round-robin 0' prio=1 status=active",
+        ##   "  |- 3:0:0:3 sde 8:64  active ready running",
+        ##   "  `- 4:0:0:3 sdi 8:128 active ready running"
+        ## ];
+
+        my $found = 0;
+
+        LINE:
+        foreach my $line ( @out ){
+
+            if ( defined $volumeInfo->{ $host }->{ 'wwn' } && $line =~ /^$volumeInfo->{ $host }->{ 'wwn' }/ && !$found ){
+                $found = 1; ## We know we're in the correct section but don't need the current line
+                next LINE;
+            }
+
+            if ( $line =~ /^\w+ dm/ && $found ){ ## We are at the beginning of the next section
+                $found = 0;
+                last LINE;
+            }
+        }
+    }
+
+    ## Run SQL to put into backup mode
+    print "Running SQL to put master in backup mode\n" if $debug;
+
+    if(!ariba::DBA::HanaSampleSQLQueries::executeSQLQuery( $mon, 'createSnapshot', $masterdbc, undef, undef, $comment )) {
+        push(@errors, ariba::DBA::HanaSampleSQLQueries::hanaError()) if ariba::DBA::HanaSampleSQLQueries::hanaError();
+    }
+    
+    ## Waiting For  /hana/data/A01/mnt00001/hdb00001/snapshot_databackup_0_1 file to be created by createSnapshot query  
+    ## Adding recursive call to check above file until we found 
+    &waitForFile; 
+    
+
+
+    ## We have volumes, luns, mount points, we should be good to get the VV's so we can snapcopy them ...
+
+    $startTime = time();
+    foreach my $host ( keys %{ $volumeInfo } ){
+        next unless defined $volumeInfo->{ $host }->{ 'inserv' };
+        my $mach = ariba::Ops::Machine->new( $volumeInfo->{ $host }->{ 'inserv' } );
+        print "Existing as at this point bcv-backup-hana only works for inserv OS!!\n.Tools team is working to fix this for enginuty OS\n", unless ($mach->os() =~ /inserv/i); 
+        next unless ($mach->os() =~ /inserv/i);
+        my $nm = ariba::Ops::NetworkDeviceManager->newFromMachine( $mach );
+        my $vvs = $nm->lunsOnHost($host, $debug);
+        
+        foreach my $vv ( @{$vvs} ){
+            my $vvInstance = $vv;
+            push @{ $volumeInfo->{ $host }->{ 'vvs' } }, $vvInstance;
+            print "Creating snapshot for $vvInstance now\n" if $debug;
+            my $dstvv = "scro2-$vvInstance";
+            if ($nm->cmdShowvv($dstvv)) {
+                print "Destination vv $dstvv exists, so removing it\n" if $debug;
+                if (!$nm->removeVV($dstvv)) {
+                    print "Failed to remove destination vv $dstvv\n" if $debug;
+                    push (@errors, $nm->error());
+                }
+            }
+
+            print "Running command createSnapCopy( $vvInstance, $dstvv, 1 ) now\n" if $debug;
+            if (!$nm->createSnapCopy( $vvInstance,$dstvv , 1 )){  ## <- 1 == RO
+                print "Failed to run command createSnapCopy( $vvInstance, $dstvv, 1 ) \n" if $debug;
+                push (@errors, $nm->error()) ;
+            }
+
+
+        }   
+    }
+
+    my $endTime   = time();
+
+    ## Run SQL to remove from backup mode
+    print "Running SQL to remove master from backup mode\n" if $debug;
+    if (!ariba::DBA::HanaSampleSQLQueries::executeSQLQuery( $mon, 'dropSnapshot', $masterdbc, undef, undef, $comment )) {
+        push(@errors, ariba::DBA::HanaSampleSQLQueries::hanaError()) if ariba::DBA::HanaSampleSQLQueries::hanaError();
+    }
+
+
+    my $errorString = join(", ", @errors);
+
+
+
+    my $email = $mon->default('notify.email');
+
+
+    $queries{"backup of $instance on $hostname to bcv $bcvid"} = {
+        crit => "answer =~ /Sync Failed/",
+        warn => "answer =~ /Warning: RW Copy exist/",
+        noRowCount => 1,
+        description => 'Backup History Log can be found at /var/log/bcv-log-MMYYYY.txt',
+        backupStartTime => $startTime,
+        backupEndTime   => $endTime,
+        note => 'http://ops.ariba.com/documentation/SRE/processes/operational/bcv-backup.txt',
+        ticketOnWarnOpenAfterMinutes => 10,
+        perl => sub { main::vmDisplayMessage($productName, $volumeInfo,
+                $startTime, $endTime, $errorString) },
+    };
+
+    my $machine = ariba::Ops::Machine->new($hostname);
+    my $datacenter = $machine->datacenter();
+    my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+    my $monserver  = ariba::Ops::PageUtils::monitorServer($mon);
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails(
+        "bcv-backups", $tab, $service, undef, \%queries
+        );
+
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monserver);
+
+}
+
+sub vmDisplayMessage  {
+    my ($productName, $volumeInfo, $startTime, $endTime, $errorString) = @_;
+
+    my $message = "Product: $productName";
+    my @msg = $message;
+    foreach my $host ( sort keys %{ $volumeInfo } ){
+        my $line = "";
+        next unless defined $volumeInfo->{ $host }->{ 'inserv' };
+        $line = "Host: $host, Volume: ";
+        $line .=  "$volumeInfo->{ $host }->{ 'wwn' },";
+        $line .= " bcv:";
+        my @vvs = @{$volumeInfo->{ $host }->{ 'vvs' }};
+        foreach my $vv ( @vvs ){
+            $line .= " scro2-$vv";
+        }
+        push (@msg,$line)
+    }
+
+
+    if ($errorString) {
+
+        push(@msg, "Begin: " . localtime($startTime));
+        my $errorMsg = "Sync Failed: error was [$errorString]";
+        $errorMsg = "Warning: RW Copy exist, Check with DBA Team [$errorString]", if ( $errorString =~ /has snapshot children which must be removed/);
+        push(@msg, $errorMsg);
+
+    } else {
+
+        my $duration = sprintf ("%0.2f",($endTime - $startTime)/60);
+        push(@msg, "Begin: " . localtime($startTime) .  " (duration: $duration min(s))");
+
+    }
+    
+    writeLogFile(@msg);
+    return join("\n", @msg);
+
+}
+
+
+sub waitForFile {
+   my $file= "/hana/data/A01/mnt00001/hdb00001/snapshot_databackup_0_1";
+   my $waitTime = 5;
+   unless (-s $file ) {
+       print "$file is not created yet, waiting for $waitTime sec...\n", if $debug;
+       sleep $waitTime;
+       &waitForFile;
+   }
+   sleep $waitTime; ## Adding additional time to be safe for creation of snapshot_databackup_0_1 file  
+   return 1;
+}
+
+sub writeLogFile {
+    my @msg = @_;
+    my $message = join("\n", @msg);
+
+    my $date = strftime "%m%Y", localtime;
+    my $timeStamp = strftime "%d%m%Y-%H%M", localtime;
+
+    my $bcvLog = "/var/log/bcv-log-$date.txt";
+    open BCVLOG, ">>", $bcvLog or die "Unbale to open $bcvLog File $!\n";
+
+    print BCVLOG "******************* $0 STARTED - $timeStamp *********************\n";
+    print BCVLOG "$message\n";
+    
+    }
+
+main(@ARGV);
+
+__END__

@@ -1,0 +1,296 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/page/paged#32 $
+
+use strict;
+use FindBin;
+use lib ("$FindBin::Bin/../../lib");
+
+use ariba::Ops::UDPTransport;
+use ariba::Ops::PageFilter;
+use ariba::Ops::PageRequest;
+use ariba::Ops::PageAck;
+use ariba::Ops::Page;
+use ariba::monitor::StatusPage;
+use ariba::monitor::ProductStatus;
+use ariba::monitor::misc;
+use ariba::rc::InstalledProduct;
+use POSIX qw(strftime);
+
+my $debug = 0;
+my %pageTimeHistory = ();
+
+#
+# These are the main tuneable parms.  
+#
+
+# $pagesPerThrottlePeriod and $pagesGlobalPerThrottlePeriod must always equate to integers, thus
+# $pagesPerThrottlePeriod must alwasy be even if $pagesGlobalPerThrottlePeriod has a *.5 multiplier.
+my $pagesPerThrottlePeriod = 10;
+my $pagesGlobalPerThrottlePeriod = $pagesPerThrottlePeriod * 2.5;
+my $throttleTimePeriod = 10 * 60;
+my $maxAckTime = 7 * 60;
+
+
+sub main {
+    $| = 1;   # make paged work better inside of keepRunning
+
+    my $port = undef;
+    while (my $arg = shift(@ARGV)) {
+        if($arg =~ /^-d/o) { $debug = 1; next;}
+        if($arg =~ /^-port/o) { $port = shift(@ARGV); next;}
+    } 
+
+    my $transport = ariba::Ops::UDPTransport->new();
+
+    $transport->setDebug($debug);
+    $transport->initAsServer($port);
+
+    my $start = time();
+    my %seen  = ();
+
+    my $me      = ariba::rc::InstalledProduct->new();
+    my $service = $me->service();
+
+    my $productName   = ariba::monitor::StatusPage::ackedPageSystemProduct();
+    my $productStatus = ariba::monitor::ProductStatus->newWithDetails($productName, $service);
+
+    while (1) {
+
+        my ($clientHost, $clientPort, $message) = $transport->receiveMessageFromClient(30);
+
+        if ( $clientHost ) {
+            if ( $debug ) {
+                print "\n---------------------------------------------\n";
+                print "Incoming From: $clientHost:$clientPort\n";
+            }
+
+            my ($obj) = ariba::Ops::PersistantObject->createObjectsFromString($message);
+
+            $obj->print() if $debug;
+
+            if ( $obj->isa("ariba::Ops::PageRequest") ) {
+                print "Object is a page request.\n" if $debug;
+
+                if ( $seen{$obj->instance()}++ ) {
+                    print "Is a dup!\n" if $debug;
+                } else {
+                    incomingPageRequest($obj);
+                }
+
+            } elsif ( $obj->isa("ariba::Ops::PageAck") ) {
+                print "Object is a page ack.\n" if $debug;
+
+                if ( $seen{$obj->instance()}++ ) {
+                    print "Is a dup!\n" if $debug;
+                } else {
+                    incomingPageAck($obj);
+                }
+
+            } else {
+                print "UNKNOWN OBJECT FROM WIRE\n";
+            }
+        }
+
+        # run idle code even when really busy some times
+        my $now = time();
+
+        if ($now - $start > 59) {
+            $start = $now;
+            whenIdle($now, $productStatus);
+            %seen = ();
+        }   
+
+        # all our "normal" pointers to these objects are gone
+        # because no PersistantObjects are in scope.
+        # Make sure the caches are all cleaned up also so we don't leak
+
+        ariba::Ops::PageRequest->_removeAllObjectsFromCache();
+        ariba::Ops::PageAck->_removeAllObjectsFromCache();
+        ariba::Ops::Page->_removeAllObjectsFromCache();
+    }
+}
+
+sub cleanPageTimeHistory {
+    my $now = time();
+
+    while (my ($key, $arrayref) = each %pageTimeHistory) {
+        print "  pageTimeHistory pre clean $key => ", join(", ", @$arrayref), "\n" if $debug;
+        while ( scalar(@$arrayref) && ($now - $$arrayref[0]) > $throttleTimePeriod ){
+            pop(@$arrayref);
+        }
+        print "  pageTimeHistory post clean $key => ", join(", ", @$arrayref), "\n" if $debug;
+    }
+
+}
+
+sub incomingPageRequest {
+    my $pageRequest = shift;
+
+    my $product = $pageRequest->product();
+    $pageTimeHistory{$product} = [] unless defined($pageTimeHistory{$product});
+    $pageTimeHistory{"Global"} = [] unless defined($pageTimeHistory{"Global"});
+    my $history = $pageTimeHistory{$product};
+    my $globalHistory = $pageTimeHistory{"Global"};
+
+    # Check to see if the page request is filtered.  If so then send the "matched a Page Filter" email.
+    # Page filtered alerts do not count towards throttling totals.
+    if ( ariba::Ops::PageFilter->doesPageRequestMatchAnyFilter($pageRequest) ) {
+
+        print "Not paging, emailing, PageFilter->doesPageRequestMatchAnyFilter() says yes\n";
+        $pageRequest->setSquelchReason("matched a PageFilter");
+
+        $pageRequest->sendAsEmail();
+    }
+
+    # Run the throttling math and send a page alert if we have not reach either of the tab or global limits.
+    # If a limit has been reached then just send a "too many, too fast" email.
+    else {
+
+        # purge from the throttle hashes any events that are too old.
+        cleanPageTimeHistory();
+
+        my $now = time();
+
+        ## Not sure if there's a $pageRequest->severity() but I know for sure there's
+        ## $pageRequest->subject() which has the S# severity included:
+        if ( $pageRequest->subject() =~ m/ S0 /i       ||  ## Don't EVER squelch S0 pages
+             (scalar(@$history) < $pagesPerThrottlePeriod &&
+             scalar(@$globalHistory) < $pagesGlobalPerThrottlePeriod) ) {
+
+            sendPageForPageRequest($pageRequest);
+            if (-e '/var/tmp/no_stratus' && $pageRequest->subject() =~ /Stratus/)
+            {
+                print "page not counted toward throttle\n" if ($debug);
+            }
+            elsif (-e '/var/tmp/no_cookies' && $pageRequest->subject() !~ /Stratus/)
+            {
+                print "page not counted toward throttle\n" if ($debug);
+            }
+            else
+            {
+                push(@$history, $now);
+                push(@$globalHistory, $now);
+            }
+
+        } 
+        elsif ( scalar(@$history) == $pagesPerThrottlePeriod ||
+                scalar(@$globalHistory) == $pagesGlobalPerThrottlePeriod ) {
+
+            print "WILL SEND **** NO MORE PAGES PAGE for $product lasting about $throttleTimePeriod seconds ***** \n" if ($debug and scalar(@$history) == $pagesPerThrottlePeriod);
+            print "WILL SEND **** NO MORE PAGES PAGE for Global lasting about $throttleTimePeriod seconds ***** \n" if ($debug and scalar(@$globalHistory) == $pagesGlobalPerThrottlePeriod);
+
+            my $end = strftime("%H:%M", localtime(time() + $throttleTimePeriod));
+
+            $product = "Global" if scalar(@$globalHistory) == $pagesGlobalPerThrottlePeriod;
+            my $s = "New pages throttled: too many pages";
+            my $b = "no new $product pages until about $end\n";
+            my $cc = $pageRequest->requestedTo();
+            my $cust = undef;
+            my $cluster = undef;
+
+            my $tPageRequest = ariba::Ops::PageRequest->newWithError(
+                $0, "mon", $pageRequest->service(), $s, $cust, $cluster, $b, $cc);
+
+            sendPageForPageRequest($tPageRequest);
+            push(@$history, $now);
+            push(@$globalHistory, $now);
+
+            $pageRequest->setSquelchReason("too many too fast, throttled");
+            $pageRequest->sendAsEmail();
+
+        } else {
+            print "Not paging, emailing, would have sent a page but are currently throttled\n";
+            $pageRequest->setSquelchReason("too many too fast, throttled");
+            $pageRequest->sendAsEmail();
+        }
+    } # if ariba::Ops::PageFilter->doesPageRequestMatchAnyFilter($pageRequest)
+
+    $pageRequest->recursiveSave();
+
+    print "  pageTimeHistory{$product} at end    =", join(", ", @$history),"\n" if $debug;
+}
+
+sub sendPageForPageRequest {
+    my $pageRequest = shift;
+
+    my $page = ariba::Ops::Page->newFromPageRequest($pageRequest);
+
+    if ( $page ) {
+        print "Created page ", $page->instance(),"\n" if $debug;
+
+        $page->print() if $debug;
+
+        $page->send();
+
+        print "Sent to ", $page->sentTo(), "\n";
+
+        $page->recursiveSave();
+    } else {
+        print "Failed to create page for pageRequest\n!";
+    }
+}
+
+sub incomingPageAck {
+    my $pageAck = shift;
+
+    my $pageId = $pageAck->pageId();
+
+    print "\tAck is for page $pageId\n" if $debug;
+
+    if ( ariba::Ops::Page->objectWithPageIdExists($pageId) ) {
+
+        my $page = ariba::Ops::Page->newFromPageId($pageId);
+        $page->setPageAck($pageAck);
+        $page->recursiveSave();
+
+    } else {
+        print "\tGot ack for page that doesn't exist!\n" if $debug;
+
+    }
+}
+
+sub whenIdle {
+    my $now = shift;
+    my $productStatus = shift;
+
+    if ($debug) {
+        print "\n---------------------------------------------\n";
+        print "whenIdle(): server is idle\n";
+    }
+
+    cleanPageTimeHistory();
+
+    my @unackedPages = ariba::Ops::Page->recentUnackedPages();
+
+    my $status = "info";
+    $status = "warn" if @unackedPages;
+    foreach my $key (keys %pageTimeHistory) {
+        if ( $key eq "Global" ) {
+            $status = "crit" if scalar(@{$pageTimeHistory{$key}}) > $pagesGlobalPerThrottlePeriod;
+        } else {
+            $status = "crit" if scalar(@{$pageTimeHistory{$key}}) > $pagesPerThrottlePeriod;
+        }
+    }
+    $productStatus->writeStatus($status);
+
+    for my $page ( sort { $a->creationTime() <=> $b->creationTime() } @unackedPages ) {
+
+        my $id   = $page->instance();
+        my $date = $page->creationTime();
+    
+        print "Unacked page $id ". scalar(localtime($date)), "\n" if $debug;
+
+        # unacked pages will always send to the pager regardless of page filters
+        if ( $now > ($date + $maxAckTime) ) {
+            my $pageRequest = $page->pageRequest();
+
+            print "Resending\n" if $debug;
+            sendPageForPageRequest($pageRequest);
+        }
+
+        print "\n";
+    }
+}
+
+main();

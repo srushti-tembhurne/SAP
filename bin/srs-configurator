@@ -1,0 +1,351 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/srs-configurator#1 $
+#
+# a script to generate SRS product config files based on the DBA's master config
+# SRS is a fake product, for which we want to try to generate the config files
+#
+# This should be installed in root's crontab.
+#
+
+use strict;
+use warnings;
+use Data::Dumper;
+use File::Basename;
+use FindBin;
+use lib ("$FindBin::Bin/../lib", "$FindBin::Bin/../lib/perl");
+
+use ariba::Ops::ProductConfig::Constants    qw(:all);
+use ariba::rc::Utils;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductConfigFactory;
+use ariba::Ops::ProductConfig;
+use dmail::LockLib;
+
+# globals
+my $prog      = basename($0);
+my $LOCKFILE  = "/tmp/$prog";
+my $debug     = FALSE;
+my $app       = 'srs';
+my $qmCleanupUtil = "bin/cleanup-query-managers";
+
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-c <config>|-d|-h]
+
+    -c <config>  SRS Master config file path (optional). default: get from DD.xml.
+    -d           Turns on debug mode.
+    -h           Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $masterConfig;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();      next; }
+        if ($arg =~ /^-d$/o) { $debug++;     next; }
+        if ($arg =~ /^-c$/o) { $masterConfig = shift; next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    unless(dmail::LockLib::requestlock($LOCKFILE, 5)) {
+        warn "can't grab lock\n";
+        exit(2);
+    }
+
+    my $mon  = ariba::rc::InstalledProduct->new();
+
+    my ($monhost) = $mon->hostsForRoleInCluster('monserver', $mon->currentCluster());
+
+    my $args = {mon_obj => $mon, action => 'gen-config', debug => $debug};
+    my $pc   = ariba::Ops::ProductConfigFactory->new($args);
+
+    $masterConfig = $mon->default("SRSReplication.MasterConfigFile") unless ($masterConfig);
+
+    eval {
+        my ($xml, $hanaHosts) = getConfigData($mon, $app, $masterConfig);
+        my ($hanaDBRoles, $realHostList, $allHanaHosts) = buildHanaDBHostInfo($hanaHosts);
+
+        my $cfg = {xml => $xml, roles => {'primary' => {monitor => $monhost, %$hanaDBRoles} }};
+        $pc->write_app_config($app, $cfg, GENCONFIG_TMPDIR);
+
+        $pc->copy_config_dir(GENCONFIG_TMPDIR."/$app", "/home/".$pc->svcuser);
+
+        my $cipher = ariba::rc::CipherStore->new($mon->service());
+
+        # now remote copy srs/configs to monhost and hana hosts
+        my @hostList = ($monhost, @$realHostList);
+        copyToRemoteHosts($mon, $cipher, \@hostList, $app);
+
+        # cleanup qm files, which are no longer part of the SRS master config
+        cleanupQM($mon, $monhost, $cipher, $xml->{SRSReplication}, $allHanaHosts);
+    };
+    print "SRS config generation failed: $@\n" if ($@);
+
+    dmail::LockLib::releaselock($LOCKFILE);
+}
+
+sub getConfigData {
+    my $mon = shift;
+    my $app = shift;
+    my $masterConfig = shift;
+
+
+    my $srsInfo = loadSRSMasterConfig($mon, $masterConfig);
+
+    my $xml;
+    $xml->{MetaData} = {
+    	ReleaseName => ucfirst($app) . 'Rel',
+	BranchName  => "//ariba/ond/$app/trunk",
+	ServiceName => $mon->service(),
+	ClusterName => $mon->currentCluster(),
+    };
+
+    $xml->{DBConnections} = $srsInfo->{DBConns};
+
+    $xml->{SRSReplication} = {
+        SRSServers     => $srsInfo->{SRSServers},
+        SRSAgents      => $srsInfo->{SRSAgents},
+        DSIConnections => $srsInfo->{DSIConns},
+    };
+
+    return ($xml, $srsInfo->{HanaHosts});
+}
+
+sub buildHanaDBHostInfo {
+    my $hanaHosts = shift;
+
+    my %hanaDBRoles = ();
+    my @realHostList = ();
+    my @allHanaHosts = ();
+
+    my $idx = '';
+    foreach my $hanaHostPortSid (@$hanaHosts) {
+
+        my ($host, $port, $sid) = split(':', $hanaHostPortSid);
+        push(@allHanaHosts, "$host:$port:$sid");
+
+        if ($host =~ /^hanacvip(\d+)(.*)$/i) {
+            # it's a scale-up cluster; construct vip-host and real-hosts
+            my $domain = $2 ? $2 : '';
+            my @realHosts = ("hanac${1}a$domain", "hanac${1}b$domain");
+            $hanaDBRoles{"hanadatabase${idx}"} = sprintf("%s { %s }", $host, join(" ", @realHosts));
+            push(@realHostList, @realHosts);
+            push(@allHanaHosts, "$_:$port:$sid") foreach (@realHosts);
+        }
+        else {
+            # scale-out cluster (old style)
+            $hanaDBRoles{"hanadatabase${idx}"} = $host;
+            $hanaDBRoles{"hanadatabasehosts${idx}" }= $host;
+            push(@realHostList, $host);
+        }
+        $idx = $idx ? $idx+1 : 2;
+    }
+
+    return (\%hanaDBRoles, \@realHostList, \@allHanaHosts);
+}
+
+sub copyToRemoteHosts {
+    my $mon      = shift;
+    my $cipher   = shift;
+    my $hostList = shift;
+    my $app      = shift;
+
+    my $service = $mon->service();
+    my $svcUser = "svc$service";
+    my $svcPasswd = $cipher->valueForName($svcUser);
+
+    foreach my $host ( @$hostList) {
+        my @output;
+        my $ret = transferFromSrcToDest(undef, undef, GENCONFIG_TMPDIR, $app, $host, $svcUser, "/home/$svcUser", undef, 0,0,0, $svcPasswd, \@output);
+
+        print join("\n", @output) if $debug;
+    }
+}
+
+# if the DBAs removed any SRS entries from their master config file,
+# the monitoring will leave old stale query files in the monhost for the deleted SRS entries.
+# we should cleanup such query files on the monhost
+sub cleanupQM {
+    my ($mon, $monHost, $cipher, $srsInfo, $hanaHosts) = @_;
+
+    my $service   = $mon->service();
+    my $monUser   = "mon$service";
+    my $monPasswd = $cipher->valueForName($monUser);
+
+    # build regex with all valid QM pattern (SRSServer/SRSAgent instance names, hanadb,mon host)
+    my $saveRegex = buildQMSaveRegex($srsInfo, $monHost, $hanaHosts);
+
+    my $qmArgs = "-product $app -save_regex \"$saveRegex\"";
+    my $sshCmd = sprintf("ssh %s@%s '%s/%s %s'", $monUser, $monHost, $mon->installDir, $qmCleanupUtil, $qmArgs);
+    print "cleanup-qm ssh command: $sshCmd\n" if $debug;
+
+    my @output;
+    my $ret = ariba::rc::Utils::executeRemoteCommand( $sshCmd, $monPasswd, 0, undef, undef, \@output );
+    print join("\n", @output) if $debug;
+}
+
+sub buildQMSaveRegex {
+    my ($srsInfo, $monHost, $hanaHosts) = @_;
+
+    my @srsServers = map{keys %$_} @{$srsInfo->{SRSServers}};
+    my @srsAgents  = map{keys %$_} @{$srsInfo->{SRSAgents}};
+
+    # get unique hana hosts (remove duplicates, if any)
+    # add '(\..*)' between host and port, to take care of optional domain name in the hostname
+    # Ex: change 'hanacvip1001:30015:A01' to 'hanacvip1001(\..*):30015:A01:', so that it matches
+    # both 'hanacvip1001:30015:A01:' and 'hanacvip1001.snv.ariba.com:30015:A01:'
+    # Add the ':' at the end, so that only exact SID matches (Ex: A01 matches, but not A011)
+    my %uniqHanaHosts = map{$_ =~ s/:/(\\..*)?:/; $_ =~ s/$/:/; $_ => 1}@$hanaHosts;
+
+    my $regex = join('|', (@srsServers, @srsAgents, keys %uniqHanaHosts, $monHost));
+
+    return $regex;
+}
+
+sub loadSRSMasterConfig {
+    my $mon    = shift;
+    my $config = shift;
+
+    my %srsInfo;
+    my (@srsServers, @srsAgents, @dsiConns, @dbConns, @hanaHosts);
+
+    die "SRS master config not set\n" unless ($config);
+    die "SRS master config missing" unless (-f $config);
+
+    open (my $CFG, "<", $config) or die "failed to open config file: $!\n";
+
+    my $validSRSFlags = ariba::Ops::ProductConfig::Constants::SRS_FLAGS;
+    
+    while (my $line = <$CFG>) {
+        chomp($line);
+
+        # skip if it's a comment line
+        next if ($line =~ m/^((\s*)|(\s*#.*))$/);
+
+        # see if 'YES_MAINTENANCE' or 'PROVISIONING' is set
+        my $status = $line =~ /($validSRSFlags)\s*$/i ? uc($1) : 'READY';
+
+        my @fields = split(/\s+/, $line);
+        my ($hanaHost, $hanaPort, $dbName, $Sid) = split(":", $fields[8]);
+        $dbName =~ s/^\-d//;
+
+        my $findHostCmd =  $mon->default("SRSReplication.FindHostCommand");
+        die "find hostname command ($findHostCmd) not found\n" if (!$findHostCmd || !-f $findHostCmd);
+
+        my $srsHost = `$findHostCmd $fields[0]`;
+        chomp($srsHost);
+
+        # findHostCmd will return JUNK_SRVR, if it can't find srs hostname; skip those
+        next if ($srsHost =~ /junk/i);
+
+        my %srs = (
+            repServerInstance => $fields[0],
+            dsiName           => $fields[2],
+            type              => $fields[3],
+            repAgentInstance  => $fields[4],
+            dsiUsername       => $fields[7],
+            hanaHost          => $hanaHost,
+            hanaPort          => $hanaPort || 30015,
+            hanaDBName        => $dbName,
+            hanaSID           => $Sid,
+            srsHost           => $srsHost,
+            repServerHome     => $fields[9],
+            repAgentHome      => $fields[10],
+            status            => $status,
+        );
+
+        # build the repServer, repAgent, DSI, DBConnection list
+        push(@srsServers, addSRSServer(\%srs));
+        push(@srsAgents,  addSRSAgent(\%srs));
+        push(@dsiConns,   addDSIConnection(\%srs));
+        push(@dbConns,    addDBConnection(\%srs)) if ($srs{hanaSID});
+        push(@hanaHosts,  "$hanaHost:$hanaPort:$Sid") if ($hanaHost);
+
+    }
+    close($CFG);
+
+    # Build the hash as required by the XML::Simple to generate the DD.xml
+    $srsInfo{SRSServers} = [{ map {$_->{instanceName} => [$_]} @srsServers }];
+    $srsInfo{SRSAgents}  = [{ map {$_->{instanceName} => [$_]} @srsAgents }];
+    $srsInfo{DSIConns}   = [{ map {$_->{instanceName} => [$_]} @dsiConns }];
+    $srsInfo{DBConns}    = { map {$_->{instanceName}  => [$_]} @dbConns };
+    $srsInfo{HanaHosts}  = \@hanaHosts;
+
+    return \%srsInfo;
+}
+
+sub addSRSServer {
+    my $srs  = shift;
+
+    my $srsServer = {
+        serverType    => $srs->{type},
+        instanceName  => $srs->{repServerInstance},
+        srshostname   => $srs->{srsHost},
+        dsiname       => $srs->{dsiName},
+        dsiusername   => $srs->{dsiUsername},
+        repServerHome => $srs->{repServerHome},
+        srsStatus     => $srs->{status},
+    };
+
+    return $srsServer;
+}
+
+sub addSRSAgent {
+    my $srs  = shift;
+
+    my $srsAgent = {
+        agentType    => $srs->{type},
+        instanceName => $srs->{repAgentInstance},
+        srshostname  => $srs->{srsHost},
+        repAgentHome => $srs->{repAgentHome},
+        srsStatus    => $srs->{status},
+    };
+
+    return $srsAgent;
+}
+
+sub addDSIConnection {
+    my $srs  = shift;
+
+    my $dsiConn = {
+        serverType     => $srs->{type},
+        instanceName   => $srs->{repServerInstance},
+        srshostname    => $srs->{srsHost},
+        dsiname        => $srs->{dsiName},
+        dsiUserName    => $srs->{dsiUsername},
+        hanaPort       => $srs->{hanaPort},
+        hanaHostname   => $srs->{hanaHost},
+        srsStatus      => $srs->{status},
+    };
+
+    return $dsiConn;
+}
+
+sub addDBConnection {
+    my $srs  = shift;
+
+    my $DBConn = {
+        instanceName => "HANA_".$srs->{repServerInstance},
+        hostName     => $srs->{hanaHost},
+        port         => $srs->{hanaPort},
+        serverID     => $srs->{hanaSID},
+        dbName       => $srs->{hanaDBName},
+        userName     => 'system',
+    };
+
+    return $DBConn;
+}
+
+
+main(@ARGV);

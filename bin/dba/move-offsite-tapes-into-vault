@@ -1,0 +1,355 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/dba/move-offsite-tapes-into-vault#29 $
+#
+# Move tapes in and out of VAULT media pool. 
+
+use strict;
+
+use Date::Calc qw(Delta_Days);
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::monitor::misc;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+
+my $OMNIMM   = '/opt/omni/bin/omnimm';
+my $OMNILIST = '/opt/omni/bin/omnimlist';
+my $OMNIRPT  = '/opt/omni/bin/omnirpt';
+my $VAULT    = 'VAULT';
+
+sub main {
+
+    my $debug     = 0;
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+        
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-d/o) { $debug++; };
+        if ($arg =~ /^-e/o) { $sendEmail = 1; };
+        if ($arg =~ /^-p/o) { $sendPage = 1; };
+    }
+
+    my $me         = ariba::rc::InstalledProduct->new();
+    my $email      = $me->default('notify.email');
+    my $hostname   = ariba::Ops::NetworkUtils::hostname();
+    my $machine    = ariba::Ops::Machine->new($hostname);
+    my $datacenter = $machine->datacenter();
+    my $tapeDevice = (ariba::monitor::misc::tapeRobotDevicesForDatacenter($datacenter))[0];
+    my $deviceLibrary;
+    my %queries;
+    my %poolList;   # media pool hash (key: pool, value: failed move media list)
+    my %poolUsage;
+
+    # move_vault only runs in Production datacenters
+    if (($datacenter ne 'snv') && ($datacenter ne 'bou') && ($datacenter ne 'us1')) {
+        print "move_vault should only run in Production datacenter. Current datacenter: $datacenter\n";
+    } else {
+        ##########
+        # Step 1: calculate current WK#.
+        ##########
+
+        my ($tapeWeek, $totalWeeks, $deviceLibrary) = calculate_week($datacenter, $debug);
+
+        ##########
+        # Step 2: get media pool list.
+        ##########
+
+        %poolList = get_pool_list();
+
+        ##########
+        # Step 3: get media pool usage for the previous week.
+        ##########
+
+        %poolUsage = get_pool_usage(\%poolList);
+
+        ##########  
+        # Step 4: move all tapes to "VAULT".
+        ##########
+
+        move_to_vault(\%poolList, $debug);
+
+        ##########
+        # Step 5: move tapes from VAULT to corresponding media pools for the week.
+        ##########
+
+        move_from_vault(\%poolList, $tapeWeek, $debug);
+
+        ##########
+        # Step 6: get media pool tape count.
+        ##########
+
+        %queries = gather_pool_tape_count(\%poolList, \%poolUsage, $tapeWeek, $totalWeeks, $deviceLibrary, $debug);
+
+        # update MON page
+        my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($machine->datacenter());
+        my $qm  = ariba::monitor::QueryManager->newWithDetails(
+        'dba', $tab, $me->service(), undef, \%queries
+        );
+
+        $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub calculate_week {
+    my ($datacenter, $debug) = @_;
+    
+    my $totalWeeks = 12;        # 12 weeks rentention
+    my $deviceLibrary = "T380"; # tape library
+    my @dateOfFirstWeek = (2010, 12, 17);
+    my @today = (localtime)[5,4,3];
+    $today[0] += 1900; 
+    $today[1]++;
+
+    my $tapeWeek = int(Delta_Days(@dateOfFirstWeek, @today) / 7) % $totalWeeks + 1;
+
+    print "$datacenter WK$tapeWeek\n\n" if $debug;
+
+    return $tapeWeek, $totalWeeks, $deviceLibrary;
+}
+
+sub get_pool_list {
+    my %poolList;
+
+    open(LISTPOOL, "$OMNIMM -list_pool |") or die "Can't run: [$OMNIMM -list_pool] : $!";
+
+    while (my $poolItem = <LISTPOOL>) {
+        next unless $poolItem =~ /ONSITE|OFFSITE/;
+    
+        my $pool = (split /\s+/, $poolItem)[1];
+
+        # construct media pool hash for later use in pool stats
+        $poolList{$pool} = [];
+    }
+
+    close(LISTPOOL);
+    return %poolList;
+}
+
+sub get_pool_usage {
+    my $poolList = shift;
+    my %poolUsage;
+    my ($total, $used, $free, $totalTape, $emptyTape, $appendableTape);
+
+    foreach my $poolname (keys %$poolList) {
+        open(POOLSTATS, "$OMNIRPT -report media_statistics -pool $poolname |") or die "Can't run: [$OMNIMM -report media_statistics -pool $poolname] : $!";
+
+        while (my $statsItem = <POOLSTATS>) {
+            next unless $statsItem =~ /# Media|# Scratch|Total \[GB\]|Used \[GB\]|Free \[GB\]|# Appendable/;
+
+            if ($statsItem =~ /Media/) {
+                $totalTape = (split /:/, $statsItem)[1];
+                $totalTape =~ s/\s+//g;
+            } elsif ($statsItem =~ /Scratch/) {
+                $emptyTape = (split /:/, $statsItem)[1];
+                $emptyTape =~ s/\s+//g;
+            } elsif ($statsItem =~ /Total/) {
+                $total = (split /:/, $statsItem)[1];
+                $total =~ s/\s+//g;
+            } elsif ($statsItem =~ /Used/) {
+                $used = (split /:/, $statsItem)[1];
+                $used =~ s/\s+//g;
+            } elsif ($statsItem =~ /Free/) {
+                $free = (split /:/, $statsItem)[1];
+                $free =~ s/\s+//g;
+            } elsif ($statsItem =~ /Appendable/) {
+                $appendableTape = (split /:/, $statsItem)[1];
+                $appendableTape =~ s/\s+//g;
+            }
+        }
+
+        my $fullTape = ($totalTape - $emptyTape - $appendableTape);
+        my $freePercent = ($total != "0.00") ? sprintf "%.2f", (($free/$total) * 100) : "0.00";
+
+        $poolUsage{$poolname} = "Total: $total GB, Used: $used GB, Free: $free GB, $freePercent% Free Space, $fullTape out of $totalTape Media Full";
+    }
+
+    return %poolUsage;
+}
+
+sub move_to_vault {
+    my ($poolList, $debug) = @_;
+
+    foreach my $pool (sort keys %$poolList) {
+        open(LISTTAPES, "$OMNIMM -list_pool $pool -detail |") or die "Can't run: [$OMNIMM -list_pool $pool] : $!";
+
+        while (my $tapeItem = <LISTTAPES>) {
+            next unless $tapeItem =~ /label/;
+
+            my $tape = (split /\s+/, $tapeItem)[4];
+
+            unless (defined $tape) {
+                print "Tape not defined! - Do you have the right media pool?\n" if $debug;
+                next;
+            }
+
+            print "Found $tape in $pool\n" if $debug;
+
+            # Move everything to the vault.
+            print "Moving $tape to $VAULT\n" if $debug;
+            CORE::system("$OMNIMM -move_medium $tape $VAULT");
+
+            # check return value from move_medium
+            push(@{$poolList -> {$pool}}, $tape) if ($? != 0);
+        }
+
+        close(LISTTAPES);
+    }
+}
+
+sub move_from_vault {
+    my ($poolList, $tapeWeek, $debug) = @_;
+
+    open(LISTDETAIL, "$OMNIMM -list_pool $VAULT -detail |") or die "Can't run: [$OMNIMM -list_pool $VAULT -detail] : $!";
+
+    while (my $poolItem = <LISTDETAIL>) {
+        next unless $poolItem =~ /label/;
+
+        my $tape = (split /\s+/, $poolItem)[4];
+
+        next unless (defined $tape);
+        next unless $tape =~ /^(.*?)_\d+_WK${tapeWeek}$/;
+
+        my $job = $1;
+
+        $job =~ s/ON_(.*)/$1/;
+        $job =~ s/OFF_(.*)/$1/;
+
+        print "Found $tape in $VAULT\n" if $debug;
+
+        if ($tape =~ /ON_${job}_\d+_WK${tapeWeek}/) {
+            my $pool = ${job} . "_ONSITE";
+            $pool = "ASP_$pool" , if ($pool =~ m/BYR/);
+            $pool =~ s/HANA_ARCH/HDB00_LOG/ , if ($pool =~ m/HANA_ARCH/);
+            $pool =~ s/HANA_FULL/HDB00_DATA/ , if ($pool =~ m/HANA_FULL/);
+            $pool =~ s/AN\_/AN\_AUX\_/ , if ($pool =~ m/AN/);
+
+            print "Moving $tape from $VAULT to $pool\n" if $debug;
+            CORE::system("$OMNIMM -move_medium $tape $pool");
+            # check return value from move_medium
+            push(@{$poolList -> {$pool}}, $tape) if ($? != 0);
+        } elsif ($tape =~ /OFF_${job}_\d+_WK${tapeWeek}/) {
+            my $pool = ${job} . "_OFFSITE";
+            $pool = "ASP_$pool" , if ($pool =~ m/BYR/);
+            $pool =~ s/HANA_ARCH/HDB00_LOG/ , if ($pool =~ m/HANA_ARCH/);
+            $pool =~ s/HANA_FULL/HDB00_DATA/ , if ($pool =~ m/HANA_FULL/);
+            $pool =~ s/AN\_/AN\_AUX\_/ , if ($pool =~ m/AN/);
+
+            print "Moving $tape from $VAULT to $pool\n" if $debug;
+            CORE::system("$OMNIMM -move_medium $tape $pool");
+            # check return value from move_medium
+            push(@{$poolList -> {$pool}}, $tape) if ($? != 0);
+        }
+    }
+
+    close(LISTDETAIL);
+}
+
+sub gather_pool_tape_count {
+    my ($poolList, $poolUsage, $tapeWeek, $totalWeeks, $deviceLibrary, $debug) = @_;
+    my ($total, $good, $fair, $poor, $protected);
+    my %queries;
+
+    # run barcode scan to update tape library
+    my $scanError = barcode_scan($deviceLibrary, $debug);
+
+    foreach my $poolname (keys %$poolList) {
+        open(POOLSTATS, "$OMNIRPT -report media_statistics -pool $poolname |") or die "Can't run: [$OMNIMM -report media_statistics -pool $poolname] : $!";
+
+        while (my $statsItem = <POOLSTATS>) {
+            next unless $statsItem =~ /# Media|# Good|# Fair|# Poor|# Protected/;
+
+            if ($statsItem =~ /Media/) {
+                $total = (split /:/, $statsItem)[1];
+                $total =~ s/\s+//g;
+            } elsif ($statsItem =~ /Good/) {
+                $good = (split /:/, $statsItem)[1];
+                $good =~ s/\s+//g;
+            } elsif ($statsItem =~ /Fair/) {
+                $fair = (split /:/, $statsItem)[1];
+                $fair =~ s/\s+//g;
+            } elsif ($statsItem =~ /Poor/) {
+                $poor = (split /:/, $statsItem)[1];
+                $poor =~ s/\s+//g;
+            } elsif ($statsItem =~ /Protected/) {
+                $protected = (split /:/, $statsItem)[1];
+                $protected =~ s/\s+//g;
+            }
+        }
+
+        my $countString = "Total: $total, Good: $good, Fair: $fair, Poor: $poor, Protected: $protected";
+        my $answer = ((!$total) || ($total != $good) || ($protected) || (@{$poolList -> {$poolname}}) || $scanError) ? 'not ok' : 'ok';
+        my @note;
+
+        push(@note, "Failed Move > 0") if (@{$poolList -> {$poolname}});
+        push(@note, "No Media Found") if (!$total);
+        push(@note, "Fair/Poor Media Found") if ($total != $good);
+        push(@note, "Protected Media Found") if ($protected);
+        push(@note, "$scanError") if ($scanError);
+
+        my $noteString = join(", ", @note);
+
+        # Note failed moves if exist
+        my $failedCount = scalar(@{$poolList -> {$poolname}});
+        my $failedString = (@{$poolList -> {$poolname}}) ? "(" . join(", ", sort @{$poolList -> {$poolname}}) . ")" : "";
+
+        my $prevWeek = ($tapeWeek == 1) ? $totalWeeks : ($tapeWeek - 1);
+        my $usageString = $poolUsage -> {$poolname};
+        my $poolString = $poolname;
+
+        $poolString =~ s/(.*)_ONSITE/$1/;
+        $poolString =~ s/(.*)_OFFSITE/$1/;
+
+        # Setup a simple query to inform the monitoring server what our status is.
+        $queries{"$poolname"} = {
+            note => "$noteString",
+            info => "'$answer' eq 'ok'",
+            warn => "'$answer' eq 'not ok'",
+            crit => "'$answer' eq ''",
+            noRowCount => 1,
+            perl => sub { main::queryMessages($tapeWeek, $prevWeek, $countString, $usageString, $failedCount, $failedString, $answer) },
+            uiHint => "rman-backup-media-allocations/$poolString",
+        };
+    }
+
+    return %queries;
+}
+
+sub barcode_scan {
+    my ($deviceLibrary, $debug) = @_;
+    my $barcodeCmd = "$OMNIMM -repository_barcode_scan \"${deviceLibrary}\"";
+    my $scanError = "";
+
+    print "Running barcode scan $barcodeCmd\n" if $debug;
+    $scanError = "Barcode Scan Failed (exit value $?)" if (CORE::system($barcodeCmd) != 0);
+
+    return $scanError;
+}
+
+sub queryMessages {
+    my ($tapeWeek, $prevWeek, $countString, $usageString, $failedCount, $failedString, $answer) = @_;
+    my @msg;
+
+    my $week = "Current Week: WK$tapeWeek";
+    my $status = "Media Allocation: $answer";
+    my $failure = "Failed Move Count: $failedCount $failedString";
+    my $current = "WK$tapeWeek Media Status: $countString";
+    my $previous = "WK$prevWeek Media Usage: $usageString";
+    my $timestr = "Last Completed: " . localtime();
+
+    push(@msg, $week, $status, $failure, $current, $previous, $timestr);
+
+    return join("\n", @msg);
+}   
+
+
+main();
+
+exit(0);
+
+__END__

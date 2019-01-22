@@ -1,0 +1,54 @@
+#!/usr/local/bin/perl -w
+#
+# $Id$
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+
+sub main{
+	my $debug = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; }
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	my %queries = (
+		"archive job status for log_event" => {
+		  info => "answer == 1",
+		  warn => "answer != 1",
+		  ticketOnWarnOpenAfterMinutes => 1,
+		  sql => q{select count(*) from st_dispatcher_queue where ((status = 'Processing') or (status = 'Queued' and schedule_time >= (sysdate - 1))) and item = 120}
+		},
+
+		"archive job status for log_event_pair" => {
+		  info => "answer == 1",
+		  warn => "answer != 1",
+		  ticketOnWarnOpenAfterMinutes => 1,
+		  sql => q{select count(*) from st_dispatcher_queue where ((status = 'Processing') or (status = 'Queued' and schedule_time >= (sysdate - 1))) and item = 119}
+		},
+	);
+
+	my $me   = ariba::rc::InstalledProduct->new();
+	my $prod = ariba::rc::InstalledProduct->new('perf', $me->service());
+
+	my $email = $me->default('notify.email');
+
+	my $q = ariba::monitor::QueryManager->newWithDetails(
+		"truncation-status", $prod->name(), $me->service(), $me->customer(), \%queries
+	);
+	$q->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($prod));
+
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

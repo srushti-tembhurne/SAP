@@ -1,0 +1,284 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/dba/check-tapes#17 $
+#
+# This script checks the backup tapes in the drives after they have 
+# been rotated for the week. This script canbe run anytime after the
+# new tapes have been loaded in the drives and before monday (monday
+# is marked as beginning of a new week).
+#
+# This script has to be run as 'root' unix user.
+# It does not need to know any passwords.
+#
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Constants;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+
+my $omnimm = "/opt/omni/bin/omnimm";
+
+my $labelChecker = "$omnimm -repository";
+my $driveScan = "$omnimm -repository_update";
+
+my $clusterInfo = {
+	'andb-ob' => {
+		    'Library' => 'anbdboralib',
+		    'Drives'  => ['andboradrv1', 'andboradrv2'],
+		    #
+		    # Week 0 of year corresponds to WK4 in the
+		    # tape library. This needs to be reset if run at a
+		    # different time.
+		    #
+                    # mchang: Set WeekOffset to 12 for 2003.
+		    'WeekOffset' => 12,
+		    'TotalWeeks' => 12,
+		    'SlotsAllocation' => [
+					    'NA',
+					    'ORAFULL',
+					    'ORAFULL',
+					    'ORAFULL',
+					    'ORAARCH',
+					    'ORAFULL',
+					    'ORAFULL',
+					    'ORAFULL',
+					    'OFFORAFULL',
+					    'OFFORAFULL',
+					    'OFFORAFULL',
+					    'OFFORAFULL',
+					    'OFFORAFULL',
+					    'OFFORAFULL',
+					    'OFFORAARCH',
+					  ],
+
+		  },
+	'catdb-ob' => {
+		    'Library' => 'catdboralib',
+		    'Drives'  => ['catdboradrv1', 'catdboradrv2'],
+		    'WeekOffset' => 12,
+		    'TotalWeeks' => 12,
+		    'SlotsAllocation' => [
+					    'NA',
+					    'MONORAFULL',
+					    'PERFORAFULL',
+					    'OFFMONORAFULL',
+					    'OFFPERFORAFULL',
+					    'CATORAFULL',
+					    'IBXORAFULL',
+					    'EDIORAFULL',
+					    'CATORAARCH',
+					    'IBXORAARCH',
+					    'OFFCATORAFULL',
+					    'OFFIBXORAFULL',
+					    'OFFEDIORAFULL',
+					    'OFFCATORAARCH',
+					    'OFFIBXORAARCH',
+					    'AESORAFULL',
+					    'OFFAESORAFULL'
+					  ],
+		  },
+      };
+
+
+my $debug = 0;
+
+
+sub main {
+
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+	my $noScan    = 0;
+
+	while(my $arg=shift(@ARGV)){
+		if( $arg =~ /^-e/o ){ $sendEmail = 1; };
+		if( $arg =~ /^-p/o ){ $sendPage = 1; };
+		if( $arg =~ /^-d/o ){ $debug = 1; };
+		if( $arg =~ /^-s/o ){ $noScan = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $sysadmin = ariba::Ops::Constants->operationsSysadminEmailAddress();
+	my $pager = $me->default('notify.pagers') . ", $sysadmin";
+	my $email = $me->default('notify.email')  . ", $sysadmin";
+	my $cluster  = $me->currentCluster();
+
+	#my $email = 'mdubey@ariba.com,dfong@ariba.com';
+	#my $pager = 'mdubey@ariba.com,dfong@ariba.com';
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+
+	for my $package (keys(%$clusterInfo)) {
+
+		unless (currentHostForPackage($hostname, $package)) {
+			print "$hostname does not run package $package\n" if ($debug);
+			next;
+		}
+
+		my $clusterLibrary = $clusterInfo->{$package}->{Library};
+		my @clusterDrives = @{$clusterInfo->{$package}->{Drives}};
+		my $weekOffset = $clusterInfo->{$package}->{WeekOffset};
+		my $totalWeeks = $clusterInfo->{$package}->{TotalWeeks};
+		my @slotAllocation = @{$clusterInfo->{$package}->{SlotsAllocation}};
+
+		if ($debug) {
+			print "ob package $package on $hostname\n";
+			print "Library = $clusterLibrary\n";
+			print "Drives = ", join(", ", @clusterDrives), "\n";
+			print "Slots = \n  ", join("\n  ", @slotAllocation), "\n";
+		}
+
+		scanDrives(@clusterDrives) unless($noScan);
+
+		my %queries;
+
+
+		$queries{"DB backup tapes for $package on $hostname"} = {
+			#'noRowCount' => 1,
+			'info' => "numrows == 0",
+			'crit' => "numrows > 0",
+			'perl' => qq!main::validateTapeLibrary("$clusterLibrary","$weekOffset","$totalWeeks","@slotAllocation");!,
+			'note' => "Call IBM at Equinix (1-800-502-8046) to swap tapes if crit!",
+		};
+
+		my $machine = ariba::Ops::Machine->new($hostname);
+		my $datacenter = $machine->datacenter();
+		my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+		my $q = ariba::monitor::QueryManager->newWithDetails(
+			"Backups", $tab, $me->service(), $me->customer(), \%queries
+		);
+
+		$q->run();
+
+		if ($debug) {
+			$q->displayToStdout();
+		} else {
+			$q->checkStatus();
+
+			my $monserver = ($me->hostsForRoleInCluster('monserver', $cluster))[0];
+
+			if (my $ret = $q->appendToServer($monserver) != 0) {
+				next;
+			}
+
+			$q->notifyAboutStatusOnServer(
+				ariba::monitor::QueryManager::notifyList($sendEmail, $sendPage, $email, $pager)
+			);
+		}
+	}
+
+	exit(0);
+}
+
+sub currentHostForPackage {
+	my $hostname = shift();
+	my $package = shift();
+
+	my $runsOnHost = ariba::Ops::NetworkUtils::activeHostForVirtualHostUsingMacAddress($package, $hostname);
+
+	if (!$runsOnHost || $runsOnHost ne $hostname) {
+		return 0;
+	}
+
+	return 1;
+}
+
+sub scanDrives {
+	my @drives = @_;
+
+	print "Scanning drives, this can take upto 30 mins...\n" if ($debug);
+	for my $drive ( @drives ) {
+		print "  $drive...\n" if ($debug);
+		CORE::system("$driveScan $drive");
+	}
+}
+
+# ./omnimm -repository catdboralib
+# 
+# Slot [side]                Medium          Medium Label (ID)
+# ============================================================================
+# 1                          Cleaning tape
+# 2                          OmniBack II     CATARIBAFULL_2_WK8
+# 3                          OmniBack II     CATARIBAINC_3_WK8
+# 4                          Empty
+# 5                          Empty
+# 6                          OmniBack II     CATORAFULL_6_WK8
+# 7                          OmniBack II     IBXORAFULL_7_WK8
+# 8                          Empty
+# 9                          OmniBack II     CATORAARCH_9_WK8
+# 10                         OmniBack II     IBXORAARCH_10_WK8
+# 11                         OmniBack II     OFFCATORAFULL_11_WK8
+# 12                         OmniBack II     OFFIBXORAFULL_12_WK8
+# 13                         OmniBack II     OFFCATARIBAFULL_13_WK8
+# 14                         OmniBack II     OFFCATORAARCH_14_WK8
+# 15                         OmniBack II     OFFIBXORAARCH_15_WK8
+# 
+# ./omnimm -repository anbdboralib
+# Slot [side]                Medium          Medium Label (ID)
+# ============================================================================
+# 1                          Cleaning tape
+# 2                          OmniBack II     ARIBAFULL_2_WK8
+# 3                          OmniBack II     ARIBAINC_3_WK8
+# 5                          OmniBack II     EDIFULL_5_WK8
+# 6                          OmniBack II     ORAFULL_6_WK8
+# 7                          OB2 foreign
+# 10                         OmniBack II     ORAARCH_10_WK8
+# 11                         OmniBack II     OFFORAFULL_11_WK8
+# 12                         OmniBack II     OFFORAFULL_12_WK8
+# 13                         OmniBack II     OFFARIBAFULL_13_WK8
+# 14                         OmniBack II     OFFEDIFULL_14_WK8
+# 15                         OmniBack II     OFFORAARCH_15_WK8
+# 
+sub validateTapeLibrary {
+	my $library = shift();
+	my $weekOffset = shift();
+	my $totalWeeks = shift();
+	my @slotsAllocation = split(/\s+/, shift);
+
+	my $yearDay = (localtime(time()))[7];
+	my $thisWeek = ($yearDay/7) + 1;
+
+	my $tapeWeek = (($thisWeek + $weekOffset) % $totalWeeks) + 1;
+
+	my @errors;
+
+	open(CMD, "$labelChecker $library |") || die "Could not run $labelChecker $library\n";
+	while(<CMD>) {
+	    next unless (/^\d/o);
+
+	    chomp($_);
+
+	    my ($slot, $desc, $desc2, $label) = split(/\s+/, $_, 5);
+
+	    if ($slot == 1 && $desc !~ /clean/io) {
+		push(@errors, "There is no cleaning tape in slot $slot");
+	    } elsif ( $desc =~ /ob2/i ) {
+		push(@errors, "There is an uninitialized tape in slot $slot");
+	    }
+
+	    my $tapeInSlot = $slotsAllocation[$slot -1];
+	    next if ($tapeInSlot eq "NA");
+
+	    $label = "Nothing in this slot" unless($label);
+
+	    my $tapeLabel = "${tapeInSlot}_${slot}_WK${tapeWeek}";
+
+	    if ( $tapeLabel ne $label ) {
+		    push(@errors, "Wrong tape in slot $slot: $label should be $tapeLabel");
+	    }
+
+	    print "slot = $slot, desc = $desc $desc2, tape = $label, should be $tapeLabel\n" if ($debug);
+	}
+	close(CMD);
+
+	return (join("\n", @errors));
+}
+
+main();

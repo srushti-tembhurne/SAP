@@ -1,0 +1,107 @@
+#!/usr/local/bin/perl -w
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::CircularDB;
+use ariba::Ops::SharedMemoryChild;
+
+my $threadCount = 0;
+my $maxThreads = 4;
+
+sub usage {
+	my $msg = shift;
+	print "Error: $msg\n" if $msg;
+	print "Usage: $0 [-threads <n>] <cdbdir1> [<cdbdir2> ...]\n";
+	print "  -t[hreads]    number of concurrent threads to use, default is $maxThreads\n";
+	print "  -h[elp]       this help\n";
+	exit(1);
+}
+
+sub main {
+
+	my @cdbdirs = ();
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-t/) { $maxThreads = shift(@ARGV); next;}
+		if ($arg =~ /^-h/) { usage(); }
+		if ($arg =~ /^-/) { usage("Unknown arg $arg\n"); }
+		push(@cdbdirs, $arg);
+	}
+
+	for my $dir (@cdbdirs) {
+		my @cdbs = ariba::monitor::CircularDB->listDBs($dir);
+
+		my $numCdbs = scalar(@cdbs);
+		print "======= " . localtime(time()). ": converting $numCdbs cdbs ======\n";
+
+		my $i = 0;
+
+		for my $cdb (@cdbs) {
+			$i++;
+
+			unless ($i%10) {
+				print "===== " . localtime(time()) . ": $i of $numCdbs ====\n";
+			}
+
+			my $coderef = sub {
+				print $cdb->name();
+
+				
+				if ($cdb->convertCDBFromSparcToX86()) {
+					print "     converted\n";
+				} else {
+					print "     no conversion needed\n";
+				}
+			};
+
+			addThread($cdb->fileName(), $coderef);
+
+			#
+			# If we reached the limit of number of maximum process allowed, wait
+			# for one to finish, before allowing the next one to be launched
+			#
+			waitForThreads(threadCount() - maxThreadCount() + 1);
+		}
+	}
+
+	waitForThreads();
+}
+
+main();
+
+sub threadCount {
+	return $threadCount;
+}
+
+sub maxThreadCount {
+	return $maxThreads;
+}
+
+# called with the number of threads to wait for
+# will return immediately on 0
+# will wait for all remaining threads on undef
+#
+sub waitForThreads {
+	my $count = shift;
+
+	return if defined ($count) && $count < 1;
+
+	my @kids = ariba::Ops::SharedMemoryChild->waitForChildren($count);
+	$threadCount -= scalar(@kids);
+}
+
+sub addThread {
+	my $tag = shift;
+	my $coderef = shift;
+	#
+	# create and launch the child process, store the output in shared mem
+	#
+	my $size = 400 * 1024; #allow upto 400KB of output
+	my $child = ariba::Ops::SharedMemoryChild->new($coderef, $size);
+	$child->setTag($tag);
+	$child->run();
+
+	++$threadCount;
+}

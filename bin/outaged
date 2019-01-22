@@ -1,0 +1,60 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/outaged#2 $
+
+use strict;
+use FindBin;
+use lib ("$FindBin::Bin/../lib");
+
+use ariba::Ops::UDPTransport;
+use ariba::monitor::AppRecycleOutage;
+
+my $debug = 0;
+
+sub main {
+	$| = 1; # unbuffered output for better KR logging
+
+	my $port = 61501;
+	while (my $arg = shift(@ARGV)) {
+		if($arg =~ /^-d/o) { $debug = 1; next; }
+		if($arg =~ /^-port/o) { $port = shift(@ARGV); next; }
+	}
+
+	ariba::monitor::AppRecycleOutage->enableSmartCache();
+
+	my $transport = ariba::Ops::UDPTransport->new();
+
+	$transport->setDebug($debug);
+	$transport->initAsServer($port);
+
+	while(1) {
+		my ($clientHost, $clientPort, $message) = $transport->receiveMessageFromClient(30);
+
+		if ($clientHost) {
+			my($product, $appinstance, $duration) = split(/\t/, $message);
+
+			if ($debug) {
+				print "Incoming from: $clientHost:$clientPort\n";
+				print "Product: $product\n";
+				print "Instance: $appinstance\n";
+				print "Duration: $duration\n";
+			}
+
+			if(!defined($duration)) {
+				print "Bad message: $message\n" if $debug;
+				next;
+			}
+
+			my $outageName = ariba::monitor::AppRecycleOutage->instanceName($product, $appinstance);
+			if(ariba::monitor::AppRecycleOutage->objectWithNameExists($outageName)) {
+				my $checkoutage = ariba::monitor::AppRecycleOutage->new($outageName);
+				# remove the old outage, if it's still around
+				$checkoutage->remove() if(defined($checkoutage));
+			}
+			my $outage = ariba::monitor::AppRecycleOutage->newWithDetails($product, $appinstance, $duration);
+			$outage->save();
+		}
+	}
+}
+
+main();

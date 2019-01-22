@@ -1,0 +1,500 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use FindBin;
+use Data::Dumper;
+use POSIX;
+use Date::Parse;
+use Time::Piece;
+use Time::Seconds;
+
+use lib '/usr/local/ariba/lib';
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../lib";
+
+use File::Basename;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::rc::CipherStore;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::HanaClient;
+use File::Temp qw(tempfile);
+use POSIX qw(strftime);
+use dmail::LockLib;
+use constant INTERFACE_FILE => '/opt/sybase/repserver/interfaces.TOTAL';   ##for prod
+use constant TIMEOUT => "10"; ###in seconds
+
+my $debug = 0;
+my $queries;
+my $lockFile = "/tmp/" . basename($0);
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -s    Service
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode.
+    -product product
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $service;
+    my $product;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-s$/o) { $service = shift;   next; }
+        if ($arg =~ /^-product/o) { $product = shift;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+    usage( "Service and product is a required argument" ) unless ($service && $product);
+
+    die "can't grab lock\n" unless dmail::LockLib::requestlock($lockFile, 3);
+
+    my $me = ariba::rc::InstalledProduct->new($product, $service);
+    my $cluster  = $me->currentCluster();
+
+    my ($monhost) = $me->hostsForRoleInCluster( 'monitor', $cluster );
+    die "Error reading mon host for $service ...\n" unless ( $monhost );
+
+    my $mon      = ariba::rc::InstalledProduct->new('mon', $service);
+    my $user = "svc$service";
+    my $cipher = ariba::rc::CipherStore->new($service);
+    my $monpass = $cipher->valueForName($user);
+
+    my @srsServers = getAllSRSServers($me);
+    my @srsAgents = getAllSRSAgents($me);
+    my @srsDsiConnections = getAllDSIConnections($me);
+
+    for my $srsServer(@srsServers){
+        whoIsDown($srsServer);
+        diskSpace($srsServer);
+        licenseMonitoring($srsServer,$user,$monpass);
+    }
+
+    for my $dsiConn (@srsDsiConnections){
+        ticketStatus($dsiConn);
+    }
+
+    for my $srsAgent(@srsAgents){
+        repAgentStatus($srsAgent);
+        repAgentsubmitTickets($srsAgent);
+        repAgentErrorMonitor($srsAgent,$user,$monpass);
+        repAgentMemory($srsAgent,$user,$monpass);
+    }
+
+    my $email = $mon->default('notify.email');
+
+    print Dumper($queries) if $debug;
+    my $qm = ariba::monitor::QueryManager->newWithDetails('SRS Status', $me->name(), $me->service(), $me->customer(), $queries);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monhost);
+
+    dmail::LockLib::releaselock($lockFile);
+}
+
+sub whoIsDown{
+    my $args = shift;
+
+    $args->{command} = "admin who_is_down\ngo\n";
+    my $retStr = executeISQLCmd($args);
+
+    my $downInfo;
+    if ( $retStr =~ /error/i ){
+        $downInfo = "ERROR: $retStr - STATUS-crit";
+    }elsif ( $retStr !~ qr/\s+$args->{dsiname}/i ){
+        $downInfo = 'STATUS-info';
+    }else {
+        $downInfo = 'STATUS-crit';
+    }
+
+    $queries->{"$args->{instanceName}\@$args->{srshostname}"} = {
+        crit    => 'answer =~ /Crit/i',
+        info => 'answer =~ /info/',
+        perl    => sub { return $downInfo;},
+        uiHint  => "Rep Server Who Is Down",
+        correctiveActions => [
+            Ops => 'Inform DBA',
+        ],
+        description => "Rep Server Who Is Down for $args->{srshostname}",
+    };
+}
+
+sub diskSpace{
+    my $args = shift;
+
+    $args->{command} = "admin disk_space\ngo\n";
+    my $retStr = executeISQLCmd($args);
+    my ($totalUsedSpace,$totalSpace ) = parserDiskSpace($retStr);
+
+    print "totalUsedSpace $totalUsedSpace and totalSpace $totalSpace\n" if $debug;
+    my $spaceInfo;
+    if ( ! $totalSpace){
+        $spaceInfo = "Error: Seems diskSpace command failed!! STATUS-Crit";
+    }elsif ($totalUsedSpace eq 0 ){
+        $spaceInfo = "$totalUsedSpace % STATUS-Info";
+    }else{
+        my $diskUsage = sprintf ("%.2f", ($totalUsedSpace/$totalSpace) * 100 );
+        if ($diskUsage > 10 ){
+            $spaceInfo = "$diskUsage % STATUS-crit";
+        }elsif ( $diskUsage > 5 ){
+            $spaceInfo = "$diskUsage % STATUS-warn";
+        }else {
+            $spaceInfo = "$diskUsage % STATUS-Info";
+        }
+    }
+
+    ##print "spaceInfo $spaceInfo\n";
+    $queries->{"$args->{instanceName}\@$args->{srshostname} - Disk Space"} = {
+        crit    => 'answer =~ /Crit/i',
+        warn => 'answer =~ /Warn/i',
+        info => 'answer =~ /info/',
+        perl    => sub { return $spaceInfo;},
+        uiHint  => "Rep Server Disk Space",
+        correctiveActions => [
+            Ops => 'Inform DBA',
+        ],
+        description => "Rep Server Disk Space",
+    };
+
+}
+
+sub parserDiskSpace {
+    my $retStr = shift;
+
+        my @content;
+    my @dataStr = split ("\n",$retStr);
+    for my $part (@dataStr){
+        $part =~ s/^\s+|\s+$//g;
+        next if ($part !~ /partition|new_partition/);
+        push @content, $part;
+    }
+    print "Returning CONTENT \n", Dumper @content, "\n", if $debug;
+
+    my $totalSpace = 0;
+    my $totalUsedSpace = 0;
+
+    for my $partition (@content) {
+        my @checkPartition = split /\s+/, $partition;
+        my $usedSegment = $checkPartition[-2];
+        $totalUsedSpace += $usedSegment;
+        my $totalSegment = $checkPartition[-3];
+        $totalSpace += $totalSegment;
+    }
+    return $totalUsedSpace,$totalSpace;
+}
+
+sub licenseMonitoring{
+    my ($args,$user,$monpass) = @_;
+
+    my $host = "$user $args->{srshostname}";
+    my $command = "ssh -l $host 'cd /sybase/repserver16SP03/SYSAM-2_0/licenses; grep INCREMENT * |grep -v HVAR'";
+
+    my @output;
+    my $status = ariba::rc::Utils::executeRemoteCommand($command,$monpass,0,undef,undef,\@output);
+    my $licenseInfo;
+
+    my $currentTime = localtime ;
+    $currentTime = str2time ("$currentTime GMT");
+    print "Current Date $currentTime\n", if $debug;
+
+    for my $license (@output) {
+        next unless ($license =~ /INCREMENT/);
+        chomp($license);
+        my @info = split /\s/, $license;
+
+        my $expDate = str2time("$info[4] GMT");
+        print "Expiration Date $expDate\n", if $debug;
+        my $licenseName = $info[1];
+
+        my $willExpire = sprintf ("%d" , (($expDate - $currentTime)/86400)) ;
+        if ($willExpire < 30 )  {
+            $licenseInfo .= "Crit: $licenseName expire in $willExpire days\n";
+        } elsif ($willExpire < 60 )  {
+            $licenseInfo .= "Warning: $licenseName expire in $willExpire days\n";
+        }else {
+            $licenseInfo .= "Info: $licenseName expire in $willExpire days\n";
+        }
+    }
+
+    $queries->{"$args->{srshostname}"} = {
+        crit    => 'answer =~ /Crit/i',
+        warn => 'answer =~ /Warn/i',
+        info => 'answer =~ /info/',
+        perl    => sub { return $licenseInfo;},
+        uiHint  => "Rep Server License Monitoring",
+        correctiveActions => [
+            Ops => 'Inform DBA',
+        ],
+        description => "Rep Server License Monitoring",
+    };
+}
+
+sub ticketStatus {
+    my $args = shift;
+
+    my $year = strftime("%y",localtime (time));
+    my $port = $args->{hanaPort};
+    my $timeout = 20;
+    my $tries = 4;
+    my $sql = "select CNT,H1, H2, rdb_t, seconds_between(to_SECONDDATE(concat(concat(concat('20',H1),' '),H2)), NOW())/60.00 as min_delay from rs_ticket_history where H1 like '$year/%' and CNT in (select max(CNT) from rs_ticket_history where H1 like '$year/%')";
+
+    my $statusInfo;
+    my $hc = ariba::Ops::HanaClient->new($args->{dsiUserName},$args->{password},$args->{hanaHostname},$port);
+    if ( ! $hc->connect($timeout,$tries) && $hc->error() !~ /failed to load cluster config/i ){
+        $statusInfo = $hc->error()." $args->{hanaHostname}" || "Not able to connect to $args->{hanaHostname}";
+    }else{
+        my $results = $hc->executeSql($sql);
+        if ($results){
+            $statusInfo = getLatency($results);
+        }
+    }
+
+    $queries->{"$args->{instanceName}\@$args->{srshostname} (Max Latency in Minutes)"} = {
+        crit    => 'answer =~ /Error/i || answer >= 240', ### it's in minutes
+        warn => 'answer >= 100',     ### it's in minutes
+        recordMaxResults => 110000,
+        perl    => sub { return $statusInfo;},
+        uiHint  => "Rep Server Ticket Status",
+        correctiveActions => [
+            Ops => 'Inform DBA',
+        ],
+        description => "Rep Server Ticket Status for $args->{srshostname}",
+    };
+}
+
+sub getLatency {
+    my $line = shift;
+
+    my ($cnt, $h1, $h2, $rdb_t, $maxLatency) = split /\t/, $line;
+
+    return $maxLatency;
+}
+
+sub repAgentStatus{
+    my $args = shift;
+
+    $args->{command} = "ra_status\ngo\n";
+    my $retStr = executeISQLCmd($args);
+
+    $queries->{"$args->{instanceName}\@$args->{srshostname} - RA Status"} = {
+        crit    => 'answer !~ qr/\s+replicating\s+/is',
+        info => 'answer =~ qr/\s+replicating\s+/is',
+        perl    => sub { return $retStr;},
+        uiHint  => "Rep Agent Status",
+        correctiveActions => [
+            Ops => 'Inform DBA',
+        ],
+        description => "Rep Agent Status for $args->{srshostname}",
+    };
+}
+
+sub repAgentsubmitTickets {
+    my $args = shift;
+    my $h1 = time;
+    my $h2 = strftime("%Y/%m/%d",localtime (time));
+
+    $args->{command} = "rs_ticket $h1,$h2\ngo\nra_date\ngo\n";
+    my $retStr = executeISQLCmd($args);
+
+    $queries->{"$args->{instanceName}\@$args->{srshostname} - Submit Ticket"} = {
+        crit    => 'answer !~ qr/successful/is',
+        info => 'answer =~ qr/successful/is/',
+        perl    => sub { return $retStr},
+        uiHint  => "Rep Agent Submit Ticket",
+        correctiveActions => [
+            Ops => 'Inform DBA',
+        ],
+        description => "Rep Agent Submit Ticket: $retStr",
+    };
+}
+
+sub repAgentErrorMonitor{
+    my ($args,$user,$monpass) = @_;
+
+    my $host = "$user $args->{srshostname}";
+    my $command = "ssh -l $host 'sudo su -c \"grep ^E /sybase/rao*/RAX-*/SSS_RAS[0-9][0-9]/log/SSS_RAS[0-9][0-9].log|grep RB_INVALID_ROLLBACK_ID\"'";
+
+    my @output;
+    my $status = ariba::rc::Utils::executeRemoteCommand($command,$monpass,0,undef,undef,\@output);
+
+    ##get errors for last 15 min
+    my @result;
+    my $time15Minback = strftime("%Y%m%d%H%M%S",localtime(time()-15*60));
+    for my $line (@output){
+        next unless($line);
+        my ($errorTime) = $line =~ /E.*?(\d+.*?)\.\d+/i;
+        $errorTime=~ s/(\/|:|\s+)//g;
+        if ($errorTime > $time15Minback){
+            push (@result,$line);
+        }
+    }
+
+    $queries->{"$args->{instanceName}\@$args->{srshostname} - Error"} = {
+        crit    => "answer ne ''",
+        perl    => sub { return join("\n",@result);},
+        uiHint  => "Rep Agent Error",
+        correctiveActions => [
+            Ops => 'Create Ops Ticket for Warn/Crit Assign it to DBA',
+        ],
+        description => "Rep Agent Error for $args->{srshostname}",
+    };
+}
+
+sub repAgentMemory{
+    my ($args,$user,$monpass) = @_;
+
+    my $host = "$user\@$args->{srshostname}";
+    my $command = "ssh -t $host 'ps -elf | grep -i rax |grep futex_|grep -v grep'";
+
+    my @output;
+    my $status = ariba::rc::Utils::executeRemoteCommand($command,$monpass,0,undef,undef,\@output);
+    @output = grep {$_ =~/futex_/i} @output;
+
+    my @line = split(' ',$output[0]);
+    my $size = sprintf("%.2f",$line[9]/(1024*1024));
+
+    $queries->{"$args->{instanceName}\@$args->{srshostname} - Memory in GB"} = {
+        crit    => "answer >= 30",
+        warn    => "answer > 26",
+        perl    => sub { return $size;},
+        recordMaxResults => 10000,
+        uiHint  => "Rep Agent Memory",
+        correctiveActions => [
+            Ops => 'Create Ops Ticket for Warn/Crit Assign it to DBA',
+        ],
+        description => "Rep Agent Memory for $args->{srshostname}",
+    };
+}
+
+sub executeISQLCmd {
+    my $args = shift;
+
+    my (undef, undef, $sybaseUID) = getpwnam('sybase') || die "failed to getpwnam('sybase'): $!";
+    my (undef, undef, undef, $sybaseGID) = getpwnam('sybase') || die "failed to getpwnam('sybase'): $!";
+
+    my ($commandFileName,$outputFileName);
+    my $output = eval {
+        my ($fh,$fh1);
+        ($fh, $commandFileName) = tempfile();
+        chmod 0644, $commandFileName;
+        print $fh $args->{command} || die "failed to write to '$commandFileName': $!";
+        close $fh;
+
+        ($fh1, $outputFileName) = tempfile();
+        chmod 0666, $outputFileName;
+        chown $sybaseUID, $sybaseGID, $outputFileName;
+
+        my $command = "sudo -u sybase -i isql -w2000 -H $args->{srshostname} -U $args->{username} -P $args->{password} -J utf8 -S $args->{instanceName} -i $commandFileName -o $outputFileName -I ". INTERFACE_FILE ." -t ". TIMEOUT;
+        print "command Args ".$args->{command}."\n" if $debug;
+        print "executing command $command\n" if $debug;
+        `$command`;
+        my $out = '';
+        while(<$fh1>) {
+            $out .= $_;
+        }
+        close($fh1);
+        return $out;
+    };
+
+    unlink $commandFileName if $commandFileName;
+    unlink $outputFileName if $outputFileName;
+
+    print "output for ".$args->{srshostname}. " $output\n" if ($debug);
+    return $output;
+}
+
+sub getAllSRSServers {
+    my $me = shift;
+    my @allServers = ();
+    my $savedPassword;
+
+    my @srsServers = $me->defaultKeysForPrefix("monitoring.srsservers.");
+    for my $serverName(@srsServers){
+        ##password same for all servers, so for some it is not configured so reading from other
+        my $serverPass = $me->default("$serverName.password");
+        $savedPassword = $serverPass if $serverPass;
+        my $ret = {
+            serverType => $me->default("$serverName.type"),
+            instanceName => $me->default("$serverName.instanceName"),
+            username => $me->default("$serverName.targetusername"),
+            srshostname => $me->default("$serverName.srshostname"),
+            dsiname => $me->default("$serverName.dsiname"),
+            dsiusername => $me->default("$serverName.dsiusername"),
+        };
+        next unless $ret->{srshostname};
+        push @allServers, $ret;
+    }
+    for my $server (@allServers) { $server->{password} = $savedPassword; }
+    return @allServers;
+}
+
+sub getAllSRSAgents {
+    my $me = shift;
+    my @allAgents = ();
+    my $savedPassword;
+
+    my @srsAgents = $me->defaultKeysForPrefix("monitoring.srsagents.");
+    for my $agentName(@srsAgents){
+        ##password same for all servers, so for some it is not configured so reading from other
+        my $agentPass = $me->default("$agentName.password");
+        $savedPassword = $agentPass if $agentPass;
+        my $ret = {
+            agentType => $me->default("$agentName.type"),
+            instanceName => $me->default("$agentName.instanceName"),
+            username => $me->default("$agentName.targetusername"),
+            srshostname => $me->default("$agentName.srshostname"),
+        };
+        next unless $ret->{srshostname};
+        push @allAgents, $ret;
+    }
+    for my $agent (@allAgents) { $agent->{password} = $savedPassword; }
+    return @allAgents;
+}
+
+sub getAllDSIConnections {
+    my $me = shift;
+    my $ret;
+    my $savedServerPass;
+
+    my @allDSIConnections;
+    my @dsiConnections = $me->defaultKeysForPrefix("monitoring.dsiconnections.");
+    my $hanaHost = $me->default("monitoring.hanadbs.hostname");
+
+    for my $dsi (@dsiConnections){
+        my $serverPass = $me->default("$dsi.password");
+        $savedServerPass = $serverPass if defined $serverPass;
+
+        $ret = {
+            instanceName => $me->default("$dsi.instanceName"),
+            targetUserName => $me->default("$dsi.targetusername"),
+            srshostname => $me->default("$dsi.srshostname"),
+            dsiname => $me->default("$dsi.dsiname"),
+            dsiUserName => $me->default("$dsi.dsiusername"),
+            hanaPort    => $me->default("$dsi.port"),
+            hanaHostname =>  $me->default("$dsi.srshanahost"),
+        };
+        next unless $ret->{srshostname};
+        push @allDSIConnections , $ret;
+    }
+    for my $dsi (@allDSIConnections) { $dsi->{password} = $savedServerPass;}
+    return @allDSIConnections;
+}
+
+main(@ARGV);

@@ -1,0 +1,255 @@
+#!/usr/local/bin/perl
+# $Id: $
+
+## QQ error checking
+## QQ perldoc
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::IntegrationPortal::AIGUtils;
+use ariba::rc::InstalledProduct;
+use Data::Dumper;
+use JSON;
+use XML::Simple;
+use Getopt::Long;
+use Pod::Usage;
+
+my $debug = 0;
+my $sendEmail = 0;
+my $sendPage = 0;
+my $help = 0;
+
+
+my $cfgfile;
+
+my $prodName = "mon";
+my $UI = "JMS Queue Status";
+
+#-----------------------------------------------------------------
+#process the command line options
+GetOptions (
+    "debug"   =>  \$debug,
+    "eMail"   =>  \$sendEmail,
+    "page"    =>  \$sendPage,
+    "cfg:s"    =>  \$cfgfile,
+    "help|?"    =>  \$help,
+) or pod2usage(2);
+
+pod2usage(1) if $help;
+
+#-----------------------------------------------------------------
+my $product = ariba::rc::InstalledProduct->new();
+
+my $installdir = $product->installDir();
+my $email = $product->default('notify.email');
+my $service = $product->service();
+
+$product = ariba::rc::InstalledProduct->new($prodName, $service)
+    unless ( $product->name eq $prodName );
+
+#-----------------------------------------------------------------
+# get the configuration 
+$cfgfile = "$installdir/etc/aig-jms-queue-status.json" unless $cfgfile;
+
+my $fh;
+open ($fh, "<", $cfgfile) or die "Can't open configuration file $cfgfile: $!\n";
+my @lines = <$fh>;
+close($fh);
+my $jsonStr = join('', @lines);
+my $cfg = eval {
+    return JSON::decode_json($jsonStr);
+};
+die "Error parsing JSON configuration file $cfgfile: $@\n" if ( $@ );
+
+#-----------------------------------------------------------------
+# retrieve jms queue data
+my $portal_data = eval {
+    return retrieveJmsQueueData($product, $cfg); 
+};
+die "error retrieving data: $@\n" if ( $@ );
+print Dumper($portal_data) if $debug;
+
+#-----------------------------------------------------------------
+# construct query hash
+my $queries = eval {
+    return buildQueries($portal_data, $cfg->{queryspec});
+};
+die "error building queries: $@\n" if ( $@ );
+die "there is no queries" unless ( keys %{$queries} );
+print Dumper($queries) if $debug;
+
+#-----------------------------------------------------------------
+# process queries
+my $qmName = "jms-queue-status";
+my $processArgs = [$debug, $email, $sendEmail, $sendPage];
+process_aig_queries($qmName, $queries, $processArgs);
+
+exit(0);
+
+#-----------------------------------------------------------------
+#-----------------------------------------------------------------
+sub retrieveJmsQueueData {
+    my ($product, $cfg) = @_;
+    my $data = {};
+
+    # pull configuration data
+    my $user = $product->default("AIGPortal.userName");
+    my $pwd = $product->default("AIGPortal.password");
+    my $proxy = $product->default("AIGPortal.proxy");
+    my $jmsurls = $product->default("AIGPortal.jmsQueueUrls");
+
+    die "Missing DD configuration"
+        unless ($user && $pwd && $jmsurls );
+
+    my @urls = split ' ', $jmsurls;
+
+    # pull the queue status content using curl
+    # curl and parameters
+    my $curl = "/usr/bin/curl";
+
+    my $timeout = 100;
+    my @args = qq(--silent --insecure --fail);
+    push @args, qq(--proxy $proxy) if $proxy;
+    push @args, qq(--max-time $timeout);
+    push @args, qq(--user $user:$pwd);
+    push @args, qq(--url );
+
+    my $xs = XML::Simple->new();
+
+    foreach my $url ( @urls ) {
+        my $cmd = qq($curl @args $url);
+        print $cmd if ( $debug );
+        my $xml = qx($cmd);
+        die "Failure retrieving portal queue content for $url: $?" if $?;
+
+        my $ref = eval {
+            $xs->XMLin($xml);
+        };
+        die "Error parsing the incoming xml data: $@\n" if ( $@ );
+
+        # get each portal queue from this url
+        # each entry in the original xml represents a queue
+        foreach my $eid ( keys %{$ref->{entry}} ) {
+            my $props = $ref->{entry}->{$eid}->{content}->{"m:properties"};
+            my $queue_name = $props->{"d:Name"};
+            next unless $queue_name;
+            
+            # get each property of the queue
+            for my $p ( keys %{$props} ) {
+                next if ( $p eq "d:Name" );
+
+                $data->{$url}{queue}{$queue_name}{$p} = $props->{$p};
+                $data->{$url}{total}{$p}{value} += $props->{$p};
+                $data->{$url}{total}{$p}{count}++;
+            }
+        } # end for each queue
+    } # end for each url
+
+    return $data;
+}
+
+sub buildQueries {
+    my ($data, $qcfg) = @_;
+
+    my $qs = {};
+
+    # data structure 
+    # $data->{url}->{queue}->{queuename}->{property}
+    # $data->{url}->{total}->{propname}->{value}
+    # $data->{url}->{total}->{propname}->{count}
+    #
+    foreach my $url ( keys %{$data} ) { 
+        foreach my $query_name ( keys %{$qcfg} ) {
+            my $qspec = $qcfg->{$query_name};
+
+            my $prop = $qspec->{"prop-name"};
+            my $qdisplayname = $qspec->{"display-name"};
+            my $description = $qspec->{"description"};
+            my $warn = $qspec->{"warn"};
+            my $crit = $qspec->{"crit"};
+            my $monitor_flag = $qspec->{"monitor-flag"};
+
+            # indivial prop monitor only if flag set
+            if ( $monitor_flag ) {  
+             foreach my $queue ( keys %{$data->{$url}{queue}} ) {
+
+        
+                my $qname = "$url $queue $qdisplayname";
+                my $val = $data->{$url}{queue}{$queue}{$prop};
+                $val = "none" unless defined($val);
+
+                $qs->{$qname} = { # a query prepared for QueryManager
+                    description => $description,
+                    uiHint => $UI,
+                    perl => "$val", 
+                    warn => "$warn",
+                    crit => "$crit"
+                };
+             }
+            }
+
+            my $aggr_flag = $qspec->{"aggr-flag"};
+            if ( $aggr_flag ) {
+                $warn = $qspec->{"aggr-warn"};
+                $crit = $qspec->{"aggr-crit"};
+                my $aggrtype = $qspec->{"aggr-type"};
+
+                my $description = "Sum";
+                $description = "Average" if ( $aggrtype eq "average" );
+                $description = "Count" if ( $aggrtype eq "count" );
+
+                my $queryname = "$description: $url in $qdisplayname";
+                my $val = $data->{$url}{total}{$prop}{value};
+                my $cnt = $data->{$url}{total}{$prop}{count};
+                $val = $val / $cnt if ( "$aggrtype" eq "average" && $cnt );
+                
+                $description .= " for all queues";
+
+                $qs->{$queryname} = { # a node level query for QueryManager
+                    description => $description,
+                    uiHint => $UI,
+                    perl => "$val",
+                    warn => "$warn",
+                    crit => "$crit"
+                }
+            } # end for the aggregation condition
+        }
+    }
+
+    return $qs;
+}
+
+
+=pod
+
+=head1 NAME
+
+aig-jms-queue-status
+
+=head1 SYNOPSIS
+
+aig-jms-queue-status [-d] [-e] [-p]
+    -d: debug
+    -e: send email for alerts
+    -p: send page for alerts
+
+=head1 DESCRIPTION
+
+This script monitors the status of the jms queues 
+for the ariba integration gateway portal. 
+It shows the message count for each queue and 
+the total message size for all queues under the same tenant.
+The status data is retrieved using curl via rest api
+exposed by the integration application. The rest api urls
+and the access credentials are configured
+in MON's DeploymentDefaults.cfg and tokenmap.cfg.
+The monitor query specifications are configured in
+etc/aig-jms-queue-status.json with details of the display,
+thresholds, flags, and aggregation. Each monitor query
+is associated with one metric property (size, count).
+The message size from the status page is in KB.
+
+=cut

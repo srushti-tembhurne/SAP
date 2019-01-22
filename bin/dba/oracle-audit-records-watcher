@@ -1,0 +1,117 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use Pod::Usage;
+use Getopt::Long;
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+use ariba::monitor::BackupUtils;
+use ariba::rc::Utils;
+use ariba::rc::Passwords;
+use ariba::rc::CipherStore;
+use Parallel::ForkManager;
+use dmail::LockLib;
+
+   my $lockFile = "/tmp/$0";
+   dmail::LockLib::forceQuiet(); 
+   exit(0) unless (dmail::LockLib::requestlock($lockFile),5);
+
+
+    my $debug = 0;
+
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    GetOptions(
+        "debug|d+" => \$debug,
+        "e" => \$sendEmail,
+        "p" => \$sendPage,
+   );
+
+   my $mon = ariba::rc::InstalledProduct->new();
+
+   my $service = $mon->service();
+
+   my $cluster = $mon->currentCluster();
+
+   my @products = ariba::rc::InstalledProduct->installedProductsList($service);
+
+   my $email = $mon->default('notify.email');
+
+   my @dbConnections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+
+   my $systemUser = "system";
+  
+   my $systemPass = $mon->default("dbainfo.$systemUser.password");
+
+   my ($productName,$product,$instance,$host,$vhost) = 0;
+
+   my $MAX_PROCESSES = 5;
+  
+   my $pm = Parallel::ForkManager->new($MAX_PROCESSES);
+
+    my @uniquedbcs = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbConnections);
+
+    @uniquedbcs = grep{$_->dbServerType() eq ariba::Ops::DBConnection->oracleDBServerType()}@uniquedbcs;
+    
+    @uniquedbcs = grep{!$_->isDR()}@uniquedbcs;
+
+
+   foreach my $dbc (@uniquedbcs) {
+         my $pid = $pm->start and next;
+         $instance = uc($dbc->sid());
+         $product = $dbc->product(); 
+         $productName = $dbc->product()->name();
+         $vhost = $dbc->host();
+         my %queries = ();
+         my $oracleClient;
+         $oracleClient = ariba::Ops::OracleClient->new($systemUser, $systemPass, $instance, $vhost);
+         unless ($oracleClient->connect(20,4)) {
+                    # continue on even if there is an error
+         }
+        $queries{"Number of audit records generated in last one day for [$instance] on $vhost"} = {
+            warn => "answer > 100",
+            crit => "answer > 100000",
+            description => 'Row count form dba_audit_trail table',
+            uiHint => 'oracle audit record status',
+            correctiveActions => [
+                Ops => 'Contact DBA', 
+            ],
+            timeout => 120,
+            format => '%d' ,
+            sql => q`select count(*) from dba_audit_trail where timestamp > sysdate-1`,
+        };
+
+        $queries{"Total number of Audit records > 100000 for [$instance] on $vhost"} = {
+            crit => "answer eq 'YES'",
+            description => 'Row count form dba_audit_trail table',
+            uiHint => 'oracle audit record status',
+            correctiveActions => [
+                Ops => 'Contact DBA',
+            ],
+            timeout => 120,
+            sql => q`select case when count(*) > 100000 then 'YES' else 'NO' end from dba_audit_trail  where rownum < 100010`,
+        };
+
+
+
+       my $qm = ariba::monitor::QueryManager->newWithDetails("dba", $productName, $mon->service(), undef, \%queries);
+       $qm->setSQLConnectInfoFromOracleClient($oracleClient);
+       $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+       $pm->finish;
+
+   }
+
+   $pm->wait_all_children;
+
+  END {
+    dmail::LockLib::releaselock($lockFile);
+  }

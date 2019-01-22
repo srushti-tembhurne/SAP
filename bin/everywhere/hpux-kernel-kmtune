@@ -1,0 +1,121 @@
+#!/usr/local/bin/perl -w
+
+# Script to display differences between a master file of HP kernel variables and 
+
+use strict;
+use Getopt::Std;
+use lib qw(/usr/local/ariba/lib);
+
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use File::Copy;
+
+sub main {
+
+	my %opts = ();
+	getopts('sm:', \%opts);
+
+	my $masterfile = $opts{'m'} ? $opts{'m'} : "/stand/build/master.kmtune";
+
+	my $key;
+	my $command;
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $machine = ariba::Ops::Machine->new($hostname);
+	my $exit_value; 
+
+	if (($machine->os() ne "hp-ux") or not $machine->provides('db')) {
+		print "$hostname must run hp-ux and provide db service\n";
+		exit (-1);
+	}
+
+	
+	my %master = GenerateVarHash($masterfile, "B.11.00");
+	my %thishost = GenerateVarHash("/usr/sbin/kmtune|", $machine->osVersion());
+	
+	unless ($opts{'s'}) {
+		printf "%-20s%30s%60s\n", "key", "master", $hostname;
+		printf "%-20s%30s%60s%10s\n", "===", "======", "=====";
+	} else {
+		chdir "/stand/build" or die $!;
+		runcmd ("/usr/lbin/sysadm/system_prep -s system");
+	}
+	
+	foreach $key (sort keys %master) {
+
+		next if not defined $thishost{$key};
+
+		if ($master{$key} ne $thishost{$key}) {
+
+			if ($opts{'s'}) {
+				runcmd ("kmtune -S /stand/build/system -s $key=\'$master{$key}\'");
+			} else {
+				printf "%-20s%30s%60s\n", $key, $master{$key}, $thishost{$key};
+			}
+		}
+	}
+	
+	if ($opts{'s'}) {
+		runcmd ("mk_kernel -s system");
+
+		print "Moving /stand/system to /stand/system.prev\n";
+		move ("/stand/system", "/stand/system.prev");
+
+		print "Moving /stand/vmunix to /stand/vmunix.prev\n";
+		move ("/stand/vmunix", "/stand/vmunix.prev");
+
+		print "Moving /stand/dlkm to /stand/dlkm.prev\n";
+		move ("/stand/dlkm", "/stand/dlkm.vmunix.prev");
+
+		print "Moving /stand/build/system to /stand/system\n";
+		move ("/stand/build/system", "/stand/system");
+
+		runcmd ("kmupdate", "/stand/build/vmunix_test");
+
+
+		print "Kernel update complete.  The system must now be rebooted.\n";
+		print "Please run 'shutdown -r 0' to complete the process.\n";
+	}		
+}
+
+sub GenerateVarHash {
+
+	my $vars = shift;
+	my $osver = shift;
+
+	my %varhash;
+	my $var;
+	my $val;
+
+	open(FILE, "$vars") or die "Cannot open $vars: $!\n";
+
+	while (<FILE>) {
+
+		next if /^Parameter/;
+
+		if ($osver eq "B.11.11") {
+			($var, $val) = /(\S+)\s+\S+\s+\S+\s+(\S+)/;
+		} else {
+			($var, $val) = /(\S+)\s+(\S+)/;
+		}
+
+		next if not defined $var;
+			
+		$varhash{$var} = $val;
+	}
+	close FILE;
+	
+	return %varhash;
+}
+
+sub runcmd {
+	my $command = shift;
+
+	print "Running: $command\n";
+	system $command;
+}
+
+
+main;
+
+exit(0);
+

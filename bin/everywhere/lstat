@@ -1,0 +1,36 @@
+#!/usr/local/bin/perl
+
+#
+# $Id: //ariba/services/monitor/bin/everywhere/lstat#3 $
+#
+
+use strict;
+
+main(@ARGV);
+
+sub main {
+	my $file = shift;
+	my @fields = qw ( device inode mode numlink uid gid rdev size atime mtime ctime blksize blocks );
+	my @stat;
+
+	if($file =~ /^-[\?h]/) {
+		print "Usage: lstat FILE\n";
+		print "\nThis program will list the results of the stat(2) system call\n";
+		print "for the specified file.\n\n";
+		exit(0);
+	}
+
+	unless ( @stat = lstat( $file ) ) {
+		print "$file - No such file or directory.\n";
+		exit(1);
+	}
+
+	while ( my $field = shift(@fields) ) {
+		my $value = shift(@stat);
+		if($field =~ /time/) {
+			$value = localtime($value);
+		}
+
+		print "$field = $value\n";
+	}
+}

@@ -1,0 +1,109 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/common/3par-node-cache-stats#6 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::NetworkDeviceManager;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Startup::Common;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::FileSystemUtilsRPC;
+
+# keep about a year's worth of results, at 1 sample every 5 minutes
+my $MAX_RESULTS = 105120;
+$| = 1;
+
+sub main {
+
+	my $debug=0;
+	my $sendEmail=0;
+	my $sendPage=0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug++; }
+		if($arg =~ /^-e/o){ $sendEmail=1; };
+		if($arg =~ /^-p/o){ $sendPage=1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+
+	# set this so that inserv logs to the right place
+	$ENV{'LOGSDIR'} = ariba::Ops::Startup::Common::logsDirForProduct($me);
+
+	$main::quiet = 1 unless $debug >= 1;
+
+	my $email = $me->default('notify.email');
+	my $cipherStore = ariba::rc::CipherStore->new( $me->service() );
+	my $username = "svc" . $me->service();
+	my $password = $cipherStore->valueForName($username);
+
+        my $hostname = ariba::Ops::NetworkUtils::hostname();
+        my $machine = ariba::Ops::Machine->new($hostname);
+        my $datacenter = $machine->datacenter();
+
+	my @inservDevices = ariba::Ops::NetworkDeviceManager->newFromDatacenter($datacenter, 'inserv');
+
+	unless (scalar(@inservDevices)) {
+		print "no 3par units found in $datacenter" if $debug;
+		exit 1;
+	}
+
+	my %queries;
+
+	for my $nm (@inservDevices) {
+
+		$nm->setDebug($debug -1 ) if $debug >= 2;
+		$nm->setLogResponses(0);
+
+		my $inservHostname = $nm->hostname();
+
+		# Gather the vv Cache Stats
+		my $nodeCacheStats = $nm->nodeCacheStats();
+
+		for my $node(keys %$nodeCacheStats) {
+
+			my $nodeName = $nodeCacheStats->{$node}->name();
+
+			my $readHitRatio;
+			$readHitRatio = sprintf "%2.2f", 
+				$nodeCacheStats->{$node}->readHits() / 
+					$nodeCacheStats->{$node}->readAccesses() * 100
+					if $nodeCacheStats->{$node}->readAccesses();
+			$queries{"$inservHostname: $nodeName Read Cache Hit Ratio"} = {
+				uiHint => "$inservHostname/Cache/Node",
+				recordMaxResults => $MAX_RESULTS,
+				info => 1,
+				warn => 0,
+				crit => 0,
+				perl => "return '$readHitRatio'",
+			};
+
+			my $writeHitRatio;
+			$writeHitRatio = sprintf "%2.2f", 
+				$nodeCacheStats->{$node}->writeHits() / 
+					$nodeCacheStats->{$node}->writeAccesses() * 100
+					if $nodeCacheStats->{$node}->writeAccesses();
+			$queries{"$inservHostname: $nodeName Write Cache Hit Ratio"} = {
+				uiHint => "$inservHostname/Cache/Node",
+				recordMaxResults => $MAX_RESULTS,
+				info => 1,
+				warn => 0,
+				crit => 0,
+				perl => "return '$writeHitRatio'",
+			};
+		}
+
+	}
+
+	my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+	my $q = ariba::monitor::QueryManager->newWithDetails("3par-performance-stats", $tab, $me->service(), undef, \%queries);
+	$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

@@ -1,0 +1,51 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/ssl-host-cipher-tool#3 $
+# Generate a mapping of cipher/bit level used by ip/host.
+# dsully@ariba.com
+
+use strict;
+use Socket;
+
+sub main {
+
+	my $want = $ARGV[0] || do {
+		print "Usage: $0 <url>\nExample:\n";
+		print "\t$0 \"POST /service/transaction/cxml.asp\"\n\n";
+		exit;
+	};
+
+	my (%have,%bits) = ();
+
+	open CIPHER, '/var/log/apache/raven_cipher_log' or die $!;
+	while(<CIPHER>) {
+		next unless /$want/;
+		next if / 10\.10\./;
+		$have{(split /\s+/)[2]} = 1;
+	}
+	close CIPHER;
+
+	open SSL, '/var/log/apache/raven_ssl_log' or die $!;
+	while(<SSL>) {
+		next unless /Client IP/;
+		my ($ip) = (/(\d+\.\d+\.\d+\.\d+)/);
+		next unless exists $have{$ip};
+		my ($bits) = (/(Protocol:.+)$/);
+		push @{ $bits{$ip} }, $bits;
+	}
+	close SSL;
+
+	while(my($ip,$data) = each %bits) {
+
+		my ($host) = (gethostbyaddr(inet_aton($ip),AF_INET))[0] || $ip;
+
+		print "Host: $host - IP: $ip\n";
+	
+		my %saw = ();
+		map { print "\t$_\n"; } sort grep !$saw{$_}++, @{$data};
+	}
+}
+
+main();
+
+__END__

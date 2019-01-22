@@ -1,0 +1,421 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/hana-file-watcher#4 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use Data::Dumper;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DBConnection;
+#use dmail::LockLib;
+use ariba::rc::CipherStore;
+use ariba::rc::Passwords;
+use ariba::rc::Utils;
+use ariba::Ops::DBConnection;
+my $debug = 0;
+
+$main::quiet = 1 unless ($debug);
+
+use constant HANA_INI_MON_REPO => '/usr/sap/A01/SYS/global/hdb/custom/config/';			#Location of history files, created when a server file is different from base file.
+use constant HANA_INI_REPO =>  '/usr/sap/A01/SYS/global/hdb/custom/config/';			#Locatin of the base file against which server file needs to be compared against
+use constant HANA_SERVER_INI_FILE_PATH => '/usr/sap/A01/SYS/global/hdb/custom/config/';	#Location of the server file to be monitored
+
+main(@ARGV);
+sub main{
+		my @args = @_;
+		my ($service,$baseFileNameSuffix,$sendEmail,$sendPage) = (undef,undef,undef,0,0);
+		while (my $arg = shift(@args)) {
+			if ($arg =~ m|^-service$|) { $service = shift(@args); next; }
+			if ($arg =~ m|^-bfsuffix$|){ $baseFileNameSuffix = shift(@args); next; }
+			if ($arg =~ m|^-d$|) { $debug = 1; $main::quiet =0; next;}
+			if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+			if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+		}
+
+        my $me = ariba::rc::InstalledProduct->new('mon');
+        $service = $me->service();
+        if(!defined $service || $service eq "") {
+            &usage();
+        }
+		ariba::rc::Passwords::initialize($service);	
+		#my $user = "mon"."$service";
+		my $user = $me->default("dbainfo.hana.admin.userName");
+		my $password= $me->default('dbainfo.hana.admin.password');
+	
+		my $email = $me->default('notify.email');
+		my @products = ariba::rc::InstalledProduct->installedProductsList( $me->service() );
+
+
+		my @hanaHosts = ();
+
+		my %queries;
+        my @filesToWatch = qw(global.ini executor.ini nameserver.ini indexserver.ini statisticsserver.ini);
+        my ($command,$success) = ("","");
+        my @output = ();
+        my $ssh = ariba::rc::Utils::sshCmd();
+        my ($fileModifiedTime,$currentEpochTime) = (undef,undef);
+		my @alreadyVisitedHosts = ();
+
+		foreach my $p (@products){
+			my @connections             = ariba::Ops::DBConnection->connectionsFromProducts( $p );
+			my @connectionsByHostAndSid = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid( @connections );
+			for my $dbc ( @connectionsByHostAndSid ) {
+				if ( $dbc->dbServerType() ne ariba::Ops::DBConnection->hanaDBServerType() ) {
+					next;
+				}
+			
+				my $product = $dbc->product();
+				my $productName = $product->name();
+				my $cluster = $product->currentCluster(); 
+							
+				print "Analyzing : Product $productName in cluster $cluster\n" if($debug); 
+				my @allRoles = $product->allRolesInCluster($cluster);
+				
+				my @eligibleRoleList = grep { $_ =~ /hana/ } @allRoles;
+				print "Eligible roles : @eligibleRoleList\n" if($debug);
+
+				@hanaHosts = ();
+				foreach my $el (@eligibleRoleList) {
+					push(@hanaHosts,$product->hostsForRoleInCluster( $el, $cluster ));
+				}	
+
+				# If for the different products, same hana host is considered, no neeed to check the same path multiple times
+				foreach my $hanaHost (@hanaHosts)	{
+					if(grep $_ eq $hanaHost,@alreadyVisitedHosts){	
+						next;
+					} else {
+						push(@alreadyVisitedHosts,$hanaHost);
+					}
+					print "Checking hana host : $hanaHost\n" if($debug);
+					foreach my $f (@filesToWatch) {
+                		$queries{"$f modify status in $hanaHost"} = {
+                    		info    => 'answer =~ /^No Change/',
+							warn    => 'answer =~ /^Warn/', 
+                    		crit    => 'answer =~ /^Error/',
+                    		recordItem          => 'answer',
+                    		perl => sub {run($f,$baseFileNameSuffix,$cluster,$hanaHost,$user,$password);}
+                		};
+					}
+					# Executing a last statement here. This is because, the ini file is same across all the host. 
+					# Check has to be done for only one host in a cluster. 
+					last;
+				}
+			}	
+		}
+	
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+					"hana-file-monitor",'mon','dev',undef,\%queries);
+		$qm->setUiManager('hana-inifile-watcher');
+		$qm->processQueries(0, $email, $sendEmail, $sendPage);
+
+}
+
+sub usage{
+        my $error = shift;
+        print "$error\n\n" if(defined $error);
+        print "Usage: $0 -service \$service [-bfsuffix \$baseFileNameSuffix] [-e][-p]\n";
+		print "     -bfsuffix : Provide the suffix string for ini base files in hana host. Defaiult is _bkup_01102015\n";
+		print "     -e : Enables email sending\n";
+		print "     -p : Enables sending of pages\n";
+        exit(1);
+}
+
+sub prepareFileComparisons {
+        my ($fileToWatch,$baseFileNameSuffix,$cluster,$hostName,$userName,$password,$baseFileData,$prevNotifyFileData,$serverFileData) = @_;
+		my $baseFileName = undef;
+		my $ssh = ariba::rc::Utils::sshCmd();
+
+		#The below commented lines of code is required when considering the base file is kept in the monserver.
+        #if(-e HANA_INI_REPO.$fileToWatch."_".$hostName){
+        #        $baseFileName = HANA_INI_REPO.$fileToWatch."_".$hostName;
+        #}
+        #elsif(-e HANA_INI_REPO.$fileToWatch) {
+        #        $baseFileName = HANA_INI_REPO.$fileToWatch;
+        #} else {
+        #        $baseFileName = undef;
+        #}
+        #if(!defined $baseFileName){
+		#		if($baseFileName =~ /executor/) {
+		#			return "Warn:Unable to find the base file - $fileToWatch";
+		#		}else {
+        #        	return "Error:Unable to find base file - $fileToWatch";
+		#		}
+        #}else {
+        #        #Read the content of the base file
+        #        @{$baseFileData} = &readFileContent($baseFileName);
+        #}
+
+
+		#The below code segment is required considering the base file is kept in the hana server
+		# Refer HOA-50350
+		if(!defined $baseFileNameSuffix	|| $baseFileNameSuffix =~ //) {
+			$baseFileNameSuffix = "_bkup_01102015";
+		}
+		$baseFileName = HANA_INI_REPO.$fileToWatch.$baseFileNameSuffix;
+		my $command = "${ssh} ${userName}\@${hostName} cat ${baseFileName}";
+		print "Executing command to obtain the base file : $command \n" if($debug);
+		my $success = ariba::rc::Utils::executeRemoteCommand($command, $password, 0, undef, undef,$baseFileData);
+		if($success == 0) {
+			return "Error:Unable to read base file $baseFileName from $hostName";
+		}	
+		chomp(@{$baseFileData});
+		if(@{$baseFileData}[1] =~ /No such file or directory/){
+			if($baseFileName =~ /executor/) {
+				return "Warn: Unable to find the base file to compare : $baseFileName";
+			}else {
+				return "Error : Unable to find the base file to compare : $baseFileName";
+			}
+
+		}	
+
+        #Get the content of the ini file from the server.
+        my $serverFileName = HANA_SERVER_INI_FILE_PATH.$fileToWatch;
+        $command = "${ssh} ${userName}\@${hostName} cat ${serverFileName}";
+
+		print "Executing command to obtain the actual server file : $command\n" if($debug);
+        $success = ariba::rc::Utils::executeRemoteCommand($command, $password, 0, undef, undef,$serverFileData);
+		if($success == 0) {
+            return "Error:Unable to read server file $serverFileName from $hostName";
+        }
+        chomp(@{$serverFileData});
+
+        if(@{$serverFileData}[1] =~ /No such file or directory/){
+				if($serverFileName =~ /executor/) {
+					return "Warn:Unable to find the file : $serverFileName";
+				}else {
+                	return "Error:Unable to read the file : $serverFileName";
+				}
+        }
+
+        my $prevNotifyFileName = getPreviousIniBackupCopy($fileToWatch,$cluster,$hostName);
+        if(defined $prevNotifyFileName) {
+				print "Verifying previously raised alert status in file :$prevNotifyFileName\n" if($debug);
+                @{$prevNotifyFileData} = &readFileContent($prevNotifyFileName);
+        }else {
+				print "Unable to find any previousily raised alarm in file\n" if($debug);
+                @{$prevNotifyFileData} = ();
+        }
+        return "Success:$baseFileName:prevNotifyFileName";
+}
+
+
+##################################################################################################################
+#sub run 
+#Purpose : Subroutine to be part of the monitoring query 
+#        : compares base file with the server file. Raise the alarm if there is a difference.
+#		 : history file is created at each instance of file difference.
+#	     :  
+#Returns : Reference to hash having key-value pair formed through pattern in suplied list of strings.
+###################################################################################################################
+sub run {
+        my ($fileToWatch,$baseFileNameSuffix,$cluster,$hostName,$userName,$password) = @_;
+        my @baseIniDataArr = ();
+        my @prevIniDataArr = ();
+        my @serverIniDataArr = ();
+
+        my ($baseIniDataDict,$prevIniDataDict,$serverIniDataDict) = (undef,undef,undef);
+        $baseIniDataDict = &prepareKeyValuePair(@baseIniDataArr);
+        if($#prevIniDataArr >= 0) {
+                $prevIniDataDict = &prepareKeyValuePair(@prevIniDataArr);
+        }
+        $serverIniDataDict = &prepareKeyValuePair(@serverIniDataArr);
+
+
+        my $result = &prepareFileComparisons($fileToWatch,$baseFileNameSuffix,$cluster,$hostName,$userName,
+                                                $password,\@baseIniDataArr,\@prevIniDataArr,\@serverIniDataArr);
+
+        my @serverIniDataArrBkp = @serverIniDataArr;
+        chomp(@baseIniDataArr);
+        chomp(@prevIniDataArr);
+        chomp(@serverIniDataArr);
+		
+        my %baseIniHash;
+        my %prevIniHash;
+        my %serverIniHash;
+        if($result =~ /^Success/){
+                #Generate key value pair for the contents of file read from various sources
+
+                #Create a key-value from data from base file.
+                &prepareKeyValuePair(\%baseIniHash,@baseIniDataArr);
+
+                #Create a key-value for data from server
+                &prepareKeyValuePair(\%serverIniHash,@serverIniDataArr);
+
+                #Create a key-value for data from prevInihash
+                &prepareKeyValuePair(\%prevIniHash,@prevIniDataArr);
+
+				my $response = "Error:Base file $fileToWatch has a different set of attributes compared to server file version";
+                #Check if a new key is added or deleted compared to base ini file. 
+                if(&checkHashKeyDiffs(\%baseIniHash,\%serverIniHash) || &checkHashValueDiffs(\%baseIniHash,\%serverIniHash)) {
+					if(&checkHashKeyDiffs(\%prevIniHash,\%serverIniHash) || &checkHashValueDiffs(\%prevIniHash,\%serverIniHash)) {
+						$result = &createBackupIniFile($fileToWatch,$cluster,$hostName,$userName,$password,@serverIniDataArrBkp);
+						if($result =~ /^Warn/) {
+							$response = $response."\n".$result;	
+						}
+						return $response;
+					}else {
+						return $response;	
+					}	
+				}else{
+					$response = "No Change";
+					if(&checkHashKeyDiffs(\%prevIniHash,\%serverIniHash) || &checkHashValueDiffs(\%prevIniHash,\%serverIniHash)) {
+						$result = &createBackupIniFile($fileToWatch,$cluster,$hostName,$userName,$password,@serverIniDataArrBkp);
+						if($result =~ /^Warn/) {
+							$response = $response."\n".$result;
+						}
+					}
+					return $response; 
+				}
+        }else{
+                return $result;
+        }
+}
+
+
+##################################################################################################################
+#sub prepareKeyValuepair
+#Purpose : Receives a list having string with representation word1 = word2
+#        : Convert word1 as key and word2 as value of hte hash
+#Returns : Reference to hash having key-value pair formed through pattern in suplied list of strings.
+###################################################################################################################
+sub prepareKeyValuePair {
+        my $originalVersion = shift;
+        my @strArr  = @_;
+        my @kvList = undef;
+        #my %originalVersion;
+        chomp(@strArr);
+        my $modifyIndFlag = 0;
+        foreach(@strArr){
+                unless($_ =~ /^\[.*?\]$/ || $_ =~ /^\s*$/){     #Ignore the lines that begins and ends with [ and ] respectively
+                        if($_ =~ /.+?=.+/) {
+                                @kvList = split("=",$_);
+                                $kvList[0] =~ s/^\s+//;
+                                $kvList[0] =~ s/\s+$//;
+                                $kvList[1] =~ s/^\s+//;
+                                $kvList[1] =~ s/\s+$//;
+                                $originalVersion->{$kvList[0]} = $kvList[1];
+                        }
+                }
+        }
+        return;
+}
+
+####################################################################################################################
+#sub checkHashKeyDiffs
+# Purpose : Receive references to two different hashes
+#         : Check if there exists a key present in oldVersion hash that is not present in newVersion hash.
+#         : Check if there exists a key present in newversion hash but not present in oldVersion hash.
+# Returns : 1 - If ther is a difference in keys of hash
+#         : 0 - If two hashes has same set of keys.
+####################################################################################################################
+
+sub checkHashKeyDiffs {
+        my ($oldVersion,$newVersion) = @_;
+        my @diff = grep {my $d = $_; !grep($_ eq $d,keys %{$newVersion})} keys %{$oldVersion};
+        if($#diff >= 0){
+                return 1;
+        }
+        @diff = ();
+        @diff = grep {my $d = $_; !grep($_ eq $d, keys %{$oldVersion})} keys %{$newVersion};
+        if($#diff >= 0){
+                return 1;
+        }else {
+                return 0;
+        }
+}
+
+####################################################################################################################
+#sub checkHashValueDiffs
+# Purpose : To be called only after ensuring all keys of oldVersion is present in newVersion.
+#         : Check for each value in oldVersion for a specific key is same in newVersion
+# Returns : 1 - There is a value difference
+#         : 0 - No value differences for all keys.
+####################################################################################################################
+sub checkHashValueDiffs {
+        my ($oldVersion,$newVersion) = @_;
+        foreach(keys %{$oldVersion}) {
+                if("$oldVersion->{$_}" ne "$newVersion->{$_}") {
+                        return 1;
+                }
+        }
+        return 0;
+}
+
+####################################################################################################################
+#sub getPreviousIniBackupCopy
+# Purpose : When a hana ini file modification alert appears, the ini file is compared with previous
+#           previously stored ini file version, whose creation triggered alert.
+#           If the current file is same as previous file, no need to create a new temporary file.
+#                       If the current file is different from previous file, create a new temporary file with new timestamp.
+# Returns : Name of the file which has the content ini file, because of which previous alert is raised.
+#                 : undef  - if error or unable to find the previous backup file path
+####################################################################################################################
+sub getPreviousIniBackupCopy {
+        my($fileName,$cluster,$hostName) = @_;
+        my $searchPath = HANA_INI_MON_REPO."$cluster"."_"."$fileName"."_*";
+        my $cmd = 'ls -t '.$searchPath;
+        my @output;
+        my $success = ariba::rc::Utils::executeLocalCommand($cmd,undef,\@output,undef,1);
+        if($success) {
+                if($output[0] =~ /No such file or directory/i) {
+                        return "";
+                }else{
+                        return $output[0];
+                }
+        }else {
+                return undef;
+        }
+}
+
+####################################################################################################################
+#sub readFileContent
+# Purpose :
+####################################################################################################################
+sub readFileContent {
+                my($fileName) = shift;
+                open(FH,$fileName) || return ();
+                my @fileContent = <FH>;
+                chomp(@fileContent);
+                return @fileContent;
+}
+
+####################################################################################################################
+#sub createBackupIniFile
+# Purpose : When an alert is created, a backup file is to be created
+#           When the script find that this is an already raised alert comparing the value in the file, do not create the file again.
+# Return  : Success if file is created successfully
+#         : Error <Error string> if the file creation fails.
+####################################################################################################################
+sub createBackupIniFile {
+        my $fileName = shift;
+		my $cluster = shift;
+		my $hostName = shift;
+		my $userName = shift;
+		my $password = shift;
+        my @fileContents = @_;
+        my $currentEpochTime = `date +%s`;
+		chomp($currentEpochTime);
+		my @output = ();
+
+		return if($#fileContents == -1);
+        $fileName = HANA_INI_MON_REPO."${cluster}_${fileName}_${currentEpochTime}";
+
+
+
+        #print "Creating backup file $fileName\n";
+        #open(FH,">> $fileName") || return "Warn:Unable to create backup file  : $fileName";
+		my $dataToPrint = join("\n",@fileContents);
+        #print FH $dataToPrint; 
+        #close(FH);
+		my $ssh = ariba::rc::Utils::sshCmd();
+		my $command = "echo \'${dataToPrint}\' | ${ssh} ${userName}\@${hostName} cat > ${fileName}";
+		#print "Command : $command\n";
+		my $success = ariba::rc::Utils::executeRemoteCommand($command, $password, 0, undef, undef,\@output); 
+
+
+}
+
+

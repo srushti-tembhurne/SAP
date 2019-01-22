@@ -1,0 +1,56 @@
+#!/usr/local/bin/perl
+#
+# Simple client to ack a page
+#
+# $Id: //ariba/services/monitor/bin/page/ackpage#6 $
+#
+
+use FindBin;
+use lib ("$FindBin::Bin/../../lib");
+
+use ariba::Ops::PageRequest;
+use ariba::Ops::PageAck;
+use ariba::Ops::PageUtils;
+
+my $server;
+my $port;
+my $debug;
+my $pageid;
+my $from;
+
+sub main {
+	while ($arg = shift(@ARGV)) {
+		if ($arg =~ /^-help/) { usage();}
+		if ($arg =~ /^-d/) { $debug = 1; next;}
+		if ($arg =~ /^-s/) { $server = shift(@ARGV); next;}
+		if ($arg =~ /^-p/) { $port = shift(@ARGV); next;}
+		if ($arg =~ /^-f/) { $from = shift(@ARGV); next;}
+		if ($arg !~ /^-/) { $pageid = $arg; next;}
+	}
+
+	usage() unless ( $pageid );
+
+	$from = $ENV{'USER'} unless ( $from );
+	$server = ariba::Ops::PageUtils::pageServer() unless ( $server );
+
+	print "acking page $pageid as $from, connecting to server $server\n";
+
+	my $ack = ariba::Ops::PageAck->newWithPageId($pageid, $from, ariba::Ops::PageAck->viaCommandline());
+
+	if ( $ack->sendToServer($server, $debug, $port) ) {
+		print "sent ack\n";
+	} else {
+		print "failed to send ack\n";
+	}
+}
+
+sub usage {
+	print "Usage: ackpage [-server server] [-port port ] <pageId>\n";
+	print "\n";
+	print "Acknowledge receipt of a page\n";
+	print "By default server is computed using product API\n";
+	exit(1);
+}
+
+main();
+

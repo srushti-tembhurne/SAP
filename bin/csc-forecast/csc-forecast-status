@@ -1,0 +1,344 @@
+#!/usr/local/bin/perl
+
+# The monitoring request is to ping pairs of several hosts, every 15 minutes, so no single host is pinged more than once in
+# a given time period.  This means the script needs to read in a record of what needs to be done, process the next host,
+# mark it as done, unless it is the last host in which case the marks should be removed and the next iteration will start over.
+# The very first time this runs, the file will need to be created with the relevant data.
+# !! See after __END__ for a detailed breakdown of the processing.
+
+use strict;
+use warnings;
+
+use Getopt::Long qw(:config bundling no_ignore_case_always no_getopt_compat require_order);
+use Data::Dumper;
+use JSON;
+use File::Slurp;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::Ops::HTTP;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProductAPIExtensions;
+
+sub wordSplit;
+
+# This will load the "new" Perl Jolokia/JMX support.  It *must* follow *all* the other 'use' statements so it doesn't accidentally
+# pull in any modules that should be for/from the 'old' perl.
+use lib "/usr/local/tools/lib/perl5/site_perl/5.20.1";
+use JMX::Jmx4Perl;
+use JMX::Jmx4Perl::Request;
+# Normally called implicitly by one of the above, but because @INC is being modified below, must explicitly 'use' it here.
+use JMX::Jmx4Perl::Agent;
+
+# This (hopefully) will remmove the Tools directory before the debugger tries to run, when it's invoked.  There are 2 direcotries
+# added (per simple inspection) so if that changes, this may break everything.  Thanks to Dana D. for the suggestion.
+BEGIN {
+    # Loop over the @INC array and remove entries that match the 'use lib' directive above.  Currently I believe only two entries
+    # are added, but this allows for more (or less), as needed.  The entries are guaranteed to all be at the 'shift' end of the array.
+    shift @INC while ($INC[0] =~ m@/usr/local/tools/lib/perl5/site_perl/5.20.1@);
+}
+
+# This will *only* activate if using the Perl debugger (perl -d ...) and is needed in lieu of the 'sub main', in order to get the
+# debugger to stop here.  Some Ariba modules, like ProductAPIExtensions.pm, use the 'INIT{}' compilation subroutine, which will
+# cause the debugger to stop in the module's INIT code.  Simply type 'c' to continue, and it will then stop here, auto-magically.
+# For scripts with a 'sub main', a 'c main::main' achieves the same thing.
+if (defined $DB::single)
+{
+    $DB::single = 1;
+}
+
+my $debug = 0;
+
+my $sendEmail = 0;
+my $sendPage  = 0;
+my $cluster;
+my $test  = 0;
+
+# Debug allows full queue processing, while test skips that processing.  test mode is mostly for development, to be sure everything
+# that happens is local.
+GetOptions  (
+                'debug|d'      => \$debug,
+                'sendemail|e'  => \$sendEmail,
+                'sendpage|p'   => \$sendPage,
+                'test|t'       => \$test,
+                'cluster|c=s'  => \$cluster,
+            );
+
+# This is for determining the proper path name to the etc for a product/build, used to find the configuration file.
+# The mon product is also used later.
+my $monProduct = ariba::rc::InstalledProduct->new ();
+my $etc = $monProduct->installDir () . '/etc';
+
+my $jsonCfgStr = eval {
+    my $config_file = $ENV{CSC_FORCAST_STATUS_CONFIG_FILE} || "$etc/query/csc-forecast-status.conf";
+    my $contents = read_file($config_file)
+        or die "failed to read_file $config_file: $!";
+    print "CHECK:  config file:  $config_file\n" if $test or $debug;
+    return $contents if $contents;
+    die "ERROR:  No config data found!  Aborting ...\n";
+};
+
+# This must be done once, outside the port processing loop, to get everything set up correctly.  Note this is
+# part of a kludge, needed because @statusMap contains references, which means when JMZ::Jmx4Perl touches
+# the mbean part, it changes in @statusMap.  But the clean version needs to be used for the second and any
+# subsequent iterations, which means @statusMap must be recreated from the original JSON each time.  Also, we
+# "know" the JSON at the top is an array, which we should check.
+my @statusMap = eval
+    {
+        my $ref = decode_json $jsonCfgStr or die "failed to 'decode_json' the contents of $jsonCfgStr\n";
+        return @$ref if ref ($ref) eq 'ARRAY';
+        die "ERROR:  invalid JSON string, must be an array:  $jsonCfgStr\n";
+    };
+
+# The first element of the configuration contains the current definitions for crit and warn levels.  It is a hash ref,
+# with 'crit' and 'warn' as the keys.
+my $defaultHRef = shift @statusMap; # Remove this value and ...
+my ($crit, $warn) = ($defaultHRef->{crit}, $defaultHRef->{warn},); # extract the two notification levels.
+
+# NOTE & NOTE!!!  Jolokia URL REQUIRES a terminating slash:
+#                   http://app830:17002/jolokia/
+
+# To make this even more independent of changes, by having everything in the config file, will make the second element of the
+# config file be the appNames.  This will remove the hash ref and extract the appNames in one go.
+my ($supplierAppName, $buyerAppName) = @{(shift @statusMap)->{appName}};
+die "ERROR:  missing application names, aborting ...\n"
+    unless ($supplierAppName && $buyerAppName);
+
+my $product = ariba::rc::InstalledProduct->new ('an', $monProduct->service()); 
+my $name = $product->name ();
+my $service = $product->service ();
+my $email = $product->default ('notify.email');
+my $customer = $product->customer () || undef;
+
+unless ($cluster)
+{
+  $cluster = $product->currentCluster () || 'primary';
+}
+
+# Get instances for both supplier and buyer app names.  Unfortunately, this way does the search through the full set of
+# instances twice, but there is no method for appInstancesMatchingFilteredNameInCluster (or equivalent).
+my @instances = $product->appInstancesWithNameInCluster ($supplierAppName, $cluster);
+push @instances, $product->appInstancesWithNameInCluster ($buyerAppName, $cluster);
+
+my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($product);
+my $communityList = join (', ', grep {($_ % 2) == 1} @communityIds);
+
+# Since we need a list of all the servers:ports to store in a file, the first time this is run, this loop should just store the
+# values it finds for later processing.  We need half the count of 'instance number of slots' in this array, where each element
+# holds an anonymous array with two elements, buyer/supplier host:port.  See after __END__ for detailed explanation.
+my @hostsData;
+my $halfInstanceCount = @instances / 2;
+foreach my $count (0 .. $#instances)
+{
+    my $appName = $instances[$count]->appName;
+    if ($appName =~ /$buyerAppName/o)
+    {
+        # Buyer host:port always at element 0 of anonymous array.
+        unshift @{$hostsData[$count % $halfInstanceCount]}, $instances[$count]->host . ':' . $instances[$count]->jolokiaPort;
+    }
+    elsif ($appName =~ /$supplierAppName/o)
+    {
+        # While Supplier host:port always ends up at element 1 of anonymous array.
+        push @{$hostsData[$count % $halfInstanceCount]}, $instances[$count]->host . ':' . $instances[$count]->jolokiaPort;
+    }
+}
+
+print Dumper (\@hostsData), if $debug or $test;
+
+my (@hostsPorts);
+# If this fails, it likely means the file does not exist and the values from %hostsData should be used.
+{
+    my $config_file = "$etc/csc-forecast-hosts.txt";
+    my ($contents, $VAR1);
+    if (-f $config_file && ($contents = read_file($config_file)))
+    {
+        @hostsPorts = @{eval $contents};
+
+        # At this point, the values read in from the file need to be checked against the set of existing values derived from instances,
+        # to be sure a topology change has not happened in the meantime.  That is done here.  Since everything is done using arrays,
+        # and array order is consistent, we can use that fact to select the things to compare.  The point to remember is that the array
+        # @hostsPorts will never have the full complement of elements, it will have one or more fewer elements than @hostsData, including
+        # being empty.  And the index of the highest element of @hostsPorts will be the index of the matching element in @hostsData, to
+        # compare.  We must compare both indices, since it is conceivable for a topology change to only impact the right side host and
+        # later.  The test must succeed completely, otherwise we assign the newly read in @hostsData.
+        if (! (@hostsPorts && $hostsPorts[$#hostsPorts]->[0] eq $hostsData[$#hostsPorts]->[0] &&
+            $hostsPorts[$#hostsPorts]->[1] eq $hostsData[$#hostsPorts]->[1]))
+        {
+            @hostsPorts = @hostsData;
+        }
+    }
+    else
+    {
+        # This handles the first time ever run scenario.  The array @hostsData is all of the hosts/ports found for the SCM.*Scheduler apps.
+        @hostsPorts = @hostsData;
+    }
+}
+
+# The @hostsPorts array will have X elements, each element being an anon array with two host:port values, one buyer side [0], the other
+# will be supplier side [1].  We process one pair each time the script runs, by shifting the top element from @hostsPorts.  However, if
+# the array has no content, we need to go back to the source and reload.  Note I don't think this can ever happen, given the tests above,
+# but leaving here, to be sure.
+unless (@hostsPorts)
+{
+    @hostsPorts = @hostsData;
+}
+# Now extract the first element, to process, and save the remainder back to the file for future use.
+my @hostsToProcess = @{shift @hostsPorts};
+
+open my $HOSTLIST, '>', "$etc/csc-forecast-hosts.txt" or die "ERROR:  Cannot open file '$etc/csc-forecast-hosts.txt' for writing:  $!\n";
+print $HOSTLIST Dumper (\@hostsPorts);
+close $HOSTLIST;
+
+my %queries;
+
+foreach my $hostPort (@hostsToProcess)
+{
+  print "\nHost:Port being processed this iteration is $hostPort\n" if $test or $debug;
+
+  @statusMap = eval
+          {
+              # We know the ref is to an array, else processing would have aborted earlier.  We also know it has the two, no longer
+              # needed, elements, for crit/warn levels and the application names, which need to be removed.
+              my $ref = decode_json $jsonCfgStr or die "failed to 'decode_json' the contents of $jsonCfgStr\n";
+              # Shift first two items off and then return the rest.
+              shift @$ref;
+              shift @$ref;
+              return @$ref;
+          };
+  my $connection = eval {return JMX::Jmx4Perl->new (url => "http://$hostPort/jolokia/")};
+  die "ERROR:  connection to Jolokia service failed for 'http://$hostPort/jolokia/'\n" if $@;
+
+  foreach my $requestDef (@statusMap) # $requestDef is a hash ref.
+  {
+    my ($requestName) = ($requestDef->{mbean} =~ /:type=(.*)/);
+    my $request = JMX::Jmx4Perl::Request->new (
+                                                READ,
+                                                $requestDef,
+                                              );
+
+    my $response = $connection->request ($request);
+    print "=======================\n$requestName:\n\n", Dumper ($response) if $test or $debug;
+
+    # If we can't connect to a server, do the next loop iteration.
+    next if $response->{error} and $response->{error} =~ /500 Can't connect/;
+    # Actually, to prevent other issues with execution, be sure the response object has a usable value, else there are
+    # problems trying to use it as a ref.
+    next unless $response->value();
+
+    # For each of the requests, process the 'value' key by name and for community, creating a query for each.
+    foreach my $value (sort (keys %{$response->value()})) # The value here is one of 'Items Stuck', 'Error Count', 'Lag'
+    {
+      #  tag example:      "Forecast Queue Monitor Items Stuck"
+      my $tag = wordSplit ("$requestName $value");
+      while (my ($community, $counts) = each %{$response->{value}->{$value}}) # Community is a number.
+      {
+        my $label = $community % 2 ? "SCM Supplier Queue Processor" : "SCM Buyer Queue Processor";
+        $queries {"$tag for last 30 days for community $community"} = {
+                              crit => "answer >= $crit",
+                              warn => "answer >= $warn",
+                              # This will be the second level header, under 'CSC Forecast'.
+                              uiHint => "$label/Community $community",
+                              perl => sub {
+                                            return $counts;
+                                          },
+                              description => "$tag",
+                            };
+      }
+    }
+  }
+}
+
+print Dumper (\%queries) if $test or $debug;
+
+my $q = ariba::monitor::QueryManager->newWithDetails ("CSC Forecast", $name, $service, $customer, $cluster, \%queries);
+
+$q->processQueries ($debug, $email, $sendEmail, $sendPage) unless $test;
+
+# WARNING:  this function is currently only useful for very specific camelback style strings.
+# One argument, a string which may have camelback format as in TheEndOfItAll.
+# Returns a string, with the words separated by single spaces as in 'The End Of It All'.
+sub wordSplit
+{
+  my $string = shift;
+
+  # There are cases where strings may have multiple adjacent upper case letters.  These need to be found and handled, such that
+  # only the last uppercase pair is split:  POG --> PO G
+  my ($ucString) = ($string =~ /([A-Z]{2,})/);
+  # What is found is the full string, we need length-1 of it to use in the pattern match below.  Also, to eliminate uninitialized
+  # errors, check to be sure there's something in it before using it.
+  if ($ucString)
+  {
+    $ucString = substr $ucString, 0, -1;
+    $string =~ s/($ucString|\S)([A-Z])/$1 $2/g;
+  }
+  else
+  {
+    $string =~ s/(\S)([A-Z])/$1 $2/g;
+  }
+  # Trim any leading/trailing space from the new string.
+  $string =~ s/(^\s+|\s+$)//g;
+
+  return $string;
+}
+
+__END__
+
+This is an attempt to describe what the above is doing, for future maintainers, since it is a bit complex.  This came about because
+of the evolutionary nature of the development of this script, plus that fact that a particular course had been chosen, and then it was
+discovered there was a major error in the processing due to an erroneous assumption about how the hosts and instances were related.
+
+The primary request was that for any pair of hosts (buyer/supplier), they would not be accessed more than once in a given period equal
+to the (number of instances/2) * 15 min.  For example, for 6 instances, that would be once every (6/2)*15 = 45 minutes.  This needed
+a way to determine which instance pairs to process at a given point, and saving the remaining pairs for future processing.  Note that
+I was assured there would always be pairs of instances, one each Buyer/Supplier.
+
+The solution was to query the instances for the needed information and store it in an array of arrays, where each inner array would
+have two elements, the buyer side [0] and supplier side [1].  This fits the provided information, above.  The layout diagramatically is:
+
+    [
+        [
+            'buyer_host1:port',
+            'supplier_host1:port'
+        ],
+        [
+            'buyer_host2:port',
+            'supplier_host2:port'
+        ],
+        [
+            'buyer_host3:port',
+            'supplier_host3:port'
+        ],
+        # And so on.
+    ]
+
+Processing is as follows:
+
+    Determine the instances matching either SCMBuyerQueueProcessor or SCMSupplierQueueProcessor and extract the host and Jolokia
+    port.  Push the value onto the anonymous array if it is the Supply side, else unshift if it is Buyer side.  This will be the
+    @hostsData array.  This will guarantee the order defined above, because:
+
+        If the array is empty, push or unshift will create index 0, with either the Buyer or Supplier side data.  The next item to
+        be processed will be the opposite of whatever was just handled, such that:
+
+            If the array has one element, and the current result is a Buyer instance, it will unshift to index zero, and the existing
+            value will become index 1, which is correct for Supplier.
+
+            If the array has one element, and the current result is a Supplier instance, it will push to index one, and the existing
+            value will remain index 0, which is correct for Buyer.
+
+    Get the saved data from the file:
+
+        If there's no file, or if the file content creates an empty outer array, assign the @hostsData array to @hostsPorts.
+
+        If there is data from the file, check it against the @hostsData array, which is the source of trueth each time the script
+        runs, as to the correct topology.  If it doesn't match, throw the file data away and assign @hostsData to @hostsPorts.
+
+        If it does match, use the values in @hostsPorts.
+
+    shift the index 0 value from @hostsPorts and save the remainder of @hostsPorts to the file, overwritting whatever was there.
+
+    For each host:port in the array shifted off, process as before, creating the queries.

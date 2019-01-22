@@ -1,0 +1,248 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/alertsite-stats#11 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::StatusPage;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+use XML::XPath;
+use XML::XPath::XMLParser;
+
+my $debug = 0;
+
+# This method extract the informations :
+#	- Host -> The url monitored by alert site
+#	- Location -> From where the ping has been run
+#	- Ping -> The ping value
+# It returns (host1, location1, ping1, host2, location2, ping2...)
+sub extractInfosFromXML {
+
+	my $xmlString = shift;
+	
+	my $host = undef;
+	my $location = undef;
+	my $ping = undef;
+	
+	# It parses the xml string.
+	# The xml string should be :
+	#
+	#	<Status>
+	#		<Account>
+	#			<Device descrip='descrip1'>		=> descrip == Host
+	#				<Location loc_descrip='loc_descrip1'>		=> loc_descrip == Location
+	#					<resptime_last>PING1</resptime_last>		=> Ping
+	#				</Location>	
+	#				<Location loc_descrip='loc_descrip2'>		=> loc_descrip == Location
+	#					<resptime_last>PING2</resptime_last>		=> Ping
+	#				</Location>
+	#			</Device>
+	#			<Device descrip='descrip2'>
+	#				<Location loc_descrip='loc_descrip3'>		=> loc_descrip == Location
+	#					<resptime_last>PING3</resptime_last>		=> Ping
+	#				</Location>
+	#			</Device>
+	#		</Account>
+	#	</Status>
+	my $xp = XML::XPath->new(xml => $xmlString);
+
+	my $hostNodeSet = $xp->find('/Status/Account/Device/@descrip'); 
+
+	my $result = {}; 
+
+	foreach my $hostNode ($hostNodeSet->get_nodelist) {
+		$host = $hostNode->getNodeValue();
+		$result->{$host} = {};
+
+		my $locationNodeSet = $xp->find("/Status/Account/Device[\@descrip='".$host."']/Location");
+
+		foreach my $locationNode ($locationNodeSet->get_nodelist) {
+
+			my $locationAttrNodeSet = $xp->find("/Status/Account/Device[\@descrip='".$host."']/Location/\@loc_descrip");
+
+			foreach my $locationAttrNode ($locationAttrNodeSet->get_nodelist) {
+
+				$location = $locationAttrNode->getNodeValue();
+
+				my $pingNodeSet = $xp->find("/Status/Account/Device[\@descrip='".$host."']/Location[\@loc_descrip='".$location ."']/resptime_last");
+				foreach my $pingNode ($pingNodeSet->get_nodelist) {
+					
+					$ping = $pingNode->string_value();
+
+					$result->{$host}->{$location} = $ping;
+
+				}
+			}
+		}
+	}
+	return $result;
+}
+
+
+# It extracts the session id from the xml string returned by
+# alert site when the script log in.
+# The xml string should be :
+#	<Login>
+#		<sessionid>SESSIONID</sessionid>
+#	</Login>
+sub getSessionIDFromXML {
+	my $xmlString = shift;
+
+	my $sessionId = undef;
+
+	my $xp = XML::XPath->new(xml => $xmlString);
+
+	my $nodeSet = $xp->find('/Login/sessionid'); 
+
+	foreach my $node ($nodeSet->get_nodelist) {
+		$sessionId = $node->string_value();
+	}
+	
+	return $sessionId;	
+}
+
+
+# It pulls out informations from alert site and process them.
+# This method returns the informations :
+#	- Host -> The url monitored by alert site
+#	- Location -> From where the ping has been run
+#	- Ping -> The ping value
+# It will be returned as a list : (host1, location1, ping1, host2, location2, ping2...)
+sub fetchAlertsiteData {
+	# A monitor product
+	# It's used for retrieving login, password and alertSite url
+	my $mon = shift;
+
+	my $alertSiteUrlString = $mon->default('Ops.AlertSite.xmlurl');
+	my $siteLogin    = $mon->default('Ops.AlertSite.login');
+	my $sitePassword = $mon->default('Ops.AlertSite.password');
+
+	my $command = "obj_device=-1&Rdate=now&sort_order=asc&devtype=0";
+
+	$alertSiteUrlString .= "?$command";
+
+	print ("Alert Site url used : " . $alertSiteUrlString . "\n") if ($debug);
+
+	my $url = ariba::monitor::Url->new($alertSiteUrlString);
+	$url->setusername($siteLogin);
+	$url->setpassword($sitePassword);
+	# the new alertsite interface returns the XML in what geturl interprets as headers
+	$url->setincHeaders('1');
+
+	$url->setUseOutOfBandErrors(1);
+	my @urlOutput = $url->request();
+	if (defined $url->error()) {
+		print "Error : ", $url->error(), "\n";
+		die;
+	} 
+
+	my $myUrlOutput = "@urlOutput";
+
+	# because we're including the headers in the output to get the XML, we have
+	# to strip off everything up to the xml header.
+	$myUrlOutput =~ s%^.*<\?xml%<?xml%s;
+
+	print ("Output String : " . $myUrlOutput . "\n") if ($debug);
+
+	return extractInfosFromXML($myUrlOutput);
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	$debug = 0;
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; };
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $email = $me->default('notify.email');
+
+	my $pn = ariba::monitor::StatusPage::commonProduct();
+
+	my $result = fetchAlertsiteData($me);
+
+	my $queryNameIV = undef;
+	my $queryNameAV = undef;
+	my %queryToRecordFetchedData;
+
+	foreach my $host (keys %{$result})	{ 
+	
+		# These are instant values.
+		# We need them to compute the averages ones. 
+		# So these values won't be displayed. They will just be stored.
+		for my $location (keys %{$result->{$host}}) {
+			my $ping = $result->{$host}->{$location};
+    
+			print "($host, $location, $ping)\n" if ($debug);
+			
+			
+			$queryNameIV = "Instant response time for website $host from $location";	
+			$queryToRecordFetchedData{$queryNameIV} = {
+				'recordMaxResults' => 26784,
+				'recordItem' => "answer",
+				'format' => "%0.3f secs",
+
+				'info' => "1",
+
+				'perl' => "$ping",
+			};
+		}
+	}
+
+	# We have to process instant values queries here, otherwise the average values computation 
+	# is not able to use the latest instant values.
+	my $qm = ariba::monitor::QueryManager->newWithDetails("Response times for http get record only", $pn, $me->service(), $me->customer(), \%queryToRecordFetchedData);
+	$qm->setUiHint('ignore');
+
+	$qm->processQueriesUsingServer($debug, $email, 0, 0);
+
+	my %queryToComputeAverageValues; 
+
+	foreach my $host ( keys %{$result})	{ 
+	
+		# Then we compute average values
+		for my $location (keys %{$result->{$host}}) {
+			my $ping = $result->{$host}->{$location};
+
+
+			print "($host, $location, $ping)\n" if ($debug);
+	
+			print "Average value : $ping\n" if ($debug);
+			
+			$queryNameIV = "Instant response time for website $host from $location";	
+			$queryNameAV = "Avg response time for $host from $location";	
+			my $cdbName = ariba::monitor::Query->generateInstanceName($queryNameIV, $pn);
+			
+			$queryToComputeAverageValues{$queryNameAV} = {
+				'recordMaxResults' => 26784,
+				'recordItem' => "answer",
+				'format' => "%0.3f secs",
+				info => "1",
+
+				#XXX 
+				#'info' => "answer >= 0.8",
+				#'warn' => "answer >= 2",
+				#'crit' => "answer >= 8",
+
+				'extractRecorded' => "average($cdbName, +3)",
+			};
+		}
+
+	}
+
+	my $q = ariba::monitor::QueryManager->newWithDetails("network-alert-site", $pn, $me->service(), $me->customer(), \%queryToComputeAverageValues);
+
+	$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+	
+}
+
+main();
+
+__END__

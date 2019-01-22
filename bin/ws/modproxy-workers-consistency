@@ -1,0 +1,229 @@
+#!/usr/local/bin/perl -w
+
+##########################################################################
+#   This executable parses the proxy balancer output and formats#
+##########################################################################
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use LWP::Simple;
+use Data::Dumper;
+
+my $debug = 0;
+my $service;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-s$/o) { $service = $arg; next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new(); # for emailing
+    my $ssws = ariba::rc::InstalledProduct->new( "ssws", $service );
+    exit unless ( $ssws );
+    
+    my @productsWeNeedToMonitor = ariba::rc::InstalledProduct->installedProductsList($service);
+    my %webServers;
+    my @webserverHosts = $ssws->hostsForRoleInCluster("ss-webserver", "primary");  
+    $webServers{"ss-webserver"} =  \@webserverHosts;
+    my @adminServers = $ssws->hostsForRoleInCluster("ss-adminserver", "primary");
+    $webServers{"ss-adminserver"} = \@adminServers; 
+
+    my %queries;
+
+    for my $webserverType (keys %webServers) {
+        for my $webserverHost (@{$webServers{$webserverType}}) {
+            my $infoFromWebserver = getInfoFromWebserver($ssws, $webserverHost);
+            for my $product (@productsWeNeedToMonitor) {
+                my $productName = $product->name();
+                print " * * * " . $productName . " * * *\n" if ($debug > 1);
+                my @appInstancesToMonitor = $product->appInstancesVisibleViaRoleInCluster($webserverType);
+                my $totalAppinstanceCount = scalar(@appInstancesToMonitor);
+                next if ($totalAppinstanceCount == 0);
+                my ($numWorkersDown, $missingWorkersRef, $erroredWorkersRef) = parseAndUpdate($infoFromWebserver, $productName, \@appInstancesToMonitor);
+                
+                $queries{"Missing Proxy Workers for $productName on $webserverHost"} = {
+                    warn                            => "numrows > ($totalAppinstanceCount/4)",
+                    perl                            => sub { return join ("\n" , @{$missingWorkersRef}); },
+                    uiHint                          => "$productName/$webserverType/$webserverHost",
+                    description                     => "This category lists all those appinstances for which there was no definition found in the modproxy file.",
+                    inf_field                       => "missing_workers_cnt",
+                    inf_tags                        => qq(product="$productName",ws_type="$webserverType",host="$webserverHost"),
+                };
+                
+                $queries{"Proxy Workers in error state for $productName on $webserverHost "} = {
+                    warn                            => "numrows > ($totalAppinstanceCount/4)",
+                    crit                            => "numrows > ($totalAppinstanceCount/2)",
+                    perl                            => sub { return join ("\n" , @{$erroredWorkersRef}); },
+                    uiHint                          => "$productName/$webserverType/$webserverHost",
+                    description                     => "This category lists all the workers that are down (i.e. in error state with respect to modproxy).",
+                    inf_field                       => "workers_in_error_state_cnt",
+                    inf_tags                        => qq(product="$productName",ws_type="$webserverType",host="$webserverHost"),
+                };
+                
+                # Logic for Extra workers is still pending hence commented.
+                # $queries{"Extra Proxy Workers for $productName on $webserverHost "} = {
+                #     warn                            => "numrows > 0",
+                #     crit                            => "numrows > ($totalAppinstanceCount/2)",
+                #     perl                            => sub { return join ("\n" , @{$extraWorkersRef}); },
+                #     uiHint                          => "$productName/$webserverType/$webserverHost",
+                #     description                     => "This category lists all those workers found in the modproxy conf file for which a corresponding appinstance was not found.",
+                #     inf_field                       => "extra_workers_cnt",
+                #     inf_tags                        => qq(product="$productName",ws_type="$webserverType",host="$webserverHost"),
+                # };
+                
+                $queries{"Percentage down (proxy workers in error state & missing proxy workers) for $productName on $webserverHost "} = {
+                    warn                            => "defined(answer) && answer >= 15",
+                    format                          => "%.2f%%\n",
+                    perl                            => sub { return $numWorkersDown; },
+                    uiHint                          => "$productName/$webserverType/$webserverHost",
+                    description                     => "This category prints the percentage of workers that are down/missing with respect to all appinstances",
+                    inf_field                       => "percent_down",
+                    inf_tags                        => qq(product="$productName",ws_type="$webserverType",host="$webserverHost"),
+                };
+            }
+        }
+
+
+    }
+
+    my $email = $mon->default('notify.email');
+    
+    my $qm = ariba::monitor::QueryManager->newWithDetails('modproxy-workers', $ssws->name(), $ssws->service(), $ssws->customer(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    
+}
+
+
+#   The below method is resposible for getting the
+#   query information and storing it in a temporary
+#   file that is used by the query manager
+
+sub getInfoFromWebserver {
+    my ($ssws, $webserver) = @_;
+
+    my $port = $ssws->default( "WebServerHTTPPort" );
+
+    my $url = "http://$webserver:$port/balancer-manager";
+    print "pinging URL: $url \n" if ($debug > 1);
+
+    my $content = qq(curl -s $url | grep "href" | sed "s/<[^>]*>/ /g");
+    # my $content = LWP::Simple::get( $url );
+    print "content: `$content` \n" if ($debug > 1);
+    return `$content`;
+}
+
+sub  trim { my $s = shift; $s =~ s/^\s+|\s+$//g; return $s };
+sub  trimBraces { my $s = shift; $s =~ s/^\[+|\]+$//g; return $s };
+
+# This sub will parse the modproxy status content based on the appinstances
+sub parseAndUpdate {
+    my ($content, $productName, $appInstancesToMonitorRef) = @_;
+    my @lines = split( /\n/, $content );
+    my @answers;
+
+    my %lbs;
+    my %workers;
+    my $balancer;
+    my @workergroup;
+    foreach(@lines)
+    {
+        my $line = trim($_);
+        my @a = split ' ', $line;
+        if (index($line, "LoadBalancer") == 0)
+        {
+            push @{$lbs{$balancer}},@workergroup;
+            $balancer=trimBraces($a[-1]);
+            # print $balancer;
+            undef @workergroup;
+        }
+        if (index($line, "https") == 0)
+        {
+            $workers{@a[1]}=[@a[5],$balancer];
+            push @workergroup, $a[1];
+            # print Dumper \@workergroup;
+        }
+        # print $line;
+    }
+
+    my @appInstancesToMonitor = @{$appInstancesToMonitorRef};
+    ############# calculation of missing and errored workers ###############
+    
+    my @missingWorkers;
+    my @erroredWorkers;
+    
+    # Initially, we use appinstances from the product as a source of truth and compute the missing and errored workers in modjk list
+    # based on each appinstance.
+    for my $instance (@appInstancesToMonitor) {
+        print "Monitoring " . $instance->workerName() . "(" . $instance->logicalName() . ")\n" if ($debug > 1);
+        # We look for the worker.<WorkerName>.state pattern in the modjk status response, if it isnt present or if the status is not OK,
+        # we report it as an error.
+        # sample patterns present in modproxy status response:
+        # 'Node3app878lab1' => [
+                            # Status:    'Ok' / 'Err',
+                            # Loadbalancer name 'p27e886ac_s4taskcxml_c2' ]
+
+        # below making workername as string by adding double quotes,some how otherwise its failing.
+        my @state = $workers{"".$instance->workerName()};
+        if (!defined (@state)) {
+            push (@missingWorkers, $instance->logicalName() . " (" . $instance->workerName() . ")");
+        }
+        else {
+            push (@erroredWorkers, $instance->logicalName() . " (" . $instance->workerName() . ")") unless ($state[0][0] eq "Ok");
+        }
+    }
+    
+    ######### calculation of percentage of workers down for a given app #########
+    
+    my $numWorkersDown = ((scalar(@missingWorkers) + scalar(@erroredWorkers)) / scalar(@appInstancesToMonitor)) * 100;
+    
+    ############## Formatting response returned to the query ###################
+    
+    if ($debug > 1) {
+        push (@answers, "\n\n1. Missing Appinstances : \n");
+        push (@answers, sort(@missingWorkers));
+        # push (@answers, "\n\n2. Extra Workers : \n");
+        # push (@answers, sort(@extraWorkers));
+        push (@answers, "\n\n2. Workers in error state : \n");
+        push (@answers, sort(@erroredWorkers));
+        push (@answers, "\n\n3.% down (workers in error state & missing appinstances) : " . $numWorkersDown . "\n");
+        
+        print "\n\n returning answers: @answers";
+    }
+
+    return ($numWorkersDown, \@missingWorkers, \@erroredWorkers);
+}
+
+main(@ARGV);
+
+__END__

@@ -1,0 +1,80 @@
+#!/usr/local/bin/perl -w
+
+# Create a volume group for a bcv
+# $Id: //ariba/services/monitor/bin/everywhere/create-vg-for-dg#3 $
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+
+use File::Path;
+use ariba::Ops::EMCUtils;
+
+my $debug = 0;
+
+sub usage {
+	print "Usage: $0 -dg <deviceGroup> -type [std|bcv] [-fsck] [-debug]\n";
+	print "Example:\n\n";
+	print "\t$0 -dg ora01a-2 -type bcv -debug\n";
+	exit(0);
+}
+
+sub main {
+	my $deviceGroup = '';
+	my $deviceType  = '';
+	my $fsck = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-d(?:ebug)?$/o) { $debug++ };
+		if ($arg =~ /^-dg/o) { $deviceGroup = shift(@ARGV) };
+		if ($arg =~ /^-type/o) { $deviceType = shift(@ARGV) };
+		if ($arg =~ /^-fsck/o) { $fsck = 1 };
+	}
+
+	usage() unless $deviceGroup;
+	usage() unless $deviceType;
+
+	ariba::Ops::EMCUtils::setDebug($debug);
+
+	print "Working on $deviceGroup ...\n";
+
+	my ($symmList,$deviceOrder);
+
+	if ($deviceType eq 'bcv') {
+
+		($symmList,$deviceOrder) = ariba::Ops::EMCUtils::symmBCVDeviceListForDeviceGroup($deviceGroup);
+	} else {
+
+		($symmList,$deviceOrder) = ariba::Ops::EMCUtils::symmSTDDeviceListForDeviceGroup($deviceGroup);
+
+		# for std devices, we don't want to have the -\d notation.
+		$deviceGroup =~ s/-\d$//;
+	}
+
+	# pull any secondary fiber paths
+	ariba::Ops::EMCUtils::findSecondaryPathsForSymmDevices($symmList);
+
+	if ($debug > 1) {
+		print "Writing out device file paths for debugging.\n";
+
+		my $primaryPathsFile = "/tmp/$deviceGroup.primarypaths.txt";
+		my $allPathsFile     = "/tmp/$deviceGroup.allpaths.txt";
+
+		ariba::Ops::EMCUtils::writePathListToFile(
+			$primaryPathsFile, 
+			ariba::Ops::EMCUtils::primaryPathsForSymmDeviceList($symmList, $deviceOrder)
+		);
+
+		ariba::Ops::EMCUtils::writePathListToFile(
+			$allPathsFile,
+			ariba::Ops::EMCUtils::allPathsForSymmDeviceList($symmList, $deviceOrder)
+		);
+	}
+
+	ariba::Ops::EMCUtils::createVolumeGroupForDeviceGroup($deviceGroup, $symmList, $deviceOrder);
+
+	print "Created /dev/$deviceGroup successfully.\n";
+}
+
+main();
+
+__END__

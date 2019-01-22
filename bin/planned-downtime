@@ -1,0 +1,577 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/planned-downtime#32 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use ariba::rc::InstalledProduct;
+use ariba::rc::ArchivedProduct;
+use ariba::rc::Globals;
+use ariba::monitor::ProductStatus;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Utils;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::BusyPageController;
+use Time::Local;
+use Date::Calc;
+
+my $debug = 0;
+my $vers = 1.1;
+
+
+my $NOTIFICATIONTEMPLATE = "../etc/planned-downtime-notification-template.txt";
+
+
+sub usage {
+	print "Error: $_[0]\n" if $_[0];
+	print "usage: $0 (version $vers)\n";
+	print "          -products <an,fx,anl,...>\n";
+	print "          -service <service>\n";
+	print "          -customer <customer,customer2,...>\n";
+	print "          -allcustomers\n";
+	print "          -comment 'description of downtime'\n";
+	print "          -duration <duration in minutes>\n";
+	print "          -mclname 'dir/full-MCL-name'\n";
+	print "          -jira <ticketId>\n";
+	print "          -start mark start of planned downtime\n";
+	print "          -stop mark stop of planned downtime\n";
+	print "          -startTime start of downtime YYYY-MM-DD:HH:mm\n";
+	print "          -endTime end of downtime YYYY-MM-DD:HH:mm\n";
+	print "          [-new] for first-time products/customers\n";
+	print "          [-ls] lists all current planned downtime\n";
+	print "          [-stopById <id,id2,...>] mark stop of planned downtime with -ls' ID\n"; 
+	print "          [-notification] will generate an e-mail template for sending to support\n";
+	print "          [-help]\n";
+	print "          [-debug]\n";
+	print "\n";
+	print "Notes:  Use the directory and path from perforce for the MCL name,\n";
+	print "        for example, -mclname network/n1redesign_20010310.txt\n";
+	print "\n";
+	print "        Product list may contain datacenter names\n";
+	print "\n";
+	print "\n";
+	exit(1);
+}
+
+sub main {
+	my ($service, @customers, $allCustomers, $comment, $jira_id, $duration, $start, $stop, $startDTime, $endDTime,
+	    $mcl, $newProduct, $notify, $startTime);
+    my $range = 0;
+	my %productNamesHash;
+	my @stopIds; 
+
+	while (my $arg = shift(@ARGV)) {
+
+		if ($arg =~ /^-products/) { 
+			while($arg = shift(@ARGV)) { # backward compatible
+				if($arg !~ /^-/) {
+					map { $productNamesHash{$_} = 1; } split(/,/, $arg); 
+				} else {
+					last;
+				}
+			}
+			last unless $arg;
+		}
+		if ($arg =~ /^-help/) { usage();}
+		if ($arg =~ /^-debug/) { ++$debug; next;}
+		if ($arg =~ /^-start$/) { $start = 1; next;}
+		if ($arg =~ /^-stop$/) { $stop = 1; next;}
+		if ($arg =~ /^-service/) { $service = shift(@ARGV); next;}
+		if ($arg =~ /^-customer/) { @customers = split(/,/, shift(@ARGV)); next;}
+		if ($arg =~ /^-duration/) { $duration = shift(@ARGV); next;}
+		if ($arg =~ /^-allcustomers/i) { $allCustomers = 1; next;}
+		if ($arg =~ /^-comment/) { $comment = shift(@ARGV); next;}
+		if ($arg =~ /^-mclname/) { $mcl = shift(@ARGV); next;}
+		if ($arg =~ /^-jira/) { $jira_id = shift(@ARGV); next;}
+		if ($arg =~ /^-startTime/) { $range++; $startDTime = shift(@ARGV); next;}
+		if ($arg =~ /^-endTime/) { $range++; $endDTime = shift(@ARGV); next;}
+		if ($arg =~ /^-new/) { $newProduct = 1; next;}
+		if ($arg =~ /^-ls/) { listDowntimes(); exit(0); }
+		if ($arg =~ /^-stopById/i) { push(@stopIds, split(/,/, shift(@ARGV))); next; }
+		if ($arg =~ /^-notification/) { $notify = 1; next;}
+		usage("Unknown arg: $arg");
+	}
+
+	if (@stopIds) { 
+		stopDowntimeByIds(@stopIds); 
+		exit(0); 
+	}
+
+	unless ( defined($service) ){
+		usage("Need a service name");
+	}
+
+	unless ( scalar(keys %productNamesHash) ) {
+		usage("Need at least one product name");
+	}
+
+	unless ( $stop || $start || $range){
+		usage("Need to have -start or -stop, or -startTime and -endTime");
+	}
+
+	if ( @customers && $allCustomers ) {
+		usage("Cannot use both -allCustomers and -customer flags");
+	}
+
+	if ( $start && ! defined($comment) ) {
+		usage("Need a downtime comment");
+	}
+
+	if ( $start && ! defined($mcl) ) {
+		usage("Need an MCL name, like network/n1redesign_20010310.txt");
+	}
+
+	if ( defined($mcl)  && $mcl !~ m|/| ) {
+		usage("MCL name needs to be the path under production-ops/mcl directory, like network/n1redesign_20010310.txt");
+	}
+
+	if ( $start && ! defined($jira_id) ) {
+		usage("Need a JIRA ID\n");
+	}
+
+    if ( ($start && (defined($startDTime) || defined($endDTime))) || ($stop && (defined($startDTime) || defined($endDTime))) ) { 
+        usage("Please specify -start|-stop or -startTime and -endTime (not both)");
+    }
+
+    if ( $start && !defined($duration) ) {
+        usage("Need an estimated duration time of downtime");
+    }
+
+	if (defined($duration) && $range > 0) {
+		usage("-duration does not apply to a start, end time range");
+	}
+
+    if ($range == 1) {
+        usage("Must provide both -startTime and -endTime\n");
+    }
+
+    if ($range == 2) {
+        if ( $startDTime !~ /^\d{4}-\d{2}-\d{2}:\d{2}:\d{2}$/ ) {
+            usage("Missing or bad start date/time format");
+        }
+        if ( $endDTime !~ /^\d{4}-\d{2}-\d{2}:\d{2}:\d{2}$/ ) {
+            usage("Missing or bad end date/time format");
+        }
+        if ($startDTime gt $endDTime) {
+            usage("End date must be after start date")
+        }
+
+        ($startTime, $duration) = rangeDuration($startDTime, $endDTime);
+    }
+
+	if ($duration && $duration =~ m/\D/) {
+		usage("Duration is the total estimated duration time in minutes; please provide minutes");
+	}
+
+	# check for fake products
+	my %fakeProductNames = (
+		ariba::monitor::StatusPage::disasterRecoveryProduct()	=> 1,
+		ariba::monitor::StatusPage::ackedPageSystemProduct()	=> 1,
+		ariba::monitor::StatusPage::commonProduct()				=> 1,
+	);
+
+	my %downtimeProductsHash = ();
+
+	if ($allCustomers) {
+		push (@customers, undef);
+	}
+	
+	my $fakeCustomer = "fakecustomername";
+	foreach my $productName (keys %productNamesHash) {
+
+		if ( exists($fakeProductNames{$productName}) ) {
+			$downtimeProductsHash{$productName}->{$fakeCustomer} = 1;
+		} elsif ( ariba::rc::Globals::isSharedServiceProduct($productName) ) { 
+			my $installed = ariba::rc::InstalledProduct->isInstalled($productName, $service); 
+			if ($installed || $newProduct) { 
+				$downtimeProductsHash{$productName}->{$fakeCustomer} = 1;
+			} else { 
+				print "Skipping $productName $service as it doesn't seem to be installed. Try -new if applicable.\n";
+				next;
+			} 
+		} else { # ASP Product
+			my @productList;
+			unless (@customers) { 
+				print "No customer specified for ASP product $productName.\n"; 
+				next; 
+			} 
+			for my $customer (@customers) {
+				my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName, $customer); 
+				
+				if (@products) { 
+					push (@productList, @products);
+				} else {
+					if ($newProduct) { # tmid: 64751 
+						$downtimeProductsHash{$productName}->{$customer} = 1;
+						print "New $productName $service $customer can't be checked for integated suite. Please be sure to set planned downtime for all applicable products for the customer.\n" unless ($productName eq 's2'); 
+					} else { 
+						print "Skipping $productName $service $customer as it doesn't seem to be installed. Try -new if applicable.\n";
+						next;
+					}
+				}
+			}
+			
+			for my $product (@productList) {
+				$downtimeProductsHash{$product->name()}->{$product->customer()} = 1;
+				if ( $product->isInstanceSuiteDeployed() ) {
+					for my $suiteProduct ($product->instanceSuiteMembersList()) {
+						$downtimeProductsHash{$suiteProduct}->{$product->customer()} = 1;
+					}
+				}
+			}
+		}
+	}
+
+
+	my @products;
+        
+	for my $product (keys %downtimeProductsHash) {
+
+		if ($start || $range) {
+			print "\n";
+			print "Starting planned downtime.\n\n";
+			print "      Service: $service\n";
+			print "      Product: $product\n";
+
+			if (keys %{$downtimeProductsHash{$product}} && 
+				!exists($downtimeProductsHash{$product}->{$fakeCustomer})) {
+				print "  Customer(s): ",join(" ", keys %{$downtimeProductsHash{$product}}), "\n" ;
+			}
+
+            if ($start) {
+                print "      Estimated duration time : $duration minutes\n";
+            } else {
+                print "      Planned Downtime scheduled between $startDTime and $endDTime\n";
+                print "      Estimated duration time : $duration minutes\n";
+            }
+
+			print "      Note:\n";
+			print "            $comment [JIRA_ID: $jira_id]; MCL=$mcl\n";
+			print "\n";
+			print "REMINDER:  You must run this program again with the -stop\n";
+			print "flag to mark the end of the planned downtime for these products.\n";
+			print "\n";
+        }
+        else {
+			print "\n";
+			print "Stopping planned downtime.\n\n";
+			print "      Service: $service\n";
+			print "      Product: $product\n";
+
+			if (keys %{$downtimeProductsHash{$product}} && 
+				!exists($downtimeProductsHash{$product}->{$fakeCustomer})) {
+				print "  Customer(s): ",join(" ", keys %{$downtimeProductsHash{$product}}), "\n" ;
+			}
+			print "\n";
+		} 
+
+		for my $customer (keys %{$downtimeProductsHash{$product}}) {
+			$customer = undef if $customer eq $fakeCustomer;
+			if ($start || $range) {
+				push(@products, setPlannedDowntime($service, $product, $customer, $comment, $mcl, $duration, $startTime, $jira_id, $range));
+            } else {
+				removePlannedDowntime($service, $product, $customer, $comment, $mcl);
+			}
+		}
+
+	}
+
+	if ($notify && ($start || $range)) {
+		my %tokenMap;
+
+		print "Here is the notification e-mail template :\n\n";
+		print "-------------------------------------\n";
+		_initializeTokens (\@products, \%tokenMap, time(), $jira_id, $comment, $duration); 
+		_replaceTokens ($NOTIFICATIONTEMPLATE, \%tokenMap);
+		print "-------------------------------------\n";
+	}
+}
+
+sub setPlannedDowntime {
+	my ($service, $product, $customer, $comment, $mcl, $duration, $startTime, $jira_id, $range, $start ) = @_;
+	return _modifyPlannedDowntimeForProduct($service, $product, $customer, $comment, $mcl, $duration, $startTime, $jira_id, $range, 1);
+}
+
+sub removePlannedDowntime {
+	my ($service, $product, $customer, $comment, $mcl, $start) = @_;
+	_modifyPlannedDowntimeForProduct($service, $product, $customer, $comment, $mcl, undef, undef, 0);
+}
+
+sub _modifyPlannedDowntimeForProduct {
+
+	my ($service, $product, $customer, $comment, $mcl, $duration, $startTime, $jira_id, $range, $start) = @_;
+
+	my $productStatus = ariba::monitor::ProductStatus->newWithDetails($product, $service, $customer);
+
+	print (($start ? "Starting":"Ending"), " planned downtime for product $product, service $service", ($customer ? ", customer $customer":""), "\n") if $debug;
+
+	my $busyPage = undef;
+	if (ariba::rc::InstalledProduct->isInstalled($product, $service, undef, $customer)) {
+
+		my $productInstance = ariba::rc::InstalledProduct->new($product, $service, undef, $customer);
+
+		$busyPage = ariba::Ops::BusyPageController->newFromProduct($productInstance);
+		$busyPage->setDebug($debug);
+	}
+	
+
+	if ($start) {
+
+		if ($debug < 2) {
+			$startTime = time() unless ($range);
+
+			$productStatus->setInPlannedDownTime(1);
+			$productStatus->setComment($comment);
+			$productStatus->setMcl($mcl);
+			$productStatus->setPlannedDownTimeStart($startTime);
+			$productStatus->setDuration($duration);
+			$productStatus->setTmid($jira_id); # Actually Setting jira id not ticket master ID (tmid)...
+			$productStatus->save();
+
+ 			$busyPage->setPlanned($duration, $startTime, 1) if ($busyPage);
+
+
+		}
+
+	} else {
+
+		if ($debug < 2) {
+			$productStatus->setInPlannedDownTime(0);
+			$productStatus->deleteComment();
+			$productStatus->deleteMcl();
+			$productStatus->deletePlannedDownTimeStart();
+			$productStatus->deleteDuration();
+			$productStatus->deleteTmid(); # Actually deleting jira id not ticket master ID (tmid)...
+			$productStatus->save();
+
+			$busyPage->setUnplanned(1) if ($busyPage);
+
+		}
+	}
+
+	return $productStatus;
+}
+
+# Typical email notification template :
+#
+#
+# To: SV_Strategic_Sourcing_Downtime; <Requestor>
+# CC: Ask_Ops
+# Subject: Planned downtime notification - JIRA_ID: <JIRA_ID>
+#
+#
+# 	DOWNTIME COMMUNICATION TO CUSTOMER SUPPORT
+#
+# [ X ] PLANNED or [  ] UNPLANNED DOWNTIME
+#
+# TICKET NUMBER:		<JIRA_ID>
+# SR NUMBER:		<ENTER SERVICE REQUEST NUMBER>
+#
+#
+# <PRODUCTS_ASP>
+#
+#
+# <PRODUCTS_SHARED>
+# 
+# 
+# REQUESTOR:		<ENTER NAME OF PERSON IN CHARGE>
+# REASON FOR DOWNTIME:	<ENTER SHORT DESCRIPTION OF REASON>
+# DATE: 			<MONTH> <DAY> <YEAR>
+# START TIME (PST):	<IF IMMEDIATE, ENTER "STARTING NOW">
+# EXPECTED DURATION:	<DURATION_HOURS> hours <DURATION_MINUTES> minutes
+# AFFECTED SITES:		<LIST ALL INVOLVED SITES>
+# COMMENTS:		<COMMENTS>
+#
+# [  ] CHANGES
+# SITES:			<LIST IMPACTED SITES>
+# COMMENTS:		<SPECIFY CHANGES>
+#
+# **************************************************************************************************
+# 
+# [  ] SCHEDULED AS (Ariba Sourcing) SERVICE PACK UPGRADE DOWNTIME
+# 
+# APPLICATIONS:		[ ] AS and any integrated module [  ] ANL standalone
+# UPGRADE DATE: 		<MONTH> <DAY> <YEAR>
+# WAVE: 			<ENTER WAVE #>
+# SITES: 			<LIST SITES IN EACH WAVE>
+# 
+# [  ] CHANGES
+# WAVES:			<LIST IMPACTED WAVES/SITES>
+# COMMENTS:		<SPECIFY CHANGES>
+
+
+# Initialize the tokens usend to customize a file
+sub _initializeTokens {
+	my $productStatusRef = shift;
+	my $tokenMap = shift;
+	my $start = shift;
+	my $jira_id = shift;
+	my $comment = shift;
+	my $duration = shift;
+
+	my ($lsec,$lmin,$lhour,$lmday,$lmon,$lyear,$lwday,$lyday,$lisdst) = localtime($start);
+
+	map {$_ = '0' . $_ if (length($_) == 1)} ($lsec, $lmin, $lhour, $lmday, $lmon);
+
+	$$tokenMap{'<MIN>'} = $lmin;
+	$$tokenMap{'<HOUR>'} = $lhour;
+	$$tokenMap{'<DAY>'} = $lmday;
+	$$tokenMap{'<MONTH>'} = $lmon + 1;
+	$$tokenMap{'<YEAR>'} = $lyear + 1900;
+
+
+
+	my %aspProducts;
+	my @sharedProducts;
+		
+	for my $productStatus (@$productStatusRef) {
+		my $product;
+
+		if (ariba::rc::InstalledProduct->isInstalled($productStatus->productName(), $productStatus->service(), undef, $productStatus->customer())){
+			$product = ariba::rc::InstalledProduct->new($productStatus->productName(), $productStatus->service(), undef, $productStatus->customer());
+		} else {
+			$product = ariba::rc::ArchivedProduct->new($productStatus->productName(), $productStatus->service(), undef, $productStatus->customer()) unless ($product);
+		}
+
+		# Is it an ASP product ?
+		if (ariba::rc::Globals::isASPProduct($productStatus->productName())) {
+			push(@{$aspProducts{$productStatus->customer()}}, $product);
+		} else {
+			push(@sharedProducts, $product);
+		}
+	}
+
+	# PRODUCTS_ASP token will contain all asp products information
+	$$tokenMap{'<PRODUCTS_ASP>'} =  "";
+
+	if (keys(%aspProducts)){
+		$$tokenMap{'<PRODUCTS_ASP>'} =  "CUSTOMER              APPLICATION\n";
+		$$tokenMap{'<PRODUCTS_ASP>'} .= "--------              -----------\n";
+	}
+
+	# We go through all customers that will be taken down
+	foreach my $customer (keys(%aspProducts)) {
+		
+		next unless (@{$aspProducts{$customer}});
+
+		my @products = @{$aspProducts{$customer}};
+
+		$$tokenMap{'<PRODUCTS_ASP>'} .= $products[0]->prettyCustomerName() . " (" . $customer .") : ";
+		
+		foreach my $product (@products) {
+			$$tokenMap{'<PRODUCTS_ASP>'} .= uc($product->name()) . ", "; 
+		}
+		chop($$tokenMap{'<PRODUCTS_ASP>'} );	
+		chop($$tokenMap{'<PRODUCTS_ASP>'} );	
+
+		$$tokenMap{'<PRODUCTS_ASP>'} .= "\n";
+	}
+
+
+	# All the shared products that will be taken down
+	$$tokenMap{'<PRODUCTS_SHARED>'} = "";
+	$$tokenMap{'<PRODUCTS_SHARED>'} = "SERVICE\n-------\n" if (@sharedProducts);
+
+	foreach my $product (@sharedProducts) {
+		$$tokenMap{'<PRODUCTS_SHARED>'} .= uc($product->name()) . "\n"; 
+	}
+
+
+	$$tokenMap{'<COMMENTS>'} = $comment;
+	$$tokenMap{'<JIRA_ID>'} = $jira_id;
+
+
+
+	# Tokens about the duraction of the planned downtime
+
+	my $totalDurationInMin = $duration;
+
+	my $minutes = $totalDurationInMin % 60;
+	my $hours = ($totalDurationInMin - $minutes) / 60;
+
+	map {$_ = '0' . $_ if (length($_) == 1)} ($hours, $minutes);
+
+	$$tokenMap{'<DURATION_HOURS>'} = $hours;
+	$$tokenMap{'<DURATION_MINUTES>'} = $minutes;
+	$$tokenMap{'<DURATION>'} = $duration;
+
+
+}
+
+
+sub _replaceTokens {
+
+	my $srcFile = shift; 		 # The name of the file to tokenize
+	my $tokenMap = shift;	 # A map : Token -> Value, where the value will replace the token
+
+
+	print "Tokens available : [", join(', ', %$tokenMap), "]\n" if ($debug);
+
+	return unless ($srcFile);
+
+	print "Replacing tokens : Sourcefile [$srcFile]\n" if ($debug);
+
+	open (FILEIN, $srcFile);
+	my @lines = <FILEIN>;
+	close(FILEIN); 
+
+
+	foreach my $line (@lines ) {
+
+		foreach my $key (keys(%$tokenMap)) {
+			$line =~ s/$key/$$tokenMap{$key}/g;
+		}
+
+		print $line;
+	}   
+}
+
+sub listDowntimes { 
+	my @downtimes = ariba::monitor::ProductStatus->objectsWithProperties(
+		'inPlannedDownTime' => 1); 
+	if (@downtimes) { 
+		my $format = "%-30s  %-10s  %-25s  %7s\n"; 
+		
+		printf($format, "ID", "Product", "Customer", "JIRA_ID"); 
+		print "=" x 78 . "\n"; 
+		foreach my $downtime (@downtimes) { 
+			printf($format, $downtime->instance(), $downtime->productName(), $downtime->customer() || '', $downtime->tmid()); 
+		} 
+	} else { 
+		print "There are no planned downtimes set.\n"; 
+	} 
+} 
+
+sub stopDowntimeByIds { 
+	my @stopIds = @_; 
+
+	foreach my $stopId (@stopIds) { 
+		if (ariba::monitor::ProductStatus->objectWithNameExists($stopId)) {
+			my $ps = ariba::monitor::ProductStatus->new($stopId); 
+			removePlannedDowntime($ps->service(), $ps->productName(), $ps->customer() || undef, $ps->comment(), $ps->mcl());		
+			print "Stopping planned downtime for $stopId\n"; 
+		} else { 
+			print "Downtime ID doesn't exists: $stopId\n"; 
+		} 
+	}
+}
+
+sub rangeDuration {
+    my $startTime = shift;
+    my $endTime = shift;
+    my $duration;
+
+    my ($year, $mon, $day, $hour, $min) = $startTime =~ /^(\d{4})-(\d{2})-(\d{2}):(\d{2}):(\d{2})$/x;
+    my ($year2, $mon2, $day2, $hour2, $min2) = $endTime =~ /^(\d{4})-(\d{2})-(\d{2}):(\d{2}):(\d{2})$/x;
+    $mon--;
+    $mon2--;
+    $startTime = timelocal(0, $min, $hour, $day, $mon, $year);
+    $endTime = timelocal(0, $min2, $hour2, $day2, $mon2, $year2);
+    $duration = ($endTime - $startTime) / 60;
+
+    return ($startTime, $duration);
+}
+
+main();
+

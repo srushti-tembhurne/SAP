@@ -1,0 +1,73 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/buyer/corrupted-data-monitoring
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::OracleClient;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::Startup::Common;
+
+sub main {
+    my $debug = 0;
+    my $quiet = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while(my $arg=shift(@ARGV)){
+            print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+            if($arg =~ /^-d/o){ $debug=1; }
+            if($arg =~ /^-e/o){ $sendEmail=1; };
+            if($arg =~ /^-p$/o){ $sendPage=1; };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+
+    my $product= ariba::rc::InstalledProduct->new("an");
+    my $productName = $product->name();
+    my %queries = ();
+
+    my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($product);
+    my $communitiesList = join(", ", @communityIds);
+
+    $queries{ "Detected corrupted records" } = { 
+        warn => "numrows > 0",
+        runForCommunities => $communitiesList,
+        ticketOnWarnOpenAfterMinutes => 1,
+        uiHint => "Corrupt Data",
+        sql  => "SELECT nc.timecreated, " .
+                "       nc.tablename, " .
+                "       nc.rootid, " .
+                "       nc.currentschema, " .
+                "       nc.correctschema " .
+                "FROM   monitorcorruptedschemadatatab nc " .
+                "WHERE  nc.FIXEDDATE is null ",
+    };
+
+    my $email = $me->default('notify.email');
+
+    my $queryManager = ariba::monitor::QueryManager->newWithDetails(
+            "dba",
+            $product->name(),
+            $service,
+            $product->customer(),
+            \%queries);
+
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($product, $queryManager);
+
+    $queryManager->processQueriesUsingServer(
+        $debug,
+        $email,
+        $sendEmail,
+        $sendPage);
+}
+
+main();

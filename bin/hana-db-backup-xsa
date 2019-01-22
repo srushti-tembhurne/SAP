@@ -1,0 +1,366 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+use Data::Dumper;
+use File::Basename;
+use POSIX qw(strftime);
+use Getopt::Long        qw(GetOptions);
+use Pod::Usage          qw(pod2usage);
+use POSIX qw(strftime);
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DBConnection;
+use ariba::Ops::HanaClient;
+use ariba::Ops::HanaControl;
+use dmail::LockLib;
+
+=head1 SYNOPSIS
+
+    hana-db-backup -t "backup type"
+
+    Options:
+        --help|-h            Show this help.
+        --debug|-d           Debug.
+        --verbose|-v         Verbose.
+        --type|-t            Type of backup(full|incr)
+        --product|-product   product name
+
+=cut
+
+my $debug = 0;
+my $verbose = 0;
+my $type = "full";
+my $sqls;
+my $backupMdsXsa;
+my $backupStatusSql;
+
+my $prog = basename($0);
+my $LOCKFILE = "/tmp/$prog";
+
+my %path_overrides = (
+    load6 => '/hana/log/A01/mnt00002/BACKUP/',
+);
+
+my %xsa_fss_src_path = (
+    fss => '/hana/shared/<SID>/xs/controller_data/fss',
+    xsa => '/usr/sap/<SID>/SYS/global/xsa',
+);
+
+my %destPath = (
+    labDC  => '/hana/shared/<SID>/HDB00/backup/data/XSA_FSS',
+    prodDC => '/hana_backup/<SID>/data/XSA_FSS',
+);
+
+sub getHanaDbcsForProduct {
+    my ($productName, $service) = @_;
+
+    my $product = ariba::rc::InstalledProduct->new($productName, $service);
+    my @all_dbcs = ariba::Ops::DBConnection->connectionsFromProducts($product);
+
+    my @dbcs = grep { $_->isHana && ! $_->isDR } @all_dbcs;
+    @dbcs = ariba::Ops::DBConnection->uniqueConnectionsByHostAndPort(@dbcs);
+
+    unless(@dbcs) {
+        # if no hana dbcs found, might as well exit right here and now.
+        print "no hana dbcs found for product: $productName and service: $service.\n";
+        dmail::LockLib::releaselock($LOCKFILE);
+        exit(0);
+    }
+
+    return \@dbcs;
+}
+
+sub parse_dbc {
+    my $dbc = shift;
+
+    my $product   = $dbc->product->name;
+    my $host      = $dbc->host();
+    $host         =~ s/:\d+//; # strip port
+    my $dbsid     = uc($dbc->sid());
+    $dbsid        =~ s/^([^.]+).*/$1/;
+    my $dbname    = $dbc->dbname() || $dbsid;
+    $dbname       = uc($dbname);
+    my $port      = $dbc->port();
+    my $hanaHosts = [ sort(@{$dbc->hanaHosts()}) ]; # sort to minimize frivolous standby connect errors
+
+    return ($product, $host, $dbsid, $dbname, $port, $hanaHosts);
+}
+
+sub get_file_pfx {
+    my ($service, $mon_name, $dbname) = @_;
+
+    $mon_name = uc($mon_name);
+    my $bkp_type     = uc($type);
+
+    my @localtime = localtime;
+    my $file_pfx = "$mon_name.SCHEDULED_${bkp_type}_${dbname}_";
+    $file_pfx .= sprintf("%4d-%02d-%02d_%02d%02d",
+        $localtime[5]+1900, $localtime[4]+1, $localtime[3], $localtime[2], $localtime[1]);
+
+    # tack on path override
+    $file_pfx = $path_overrides{$service} . $file_pfx if $path_overrides{$service};
+
+    return $file_pfx;
+}
+
+sub main {
+    my $help;
+    my $product;
+
+    GetOptions(
+               'help|h'      => sub {pod2usage(1)},
+               'debug|d'     => sub { $debug++ },
+               'verbose|v'   => sub { $verbose++ },
+               'product=s'   => \$product,
+               'type|t=s'    => \$type,
+    );
+
+    unless( $product ){
+        pod2usage("product name must required");
+        exit(-1);
+    }
+
+    unless ( $type =~ /^(full|incr)$/i ) {
+        warn "backup type: '$type' not supported. Accepted types: full, incr\n";
+        exit(-1);
+    }
+
+    unless(dmail::LockLib::requestlock($LOCKFILE, 5)) {
+         warn "can't grab lock\n";
+         exit(-1);
+    }
+
+    $sqls = getSQL();
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $service = $mon->service();
+    my $dbuser = $mon->default ("dbainfo.hana.system.username");
+    my $dbpass = $mon->default ("dbainfo.hana.system.password");
+
+    my $is_incremental = lc($type) eq 'incr' ? "incremental" : "";
+    $backupMdsXsa = $sqls->{backupSql};
+    $backupMdsXsa =~ s/<TYPE>/$is_incremental/g;
+    my $dbcs = getHanaDbcsForProduct($product,$service);
+
+    my $seen;
+    for my $dbc (@$dbcs) {
+        my ($product, $host, $sid, $dbname, $port, $hanaHosts) = parse_dbc($dbc);
+
+        $seen->{"$host:SID"} = $sid;
+        if (! defined $seen->{"$host:XSA"} ){
+            unless( executeXSA($host,$mon) ){
+                print "Failed to execute XSA on host: $host, so cannot proceed backup\n";
+                $seen->{"$host:XSA"} = 0;
+            }else {
+                $seen->{"$host:XSA"} = 1;
+            }
+        }
+
+        # if XSA command not executed then there is no point of taking backup for its tenants
+        next unless( $seen->{"$host:XSA"} );
+
+        my $dbinfo = "sid=$sid dbname=$dbname host=$host port=$port hosts=@$hanaHosts";
+        dbg("(product=$product) connecting to: $dbinfo");
+
+        my $hanaClient = ariba::Ops::HanaClient->new($dbuser, $dbpass, $host, $port, $hanaHosts);
+        $hanaClient->setDebug($debug > 1);
+
+        $hanaClient->connect(30, 2); 
+        if((my $err = $hanaClient->error())) {
+            print "ERROR: db connect failed for $dbinfo: $err";
+            $hanaClient->disconnect; 
+            next;
+        }
+
+        my $sysdb_host = $hanaClient->sysdb_host;
+        my $sysdb_port = $hanaClient->sysdb_port;
+        unless($seen->{$sysdb_host}) {
+            ## its System backup
+            my $sysdbname = "SYSTEMDB";
+            my $isSystem = 1;
+            my $status = submitBackup($service, $mon->name, $sid, $dbuser, $dbpass, $sysdb_host, $sysdb_port, $sysdbname, $isSystem);
+            $seen->{$sysdb_host} = 1;
+            $seen->{"$sysdb_host:STATUS"} = $status;
+        }
+
+        if ( $seen->{$sysdb_host} && $seen->{"$sysdb_host:STATUS"} ){
+            submitBackup($service, $mon->name, $sid, $dbuser, $dbpass, $sysdb_host, $sysdb_port, $dbname);
+        }
+    }
+
+    # wait for MDC backups (running via child pids) to finish
+    while((my $pid = wait) != -1) {
+        dbg("child $pid exited");
+    }
+
+    backup_XSA_FSS_Dir($seen,$service,$mon);
+
+    dmail::LockLib::releaselock($LOCKFILE);
+}
+
+sub submitBackup {
+    my ($service, $mon_name, $sid, $dbuser, $dbpass, $sysdb_host, $sysdb_port, $dbname, $isSystem) = @_;
+
+    my $file_pfx = get_file_pfx($service, $mon_name,$dbname);
+    my $backup_sql = "$backupMdsXsa ('$file_pfx')";
+    $backup_sql =~ s/<DB_NAME>/$dbname/ig;
+
+    my $dbinfo = "sid=$sid dbname=$dbname host=$sysdb_host port=$sysdb_port";
+    if($debug) {
+        dbg("would back up: $dbinfo with sql: $backup_sql");
+        return;
+    }
+
+    my $hc = ariba::Ops::HanaClient->new($dbuser, $dbpass, $sysdb_host, $sysdb_port, undef);
+    $hc->setDebug($debug > 1);
+
+    if ( $isSystem ){
+        print "connecting to MDC master for $dbname backup: $dbinfo\n";
+        unless ( $hc->connect(30, 2) ){
+            print "ERROR: db connect failed for $dbinfo: ".$hc->error()."\n";
+            $hc->disconnect;
+            exit(1);
+        }
+        print "Running backup for: $dbinfo with sql: $backup_sql\n";
+        my $st_date = strftime "%Y-%m-%d", localtime;  # get Backup start date
+        $hc->executeSql($backup_sql);
+
+        my $end_date = strftime "%Y-%m-%d", localtime; # get backup end date
+        my $backupStatusSql = $sqls->{backupStatusSql};
+        $backupStatusSql =~ s/<ST_DATE>/$st_date/i;
+        $backupStatusSql =~ s/<ED_DATE>/$end_date/i;
+
+        my @data;
+        eval { $hc->executeSqlWithTimeout($backupStatusSql, 10, \@data); };
+        $hc->disconnect();
+        my $status =  @data && $data[0] =~ /successful/i ?  1 : 0;
+        return $status;
+    }
+
+    my $pid = fork;
+    print "ERROR: fork failed: $!\n" unless defined $pid;
+
+    return if $pid; # parente
+
+    if($pid == 0) { # child
+        print "connecting to MDC master for tenant $dbname backup: $dbinfo\n";
+        unless ( $hc->connect(30, 2) ) {
+            print "ERROR: db connect failed for $dbinfo: ".$hc->error()."\n";
+            $hc->disconnect;
+            exit(1);
+        }
+
+        print "Running backup for: $dbinfo with sql: $backup_sql\n";
+        $hc->executeSql($backup_sql);
+        exit(0);
+    }
+}
+
+sub dbg {
+    my $txt = shift;
+    return unless $debug || $verbose;
+    my $d = strftime("%d-%b-%Y %H:%M:%S", localtime);
+    print "[$d] [$$] [DEBUG] $txt\n";
+}
+
+sub executeXSA{
+    my ($host, $mon) = @_;
+
+    my $mdsXSACmd = 'XSA backup-fss';
+
+    if ($debug){
+        dbg("Executing XSA on $host");
+        return 1;
+    }
+
+    my $cipherStore = ariba::rc::CipherStore->new($mon->service());
+    my $user = 'mon'.$mon->service();
+
+    my $hdbUser = ariba::Ops::HanaControl::hana_user(host=>$host, user=>$user, password=> $cipherStore->valueForName($user));
+
+    my $sudoCmd = "sudo su - $hdbUser -c \"$mdsXSACmd\"";
+    my $sshCmd = "ssh $user\@$host '$sudoCmd'";
+    my @output;
+    my $ret = ariba::rc::Utils::executeRemoteCommand($sshCmd, $cipherStore->valueForName($user), 0, undef, undef, \@output);
+
+    if(! $ret || ! (grep {$_ =~ /OK/i} @output) ){
+        print "Error: Failed to execute XSA command on: $host\n";
+        print "@output\n";
+        return;
+    }
+
+    return 1;
+}
+
+sub backup_XSA_FSS_Dir{
+    my ($seen,$service,$mon) = @_;
+
+    my $cipherStore = ariba::rc::CipherStore->new($mon->service());
+    my $user = 'mon'.$mon->service();
+
+    my $date = strftime "%Y-%m-%d", localtime;
+    for my $key (keys %$seen){
+        next if ($key !~ /XSA/ || ! $seen->{$key});
+        my ($host) = split(':',$key);
+        my $backupPath = getBackupPath($seen->{"$host:SID"},$service);
+
+        # Create directory before copy
+        my $mkdirCmd = 'sudo mkdir -p '.$backupPath->{xsa}->{dst}.'/'.$date;
+
+        # copy files
+        my $cpCmd = 'sudo cp -rp '.$backupPath->{fss}->{src}.' '. $backupPath->{fss}->{dst}.'/'.$date.'; sudo cp -ap '. $backupPath->{xsa}->{src}.' '. $backupPath->{xsa}->{dst}.'/'.$date;
+
+        # join commands
+        my $sudoCmd = $mkdirCmd.';'.$cpCmd;
+
+        my $sshCmd = "ssh $user\@$host \'$sudoCmd\'";
+        print "[INFO] executing command[$sshCmd]\n";
+
+        if ($debug){
+            dbg("Executing copy command on $host:[$sshCmd]");
+            next;
+        }
+        my @output;
+        my $ret = ariba::rc::Utils::executeRemoteCommand($sshCmd, $cipherStore->valueForName($user), 0, undef, undef, \@output);
+
+        unless( $ret ){
+            print "\n[Error]: Failed to copy XSA and FSS folders on: $host\n";
+            print "@output\n";
+        }
+    }
+}
+
+sub getBackupPath {
+    my ($sid,$service) = @_;
+
+    my $path;
+    my $dstPath;
+    if ( ariba::Ops::ServiceController::isProductionServicesOnly($service) ){
+        # its production service
+        $dstPath = $destPath{prodDC};
+    } else{
+        # lab service
+        $dstPath = $destPath{labDC};
+    }
+    
+    $dstPath =~ s/<SID>/$sid/g;
+    $path->{fss}->{dst} = $path->{xsa}->{dst} = $dstPath;
+    ($path->{fss}->{src} = $xsa_fss_src_path{fss}) =~ s/<SID>/$sid/g;
+    ($path->{xsa}->{src} = $xsa_fss_src_path{xsa}) =~ s/<SID>/$sid/g;
+
+    return $path;
+}
+
+sub getSQL {
+
+    my %sql = (
+        backupSql       => 'backup data <TYPE> for <DB_NAME> using file',
+        backupStatusSql => "SELECT TOP 1 * FROM ( SELECT state_name FROM m_backup_catalog, dummy where to_date(SYS_END_TIME) ='<ST_DATE>' and to_date(SYS_END_TIME)= '<ED_DATE>' and (ENTRY_TYPE_NAME LIKE '%complete%' OR ENTRY_TYPE_NAME LIKE '%incremental%' OR ENTRY_TYPE_NAME LIKE '%differential%') ORDER BY sys_end_time DESC)"
+    );
+
+    return \%sql;
+}
+
+main();

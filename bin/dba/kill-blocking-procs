@@ -1,0 +1,147 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/etc/monitor-query-template#6 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DBConnection;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::OracleClient;
+use ariba::Ops::Machine;
+use ariba::Ops::DatacenterController;
+
+use ariba::monitor::StatusPage;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me          = ariba::rc::InstalledProduct->new();
+    my $service     = $me->service();
+    my @products    = ariba::rc::InstalledProduct->installedProductsList( $service );
+    my $hostname    = ariba::Ops::NetworkUtils::hostname();
+    my $hostobj     = ariba::Ops::Machine->new( $hostname );
+    my $datacenter  = $hostobj->datacenter();
+    my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+    my $sysUser     = "sys";
+    my $sysPass     = $me->default("dbainfo.$sysUser.password");
+    my %queries;
+    my $sql         = q|select spid from v$process where addr in (select paddr
+from v$session where program like '%AS%' and sid in (select blocking_session
+from v$session where seconds_in_wait > 600))|;
+    #my $sql         = q|select spid from v$process|;
+
+    return 0 unless ( ariba::Ops::DatacenterController::isDevlabDatacenters($datacenter) ); # devlab only for now
+
+    for my $p (@products) {
+        my $name    = $p->name();
+        my @roles   = $p->rolesForHostInCluster( $hostname, $p->currentCluster() );
+
+        for my $role ( @roles ) {
+            next unless ( $role =~ /^dr-database/ );
+            print "hostname: $hostname product: $name role: $role\n" if ( $debug );
+
+            my @dbconnections = ariba::Ops::DBConnection->connectionsFromProducts( $p );
+
+            for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbconnections)) {
+                next unless ( $dbc->isDR() );
+
+                my $host = $dbc->host;
+                next unless ( $host eq $hostname ); # don't care if not this box...?
+
+                my $instance = uc( $dbc->sid );
+                my $oc = ariba::Ops::OracleClient->new($sysUser, $sysPass, $instance, $host);
+                my @results = ();
+
+                if (!connectToOracleAndRunSQL($oc, $sql, \@results)) {
+                    my $error = $results[0];
+                    print $error if ( $debug );
+                }
+
+                print "product: $name, host: $host, sid: $instance, role: $role\n" if ( $debug );
+                my $pidString = "";
+                $pidString = killPids( @results ) if ( @results );
+
+                $queries{"killed procs on $role for $name $host $instance"} = {
+                    'info'      => 'answer eq ""',
+                    'warn'      => 'answer',
+                    'uiHint'    => "blocking procs",
+                    'perl'      => sub { return $pidString },
+                };
+            }
+        }
+    }
+    my $qm = ariba::monitor::QueryManager->newWithDetails("dba", $tab, $me->service(), $me->customer(), \%queries);
+    my $email = 'arb_dept_an_ops_dba_notifications@sap.com';
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+sub killPids {
+    my @pids = @_;
+    my $string = "";
+
+    for my $pid ( @pids ) {
+        chomp;
+        next unless ( $pid =~ /^\d+$/ );
+        print "killing $pid\n" if ( $debug );
+        my $ret = kill 9, $pid; # signal is sent, pid is not necessarily killed
+        $string .= "$pid " if ( $ret );
+    }
+    return $string;
+}
+
+sub connectToOracleAndRunSQL {
+    my $oc         = shift;
+    my $sql        = shift;
+    my $resultsRef = shift;
+
+    my $dataguardSQLTimeout = 360;
+    $oc->connect(20, 4);
+    if ($oc->error() || 
+        !$oc->executeSqlWithTimeout($sql, $dataguardSQLTimeout, $resultsRef) || 
+        $oc->error()) {
+        $$resultsRef[0] ||= "Oracle Error: " . $oc->error();
+        return 0;
+    }
+    $oc->disconnect(); # Need this to close connection ASAP to avoid conflict with bcv backup.
+
+    return 1;
+}
+
+main(@ARGV);
+
+__END__

@@ -1,0 +1,185 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/dba/routine-maint#13 $
+#
+# This script will shorten the alert log to last n reboots. This is so that
+# the file does not grow forever and fillup the disk
+# 
+# This script has to be run as 'oracle' unix user
+# It does not need to know any passwords.
+#
+
+use strict;
+use File::Path;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::misc;
+use ariba::util::OraInfo;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::DBConnection;
+
+my $debug = 0;
+
+sub main 
+{
+	my $task;
+	my @args;
+	my @productNames;
+
+	while(my $arg=shift(@ARGV)){
+		if( $arg =~ /^-d/o ){ $debug = 1; next; };
+		if( $arg =~ /^-t/o ){ $task = shift(@ARGV); next; };
+		push(@args, $arg);
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $cluster  = $me->currentCluster();
+
+	# Only check products that have a database.
+	my @products = ariba::rc::InstalledProduct->installedProductsList($me->service());
+
+	my @connections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections)) {
+
+		my $type = $dbc->type();
+		my $virtualHost = $dbc->host();
+		my $instance = uc($dbc->sid());
+
+
+		my $product = $dbc->product();
+		my $activeHost = $product->activeHostForVirtualHostInCluster($virtualHost, $cluster);
+
+		if (!$activeHost || $activeHost ne $hostname) {
+			next;
+		}
+
+		if ($task eq "shorten-alert") {
+			shortenAlertLog($instance, @args);
+		} elsif ($task eq "dbstats") {
+			dbstats($instance, @args);
+		}
+	}
+}
+
+sub shortenAlertLog 
+{
+	my $instance = shift();
+	my @args = @_;
+
+	my $keepLast;
+	while(my $arg=shift(@args)) {
+		if( $arg =~ /^-k/o ){ $keepLast = shift(@args); next; };
+	}
+
+	$keepLast = 5 unless($keepLast);
+
+	my $alertLogFile = ariba::monitor::misc::alertLogFileForSid($instance);
+
+	return undef unless(-f $alertLogFile);
+
+	open(LOG, "$alertLogFile") || return undef;
+	my @lines = <LOG>;
+	close(LOG);
+
+	my $reboot = 0;
+	my $lineNum = 0;
+	my @lineNumForReboot;
+
+	for my $line (@lines) {
+
+	    if ($line =~ /Starting up ORA/o) {
+		$reboot++;
+		$lineNumForReboot[$reboot] = $lineNum;
+	    }
+
+	    $lineNum++;
+	}
+
+	if ($debug) {
+	    print "Found $reboot restarts (total lines: $lineNum), will keep $keepLast restarts in $alertLogFile\n";
+	}
+
+	if ($reboot > $keepLast) {
+	    my $keepFrom = $lineNumForReboot[$reboot - $keepLast + 1];
+	    my $keepTo = $lineNum - 1;
+
+	    my $new = "$alertLogFile.tmp";
+	    my $old = $alertLogFile . "." . time();
+
+	    if ($debug) {
+		print "keeping lines from $keepFrom to $keepTo in the current log\n";
+		print "keeping lines from 0 to $keepFrom in log $old\n";
+	    }
+
+	    open(NEWLOG, "> $new") || die "Could not open $new, $!\n";
+	    print NEWLOG @lines[$keepFrom..$keepTo];
+	    close(NEWLOG);
+
+	    open(OLDLOG, "> $old") || die "Could not open $old, $!\n";
+	    print OLDLOG @lines[0..$keepFrom];
+	    close(OLDLOG);
+
+	    unless($debug) {
+		rename($new, $alertLogFile) ||
+			    warn "could not rename $new to $alertLogFile, $!\n";
+	    }
+	}
+
+	return 1;
+}
+
+sub dbstats
+{
+	my $instance = shift();
+	my @args = @_;
+
+	my $operation;
+	my $reportDir = "$ENV{HOME}/reports";
+
+	while(my $arg=shift(@args)) {
+		if( $arg =~ /^-r/o ){ $reportDir = shift(@args); next; };
+		if( $arg !~ /^-/o ) { $operation = $arg; next; };
+	}
+
+	$reportDir = ariba::monitor::misc::dbaLogDir($instance) . "/dbstats" unless($reportDir);
+
+	my $oraHome = ariba::util::OraInfo::sidToOracleHome($instance);
+
+	$ENV{'ORACLE_HOME'} = $oraHome;
+	$ENV{'PATH'} = "$oraHome/bin:$ENV{'PATH'}";
+	$ENV{'NLS_LANG'} = "American_America.UTF8";
+	$ENV{'ORACLE_SID'} = $instance;
+
+	my $svrmgrl = "$oraHome/bin/svrmgrl";
+
+	open(SVMGR, "| $svrmgrl > /dev/null 2>&1") || die "could not launch $svrmgrl, $!\n";
+        print SVMGR "connect internal\n";
+
+	if ($operation eq "begin") {
+	    print SVMGR "\@$oraHome/rdbms/admin/utlestat.sql\n";
+	    print SVMGR "\@$oraHome/rdbms/admin/utlbstat.sql\n";
+	} elsif ($operation eq "end") {
+	    print SVMGR "\@$oraHome/rdbms/admin/utlestat.sql\n";
+	}
+
+	print SVMGR "exit\n";
+	close(SVMGR) || die "bad return from $svrmgrl\n";
+
+	if ($operation eq "end") {
+		mkpath($reportDir);
+		my $reportFile = "dbstat" . "." . time();
+		return rename("report.txt", "$reportDir/$reportFile") || die "could not rename file to $reportDir/$reportFile, $!\n";
+	}
+
+	return 1;
+}
+
+main();
+
+__END__
+

@@ -1,0 +1,370 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/integration-of-asp-products#3 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Machine;
+use ariba::monitor::StatusPage;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+use XML::XPath;
+use XML::XPath::XMLParser;
+
+my $debug = 0;
+
+my %integratedProducts = (
+		acm => "ACM",
+		anl => "Analysis",
+		aes  => "Sourcing",
+		an => "AribaNetwork",
+	);
+
+
+sub usage {
+	print 	"Error: $_[0]\n" if $_[0];
+	print	"\n",
+		"Usage: \n",
+		"$0 [-d|-e|-p|-h]\n",
+		"-d			turns on debugging\n",
+		"-e			send email notification\n",
+		"-p			send pager notification\n",
+		"-h			this help\n",
+		"-product <product name>\n",
+		"\n";
+	exit(1);
+}
+
+sub processUrl {
+	my $frontDoorUrl = shift;
+	my @integratedProducts = @_;
+
+	my $url = ariba::monitor::Url->new($frontDoorUrl);
+	$url->setUseOutOfBandErrors(1);
+	my @urlOutput = $url->request(12);
+	if (defined $url->error()) {
+		return "Error : ", $url->error(), "\n";
+	} 
+
+	# Typical xml file to analyze "
+	#
+	# <?xml version="1.0" encoding="UTF-8" ?>
+	# <!-- class: ariba.cxml.ProfileCheck -->
+	#
+	#	<ProfileCheckResults>
+	#
+	#		<SystemStatus status="UP" name="ACM">
+	#
+	#		<Profile profileURL="https://svcdevaes.ariba.com/rh4qa_int/ACM/cxmlchannel">
+	#
+	#			<Option name="AttachmentServlet">https://svcdevaes.ariba.com/rh4qa_int/ACM/Main/ad/internalGetDocument</Option>
+	#			<Option name="RFXNextStage">https://svcdevaes.ariba.com/rh4qa_int/ACM/Main/ad/rfxNextStage</Option>
+	#			<Option name="PortletProviderInfo.URL">https://svcdevaes.ariba.com/rh4qa_int/ACM/Main/ad/providerInfo/PortletProviderActions</Option>
+	#			<Option name="SpendManagement.Dashboard.URL">https://svcdevaes.ariba.com/rh4qa_int/ACM/Main</Option>
+	#			<Option name="SpendManagement.SSOAuthenticator.URL">https://svcdevaes.ariba.com/rh4qa_int/ACM/Main/ad/loginPage/SSOActions</Option>
+	#			<Option name="Capabilities.modules">ContractWorkbench CategoryManagement</Option>
+	#
+	#	
+	#			<Transaction requestName="AQLDataPull">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/ACM/aqlpull
+	#				</URL>
+	#			</Transaction>
+	#
+	#			<Transaction requestName="ExploreProjects">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/ACM/Main/ad/exploreProjects/ExploreProjectsDirectAction
+	#				</URL>
+	#			</Transaction>
+	#
+	#			<Transaction requestName="ProviderDoneMessage">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/ACM/cxmlchannel
+	#				</URL>
+	#			</Transaction>
+	#
+	#			<Transaction requestName="SourcingUpdateRequest">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/ACM/cxmlchannel
+	#				</URL>
+	#			</Transaction>
+	#
+	#			<Transaction requestName="ProviderSetupRequest">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/ACM/cxmlchannel
+	#				</URL>
+	#			</Transaction>
+	#	
+	#		</Profile>
+	#
+	#	</SystemStatus>
+	#	
+	#	<SystemStatus status="UP" name="Sourcing">
+	#	
+	#		<Profile profileURL="https://svcdevaes.ariba.com/rh4qa_int/Sourcing/CXMLChannelServlet">
+	#
+	#			<Option name="SpendManagement.SSOAuthenticator.URL">https://svcdevaes.ariba.com/rh4qa_int/Sourcing/SSOIndex.jsp</Option>
+	#			<Option name="AttachmentServlet">https://svcdevaes.ariba.com/rh4qa_int/Sourcing/RemoteAttachmentServlet</Option>
+	#
+	#
+	#			<Transaction requestName="ViewAttachment">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/Sourcing/RemoteAttachmentServlet
+	#				</URL>
+	#			</Transaction>
+	#	
+	#			<Transaction requestName="SourcingDataPull">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/Sourcing/IntegrationDataServlet
+	#				</URL>
+	#			</Transaction>
+	#
+	#			<Transaction requestName="SourcingUpdateRequest">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/Sourcing/cxmlchannel
+	#				</URL>
+	#			</Transaction>
+	#
+	#			<Transaction requestName="ProviderSetupRequest">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/Sourcing/cxmlchannel
+	#				</URL>
+	#			</Transaction>
+	#
+	#			<Transaction requestName="SupplierDataRequest">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/Sourcing/cxmlchannel
+	#				</URL>
+	#			</Transaction>
+	#
+	#			<Transaction requestName="ProviderDataRequest">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/Sourcing/cxmlchannel
+	#				</URL>
+	#			</Transaction>
+	#
+	#			<Transaction requestName="ProviderDoneMessage">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/Sourcing/cxmlchannel
+	#				</URL>
+	#			</Transaction>
+	#
+	#			<Transaction requestName="PunchOutSetupRequest">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/Sourcing/cxmlchannel
+	#				</URL>
+	#			</Transaction>
+	#
+	#		</Profile>
+	#	</SystemStatus>
+	#
+	#	<SystemStatus status="DOWN" name="AribaNetwork">
+	#
+	#		<![CDATA[Response returned with status Code [400] of Type [Bad Request] with message [No valid From credential was supplied [ANCLS-1781261]]. 
+	#			ariba.cxml.service.StatusException: No valid From credential was supplied [ANCLS-1781261]]]>
+	#
+	#	</SystemStatus>
+	#
+	#	<SystemStatus status="UP" name="Analysis">
+	#
+	#		<Profile profileURL="https://svcdevaes.ariba.com/rh4qa_int/Analysis/cxmlchannel">
+	#
+	#			<Option name="PortletProviderInfo.URL">https://svcdevaes.ariba.com/rh4qa_int/Analysis/Main/ad/providerInfo/PortletProviderActions</Option>
+	#			<Option name="SpendManagement.Dashboard.URL">https://svcdevaes.ariba.com/rh4qa_int/Analysis/Main/ad/dashboard</Option>
+	#			<Option name="SpendManagement.SSOAuthenticator.URL">https://svcdevaes.ariba.com/rh4qa_int/Analysis/Main/ad/loginPage/SSOActions</Option>
+	#
+	#
+	#			<Transaction requestName="AQLDataPull">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/Analysis/aqlpull
+	#				</URL>
+	#			</Transaction>
+	#
+	#			<Transaction requestName="ProviderDoneMessage">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/Analysis/cxmlchannel
+	#				</URL>
+	#			</Transaction>
+	#	
+	#			<Transaction requestName="ProviderDataRequest">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/Analysis/cxmlchannel
+	#				</URL>
+	#			</Transaction>
+	#
+	#			<Transaction requestName="SourcingUpdateRequest">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/Analysis/cxmlchannel
+	#				</URL>
+	#			</Transaction>
+	#	
+	#			<Transaction requestName="ProviderSetupRequest">
+	#				<URL>
+	#					https://svcdevaes.ariba.com/rh4qa_int/Analysis/cxmlchannel
+	#				</URL>
+	#			</Transaction>
+	#
+	#		</Profile>
+	#	</SystemStatus>
+	# </ProfileCheckResults>
+
+	my $xmlString = "@urlOutput";
+
+	print ("Output for [$frontDoorUrl]: \n" . $xmlString . "\n") if ($debug);
+
+	return 'No information available [No result from the servlet]' unless ($xmlString =~ m/ProfileCheckResults/);
+	return 'No information available [Error 404, page not found]' if ($xmlString =~ m/404 not found/i);
+
+
+#	my $xp = XML::XPath->new(xml => $xmlString);
+
+#	my $status = '';
+#	my $nodeSet = $xp->find('/ProfileCheckResults/SystemStatus'); 
+#	if ($nodeSet) {
+#		foreach my $node ($nodeSet->get_nodelist()) { 
+#			print "    " . $node->getAttribute('name') . " : " . $node->getAttribute('status') . "\n" if ($debug);
+#			my $singleStatus = $node->getAttribute('name') . " : " . $node->getAttribute('status');
+
+#			my $attrName = $node->getAttribute('name');
+#			next unless( grep {/$attrName/} @integratedProducts );
+	
+#			if ($node->getAttribute('status') eq "DOWN") {
+#				my @children = $node->getChildNodes();
+#				my $error;
+#				foreach my $child (@children) {
+#					my $childError = $child->toString();
+
+#					$childError =~ s/^\s*(\S.*)$/$1/s;
+#					$childError =~ s/^(.*\S)\s*$/$1/s;
+
+#					$childError =~ s/\&lt;/</sg;
+#					$childError =~ s/\&gt;/>/sg;
+
+#					$childError =~ s/\<html\>.*\<\/html\>//sg;
+
+#					$error .= $childError . "; ";
+#				}
+#				$error =~ s/\n//g;
+#				print "      [" . $error . "]\n" if ($debug);
+
+#				if ($error) {
+#					$singleStatus .= " -> {$error}";
+#				}
+#			}
+
+#			$status .= $singleStatus . "\n";
+#		}
+#	} else {
+#		print "No nodes have been found\n" if ($debug);
+#	}
+
+#	print "return : [$status]\n" if ($debug);
+#	return $status;
+	return "OK";
+}
+
+sub integratedProductsForProduct {
+	my $product = shift;
+
+ 	my @suite = $product->instanceSuiteMembersList (1);
+
+	my @integratedSuite;
+	foreach my $instance (@suite) {
+		push (@integratedSuite, $integratedProducts{$instance}) if ($integratedProducts{$instance});
+	}
+	return @integratedSuite;
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $prodname;
+
+	$debug = 0;
+
+
+	while(my $arg=shift(@ARGV)){
+		if ($arg =~ /^-d/o){ $debug = 1; };
+		if ($arg =~ /^-e/o){ $sendEmail = 1; };
+		if ($arg =~ /^-p$/o){ $sendPage = 1; };
+		if ($arg =~ /^-h/o) { usage();}
+		if ($arg =~ /^-product/o) { $prodname = shift(@ARGV);}
+
+	}
+
+	usage("Need a product") unless ($prodname);
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $email = $me->default('notify.email');
+
+	# For each product matching this product name in the current service
+	my @products = ariba::rc::InstalledProduct->installedProductsList( $me->service(), $prodname );
+	foreach my $product (@products) {
+
+
+		my @integratedProducts = integratedProductsForProduct($product);
+
+
+		my %queries = ();
+	
+		print "Working on product : " . $product->name() . " / " . $product->service() . ' / ' , $product->customer() , "\n" if ($debug);
+
+		if (@integratedProducts) {
+
+			my $frontDoorUrl = frontDoorUrlFromProduct($product);
+			$frontDoorUrl .= '/' unless ($frontDoorUrl =~ m|/$|);
+			$frontDoorUrl .= "cxmlchannel?action=ProfileCheck";
+
+
+	
+			$queries{"Integrated products status "} = {
+				info => "1",
+				warn => "answer && ((answer =~ m/down/si) || (answer =~ m/no information available/i) || (answer =~ m/error/i)  )",
+				perl => sub { return processUrl($frontDoorUrl, @integratedProducts);},
+			};
+		}
+
+
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+				'Integration of ASP products', $product->name(), $product->service(), $product->customer(), \%queries
+	 	);
+
+		$qm->processQueries($debug, $me->default('notify.email'), $sendEmail, $sendPage);
+	}
+
+
+}
+
+
+sub frontDoorUrlFromProduct {
+	my $product = shift;
+
+	my $url;
+	my $context;
+
+	if ($product->name() eq 'acm' || $product->name() eq 'anl') {
+		$url = $product->default('VendedUrls.FrontDoor'); 
+		$context = $product->default('Tomcat.ApplicationContext');
+	}
+
+	if ($product->name() eq 'aes') {
+		$url = $product->default('sourcing_incominghttpserverurl') || $product->default('sourcing_internalurl');
+		$context = $product->customer() . "/Sourcing";
+	}
+
+	my $customer = $product->customer();
+	$url =~ s/$customer.*$//;
+	$url .= $context;
+
+	return $url
+}
+
+
+
+main();
+
+__END__

@@ -1,0 +1,125 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use dmail::LockLib;
+use ariba::monitor::Url;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Utils;
+
+my $RUN_LOCK_FILE = '/tmp/publish-block';
+
+my $debug = 0;
+sub usage {
+	my $error = shift;
+
+	print <<USAGE;
+Usage: $0 [-e|-p|-d|-h] [-prod prodname]
+
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode.
+    -h        Shows this help.
+    -prod     arches product name.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+    exit();
+}
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $prodname = "arches";
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-prod$/o) { $prodname = shift;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+	usage("arches product name not specified") unless $prodname;
+	
+	dmail::LockLib::forceQuiet(); 
+	exit() unless (dmail::LockLib::requestlock($RUN_LOCK_FILE, 1));
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $arches = ariba::rc::InstalledProduct->new($prodname, $me->service());
+	my %queries;
+	my $cluster = "primary";
+    my %influx_data;
+    $influx_data{measurement} = "arches_publish_block";
+    $influx_data{tags} = {product => $prodname, service => $me->service(), cluster => $cluster };
+	my $gurl = $arches->default('VendedUrls.FrontDoorTopLevel') . "/Arches/api/health/get";
+	my $gpub = healthInfo($gurl);
+	my $gblock = $gpub->{archesMode}->{value};
+	$queries{"Arches Mode"} = {
+          	info => 'answer eq "Normal"',
+		crit => 'answer ne "Normal"',
+		correctiveActions   => [
+			Ops => 'Follow up with engineering',
+		],
+		perl => sub {return $gblock},
+		uiHint => "Publish Block Status",
+		};
+    $influx_data{data}->{arches_mode} = ($gblock eq "Normal") ? 1 : 0;
+	my $urls =  $arches->default('VendedUrls.FrontDoorTopLevel') . "/Arches/api/adapterPaths";
+	my $stats = healthInfo($urls);
+	push @{$stats->{entry}},{adapter=>"ariba.avro"};
+	my $entry = @{$stats->{entry}};
+	for (my $i = 0; $i < scalar $entry; $i++){
+		my $adaptername = $stats->{entry}->[$i]->{adapter};
+		my $statusUrl = $arches->default('VendedUrls.FrontDoorTopLevel') . "/Arches/api/archesmode/get?adapter="."$adaptername";
+		my $mode = healthInfo($statusUrl);
+		my $status = $mode->{mode};
+		if ($mode->{status} ==0){
+			$queries{$adaptername} = {
+				info => 'answer eq "Normal"',
+				crit => 'answer ne "Normal"',
+				correctiveActions   => [
+					Ops => 'Follow up with engineering',
+				],
+				perl => sub {return $status},
+				uiHint => "Publish Block Status",
+			};
+            $influx_data{data}->{$adaptername} = ($status eq "Normal") ? 1 : 0;
+		}
+	}
+    eval {
+        my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+        ariba::Ops::Utils::sendToStatsD($statsd_line,undef,undef,$debug) if ( $statsd_line);
+    };
+	my $email = $me->default('notify.email');
+	my $qm = ariba::monitor::QueryManager->newWithDetails('health-check', $arches->name(), $arches->service(), undef, $cluster, \%queries);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+	dmail::LockLib::releaselock($RUN_LOCK_FILE);
+}
+sub healthInfo {
+	my $value = shift;
+	debug("Checking $value");
+	my $error;
+	my $url = ariba::monitor::Url->new($value);
+	my $timeout = 60 * 15;
+	my $response = $url->request($timeout);
+	debug("Response: $response");
+	if ($url->error()) {
+		debug("Error: " . $url->error());
+		return ($url->error(), 1);
+	}
+	my $xs  = XML::Simple->new();
+	my $stat = eval { $xs->XMLin( $response ); };
+	$error = "Malformed XML: $@" if $@;
+	print $error, if ( $error && $debug);
+	return ($stat);
+}
+sub debug {
+	print "@_\n" if ($debug);
+}
+main(@ARGV);

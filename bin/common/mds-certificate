@@ -1,0 +1,89 @@
+#!/usr/local/bin/perl
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::HanaControl;
+use Time::Piece;
+use File::Basename;
+my $filename = basename($0);
+my $RUN_LOCK_FILE = '/tmp/$filename';
+
+sub usage {
+	my $error = shift;
+
+	print <<USAGE;
+Usage: $0 [-e|-p|-d|-h] [-prod prodname]
+
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode.
+    -h        Shows this help.
+    -prod     product name.
+
+USAGE
+    print "(error) $error\n" if ($error);
+    exit();
+}
+
+sub main {
+    my ($debug, $sendEmail, $sendPage, $productName);
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-prod$/o) { $productName = shift;   next; }
+        usage("Invalid argument: $arg");
+    }
+	
+    my $me = ariba::rc::InstalledProduct->new();
+    my $service = $me->service();
+    my $customer = $me->customer () || undef;
+    my %queries = ();
+    my $match = "monitoring.MDS.HANA";
+    my @output;
+    for my $dictKeypath($me->defaultKeysForPrefix($match)){
+        my $host = $me->default("$dictKeypath.server");
+        next unless($host);
+        my $monuser = "mon".$service;
+        my $cipher = ariba::rc::CipherStore->new($service);
+        my $monpass = $cipher->valueForName($monuser);
+        my $hdbUser = ariba::Ops::HanaControl::hana_user(host=>$host, user=>$monuser, password=> $monpass);
+	my $sudoCmd = "sudo su - $hdbUser -c \"xs domain-certificates\"";
+	my $sshCmd = "ssh $monuser\@$host \'$sudoCmd\'";
+	my $success = ariba::rc::Utils::executeRemoteCommand($sshCmd, $monpass, 0, undef, undef, \@output);
+	my $out = join("\n", @output);
+	if($out =~/FAILED/){
+	    $queries{'Error'} = {
+	        warn => 'answer=~/FAILED/',
+                perl => sub {return $out},
+                uiHint => "MDS Certificate/",
+             };
+        }
+        elsif($out =~ /Valid\suntil/){
+            my ($valid) = ($out) =~ /Valid\suntil\:\s+(.+)/;
+            my($month,$day,$year)=($valid)=~/\w+\s(\w+)\s(\d+).+T\s(\d+)/;
+            my $exp_date="$year/$month/$day";
+            my $e_date = Time::Piece->strptime($exp_date, "%Y/%b/%d");
+            my $now = localtime;
+            my $diff = $e_date - $now;
+            my $expiry = int($diff->days);
+            $queries{'MDS certificate will get expired in'} = {
+	        warn => 'answer < 15',
+		crit => 'answer <= 5',
+		perl => sub {return "$expiry days; Valid until $valid"},
+		uiHint => "MDS Certificate/",
+            };
+	}
+    }
+    my $email = $me->default('notify.email');
+    my $qm = ariba::monitor::QueryManager->newWithDetails("MDS-MONITORING",$productName,$service,$customer,\%queries);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+    dmail::LockLib::releaselock($RUN_LOCK_FILE);
+}
+main(@ARGV);
+
+

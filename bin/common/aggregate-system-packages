@@ -1,0 +1,228 @@
+#!/usr/local/bin/perl
+#
+# The purpose of this script is to aggregate all the RPM's reported to mon by individual hosts.
+# This aggregated list is then copied to up2date servers. A seperate script running on the
+# up2date servers will take the aggregated list and check with RHN for security updates.
+#
+##
+
+use strict;
+use lib "/usr/local/ariba/lib";
+
+use ariba::monitor::StatusPage;
+use ariba::monitor::QueryManager;
+use ariba::rc::CipherStore;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::Machine;
+use ariba::Ops::Utils;
+use File::Basename;
+use File::Path;
+
+my $debug = 0;
+
+
+sub usage {
+
+        print "usage: $0 [-h|-d] -o redhat -v <4.0> -a <x86_64> -w <dataCenter>\n",
+	      "  -h    This help\n",
+	      "  -d    Turn on debugging\n",
+	      "  -o    OS\n",
+	      "  -v    OS version\n",
+	      "  -w    Data Center\n",
+	      "  -a    Architecture\n\n";
+
+        exit(1);
+}
+
+
+sub main {
+
+        usage() unless (@ARGV > 0);
+
+        my ($os, $osVersion, $arch, $dataCenter);
+
+        my %aggregatedPackageList = ();
+
+        while (my $arg = shift @ARGV) {
+
+                if ($arg =~ /^-h/i) { usage(); }
+                if ($arg =~ /^-d/i) { $debug++; next; }
+                if ($arg =~ /^-o/i) { $os         = shift @ARGV; next; }
+                if ($arg =~ /^-v/i) { $osVersion  = shift @ARGV; next; }
+                if ($arg =~ /^-a/i) { $arch       = shift @ARGV; next; }
+                if ($arg =~ /^-w/i) { $dataCenter = shift @ARGV; next; }
+
+                usage();
+        }
+
+	if ($os ne 'redhat') {
+		die "[$os] is not a valid OS. Must be redhat.";
+	}
+
+	if ($osVersion ne '4.0') {
+		die "[$osVersion] is not a valid OS versions. Must be '4.0'.";
+	}
+
+	if ($arch ne 'x86_64') {
+	        die "[$arch] not a valid architecture. Must be 'x86_64'.";
+	}
+
+	# Find the up2date machine with the relavent OS, OS version and arch
+        my $up2dateProperties = {
+                'os'               =>	$os,
+		'osVersion'	   =>	$osVersion,
+                'arch'             =>	$arch,
+                'datacenter'       =>	$dataCenter,
+                'providesServices' =>	'up2date',
+        };
+
+        my @up2dateMachines = ariba::Ops::Machine->machinesWithProperties( %$up2dateProperties );
+
+	exit unless (@up2dateMachines);
+
+	# Find all machines with the relavent OS, OS version and arch
+        my $properties = {
+                'os'            =>      $os,
+		'osVersion'	=>	$osVersion,
+                'arch'          =>      $arch,
+                'datacenter'    =>      $dataCenter,
+        };
+
+        my @machines = ariba::Ops::Machine->machinesWithProperties( %$properties );
+
+        my $product = ariba::monitor::StatusPage->fakeProductNameForDnsDomain();
+
+	my $me          = ariba::rc::InstalledProduct->new();
+	my $username    = $me->deploymentUser();
+	my $cipherStore = ariba::rc::CipherStore->new( $me->service() );
+	my $password    = $cipherStore->valueForName($username);
+
+        foreach my $machine (@machines) {
+
+                my $queryName = $machine->hostname() . "_packages.query";
+
+                my $queryId = ariba::monitor::Query->generateInstanceName($queryName, $product);
+
+                my $query = ariba::monitor::Query->new($queryId);
+
+                my @results = $query->results();
+
+                foreach my $result (@results) {
+
+                        my ($rpm, $version, $release, $arch) = split(':', $result);
+
+                        my $key = "${rpm}-${version}-${release}-${arch}";
+
+                        unless (exists($aggregatedPackageList{$key})) {
+
+                                $aggregatedPackageList{$key} = $result;
+                        }
+                }
+        }
+
+	distributePackageList(
+		\@up2dateMachines,
+		\%aggregatedPackageList,
+		$os,
+		$osVersion,
+		$arch,
+		$username,
+		$password);
+}
+
+
+sub distributePackageList {
+
+	my $machines  = shift;
+        my $list      = shift;
+	my $os        = shift;
+	my $osVersion = shift;
+	my $arch      = shift;
+	my $username  = shift;
+	my $password  = shift;
+
+	my $sourceBase = "/var/mon/pkg";
+	my $destBase   = "/var/tmp/pkg";
+	my $file       = "${sourceBase}/${os}/${osVersion}/${arch}/packageList";
+
+	if ($debug) {
+
+		print "[DEBUG] Aggregate Package Hash Contents\n\n";
+
+	        while (my ($key, $val) = each %$list) {
+ 			printf("[DEBUG] %-40s%-40s\n", $key, $val);
+        	}
+
+		print "\n[DEBUG] Would distribute $file as $username to:\n";
+
+		foreach my $up2dateMachine (@$machines) {
+			print "[DEBUG] ", $up2dateMachine->hostname(), "\n";
+		}
+	}
+
+	else {
+
+		# write out aggregated package file list
+		if ( -f $file ) {
+			print "unlinking [$file]\n" if ($debug);
+			unlink $file;
+		}
+
+		else {
+			mkpath "${sourceBase}/${os}/${osVersion}/${arch}" unless ( -d "${sourceBase}/${os}/${osVersion}/${arch}" );
+		}
+
+		open(OUT, ">$file") or die "Unable to open file [$file] for writing: $!";
+
+	        foreach my $key (sort keys %$list) {
+
+			# This will print out something that looks like "libgcc:3.2.3:42:x86_64:Red Hat\, Inc."
+			print OUT $list->{$key}, "\n";
+	        }
+
+	        close(OUT);
+
+		# distribute the package file list to up2date machines
+		foreach my $machine (@$machines) {
+
+                	my @output = ();
+
+			# rsync's packageList from src:$sourceBase/$os/$osVersion/$arch to
+			# dest:/var/tmp/pkg/$os/$osVersion/$arch.
+			# e.g. rsync mon11.snv:/var/mon/pkg/redhat/3.0/x86_64/* app104.snv:/var/tmp/pkg/redhat/3.0/x86_64
+			unless (ariba::rc::Utils::transferFromSrcToDest(
+				undef,
+				undef,
+				$sourceBase,
+				"${os}/${osVersion}/${arch}",
+				$machine->hostname(),
+				$username,
+				$destBase,
+				undef,
+				0,
+				0,
+				0,
+				$password,
+				\@output)
+			) {
+				my @errors = ariba::Ops::Utils::outputHasRealRsyncErrors(\@output);
+
+				if (@errors) {
+					print "problem distributing package list to ", $machine->hostname(), "\n";
+					print "\n--begin copy output\n";
+					print @output;
+					print "\n--end copy output\n";
+					print "\n---begin errors\n";
+					print @errors;
+					print "\n---end errors\n";
+				}
+			}
+		}
+	}
+}
+
+
+main();

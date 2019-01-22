@@ -1,0 +1,131 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use warnings;
+
+use FindBin;
+use Getopt::Long;
+Getopt::Long::Configure qw/bundling no_ignore_case/;
+use Data::Dumper;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../../tools/lib";
+use ariba::Ops::Constants;
+
+my $debug = 0;
+my $fileName = undef;
+
+GetOptions(
+    'd|debug'   => \$debug,
+    'f|file=s'  => \$fileName,
+);
+
+my @months = qw(jan feb mar apr may jun jul aug sep oct nov dec);
+
+my $scheduleDir = ariba::Ops::Constants->oncallscheduledir();
+my ($sec,$min,$hour,$mday,$month,$year,$wday,$yday,$isdst) = localtime(time);
+$year+=1900;
+my $monthName = $months[$month];
+
+$fileName = $fileName || "$scheduleDir/$year/$monthName";
+die "Could not find '$fileName': $!\n" unless ( -e $fileName );
+my $tmpFile  = "$fileName\.new";
+
+print "Looking for '$fileName'\n" if $debug;
+
+open my $IN, '<', $fileName or die "Could not open '$fileName' for read: $!\n";
+open my $OUT, '>', $tmpFile or die "Could not open '$tmpFile' for write: $!\n";
+
+## Print warning that file format has changed:
+print $OUT "# WARNING!!  The format of this file has changed!!  You WILL break the schedule\n"
+    . "# if you do not pay attention to the documentation regarding this change located\n"
+    . "# at https://devwiki.ariba.com/bin/view/Main/ChangeToOnCallScheduleDataFile\n";
+
+my %people;
+
+LINE:
+while ( my $line = <$IN> ){
+    ## 1 cdulay/sjaiswal, mishah, n=mpedraza, s=tmaeshir, d=sutekar, t=jmcminn # out, bross, agusev
+    ## 2 grogers/asaproo, sbluvstein, n=asyed, s=cwruck, d=yle, t=jmcminn # out, wenchen
+    $line =~ m/^(\d+):?([^#]*)(?:#(.+))?$/;
+    my $day     = $1;
+    my $data    = $2;
+    my $comment = $3;
+
+    if ( $data =~ m/\A\s+\z/ ){
+        $data = undef;
+    }
+
+    if ( $day && !$comment && !$data ){
+        print "'$day'\n" if $debug;
+    } elsif ( $comment && !$data ) {
+        print "'$day' #$comment\n" if $debug;
+    } else {
+        print "'$day' - '$data' - '$comment'\n" if $debug;
+    }
+
+    if ( !defined $data ){
+        print $OUT $line;
+        next LINE;
+    }
+
+    ## Pull out the primary(ies), removing them from the $data string
+    $data =~ s/\A\s*(\S+)\,\s+//;
+    my $primaries = $1;
+    my @primaries;
+    print "Primaries: $primaries\n" if $debug;
+    if ( $primaries =~ m/\// ){ ## Has a '/'
+        @primaries = split /\//, $primaries || ["$primaries"];
+    } elsif ( $primaries !~ m/=/ ){
+        push @primaries, $primaries;
+    } else { 
+        ## Not a primary, do nothing ...
+        ## Add it back onto the data string:
+        $data = "$primaries,$data";
+    }
+    print Dumper \@primaries if $debug;
+
+    ## Print "day " first:
+    print $OUT "$day ";
+
+    ## Primaries are listed as '1=<shift1>,2=<shift2>,3=<shift3>'
+    my $pri = 0;
+    my $bak = 0;
+    foreach my $primary ( @primaries ){
+        push @{ $people{ $day } }, (++$pri) . "=$primary";
+        print "$pri=$primary," if $debug;
+    }
+
+    ## split and remove whitespace
+    my @rest = grep { $_ =~ s/^\s*(\S+)\s*$/$1/gm } split( ",", $data);
+    print Dumper \@rest if $debug;
+    my $ident = 'a';
+    foreach my $item ( @rest ){
+        if ( $item =~ m/=/ ){
+            push @{ $people{ $day } }, $item;
+            print "$item," if $debug;
+        } else { ## Backups don't have an =
+            ## Backups are listed as 'a=<backup1>,b=<backup2>,3=<backup3>'
+            push @{ $people{ $day } }, "$ident=$item";
+            print "$ident=$item," if $debug;
+            $ident++;
+        }
+    }
+
+    ## We have all the massaged data, write it out
+    if ( scalar @{ $people{ $day } } ){
+        print $OUT join ', ', @{ $people{ $day } };
+    }
+    if ( $comment ){
+        print $OUT " #$comment";
+        print " #$comment";
+    }
+    print $OUT "\n";
+    print "\n" if $debug;
+}
+
+close $IN or die "Could not open '$fileName' for read: $!\n";
+close $OUT or die "Could not open '$tmpFile' for write: $!\n";
+
+print "Done processing '$fileName'\n" if $debug;

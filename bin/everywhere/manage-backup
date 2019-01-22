@@ -1,0 +1,344 @@
+#!/usr/local/bin/perl 
+use strict;
+use warnings;
+
+=head1 NAME
+
+manage-backup
+
+=head1 SYNOPSIS
+
+ manage-backup [-h|-d] -list
+ manage-backup [-h|-d] -policy <stale_ss|no_stale_ss> -vvlist <filename> -vvlistForVolume <volume name>
+ manage-backup [-h|-d] -create [ -snap ] -jira <jira_id> [-tmid <tmid>] -vvlist <filename> -vvlistForVolume <volume name>
+ manage-backup [-h|-d] -remove -jira <jira_id> [-tmid <tmid>] -vvlist <filename> -vvlistForVolume <volume name>
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-policy <policy>>
+
+the policy for a 3PAR virtual volume
+
+=item B<-create>
+
+create a one-off snapshot via the bcv-backup script
+
+=item B<-snap>
+
+snap
+
+=item B<-vvlist <vvlist>>
+
+full path to a file containing the virtual volumes to operate on. This file should be generated using the filesystem-device-details script
+
+=item B<-vvlistForVolume <vvlistForVolume>>
+
+which volume (filesystem) to backup. this is matched against the header line of the file specified by -vvlist
+
+=item B<-volType <volType$>>
+
+volume type
+
+=item B<-jira <jira_id>>
+
+The <jira_id> which looks like HOA-12345.
+You can specify just the numerical portion of the jira ticket id if you'd like.
+If both -jira and -tmid are specified, this value will override the -tmid option.
+
+=item B<-tmid <tmid>>
+
+The <tmid> which is numerical.
+If the -jira option is also specified, this value will be overridden.
+This option is DEPRECATED.
+
+=item B<-sid <sid>>
+
+the sid
+
+=item B<-debug>
+
+turn on debugging
+
+=item B<-help|?>
+
+This excellent help message.
+
+=back
+
+=head1 DESCRIPTION
+
+
+=cut
+
+
+use FindBin;
+use lib qw(/usr/local/ariba/lib);
+use lib "$FindBin::Bin/../../../tools/lib/perl";
+
+use Getopt::Long;    # GetOptions()
+use Pod::Usage;      # pod2usage()
+
+use ariba::Ops::NetworkDeviceManager;
+use ariba::Ops::Machine;
+use ariba::Ops::InservUtils;
+use ariba::Ops::Utils;
+
+# The expiration date of the device details file is mtime + 5 days
+use constant FIVE_DAYS	=>	( 60 * 60 * 24 * 5 );
+
+my $debug = 0;
+
+
+sub findVolAndFileForSid {
+	my $sid = shift;
+	my $pat = shift;
+	my @files;
+
+	my $D;
+	opendir($D, "/var/tmp");
+	while(my $file = readdir($D)) {
+		next unless($file =~ /${sid}-virtual-volumes.txt/);
+		next if($pat && $file !~ /$pat/);
+		push(@files, $file);
+	}
+	closedir($D);
+
+	if(scalar(@files) != 1) {
+		die("Did not find unique virtual-volumes.txt for $sid");
+	}
+
+	my $file = shift(@files);
+	$file = "/var/tmp/$file";
+
+	my $vol;
+	open($D, "< $file");
+	while(my $line = <$D>) {
+		chomp($line);
+		next unless($line =~ s/^fs:\s+//);
+		$vol = $line;
+	}
+	close($D);
+
+	return($vol, $file);
+}
+
+sub main {
+	my $fileWithVvList;
+	my $vvListForVolume;
+	my $listSnapshots = 0;
+	my $createSnapshot = 0;
+	my $removeSnapshot = 0;
+	my $snap = 0;
+	my $policy;
+	my $jira;
+	my $tmid;
+	my $sid;
+	my $volType;
+	my $help;
+	my $test;
+
+	GetOptions(
+		"vvlistForVolume=s" => \$vvListForVolume,
+		"vvlist=s"          => \$fileWithVvList,
+		"policy=s"          => \$policy,
+		"create"            => \$createSnapshot,
+		"snap"              => \$snap,
+		"jira=s"            => \$jira,
+		"tmid=i"            => \$tmid,
+		"sid=s"             => \$sid,
+		"volType=s"         => \$volType,
+		"debug"             => \$debug,
+		"test"              => \$test,
+		"help|?"            => \$help,
+	) or pod2usage(2);
+
+	pod2usage(1) if $help;
+	$tmid = ariba::Ops::Utils::fix_jira_id($jira) if $jira;
+
+	if ($test) {
+		print "vvlistForVolume = $vvListForVolume\n";
+		print "vvlist = $fileWithVvList\n";
+		print "policy = $policy\n";
+		print "create = $createSnapshot\n";
+		print "snap = $snap\n";
+		print "volType = $volType\n";
+		print "tmid = $tmid\n";
+		print "jira = $jira\n";
+		print "sid = $sid\n";
+		print "debug = $debug\n";
+	}
+
+	my @bcvBackupArgs = @ARGV;
+
+	exit(1) if $test;
+
+
+	if($sid) {
+		( $vvListForVolume, $fileWithVvList ) = findVolAndFileForSid($sid, $volType);
+		print "Using vvListForVolume=$vvListForVolume and fileWithVvList=$fileWithVvList for $sid\n";
+	}
+
+	if ($fileWithVvList && !$vvListForVolume) {
+		pod2usage("Need to specify a volume name that the list corresponds to\n");
+	}
+
+	if ($policy and ($policy ne 'stale_ss' and $policy ne 'no_stale_ss')) {
+		pod2usage("Valid policy values are 'stale_ss' or 'no_stale_ss'\n");
+	}
+
+	if ($fileWithVvList) {
+		unless ( -f $fileWithVvList ) {
+			pod2usage("Unable to find file $fileWithVvList\n");
+		}
+
+		if (my $mtime = (stat($fileWithVvList))[9]) {
+			my $fileExpiration = $mtime + FIVE_DAYS;
+
+			if ($fileExpiration <= time()) {
+				die "Please re-run filesystem-device-details for volume $vvListForVolume. File $fileWithVvList has expired.\n";
+			}
+		
+			print "Device details file $fileWithVvList for $vvListForVolume is valid\n" if $debug;
+		}
+	} else {
+		pod2usage("-vvlist is a required argument\n");
+	}
+
+	#
+	# let the bcv-backup script handle backups
+	#
+	if ($createSnapshot) {
+
+		# -removeSnapCopy tells bcv-backup to remove intermediate snapshots created when doing a physical copy.
+		# This is not applicable when doing a regular snap copy.
+		push(@bcvBackupArgs, '-removeSnapCopy') unless $snap;
+
+		my $bcvErrorMsg = runBcvBackup(\@bcvBackupArgs);
+		die $bcvErrorMsg if ($bcvErrorMsg ne '');
+	}
+
+
+	#
+	# set policies
+	#
+	if ($policy) {
+		my $policyErrorMsg = setPolicy($fileWithVvList, $vvListForVolume, $policy);
+		die $policyErrorMsg if ($policyErrorMsg ne '');
+	}
+
+	exit 0;
+}
+
+sub setPolicy {
+	my $fileWithVvList = shift;
+	my $vvListForVolume = shift;
+	my $policy = shift;
+	my $errorMsg = '';
+
+	my @vvNames = ariba::Ops::InservUtils::vvNamesFromFile($fileWithVvList, $vvListForVolume);
+	if (@vvNames) {
+		my $inservHostname = shift @vvNames;
+
+		#
+		# get our 3PAR device manager
+		#
+		my $machine = ariba::Ops::Machine->new($inservHostname);
+
+		# filesystem-device-details should write the inserv hostname to the vv list file
+		my $inserv = ariba::Ops::NetworkDeviceManager->newFromMachine($machine);
+		die "Unable to find 3PAR device for '$inservHostname'" unless ($inserv);
+
+		for my $vvName (@vvNames) {
+			my @virtualVols = $inserv->cmdShowPolicyForVv($vvName);
+			my $virtualVol = $virtualVols[0];
+			my @vvPolicies = split(',', $virtualVol->policies());
+			my $policySet = 0;
+			foreach my $vvPolicy (@vvPolicies) {
+				if ($vvPolicy eq $policy) {
+					$policySet = 1;
+					last;
+				}
+			}
+
+			unless ($policySet) {
+				print "Setting policy for $vvName to $policy\n";
+				my @output = $inserv->cmdSetPolicyForVv($vvName, $policy);
+				print "@output\n" if (@output);
+				$errorMsg = join("\n", @output);
+			}
+			else {
+				print "Policy already set to $policy for $vvName\n";
+			}
+		}
+	}
+	else {
+		$errorMsg = "No VV's found in file $fileWithVvList!";
+	}
+
+	return $errorMsg;
+}
+
+sub vvNamesFromFile {
+	my $listFile = shift;
+	my $vvListForVolume = shift;
+
+	my @vvNames;
+
+	return @vvNames unless (-r $listFile);
+
+	open(LIST, $listFile) || return @vvNames;
+	while (my $line = <LIST>) {
+		#
+		# Format of the file:
+		# # ora01data01
+		# 00197-0
+		# 00197-2
+		# 00197-3
+		#
+		chomp($line);
+		next if ($line =~ /^\s*$/);
+
+		#
+		# Match the volume name in the file
+		#
+		if ($line =~ m|^\s*#\s*(.*)|) {
+			if ($1 ne $vvListForVolume) {
+				print "Error: Volume name in $listFile ($1) does not match $vvListForVolume specified on command line\n";
+				return @vvNames;
+			}
+			next;
+		}
+
+		push(@vvNames, $line);
+	}
+	close(LIST);
+
+	return @vvNames;
+}
+
+sub runBcvBackup {
+	my $bcvBackupArgs = shift;
+
+	my $bcvBackup = "/usr/local/ariba/bin/bcv-backup";
+	my $cmd = "$bcvBackup @$bcvBackupArgs";
+	my $errorMsg = '';
+
+	if ( -x $bcvBackup ) {
+		my $result = system($cmd);
+
+		if ($result != 0) {
+			$errorMsg = "bcv-backup returned non-zero result $result\n";
+		}
+	}
+	else {
+		$errorMsg = "Unable to find $bcvBackup\n";
+	}
+
+	return $errorMsg;
+}
+
+main();
+
+__END__

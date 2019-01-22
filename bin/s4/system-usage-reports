@@ -1,0 +1,182 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/s4/system-usage-reports#3 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::Url;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+
+my $debug = 0;
+
+sub main {
+	my $quiet = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while(my $arg = shift(@ARGV)) {
+		if($arg =~ m/^-d$/o) { $debug++; }
+		if($arg =~ m/^-e$/o) { $sendEmail=1; }
+		if($arg =~ m/^-p$/o) { $sendPage=1; }
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $cluster = $me->currentCluster();
+	my $service = $me->service();
+
+	my @products = ariba::rc::InstalledProduct->installedProductsList($service, "s4");
+
+	unless(@products) {
+		exit(0);
+	}
+
+	for my $product (@products) {
+
+		my %queries = ();
+
+		my @instances = $product->appInstancesWithNameInCluster("GlobalTask", $cluster);
+
+		my $instance = $instances[0];
+
+		my $systemUrl = $instance->lateSystemUsageReportsURL(7);
+		my $adminUrl = $instance->adminSystemUsageReportsURL();
+
+		my $systemStat = ariba::monitor::Url->new($systemUrl);
+
+		my @results = $systemStat->request(45);
+
+		my @lateReports = lateSummary(\@results);
+
+		my $adminStat = ariba::monitor::Url->new($adminUrl);
+		@results = $adminStat->request(45);
+
+		my @adminRealms = adminSummary(\@results);
+
+		$queries{"Late System Usage Reports"} = {
+			'info' => "numrows > -1",
+			'warn' => "numrows > 0",
+			'ticketOnWarnOpenAfterMinutes' => 30,
+			'perl' => sub { main::displayReportDetails(\@lateReports); },
+		};
+
+		$queries{"Admin Realms"} = {
+			'info' => "numrows > -1",
+			'warn' => "numrows > 1",
+			'ticketOnWarnOpenAfterMinutes' => 30,
+			'perl' => sub { main::displayAdminDetails(\@adminRealms); },
+		};
+		
+		my $email = $me->default("notify.email");
+
+		my $q = ariba::monitor::QueryManager->newWithDetails("system-reports", $product->name(), $service, $product->customer(), \%queries);
+		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+#<xml>
+#  <Description>System Usage Reports 7 days late</Description>
+#  <Reports>
+#    <Report name=Sourcing Usage - Number of Projects by Project Type>
+#      <TimeScheduled>01/13/2010 00:16:37</TimeScheduled>
+#      <CurrentTime>01/20/2010 00:16:38 </CurrentTime>
+#      <DaysLate>7.157</DaysLate>
+#      <Realm>realm1</Realm>
+#      <RealmId>1</RealmId>
+#    </Report>
+#
+#    <Report name=Sourcing Usage  - Number of Suppliers Participating>
+#      <TimeScheduled>01/13/2010 00:16:37</TimeScheduled>
+#      <CurrentTime>01/20/2010 00:17:37</CurrentTime>
+#      <DaysLate>7.00675</DaysLate>
+#      <Realm>realm2</Realm>
+#      <RealmId>3</RealmId>
+#    </Report>
+#  </Reports>
+#</xml>
+
+
+sub lateSummary {
+	my $results = shift;
+	my $report;
+	my %lateReportsDetails;
+	my @lateReports = ();
+
+	for my $line (@$results) {
+		if($line =~ m/<Report\s*name=(.*)>/) {
+			$report = $1;
+			$lateReportsDetails{$report}->{"name"} = $report;
+			next;
+		}
+		if($line =~ m/<(TimeScheduled|DaysLate|Realm|RealmId)>(.*)<.*>/) {
+			my $property = $1;
+			my $value = $2;
+
+			$lateReportsDetails{$report}->{$property} = $value;
+			next;
+		}
+	}
+
+	foreach my $key (keys(%lateReportsDetails)) {
+		push @lateReports, $lateReportsDetails{$key};
+	}
+	return @lateReports;
+}
+
+#<xml>
+#  <Description>Administrative realms</Description>
+#  <AdminRealms>
+#    <Realm name="realm1" id="1" />
+#  </AdminRealms>
+#</xml>
+
+sub adminSummary {
+	my $results = shift;
+	my @adminRealms;
+
+	for my $line (@$results) {
+		if($line =~ m/<Realm\s+name="(.*)"\s+id="(.*)"\s*\/>/) {
+			push @adminRealms, { "realm" => $1, "realmid" => $2 };
+			next;
+		}
+	}
+
+	return @adminRealms;
+}
+
+sub displayReportDetails {
+	my $reports = shift;
+	my @results;
+
+	foreach my $item (@$reports) {
+		my $key = $item->{"name"};
+		my $scheduleTime = $item->{"TimeScheduled"};
+		my $daysLate = $item->{"DaysLate"};
+		my $realm = $item->{"Realm"};
+		my $realmId = $item->{"RealmId"};
+	
+		push(@results, "$key: time = $scheduleTime, dayslate = $daysLate, realm = $realm, realmId = $realmId");
+	}
+
+	return join("\n", @results);
+}
+
+sub displayAdminDetails {
+	my $realms = shift;
+	my @results;
+
+	foreach my $item (@$realms) {
+		my $realm = $item->{"realm"};
+		my $realmId = $item->{"realmid"};
+
+		push(@results, "$realm: realmId = $realmId");
+	}
+
+	return join("\n", @results);
+}
+
+main();

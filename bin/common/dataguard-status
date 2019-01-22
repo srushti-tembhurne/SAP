@@ -1,0 +1,504 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/common/dataguard-status#84 $
+#
+# A script to monitor oracle dataguard replication status 
+# 
+# -- monitor sql for primary db:
+# select error from v$archive_dest_status where dest_id=2;
+#     -- expect errors:
+#     -- ORA-01041: internal error. hostdef extension doesn't exist
+# 
+#     -- ORA-12514: TNS:listener does not currently know of service
+#     -- requested in connect descriptor
+# 
+# 
+# -- monitor sql for primary and standby: 
+# select process, status from v$managed_standby where status='ERROR';
+# 
+# 
+# -- monitor sql to compare scn # on two sides, run this on primary db:
+#  select
+#    (select current_scn from v$database) primary_scn,
+#    newest_scn standby_scn,
+#    applied_scn apply_scn
+#    from dba_logstdby_progress@dg_standby`,
+#
+# above one did not work out very well, lets try log sequence#
+# select
+# (select sequence# from v$log where status='CURRENT') primary_seq#,
+# (select max(sequence#) from dba_logstdby_log@dg_standby)
+# standby_arrival_seq#,
+# (select max(sequence#) from dba_logstdby_log@dg_standby where applied in 
+# ('YES','CURRENT'))
+# standby_applied_seq#
+# from dual
+#
+# 
+# 
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::Globals;
+use ariba::rc::CipherStore;
+use ariba::rc::Utils;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::OutageSchedule;
+use ariba::Ops::LogParser::AlertLogParser;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+use ariba::Ops::OracleControl;
+
+use Time::Local;
+
+$main::quiet = 1;
+my $debug = 0;
+my $dataguardSQLTimeout = 3 * 60; # in seconds
+my %drSIDsWithGap = ();
+
+my $me	          = ariba::rc::InstalledProduct->new();
+my $cluster       = $me->currentCluster();
+my $systemUser    = "system";
+my $systemPass    = $me->default("dbainfo.$systemUser.password");
+
+my $sysUser       = "sys";
+my $sysPass       = $me->default("dbainfo.$sysUser.password");
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	my ($instance, $array, @productNames);
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-prod/o) { $array = \@productNames; next; };
+		if ($arg =~ /^-e/o) { $sendEmail = 1; next; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; next; };
+		if ($arg =~ /^-d/o) { $debug++; next; };
+		if ($arg !~ /^-/o ) { push(@$array, $arg); next; };
+	}
+
+
+	my @products      = ();
+
+	if (@productNames) {
+
+		for my $productName (@productNames) {
+			push(@products, ariba::rc::InstalledProduct->installedProductsList($me->service(), $productName));
+		}
+
+	} else {
+		push(@products, ariba::rc::InstalledProduct->installedProductsList($me->service(), 's4'));
+	}
+
+	exit (0) unless(@products);
+
+	my @dbconnections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+	#
+	# Check to see if this product is DR'ed at all
+	#
+	my $isDRed = 0;
+	for my $dbc (@dbconnections) {
+		if ($dbc->isDR()) {
+			$isDRed = 1;
+			last;
+		}
+	}
+
+	exit (0) unless ($isDRed);
+
+	my %physicalLogTimesForSidHost;
+	my ($PHYSICAL_LATEST_DR_TRANSPORT_TIME, $PHYSICAL_LATEST_DR_APPLY_TIME, $PHYSICAL_LATEST_PRIMARY_LOG_TIME) = 
+		qw(PHYSICAL_LATEST_DR_TRANSPORT_TIME PHYSICAL_LATEST_DR_APPLY_TIME PHYSICAL_LATEST_PRIMARY_LOG_TIME);
+	my ($ORACLE_ERROR) = "ORACLE_ERROR";
+	my ($DBC) = "DBC";
+
+	my $physicalDrOutage = ariba::monitor::OutageSchedule->new(
+		'daily 07:00-08:00', 	# bcv-backup s4 snap
+		'daily 19:00-20:00', 	# bcv-backup s4 snap
+		'thu 09:00-10:00', 		# bcv-backup s4 incrementalPhysical
+	);
+
+	my $email = $me->default('notify.email');
+
+	# These are the queries that run on both primary and DR SIDS
+
+	## First, run against the DR hosts
+	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbconnections)) {
+		 next if($dbc->dbServerType() eq 'hana');
+		next unless $dbc->isDR();
+        next if $dbc->isPhysicalReplication();
+
+		my %drQueries;
+		my $virtualHost = $dbc->host();
+		my $instance    = uc($dbc->sid());
+
+		my $product     = $dbc->product();
+		my $productName = $product->name();
+
+		my $replicationType = "DataGuard";
+
+		$drQueries{"$replicationType DR processes in error state for [$instance] on $virtualHost"} = {
+			info => "numrows == 0",
+			warn => 0, # Allow errors to be displayed as warn
+			crit => "numrows >= 1",
+			timeout => 60,
+			sql => q`select process, status from v$managed_standby where status='ERROR'`,
+		};
+
+		my ($user, $pass);
+        $user = $systemUser;
+        $pass = $systemPass;
+
+        $drQueries{"$replicationType log standby processes for [$instance] on $virtualHost"} = {
+            info => 'answer =~ /ALIVE/',
+            crit => 'answer !~ /ALIVE/',
+            sql => q`select count(*) from v$logstdby`,
+            note => "If crit, dataguard replication stopped/broken.",
+            processAnswer => sub { main::processLogStandbyAnswer(); },
+        };
+
+        # If there are any gaps in sequence numbers in this table, then there is dataguard archive log gap
+        # See TMID: 44338
+
+        my $oc = ariba::Ops::OracleClient->new($user, $pass, $instance, $virtualHost);
+        my $sql = q`select ( max(sequence#) - min(sequence#) + 1 ) - count(sequence#) from dba_logstdby_log`;
+        my @results;
+        my $oracleError;
+        my $connectResults = connectToOracleAndRunSQL($oc, $sql, \@results);
+        if (! $connectResults ) {
+            $oracleError = $results[0];
+        } else {
+            $drSIDsWithGap{$virtualHost} = $results[0];
+        }
+
+        $drQueries{"Dataguard gap for [$instance] on $virtualHost"} = {
+            info => "answer == 0",
+            warn => "answer eq '' || answer >= 1",
+            timeout => 60,
+            error => $oracleError,
+            perl => sub {return $drSIDsWithGap{$virtualHost};},
+        };
+
+        $drQueries{"Blocking session for [$instance] on $virtualHost"} = {
+            info => "answer",
+            crit => "answer > 0",
+            sql => q`select count(*) from v$session where blocking_session is not null and seconds_in_wait > 600;`,
+        };
+
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			"dataguard-status", $productName, $me->service(), undef, \%drQueries
+		);
+		$qm->setSQLConnectInfo($user, $pass, $instance, $virtualHost);
+		$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+	}
+
+	# Next, run against non-DR (primary) dbs
+	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbconnections)) {
+		next if($dbc->dbServerType() eq 'hana');
+		next if $dbc->isDR();
+        next if $dbc->isPhysicalReplication();
+        next if $dbc->isReplicated();
+
+		# don't need to do anything if there are no peers == no dataguard
+		next unless scalar($dbc->peers());
+
+		my %priQueries;
+		my $virtualHost = $dbc->host();
+		my $instance    = uc($dbc->sid());
+
+		my $product     = $dbc->product();
+		my $productName = $product->name();
+
+		my ($user, $pass) = ($systemUser, $systemPass);
+		my $replicationType;
+        $replicationType = "DataGuard";
+
+		$priQueries{"$replicationType Primary processes in error state for [$instance] on $virtualHost"} = {
+			info => "numrows == 0",
+			crit => "numrows >= 1",
+			timeout => 60,
+			sql => q`select process, status from v$managed_standby where status='ERROR'`,
+		};
+
+		$priQueries{"$replicationType archiving logs to second destination status for [$instance] on $virtualHost"} = {
+			info => "numrows == 0",
+			crit => "numrows >= 1",
+			timeout => 60,
+			sql => q`select error from v$archive_dest_status where dest_id=2`,
+			processAnswer => sub { main::processDataguardLogs($dbc, $virtualHost); }
+		};
+
+		if (!$dbc->isStarSchema() && !$dbc->isPhysicalReplication()) {
+			my ($totalTime, $networkTime, $applyTime);
+			my ($primaryTime, $primarySeq, 
+					$standbyReadTime, $standbyReadSeq,
+					$standbyApplyTime, $standbyApplySeq);
+
+			my $oc = ariba::Ops::OracleClient->new($user, $pass, $instance, $virtualHost);
+			my $sql = q`
+				select
+				((CAST((scn_to_timestamp((SELECT dbms_flashback.get_system_change_number FROM dual))) as DATE) - (to_date('01-01-1970 00:00:00','MM-DD-YYYY HH24:MI:SS'))) * 86400),
+				(select SEQUENCE# from v$log where STATUS='CURRENT'),
+				((NEWEST_TIME - to_date('01-01-1970', 'MM-DD-YYYY')) * 86400),
+				NEWEST_SEQUENCE#,
+				((APPLIED_TIME - to_date('01-01-1970', 'MM-DD-YYYY')) * 86400),
+				APPLIED_SEQUENCE#
+					from dba_logstdby_progress@dg_standby`;
+
+			my @results;
+			my $oracleError;
+			my $connectResults = connectToOracleAndRunSQL($oc, $sql, \@results);
+
+			if ( !$connectResults || !$results[0] ) {
+				$oracleError = $results[0] || "Strange, no results from sql";
+				$totalTime = $networkTime = $applyTime = "\n$oracleError";
+			} else {
+				($primaryTime, $primarySeq, 
+				 $standbyReadTime, $standbyReadSeq,
+				 $standbyApplyTime, $standbyApplySeq) = split(/\s+/, $results[0], 6);
+
+				$totalTime = $primaryTime - $standbyApplyTime;
+				$networkTime = $primaryTime - $standbyReadTime;
+				$applyTime =  $standbyReadTime - $standbyApplyTime;
+			}
+
+			# According to james, sometimes the sqlnet snv<->bou dblink 
+			# is slow and we end up getting partial results from the
+			# above query; in particular, $standbyApplyTime is zero
+			# or undef while $primaryTime is correct.  This will
+			# cause the query to go warn but not page.
+			if ($primaryTime && !$standbyApplyTime) {
+				$totalTime = undef;
+			}
+
+			#thresholds are in seconds
+			my $warn = 30 * 60;
+			my $crit = 90 * 60;
+			my $networkWarn = 60; 
+			my $networkCrit = 5 * 60;	
+			my $path = "//ariba/services/operations/documentation/prodops/common/Dataguard_archive_log_apply_time.txt";
+
+			$priQueries{"Dataguard archive total time for [$instance] on $virtualHost"} = {
+				info => 1,
+				error => $oracleError,
+				format => ariba::Ops::DateTime::scaleTime($totalTime),
+				recordMaxResults => 20000,
+				perl => sub {return $totalTime;},
+			};
+
+			$priQueries{"Dataguard archive network time for [$instance] on $virtualHost"} = {
+				info => "defined(answer) && answer <= $networkWarn",
+				warn => "!defined(answer) || answer > $networkWarn || $standbyReadTime < 1",
+				crit => "defined(answer) && answer > $networkCrit && defined(previousAnswer) && previousAnswer > $networkCrit",
+				error => $oracleError,
+				format => ariba::Ops::DateTime::scaleTime($networkTime),
+				recordMaxResults => 20000,
+				perl => sub {return $networkTime;},
+			};
+
+			$priQueries{"Dataguard archive log apply time for [$instance] on $virtualHost"} = {
+				info => "defined(answer) && answer <= $warn",
+				warn => "!defined(answer) || answer > $warn || $standbyApplyTime < 1",
+				crit => "defined(answer) && (answer > $crit && $standbyApplyTime > 1 && ($primarySeq - $standbyApplySeq > 1))",
+				error => $oracleError,
+				format => ariba::Ops::DateTime::scaleTime($applyTime),
+				recordMaxResults => 20000,
+				perl => sub {return $applyTime;},
+				note => "For initial debugging refer to $path",
+				details => {
+					"Checking for dataguard gap on $instance" =>  {	
+						perl => sub { main::checkForGap($dbc); }
+					}
+				}		
+			};
+
+		}
+
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			"dataguard-status", $productName, $me->service(), undef, \%priQueries
+		);
+		$qm->setSQLConnectInfo($user, $pass, $instance, $virtualHost);
+		$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+sub connectToOracleAndRunSQL {
+
+	my $oc         = shift;
+	my $sql        = shift;
+	my $resultsRef = shift;
+
+	$oc->connect(20, 4);
+	if ($oc->error() || 
+		!$oc->executeSqlWithTimeout($sql, $dataguardSQLTimeout, $resultsRef) || 
+		$oc->error()) {
+
+		# Retry on timeout
+		if ($oc->error() =~ /timed out running sql/ && 
+			!$oc->executeSqlWithTimeout($sql, $dataguardSQLTimeout, $resultsRef) ||
+			$oc->error()) {
+			$$resultsRef[0] ||= "Oracle Error: " . $oc->error();
+			return 0;
+		}
+	}
+	$oc->disconnect(); # Need this to close connection ASAP to avoid conflict with bcv backup.
+
+	return 1;
+}
+
+sub checkForGap {
+	my $dbc         = shift;
+
+	my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+	my $drDBPeer      = $dbc->drDBPeer();
+	my $drVirtualHost = $drDBPeer && $drDBPeer->host();
+
+	my ($user, $pass);
+	if ($dbc->isPhysicalReplication()) {
+		$user = $sysUser;
+		$pass = $sysPass;
+	} else {
+		$user = $systemUser;
+		$pass = $systemPass;
+	}
+
+
+	if ( $drVirtualHost && $drSIDsWithGap{$drVirtualHost} ) {
+		my $drInstance    = uc($drDBPeer->sid());
+		my @results;
+
+		my $oc = ariba::Ops::OracleClient->new($user, $pass, $drInstance, $drVirtualHost);
+		my $sql = q`select SEQUENCE#, APPLIED from dba_logstdby_log order by 1;`;
+		my $connectResults = connectToOracleAndRunSQL($oc, $sql, \@results);
+		if ( ! $connectResults ) {
+			my $oracleError = $results[0];
+			$query->setError($oracleError); 
+			return $oracleError; 
+		} else {
+			my $details  = "Dataguard gap detected on $drVirtualHost.  Missing SCNs:\n" . join "\n", @results;
+			return $details;
+		}
+	} else {
+		return "No dataguard gap detected on $drVirtualHost"
+	}
+
+}
+
+sub processDataguardLogs {
+	my $dbc      = shift;
+	my $hostname = shift;
+
+	my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+	my @results = $query->results();
+
+	# I believe some Oracle errors are getting eaten up by parseAlertLogArray.  See TMID:46843
+	# we are getting rows in the Error column in v$archive_dest_status, but not putting any details
+	# in the page.
+	$query->setNote(join "\n", @results);
+
+	my @newResults = ();
+	my $alertLogParser = ariba::Ops::LogParser::AlertLogParser->newFromDBConnectionAndHost($dbc, $hostname);
+
+	$alertLogParser->parseAlertLogArray(\@results);
+
+	return join("\n", @{$alertLogParser->errors()});
+}
+
+#
+# this is for physical replication DG
+#
+sub checkTimeComputed {
+	my $lag           = shift;
+	my $time_computed = shift;
+	my $time_computed_error = 0;
+
+	# We just return back the Oracle error strings if we set them above
+	return $lag if $lag and $lag !~ /^\d+$/;
+
+	my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+	# Datagaurd time_computed is updated every minute, so if it hasn't been updated
+	# in 5 minutes, there's definately a problem
+	my $note;
+	if ( ! $time_computed ) {
+		$note   .= "The time_computed value in v\$dataguard_stats is NULL.";
+		# disabling error for now, james thinks this is not necessary
+		# after latest oracle patch
+		# $time_computed_error = 1;
+	}
+
+	if ( $time_computed > 300 ) {
+		$note   .= "The time_computed value in v\$dataguard_stats ($time_computed) is greater than 5 minutes.";
+		# disabling error for now, james thinks this is not necessary
+		# after latest oracle patch
+		# $time_computed_error = 1;
+	}
+
+	if ( $time_computed_error ) {
+		$note .= "  Dataguard may be down, please call a dba.";
+		$lag = "Error: Time computed is not incrementing.";
+	}
+
+	if ($note) {
+		print "$note\n" if $debug;
+		$query->setNote($note);
+	} else {
+		$query->setNote("");
+	}
+
+	return $lag;
+}
+
+sub processLogStandbyAnswer {
+	my $self = $ariba::monitor::Query::_ourGlobalQuerySelf; 
+	my @results = $self->results(); 
+
+	return 'ALIVE' if (@results && $results[0] > 0);
+	return 'DEAD';
+}
+
+sub recordReadOnlyStartTime {
+	my $self = $ariba::monitor::Query::_ourGlobalQuerySelf; 
+	my ($currentMode) = $self->results(); 
+	my $readOnlyMode = 'READ ONLY';
+
+	if ($currentMode && $currentMode =~ /$readOnlyMode/) {
+			my ($previousMode) = $self->previousResults();
+			if (!$previousMode || $previousMode !~ /$readOnlyMode/ ||
+				!$self->readOnlyStartTime()) {
+				$self->setReadOnlyStartTime(time()) 
+			}
+	} else {
+		$self->deleteReadOnlyStartTime();
+	}
+
+	return $self->results();
+}
+
+sub inReadOnlyForLongerThanMinutes {
+	my $maxMinutes = shift;
+	my $self = $ariba::monitor::Query::_ourGlobalQuerySelf; 
+	my $readOnlyStartTime = $self->readOnlyStartTime();
+
+	return 1 if ($readOnlyStartTime && ((time() - $readOnlyStartTime) / 60) > $maxMinutes);
+	return 0;
+}
+
+sub processWaitForGap {
+	my $self = $ariba::monitor::Query::_ourGlobalQuerySelf;
+	if($self->results() eq 'WAIT_FOR_GAP') {
+	$self->setCrit("answer eq 'WAIT_FOR_GAP' && previousAnswer eq 'WAIT_FOR_GAP'");
+	}
+	return $self->results();
+}
+
+main();
+
+__END__
+

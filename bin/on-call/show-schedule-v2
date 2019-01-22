@@ -1,0 +1,709 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+
+use File::Slurp;
+
+#use lib "/home/monprod/mon-sre/show-schedule-v2";
+#use Schedule_v2;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use ariba::Oncall::Schedule_v2;
+
+# Sample URLs to access this script:
+#   https://ops.ariba.com/cgi-bin/sre_test/ops-sched
+#   https://ops.ariba.com/cgi-bin/sre_test/ops-sched?month=7&year=2014
+#   https://ops.ariba.com/cgi-bin/sre_test/ops-sched?month=7&year=2014&user=eustaris
+
+my $USER_DATA_PATH = '/home/svcops/on-call/people';
+my $SCHEDULE_HOME_PATH = '/home/svcops/on-call/schedule';
+my $CAL_MONTH_DATA_SUFFIX = '-v2';
+my $USER_INFO_PAGE_MARK = '_userinfo';
+
+my $QUERY_STR_USER = 'user';
+my $QUERY_STR_YEAR = 'year';
+my $QUERY_STR_MONTH = 'month';
+my $QUERY_STR_DAY = 'day';
+
+my $DBA_TEAM = 'DBA';
+my $DEPLOY_TEAM = 'DEP';
+my $NETWORK_TEAM = 'NET';
+my $SRE_TEAM = 'SRE';
+my $SYSADMIN_TEAM = 'SYS';
+my $TOOLS_TEAM = 'TLS';
+my $OPS_TEAM = 'OPS';
+my $OUT_OF_OFFICE= 'OUT';
+
+my $TIER_1 = '1';
+
+my $COLOR_WHITE = '#FFFFFF';
+my $COLOR_BLACK = '#000000';
+my $COLOR_BLUE = '#0000ff';
+my $COLOR_GRAY = '#C0C0C0';
+my $COLOR_YELLOW = '#FFFF00';
+my $COLOR_SEA_GREEN = '#99CCCC';
+
+my %MONTH_HASH = (1 =>  'Jan', 2 =>  'Feb', 3 =>  'Mar', 4 =>  'Apr', 5 =>  'May', 6 =>  'Jun',
+					7 =>  'Jul', 8 =>  'Aug', 9 =>  'Sep', 10 => 'Oct', 11 => 'Nov', 12 => 'Dec',
+);
+
+# Store each person's people DB entry to prevent their disk file
+# from being opened multiple times.
+my %PEOPLE_DB_HASH = ();
+
+my $USER_NO_INFO = '~';
+my $USER_INFO_ALL_STR = 'all';
+my $USER_FULL_NAME = 'fullname';
+my $USER_WORK_PHONE = 'workphone';
+my $USER_CELL_PHONE = 'cellphone';
+
+sub main {
+	# ------------------------------------------------------------------------------
+	# Script initilization. Retrieve CGI related data, determine current
+	# date, etc.
+
+	# Get my name (the name of this script).
+	my $myScriptName = $ENV{SCRIPT_URL};
+
+	# Extract query string from URL.
+	my $queryString = '';
+	if($ENV{'REQUEST_METHOD'} eq "GET") {
+		$queryString = $ENV{QUERY_STRING};
+	}
+
+	# Convert query string to hash.
+	my %queryStrHash = ();
+	my @nameValuePairs = split('&', $queryString);
+	foreach (@nameValuePairs) {
+		my ($name, $value) = split('=', $_);
+		$queryStrHash{ariba::Oncall::Schedule_v2::trimStr($name)} = ariba::Oncall::Schedule_v2::trimStr($value);
+	}
+
+#	# Log number of times this page has been viewed.
+#	my $timestamp = `/bin/date "+%Y%m%d-%H%M%S"`;
+#	chomp($timestamp);
+#	my $remoteAddr = $ENV{REMOTE_ADDR};
+#	my $remotePort = $ENV{REMOTE_PORT};
+#	ariba::Oncall::Schedule_v2::writeDebug("[$timestamp] $remoteAddr:$remotePort\n");
+
+	my $currMonthDay = ariba::Oncall::Schedule_v2::getCurrMonthDay();
+	my $currMonthNum = ariba::Oncall::Schedule_v2::getCurrMonthNum();
+	my $currYear = ariba::Oncall::Schedule_v2::getCurrYear();
+
+	# Use default current month if not specified or invalid.
+	my $desiredMonthNum = $queryStrHash{$QUERY_STR_MONTH};
+	if ( (! defined $desiredMonthNum) || ($desiredMonthNum eq '') || ($desiredMonthNum < 0) || ($desiredMonthNum > 12) ) {
+		$desiredMonthNum = $currMonthNum;
+	}
+
+	# Use default current year if not specified or invalid.
+	my $desiredYear = $queryStrHash{$QUERY_STR_YEAR};
+	if ( (! defined $desiredYear ) || ($desiredYear eq '') ) {
+		$desiredYear = $currYear;
+	}
+
+	# Month day 0 means display entire month, otherwise display
+	# only the week corresponding to the month day specified.
+	my $desiredMonthDay = $queryStrHash{$QUERY_STR_DAY};
+	if ( (! defined $desiredMonthDay) || ($desiredMonthDay eq '') ) {
+		$desiredMonthDay = 0;
+	}
+
+	# Use OS to geneate calendar for specified month.
+	my $calMonthStr = `/usr/bin/cal -s $desiredMonthNum $desiredYear`;
+
+	# Convert month to array.
+	my @calArray = split('\n', $calMonthStr);
+	# Remove month/year heading from array.
+	my $monthAndYear = shift(@calArray);
+	$monthAndYear = ariba::Oncall::Schedule_v2::trimStr($monthAndYear);
+	my ($displayMonth, $displayYear) = split(' ', $monthAndYear);
+	$displayMonth = ariba::Oncall::Schedule_v2::trimStr($displayMonth);
+	$displayYear = ariba::Oncall::Schedule_v2::trimStr($displayYear);
+
+	# Remove days of week heading, array should now contain only days of month.
+	$_ = shift(@calArray);
+
+	# Determine previous month.
+	my ($prevMonthNum, $prevYear) = split('~', ariba::Oncall::Schedule_v2::changeMonth($desiredMonthNum, $desiredYear, -1) );
+	# Determine next month.
+	my ($nextMonthNum, $nextYear) = split('~', ariba::Oncall::Schedule_v2::changeMonth($desiredMonthNum, $desiredYear, +1) );
+
+	# ------------------------------------------------------------------------------
+	# Begin rendering page.
+
+	print "Content-type: text/html", "\n\n";
+
+	# Show page headers, title, navigation links, etc.
+
+	#body { font-family: 'Arial', 'Helvetica', 'sans-serif'; }
+	#body { font-family: 'Tahoma', 'Geneva', 'sans-serif'; }
+	#body { font-family: 'Verdana', 'Geneva', 'sans-serif'; }
+	#body { font-family: 'Trebuchet MS', 'Helvetica', 'sans-serif'; }
+
+	my $titleFontSize = '5';
+	my $navLinkFontSize = '3';
+	my $linkSpacing = ('&nbsp;') x 5;
+
+	$_ = <<END;
+<head>
+<title>Ops On-Call v2</title>
+<!-- Internal CSS (style sheet) to control some aspects of appearance. -->
+<style>
+body { font-family: 'Helvetica', 'Arial', 'sans-serif'; }
+table { border-collapse: collapse; }
+td { font-size: 72%; }
+a:link { color: $COLOR_BLUE; }
+a:visited { color: $COLOR_BLUE; }
+a:hover { color: $COLOR_WHITE; background: $COLOR_BLACK;}
+</style>
+</head>
+
+<table border=0>
+<!-- Title and navigation links. -->
+<tr>
+<td align=left>
+<font size=3>Ariba Cloud Delivery On-call Schedule</font>
+</td>
+</tr>
+<tr>
+<td align=center>
+<font size=$navLinkFontSize>[<a href='$myScriptName?month=$prevMonthNum&year=$prevYear&day=0'>$MONTH_HASH{$prevMonthNum}&nbsp;&nbsp;$prevYear</a>]</font>$linkSpacing
+<font size=$titleFontSize>$displayMonth $displayYear</font>$linkSpacing
+<font size=$navLinkFontSize>[<a href='$myScriptName?month=$nextMonthNum&year=$nextYear&day=0'>$MONTH_HASH{$nextMonthNum}&nbsp;&nbsp;$nextYear</a>]</font>
+</td>
+</tr>
+
+<!-- Show current month or current week. -->
+<tr>
+<td align=center>
+<font size=$navLinkFontSize>[<a href='$myScriptName'>Current month</a>]</font>$linkSpacing
+<font size=$navLinkFontSize>[<a href='$myScriptName?month=$currMonthNum&year=$currYear&day=$currMonthDay'>Current week</a>]</font>$linkSpacing
+</td>
+</tr>
+</table>
+END
+	print "$_<br>\n";
+
+	# Begin rendering calendar for the specified month.
+
+	# Show days of the week heading with column widths spread evenly for each day of week.
+	my $calColWidth = 'width=14.30%';
+
+	# Set background color for day of week headings.
+	my $bgcolor = "bgcolor='$COLOR_GRAY'";
+
+	$_ = <<END;
+<table border=1 cellpadding=2>
+<tr>
+<th $calColWidth $bgcolor>Sunday</th>
+<th $calColWidth $bgcolor>Monday</th>
+<th $calColWidth $bgcolor>Tuesday</th>
+<th $calColWidth $bgcolor>Wednesday</th>
+<th $calColWidth $bgcolor>Thursday</th>
+<th $calColWidth $bgcolor>Friday</th>
+<th $calColWidth $bgcolor>Saturday</th>
+</tr>
+END
+	print "$_\n";
+
+	# Read the entire schedule for the specified month to avoid opening the same
+	# file repeatedly to extract data for each day of the month in the loop below.
+	my @monthSchedule = ariba::Oncall::Schedule_v2::readMonthSchedule(lc($MONTH_HASH{$desiredMonthNum}), $desiredYear, $SCHEDULE_HOME_PATH, $CAL_MONTH_DATA_SUFFIX);
+
+	# Show days of the month.
+	for (@calArray) {
+		my @daysOfCurrWeek = split ' ';
+
+		# Left or right pad short weeks.
+		if (@daysOfCurrWeek < 7) {
+			if ($daysOfCurrWeek[0] == 1) {
+				# Pad with blank days on left.
+				unshift @daysOfCurrWeek, ('~') x (7 - @daysOfCurrWeek);
+			}
+			else {
+				# Pad with blank days on right.
+				push  @daysOfCurrWeek, ('~') x (7 - @daysOfCurrWeek);
+			}
+		}
+
+		# If a specific day was requested to display, then show schedule entries for
+		# all days included in the same week only, i.e., skip days for other weeks.
+		# Otherwise show schedule for all days of the month.
+		my $showDaysForCurrWeek = 0;
+		if ($desiredMonthDay > 0) {
+			foreach (@daysOfCurrWeek) {
+				if ($_ eq $desiredMonthDay) {
+					$showDaysForCurrWeek = 1;
+				}
+			}
+		}
+		else {
+			$showDaysForCurrWeek = 1;
+		}
+
+		print "<tr>\n";
+		foreach my $calMonthDay (@daysOfCurrWeek) {
+			# Check for blank filler preceeding first day or trailing last day of month.
+			if ($calMonthDay eq '~') {
+			print "<td align='right' valign='top'>&nbsp;</td>\n";
+			}
+			else {
+				# Change background color for current day of month.
+				my $bgcolor = "bgcolor='$COLOR_WHITE'";
+				if ( ($calMonthDay == $currMonthDay) && ($desiredMonthNum == $currMonthNum) && ($desiredYear == $currYear) ) {
+					$bgcolor = "bgcolor='$COLOR_SEA_GREEN'";
+				}
+
+				print "<td $bgcolor align='right' valign='top'>\n";
+
+				# Show day of month number.
+				print "<table border=0 cellpadding=0 cellspacing=0>\n";
+				print "<tr align='right'>\n";
+				print "<td><span style='font-size: 18px;'>$calMonthDay</span></td>\n";
+				print "</tr>\n";
+				print "</table>\n";
+
+				if ($showDaysForCurrWeek) {
+					# Show on-call entries for the day.
+#					print "<br>\n";
+					$_ = showDaySchedule($currMonthDay, $calMonthDay, $desiredMonthDay, $currMonthNum, $desiredMonthNum, $currYear, $desiredYear, $USER_DATA_PATH, $SCHEDULE_HOME_PATH, $CAL_MONTH_DATA_SUFFIX, $USER_INFO_PAGE_MARK, $myScriptName, \@monthSchedule);
+					print "$_\n";
+				}
+
+				print "</td>\n";
+			}
+		}
+		print "</tr>\n";
+	}
+
+	print "</table>\n";
+#	print "<font size=2>*1=primary contact, 2=secondary (backup) contact, etc.</font><br>\n";
+	print "<font size=2>*2=secondary (backup) contact, 3=tertiary contact, etc.</font><br>\n";
+
+	# Display optional user info requested.
+	print showUserContactInfo($queryStrHash{$QUERY_STR_USER}, $USER_INFO_PAGE_MARK, $myScriptName, \%queryStrHash);
+
+	# Display misc info/links.
+	print showMiscInfo($desiredMonthNum, $desiredYear);
+
+	# Display team contact info.
+	print showTeamContactInfo();
+
+}
+
+# ------------------------------------------------------------------------------
+# Subroutines.
+
+sub showDaySchedule {
+	my $currMonthDay = $_[0];
+	my $calMonthDay = $_[1];
+	my $desiredMonthDay = $_[2];
+	my $currMonthNum = $_[3];
+	my $desiredMonthNum = $_[4];
+	my $currYear = $_[5];
+	my $desiredYear = $_[6];
+	my $userDataPath = $_[7];
+	my $scheduleHomePath = $_[8];
+	my $calMonthDataSuffix = $_[9];
+	my $userInfoPageMark = $_[10];
+	my $myScriptName = $_[11];
+	my @monthSchedule = @{$_[12]};
+
+	my $returnStr = '';
+
+	my @daySchedule = ariba::Oncall::Schedule_v2::getDaySchedule($calMonthDay, \@monthSchedule);
+
+	$returnStr = "<table border=0 cellpadding=0 cellspacing=0 width=100%>\n";
+
+	# Use hash to build a custom sort key to control how entries are sorted.
+	my %entriesHash = ();
+	foreach my $record (@daySchedule) {
+		my ($dayNum, $team, $tier, $userId, $startTime, $endTime) = split(',', $record);
+
+		my $sortTeam = $team;
+
+		# Force SRE team to top of list.
+		if ($team eq 'SRE') {
+			$sortTeam = "000$sortTeam";
+		}
+
+		# Force out of office entries to bottom of list.
+		if ($team eq $OUT_OF_OFFICE) {
+			$sortTeam = "~~~$sortTeam";
+		}
+
+		# Major sort is by team so each team is shown separately.
+		# Minor sort by time with primaries and backups interleaved.
+#		my $hashKey = "$sortTeam~$startTime~$tier~$userId~$endTime";
+		# Minor sort by shift so that all primaries are listed together.
+		my $hashKey = "$sortTeam~$tier~$startTime~$userId~$endTime";
+		my $hashValue = $record;
+		$entriesHash{$hashKey} = $hashValue;
+	}
+
+	# Determine which people are on-call now.
+	my $dbaOnCallEntry = '';
+	my $depOnCallEntry = '';
+	my $netOnCallEntry = '';
+	my $sreOnCallEntry = '';
+	my $sysOnCallEntry = '';
+	my $tlsOnCallEntry = '';
+	my $currHHMM = ariba::Oncall::Schedule_v2::getCurrTimeHHMM();
+	chomp($currHHMM);
+	if ( ($calMonthDay eq $currMonthDay) && ($desiredMonthNum eq $currMonthNum) && ($desiredYear eq $currYear) ) {
+		$dbaOnCallEntry = ariba::Oncall::Schedule_v2::findOnCallPerson($currHHMM, $DBA_TEAM, \@daySchedule);
+		$depOnCallEntry = ariba::Oncall::Schedule_v2::findOnCallPerson($currHHMM, $DEPLOY_TEAM, \@daySchedule);
+		$netOnCallEntry = ariba::Oncall::Schedule_v2::findOnCallPerson($currHHMM, $NETWORK_TEAM, \@daySchedule);
+		$sreOnCallEntry = ariba::Oncall::Schedule_v2::findOnCallPerson($currHHMM, $SRE_TEAM, \@daySchedule);
+		$sysOnCallEntry = ariba::Oncall::Schedule_v2::findOnCallPerson($currHHMM, $SYSADMIN_TEAM, \@daySchedule);
+		$tlsOnCallEntry = ariba::Oncall::Schedule_v2::findOnCallPerson($currHHMM, $TOOLS_TEAM, \@daySchedule);
+	}
+
+	# Highlight on-call person.
+	my $highlight = '';
+
+	# Display each schedule entry.
+	my $prevTeam = '~~~';
+	foreach my $key (sort keys %entriesHash) {
+		my $entry = $entriesHash{$key};
+		my ($dayNum, $team, $tier, $userId, $startTime, $endTime) = split(',', $entry);
+		readPeopleDbFile($userId, $userDataPath);
+
+		# Parse user name.
+		my $userFullName = $PEOPLE_DB_HASH {$userId} {$USER_FULL_NAME};
+		my ($userFirstName, $userLastName) = split(' ', $userFullName);
+#		my $userLastInitial = substr($userLastName, 0, 1);
+
+		my $userWorkPhone = $PEOPLE_DB_HASH {$userId} {$USER_WORK_PHONE};
+		my $userCellPhone = $PEOPLE_DB_HASH {$userId} {$USER_CELL_PHONE};
+
+		my $toolTipUserName = $userId;
+		if ($userFullName ne '') {
+			$toolTipUserName = $userFullName;
+		}
+		my $userToolTipInfo = "$toolTipUserName\n\nWork-phone: $userWorkPhone\nCell-phone: $userCellPhone";
+
+		my $displayTier = "$tier";
+		if ( ($team eq $OUT_OF_OFFICE) || ($tier eq $TIER_1) ) {
+			$displayTier = '';
+		}
+
+		my $displayUserName = $userId;
+		if ($userFirstName ne '') {
+			$displayUserName = $userFirstName;
+		}
+		# Truncate user name displayed so calendar hopefully renders without
+		# line wraps in the Ops frameset webpage.
+		$displayUserName = substr($displayUserName, 0, 8);
+
+		my $displayTeam = '';
+
+		my $userLink = "<a title='$userToolTipInfo' href='$myScriptName?month=$desiredMonthNum&year=$desiredYear&day=$desiredMonthDay&user=$userId#$userInfoPageMark'>" .
+					"$displayUserName $startTime-$endTime</a>";
+
+		# Separate each team for easier reading.
+		if ($team ne $prevTeam) {
+			$returnStr .= "<tr>\n";
+			$returnStr .= "<td align='left' valign='top'>&nbsp;</td>\n";
+			$returnStr .= "</tr>\n";
+
+			$displayTeam = $team;
+		}
+
+		if ( ($team eq $OUT_OF_OFFICE) || ($tier ne $TIER_1) ) {
+			$highlight = "bgcolor='$COLOR_GRAY'";
+		}
+		else {
+			# Highlight current on-call entry.
+			if ($calMonthDay eq $currMonthDay) {
+				if (
+					($entry eq $dbaOnCallEntry) ||
+					($entry eq $depOnCallEntry) ||
+					($entry eq $netOnCallEntry) ||
+					($entry eq $sreOnCallEntry) ||
+					($entry eq $sysOnCallEntry) ||
+					($entry eq $tlsOnCallEntry)
+					) {
+						$highlight = "bgcolor='$COLOR_YELLOW'"; 
+				}
+			}
+		}
+
+		$returnStr .= "<tr>\n";
+		$returnStr .= "<td style='padding-right: 1px;' align='right' valign='top'>$displayTeam</td>\n";
+		$returnStr .= "<td style='padding-right: 1px;' align='right' valign='bottom' $highlight><font size=1>$displayTier</font></td>\n";
+		$returnStr .= "<td align='right' valign='top' $highlight>$userLink</td>\n";
+		$returnStr .= "</tr>\n";
+		$highlight = '';
+
+		$prevTeam = $team;
+	}
+
+	$returnStr .= "</table>\n";
+
+	return $returnStr;
+}
+
+# Show misc info.
+sub showMiscInfo {
+	my $desiredMonthNum = $_[0];
+	my $desiredYear = $_[1];
+
+	my $desiredMonthName = lc($MONTH_HASH{$desiredMonthNum});
+
+	my $returnStr = <<END;
+<p>
+<a href="https://ops.ariba.com/cgi-bin/list-contacts">Ops personnel directory</a>
+<br><br>
+<a href="https://ops.ariba.com/cgi-bin/production-changes">Production changes</a>
+<!--
+  <br><br>
+  <a href="http://ops.ariba.com/documentation/prodops/archive/ocreports/$desiredYear/$desiredMonthName">SRE team on-call reports for month shown above</a>
+  <br><br>
+  <a href="http://ops.ariba.com/documentation/prodops/archive/ocreports">SRE team on-call reports</a>
+  <br><br>
+  <a href="https://ops.ariba.com/cgi-bin/show-schedule">Ops on-call schedule (previous version)</a>
+-->
+</p>
+END
+
+	return $returnStr;
+}
+
+# Show team contact info.
+sub showTeamContactInfo {
+
+	my $returnStr = <<END;
+<h3>Hosting Ops teams</h3>
+<table border=0 cellpadding=4>
+
+<tr>
+<td>
+$SRE_TEAM
+</td>
+<td>
+Site Reliability Engineering
+</td>
+<td>
+&quot;DL ARB dept an ops sre&quot; &lt;DL_52815EFCFD84A05CF4004B96\@exchange.sap.corp&gt;
+</td>
+</tr>
+
+<tr align=left valign=top>
+<td>
+$DBA_TEAM
+</td>
+<td>
+Database Administration
+</td>
+<td>
+&quot;DL ARB dept an ops dba&quot; &lt;DL_52815D12FD84A05CF4004674\@exchange.sap.corp&gt;
+</td>
+</tr>
+
+<tr align=left valign=top>
+<td>
+$DEPLOY_TEAM
+</td>
+<td>
+Deployment
+</td>
+<td>
+&quot;DL ARB dept an ops deployment (External)&quot; &lt;DL_538668E1FD84A00E6F000002\@exchange.sap.corp&gt;
+</td>
+</tr>
+
+<tr align=left valign=top>
+<td>
+$NETWORK_TEAM
+</td>
+<td>
+Network Engineering
+</td>
+<td>
+&quot;DL arb dept an ops network&quot; &lt;DL_52DD78E3DF15DB6F7301B12E\@exchange.sap.corp&gt;
+</td>
+</tr>
+
+<tr align=left valign=top>
+<td>
+$SYSADMIN_TEAM
+</td>
+<td>
+System Administration
+</td>
+<td>
+&quot;DL ARB dept_an_ops_sysadmin (External)&quot; &lt;DL_52D970AADF15DB6F7301031A\@exchange.sap.corp&gt;
+</td>
+</tr>
+
+<tr align=left valign=top>
+<td>
+$TOOLS_TEAM
+</td>
+<td>
+Tools
+</td>
+<td>
+&quot;DL ARB Dept An Ops Tools&quot; &lt;DL_52815F2AFD84A05CF4004C21\@exchange.sap.corp&gt;
+</td>
+</tr>
+
+<tr align=left valign=top>
+<td>
+$OPS_TEAM
+</td>
+<td>
+Production Operations
+</td>
+<td>
+&quot;DL ARB Dept AN Ops Prod&quot; &lt;DL_52815E56FD84A05CF400492D\@exchange.sap.corp&gt;
+</td>
+</tr>
+
+<tr align=left valign=top>
+<td>
+$OUT_OF_OFFICE
+</td>
+<td>
+Out of office
+</td>
+<td>
+&nbsp;
+</td>
+</tr>
+
+</table>
+<br>
+END
+
+	return $returnStr;
+}
+
+# Read user info from people DB disk file.
+sub readPeopleDbFile {
+	my $desiredUserId = $_[0];
+	my $userDataPath = $_[1];
+
+	# Ensure user ID was specified.
+	if ( (! defined $desiredUserId) && ($desiredUserId eq '') ) {
+		return;
+	}
+
+	# Check if user data has already been read/loaded.
+	if ($PEOPLE_DB_HASH{$desiredUserId}) {
+		return;
+	}
+
+	my $dataFile = "$userDataPath/$desiredUserId";
+	if (! -e $dataFile) {
+		$PEOPLE_DB_HASH {$desiredUserId} {$USER_INFO_ALL_STR} = $USER_NO_INFO;
+		return;
+	}
+
+	my $userInfo = read_file($dataFile);
+	$PEOPLE_DB_HASH {$desiredUserId} {$USER_INFO_ALL_STR} = $userInfo;
+
+	# Parse selected info for user.
+	my @lines = split("\n", $userInfo);
+	my @tmpArray;
+	my $arrayCount;
+	my $fieldName;
+
+	# Parse for user's fullname.
+	$fieldName = 'fullname:';
+	@tmpArray = grep { /^$fieldName/ } @lines;
+	$arrayCount = @tmpArray;
+	if ($arrayCount > 0) {
+		$_ = $tmpArray[0];
+		$_ =~ s/$fieldName//ig;
+		$_ = ariba::Oncall::Schedule_v2::trimStr($_);
+		$PEOPLE_DB_HASH {$desiredUserId} {$USER_FULL_NAME} = $_;
+	}
+
+	# Parse for user's work phone.
+	$fieldName = 'work-phone:';
+	@tmpArray = grep { /^$fieldName/ } @lines;
+	$arrayCount = @tmpArray;
+	if ($arrayCount > 0) {
+		$_ = $tmpArray[0];
+		$_ =~ s/$fieldName//ig;
+		$_ = ariba::Oncall::Schedule_v2::trimStr($_);
+		$PEOPLE_DB_HASH {$desiredUserId} {$USER_WORK_PHONE} = $_;
+	}
+
+	# Parse for user's cell phone.
+	$fieldName = 'cell-phone:';
+	@tmpArray = grep { /^$fieldName/ } @lines;
+	$arrayCount = @tmpArray;
+	if ($arrayCount > 0) {
+		$_ = $tmpArray[0];
+		$_ =~ s/$fieldName//ig;
+		$_ = ariba::Oncall::Schedule_v2::trimStr($_);
+		$PEOPLE_DB_HASH {$desiredUserId} {$USER_CELL_PHONE} = $_;
+	}
+
+}
+
+# Show user contact info.
+sub showUserContactInfo {
+	my $desiredUserId = $_[0];
+	my $userInfoPageMark = $_[1];
+    my $myScriptName = $_[2];
+    my %queryStrHash = %{$_[3]};
+
+	my $returnStr = '';
+	my $userInfo = '(select user in calendar)';
+	my $clearInfoUrl = '';
+
+	if ( (defined $desiredUserId) && ($desiredUserId ne '') ) {
+		# Get user contact info.
+		$userInfo = $PEOPLE_DB_HASH {$desiredUserId} {$USER_INFO_ALL_STR};
+		if ($userInfo eq $USER_NO_INFO) {
+			$userInfo = "User information not found for User Id: $desiredUserId";
+		}
+		else {
+			chomp($userInfo);
+			$userInfo =~ s/\n/<br>/g;
+		}
+
+		# Create link to clear user info by re-assembling the URL specified to
+		# display this page, minus the user ID param.
+		my $tmpQueryStr = '';
+		foreach my $key (keys %queryStrHash) {
+			if ($key ne $QUERY_STR_USER) {
+				if ($tmpQueryStr eq '') {
+					$tmpQueryStr = "?$key=$queryStrHash{$key}";
+				}
+				else {
+					$tmpQueryStr .= "&$key=$queryStrHash{$key}";
+				}
+			}
+		}
+
+		$clearInfoUrl = "<br><br><a href='$myScriptName$tmpQueryStr'>(Clear info)</a>";
+	}
+
+	$returnStr = <<END;
+<br>
+<a name='$userInfoPageMark'></a>
+<table border=1 cellpadding=2>
+<tr valign='top'>
+<td>User contact information:</td>
+<td>
+$userInfo
+$clearInfoUrl
+</td>
+</tr>
+</table>
+END
+
+	return $returnStr;
+}
+
+main();
+
+__END__
+

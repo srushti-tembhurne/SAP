@@ -1,0 +1,59 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/edi/interchange-status#4 $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+
+sub main{
+	my $debug = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; }
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	my %queries = (
+		"documents stuck in queued status (status unchanged for more than day)" =>
+		{
+		  info => "numrows > -1",
+		  warn => "numrows > 0",
+		  crit => "numrows > 20",
+		  format => "edi_document.id %d  %s %d hours\n",
+
+		  sql => q`
+		      select id,document_type,(sysdate-status_changed)*24 
+			  from edi_base_document 
+			  where
+				  status='Queued' and 
+				  (sysdate-status_changed)>1 and 
+				  document_type = 'EDIDocument' and
+				  direction = 1
+		  `,
+		},
+
+	);
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $edi = ariba::rc::InstalledProduct->new("edi", $me->service());
+
+	my $email = $me->default('notify.email');
+
+	my $q = ariba::monitor::QueryManager->newWithDetails(
+		"order-status", "edi", $me->service(), $me->customer(), \%queries
+	);
+	$q->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($edi));
+
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

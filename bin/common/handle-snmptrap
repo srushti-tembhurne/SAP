@@ -1,0 +1,71 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/handle-snmptrap#8 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+
+my $debug = 0;
+
+my @exclude = (
+	'Mirror \d+ Ready', 'discoveryChangeTime', '\d\d33', 
+	0461, 0462, 0466, '046D', '047D', 'Established BVC'
+);
+
+sub main {
+	my $quiet=0;
+	my $sendEmail=0;
+	my $sendPage=0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; }
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	my @traps   = ();
+	my $trapType;
+
+	chomp(my $host = <STDIN>);
+	chomp(my $ip   = <STDIN>);
+
+	while(<STDIN>) {
+		chomp;
+
+		if (/snmpTrapOID/) {
+			($trapType) = ($_ =~ /EMC-MIB::(\S+)/);
+		}
+
+		next unless /^EMC-MIB/;
+
+		for my $exclude (@exclude) {
+			exit if /$exclude/;
+		}
+
+		push @traps, $_;
+	}
+
+	my $me    = ariba::rc::InstalledProduct->new();
+	my $email = $me->default('notify.email');
+	my $pager = $me->default('notify.pagers');
+
+	if ($sendEmail) {
+		my $hostname = ariba::Ops::NetworkUtils::hostname();
+		open (MAIL, '|/usr/lib/sendmail -t') || die "Can't open sendmail!";
+		print MAIL "From: $ENV{'USER'}\@$hostname\n";
+		print MAIL "To: $email\n";
+		print MAIL "Subject: $host::$trapType\n\n";
+		print MAIL "$host sent SNMP Trap of:\n\n";
+		print MAIL join("\n", @traps);
+		print MAIL "\n\nPlease contact sysadmin to investigate.\n";
+		close(MAIL);
+        }
+}
+
+main();
+
+__END__

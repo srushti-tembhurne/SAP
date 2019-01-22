@@ -1,0 +1,123 @@
+#!/usr/local/bin/perl
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+require "geturl";
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use JSON;
+use Pod::Usage;
+use Getopt::Long;
+use Data::Dumper;
+
+
+my $debug = 0;
+
+my($mon,$me,$siteurl,$url,@results,$decoded_json);
+ 
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    
+    GetOptions(
+        "help|h" => sub { pod2usage(1); },
+        "debug|d+" => \$debug,
+        "e" => \$sendEmail,
+        "p" => \$sendPage,
+    );
+
+    $mon = ariba::rc::InstalledProduct->new('mon');
+    $me = ariba::rc::InstalledProduct->new('community', $mon->service());
+    $siteurl = $me->default('SiteURLSecure');
+    chomp($siteurl);
+    my $interval = 86400;
+    $url = "$siteurl/internal/drush-cron-i18n-import-monitor.php?duration_sec=\'$interval\'";
+    eval { geturl("-e","-q","-timeout", '60', "-results",\@results,$url) };
+	print "url $url results : @results \n" if($debug);
+    if ($@) {
+	    @results = ("URL error");
+	    $decoded_json->{'count_timed_out'} = "invalid url $url";
+    } else {
+        my $json = join('',@results);
+        eval { $decoded_json = JSON::decode_json($json); };
+        if ($@) {
+		    @results=("Invalid JSON");
+	    	    $decoded_json->{'count_timed_out'} = "JSON error $json";
+        }
+    }
+
+=pod
+my $VAR1 = {
+          'count_timed_out' => 0,
+          'count_succeeded' => 15,
+          'date_last_run' => '2018-08-09 12:56:09 AM PDT',
+          'count_failed' => 0,
+          'count_running' => 3
+        };
+=cut
+
+    my %queries;
+    $queries{'count_running'} = {
+                                    crit => "answer > 4 or answer =~ /(invalid|error)/i",
+                                    severity => 1,
+                                    description => 'Number of times drush i18n entered running state',
+                                    correctiveActions => [
+                                          Ops => '1) Send email to AUC Community alias DL ARB AUC_Eng (External) <DL_5419DA6CFD84A00838000005@exchange.sap.corp>'
+                                    ],
+				                    perl => sub {  return $decoded_json->{'count_running'}; }, 
+                                  };
+
+    $queries{'count_succeeded'} = {
+                                    crit => "answer < 6  or answer =~ /(invalid|error)/i",
+                                    severity => 1,
+                                    description => 'Number of times drush i18n entered succeeded state',
+                                    correctiveActions => [
+                                          Ops => '1) Send email to AUC Community alias DL ARB AUC_Eng (External) <DL_5419DA6CFD84A00838000005@exchange.sap.corp>'
+                                    ],
+				                    perl => sub {  return $decoded_json->{'count_succeeded'}; }, 
+                                  };
+
+    $queries{'count_failed'} = {
+                                    crit => "answer > 2  or answer =~ /(invalid|error)/i",
+                                    warn  => "answer > 0 or answer =~ /(invalid|error)/i",
+                                    severity => 1,
+                                    description => 'Number of times drush i18n entered failed state',
+                                    correctiveActions => [
+                                          Ops => '1) Send email to AUC Community alias DL ARB AUC_Eng (External) <DL_5419DA6CFD84A00838000005@exchange.sap.corp>'
+                                    ],
+				                    perl => sub {  return $decoded_json->{'count_failed'}; }, 
+                                  };
+
+    $queries{'count_timed_out'} = {
+                                    crit => "answer > 0 or answer =~ /(invalid|error)/i",
+                                    severity => 1,
+                                    description => 'Number of times drush i18n entered timed_out state',
+                                    correctiveActions => [
+                                          Ops => '1) Send email to AUC Community alias DL ARB AUC_Eng (External) <DL_5419DA6CFD84A00838000005@exchange.sap.corp>'
+                                    ],
+				                    perl => sub {  return $decoded_json->{'count_timed_out'}; }, 
+                                  };
+
+    $queries{'date_last_run'} = {
+                                    description => 'drush i18n date_last_run',
+                                    correctiveActions => [
+                                          Ops => '1) Send email to AUC Community alias DL ARB AUC_Eng (External) <DL_5419DA6CFD84A00838000005@exchange.sap.corp>'
+                                    ],
+				                    perl => sub {  return $decoded_json->{'date_last_run'}; }, 
+                                  };
+
+
+
+      my $email = $me->default('notify.email');
+      my $qm = ariba::monitor::QueryManager->newWithDetails('Drushi18n Import Monitoring', $me->name(), $me->service(), $me->customer(), \%queries);
+      $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+                                    
+}
+
+
+main(@ARGV);
+
+__END__

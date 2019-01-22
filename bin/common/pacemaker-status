@@ -1,0 +1,483 @@
+#!/usr/local/bin/perl
+# vim:et ts=4 sw=4
+ 
+# $Id: //ariba/services/monitor/bin/common/pacemaker-status#1 $
+ 
+# a script to monitor pacemaker cluster status.
+#
+# pacemaker commands can only be run as root,
+# so this should be installed in root's crontab.
+
+use strict;
+use warnings;
+use FindBin;
+use File::Basename;
+use Data::Dumper;
+
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Constants;
+use ariba::Ops::NetworkUtils qw(hostname);
+use ariba::Ops::DBConnection;
+use ariba::Ops::Machine;
+use ariba::Ops::Utils;
+
+# pacemaker tools are typically installed under /usr/sbin, but let's be safe and include all the standard system paths.
+$ENV{PATH} = '/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin';
+
+# globals
+my $prog         = basename($0);
+my $LOCKFILE     = "/tmp/$prog";
+my $debug        = FALSE;
+my $sendEmail    = FALSE;
+my $sendPage     = FALSE;
+my $hanaType     = ariba::Ops::DBConnection->hanaDBServerType();
+my $tab          = ariba::monitor::StatusPage::commonProduct();
+my $expando      = 'pacemaker-status';
+my $email;
+my %queries;
+my $clusterConfig;
+my $clusterStatus;
+
+my $defaultCorrectiveAction = "inform on-call SysAdmin.";
+
+# only monitor if this host provides this service according to machineDB.
+my $mdb_service = 'pacemaker';
+
+# why use "pcs status" instead of "crm_mon"?
+#  1) crm_mon doesn't show daemon status
+#  2) crm_mon doesn't show pcsd status
+#  3) crm_mon doesn't show cluster name. (but neither does "pcs status" if the cluster is down.
+#                                          We get that from the config cmd. See just below.)
+my $status_cmd = 'pcs status --full';
+
+# This is the only way to get cluster name -- even if the cluster is down -- assuming the cluster has been properly
+# configured in the first place. This is also where to check whether an entire cluster is in "maintenance mode"
+# (vs a particular node), in which case we don't want to alert -- unless, perhaps, if it's been in maintenance mode
+# for too long (indicating a sysadmin may have forgotten to un-maintenance it...)
+#
+my $config_cmd = 'pcs config';
+
+# these are the pacemaker daemons that must always be running.
+my @pacemaker_daemons = qw(pcsd corosync pacemaker);
+
+# these are the stonith resources we must monitor.
+# the key specifies a regex to capture the desired line in the resource output.
+# the value specifies a regex that indicates the "ok" state for the resource.
+my %stonith_resources = (
+    '^st_ilo'  => '\bStarted\b',
+    '^mon_ilo' => '\bStarted\b',
+);
+
+# these are the node properties we want to show.
+my @node_props = qw(clone_state sync_state srmode vhost roles site op_mode remoteHost version maintenance);
+
+use constant FALSE => 0; # ...because ariba::Ops::Constants sets it to empty string!
+
+my $overall_status = TRUE ;
+my ($service, $dbhost, $shortName, $product_name);
+
+sub main {
+    while(my $arg = shift) {
+        if($arg =~ /^-d/) { $debug++;          next; }
+        if($arg =~ /^-e/) { $sendEmail = TRUE; next; }
+        if($arg =~ /^-p/) { $sendPage  = TRUE; next; }
+    }
+
+    my $hostname = lc(hostname());
+    unless(ariba::Ops::Machine->new($hostname)->provides($mdb_service)) {
+        dbg("So sorry, but machineDB says this is not a $mdb_service host... bye!");
+        exit;
+    }
+
+    unless(dmail::LockLib::requestlock($LOCKFILE, 5)) {
+        warn "can't grab lock\n";
+        exit(2);
+    }
+
+    my $me      = ariba::rc::InstalledProduct->new();
+    $service = $me->service();
+    $email      = $me->default('notify.email');
+
+    # get the product name for this host, for dashboard expando.
+    # even if no product is found, we still want to show pacemaker status if it's
+    # been tagged in machineDB, in which case we'll show under product "(unknown)".
+    ($shortName) = $hostname =~ /^([^.]+)/;
+    ($product_name, $dbhost) = find_product($me->service(), $shortName);
+    if ( ! defined($product_name )) {
+      dbg("No product found. exiting...");
+      exit;
+    }
+
+    dbg("product $product_name is using this host.");
+
+    load_cluster_config();
+    load_cluster_status();
+
+    my $clusterName = get_cluster_name();
+    dbg("cluster name = $clusterName");
+    build_queries($product_name, $shortName, $clusterName);
+
+    my $subdir = "$expando/$product_name/$clusterName/$shortName";
+    my $qm = ariba::monitor::QueryManager->newWithDetails($expando, $tab, $service, undef, \%queries, undef, $subdir);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+    dmail::LockLib::releaselock($LOCKFILE);
+}
+
+sub build_queries {
+    my ($pName, $host_name, $cluster_name) = @_;
+    my $uiHint = "$pName/cluster $cluster_name/host $host_name";
+
+    # HOA-172007 - add cluster/hostname to query names, because otherwise they won't be in alert email subjects,
+    #              and SREs won't know where they came from!
+    my $pfx = "$cluster_name $host_name";
+
+    # first, load the nodes status...
+    my $nodes_status_href = get_nodes_status();
+
+    # next, find the active node, and tag the expando if I (i.e. "this host") am the active node.
+    my ($active_node, $active_host) = '';
+    my $active = FALSE;
+    for my $node (keys %$nodes_status_href) {
+        if($nodes_status_href->{$node}->{active}) {
+            $active_node = $node;
+            $active_host = $nodes_status_href->{$node}->{vhost};
+
+            if($active_host eq $host_name) {
+                $uiHint .= ' (active)';
+                $active = TRUE;
+                dbg("I am the active node.");
+            }
+            last;
+        }
+    }
+
+    # also record in influx whether I am the active host.
+    my %influx_data;
+    $influx_data{tags} = { section => 'host'   };
+    $influx_data{data} = { active  => $active  };
+    send_to_statsd( \%influx_data );
+
+    # now we can build the queries...
+    for my $prop (@node_props) {
+        for my $node (keys %$nodes_status_href) {
+            $queries{"$pfx $node $prop"} = {
+                uiHint     => "$uiHint/node status/node $node",
+                noRowCount => TRUE,
+                perl       => sub { return $nodes_status_href->{$node}->{$prop}; },
+            };
+        }
+    }
+
+    # and finally, define the alerts.
+    #
+    # these are the node attributes for which we need to alert on:
+    #   clone_state: one node (the active node) should be "PROMOTED"; all others should be "DEMOTED"
+    #   sync_state : the active node should be "PRIM"; all others should be "SOK"
+    #   srmode     : all nodes should be "syncmem"
+
+    for my $node (keys %$nodes_status_href) {
+        my $sync_state_pattern = $nodes_status_href->{$node}->{active} ? 'prim' : 'sok';
+        $queries{"$pfx $node sync_state"}{crit} = 'answer !~ /$sync_state_pattern/i';
+        $queries{"$pfx $node sync_state"}{description}        = 'Sync State. The primary node should show "PRIM".'
+                                                              . ' The standby node should show "SOK".';
+        $queries{"$pfx $node sync_state"}{correctiveActions}  = [
+            Ops => $defaultCorrectiveAction,
+        ];
+
+        $queries{"$pfx $node clone_state"}{crit}              = 'answer !~ /(de|pro)moted/i';
+        $queries{"$pfx $node clone_state"}{description}       = 'Clone State. The primary node should show "PROMOTED".'
+                                                              . ' The standby node should show "DEMOTED".';
+        $queries{"$pfx $node clone_state"}{correctiveActions} = [
+            Ops => $defaultCorrectiveAction,
+        ];
+
+        $queries{"$pfx $node maintenance"}{crit}              = 'answer =~ /^(true|yes|on|1)$/i';
+        $queries{"$pfx $node maintenance"}{description}       = 'Maintenance Mode. Should always be disabled.';
+        $queries{"$pfx $node maintenance"}{correctiveActions} = [ Ops => $defaultCorrectiveAction ];
+
+        $queries{"$pfx $node srmode"}{crit}                   = 'answer !~ /syncmem/i';
+        $queries{"$pfx $node srmode"}{description}            = 'Replication Mode. Should always be "syncmem".';
+        $queries{"$pfx $node srmode"}{correctiveActions}      = [
+            Ops => $defaultCorrectiveAction,
+        ];
+
+        # Add influx lines for the above "node" metrics
+        my %influx_data;
+        $influx_data{tags} = { section => 'node', node_name => $node };
+        $influx_data{data} = { 
+            sync_state  => ( $nodes_status_href->{$node}->{sync_state} !~ /$sync_state_pattern/i ) ? do { $overall_status = FALSE; FALSE; } : TRUE, 
+            clone_state => ( $nodes_status_href->{$node}->{clone_state} !~ /(de|pro)moted/i ) ? do { $overall_status = FALSE; FALSE; } : TRUE, 
+            maintenance => ( $nodes_status_href->{$node}->{maintenance} =~ /^(true|yes|on|1)$/i ) ? do { $overall_status = FALSE; FALSE; } : TRUE, 
+            srmode      => ( $nodes_status_href->{$node}->{srmode} !~ /syncmem/i ) ? do { $overall_status = FALSE; FALSE; } : TRUE, 
+            active      => $nodes_status_href->{$node}->{active} ? TRUE : FALSE,
+        };
+
+        send_to_statsd( \%influx_data );
+    }
+
+
+    my $cluster_config_href = get_cluster_config_href();
+    foreach my $key ( keys %$cluster_config_href ) {
+        my %influx_data;
+        $queries{"$pfx $key"} = {
+            uiHint            => "$uiHint/cluster config",
+            noRowCount        => TRUE,
+            crit              => q{answer =~ /^error/i},
+            perl              => sub { return $cluster_config_href->{$key}; },
+        };
+        $influx_data{data}->{$key} = ( $cluster_config_href->{$key} =~ /^error/i ) ? do { $overall_status = FALSE; FALSE; } : TRUE;
+
+        if ($key eq 'maintenance-mode') {
+            $queries{"$pfx $key"}{crit}              = q{answer =~ /^(true|on|yes|1)$/i };
+            $queries{"$pfx $key"}{description}       = 'Maintenance mode. Should always be disabled.';
+            $queries{"$pfx $key"}{correctiveActions} = [ Ops => $defaultCorrectiveAction ];
+
+            $influx_data{data}->{$key}  = ( $cluster_config_href->{$key} =~ /^(true|on|yes|1)$/i ) ? do { $overall_status = FALSE; FALSE; } : TRUE;
+        }
+
+        $influx_data{tags} = { section => 'cluster' };
+
+        send_to_statsd( \%influx_data );
+    }
+
+    my $stonith_status_href = get_stonith_status();
+    for my $resource (keys %$stonith_status_href) {
+        my $ok_regex = get_val(\%stonith_resources, $resource);
+        $queries{"$pfx $resource"} = {
+            uiHint            => "$uiHint/stonith resource status",
+            noRowCount        => TRUE,
+            crit              => "answer !~ /$ok_regex/",
+            perl              => sub { return $stonith_status_href->{$resource}; },
+            correctiveActions => [
+                Ops => $defaultCorrectiveAction,
+            ],
+        };
+
+        
+        # some cleanup for influx to take the portion without colon (:) due to statsD restriction
+        my ($res) = ( $resource =~ /^(.*)\s+\(/ );
+        $res =~ s/^\s+|\s+$//g;
+
+        # send stonith metrics to influx
+        # we are having data stored in two ways here: (to have flexibility later) 
+        # 1. "component" tag with value of tag as resource name, and "status" field with value 0/1
+        # 2. resource name as field with value 0/1 
+        # Ex: In Influx, pacemake_status.component=mon_ilo_hanac207b status=1,mon_ilo_hanac207b=1 
+        my %influx_data;
+        $influx_data{tags} = { section => 'stonith', component => $res };
+
+        $influx_data{data}->{$res} = $influx_data{data}->{status} = ( $stonith_status_href->{$resource} !~ /$ok_regex/ ) ? do { $overall_status = FALSE; FALSE; } : TRUE;
+        
+        send_to_statsd( \%influx_data );
+    }
+
+    my $daemon_status_href = get_daemon_status();
+    for my $daemon (@pacemaker_daemons) {
+        $queries{"$pfx $daemon"} = {
+            uiHint            => "$uiHint/daemon status",
+            noRowCount        => TRUE,
+            crit              => 'answer !~ /active/i',
+            perl              => sub { return $daemon_status_href->{$daemon} || $clusterStatus; },
+            correctiveActions => [
+                Ops => $defaultCorrectiveAction,
+            ],
+        };
+
+        # send Daemon metrics to influx
+        my %influx_data;
+        $influx_data{tags} = { section => 'daemon' };
+        $influx_data{data}->{$daemon} = ( !$daemon_status_href->{$daemon} || ($daemon_status_href->{$daemon} !~ /active/i) ) ? do { $overall_status = FALSE; FALSE; } : TRUE;
+
+        send_to_statsd( \%influx_data );
+    }
+    
+    # send overall information 
+    my %inf_data;
+    $inf_data{tags} = {};
+    $inf_data{data} = { overall_status => $overall_status };
+    send_to_statsd( \%inf_data );
+}
+
+# search hash keys for matching string and return the hash val
+sub get_val {
+    my $href = shift;
+    my $str = shift;
+    for my $key (keys %$href) {
+        return $href->{$key} if $str =~ /$key/;
+    }
+}
+
+# load_cluster_config(): run the pcs cluster config cmd and stuff the output into the $clusterConfig global.
+# we don't care about return status of run_cmd here because we deal with it by parsing the output in the Query Object.
+sub load_cluster_config {
+    my $cmd = "qx($config_cmd 2>&1)";
+    run_cmd($cmd, \$clusterConfig);
+}
+
+# load_cluster_status(): run the pcs cluster status cmd and stuff the output into the $clusterStatus global.
+# we don't care about return status of run_cmd here because we deal with it by parsing the output in the Query Object.
+sub load_cluster_status {
+    my $cmd = "qx($status_cmd 2>&1)";
+    run_cmd($cmd, \$clusterStatus);
+}
+
+# run_cmd(): run shell cmd in timeout wrapper.
+# it will return failure if the timeout triggered, or the cmd returned non-zero.
+sub run_cmd {
+    my ($code, $result_ref) = @_;
+
+    my $coderef = sub { $$result_ref = eval $code; };
+    dbg("running '$code'");
+
+    ariba::Ops::Utils::runWithTimeout(30, $coderef);
+    my $rc = $?;
+
+    defined $$result_ref or $$result_ref = '';
+
+    if($@) {
+        $$result_ref = "ERROR: timeout";
+    }
+    elsif($rc) { # cmd returned error
+        $$result_ref ||= "ERROR: $!";
+    }
+
+    return $$result_ref !~ /^error/i; # return FALSE if we match ERROR
+}
+
+# parse out the "Node Attributes" section of the cluster config output.
+# we will also mark the active node here.
+sub get_nodes_status {
+    my %node_status;
+    my ($nodes_status) = $clusterStatus =~ /^Node Attributes:\n((.+\n)*)/m if $clusterStatus;
+    my @nodes = $nodes_status =~ /^\* Node (\S+).*\n([^*]+)/mg if $nodes_status;
+    my %nodes = @nodes;
+
+    for my $prop (@node_props) {
+        for my $node (keys %nodes) {
+            ($node_status{$node}->{$prop}) = $nodes{$node} =~ /$prop[^:]+:\s*(\S+)/;
+            $node_status{$node}->{$prop} ||= '';
+
+            if($prop eq 'clone_state' && $node_status{$node}->{$prop} && $node_status{$node}->{$prop} =~ /promoted/i) {
+                $node_status{$node}->{active} = TRUE;
+                dbg("$node is the active node.");
+            }
+        }
+    }
+    return \%node_status;
+}
+
+# break multi-line string into list; remove leading/trailing ws; compress inter-field ws
+sub str2list {
+    my $str_ref = shift;
+    my @arr = split('\n', $$str_ref);
+    for my $i (0..$#arr) {
+        $arr[$i] =~ s/^\s+//;
+        $arr[$i] =~ s/\s+$//;
+        $arr[$i] =~ s/\s+/ /g;
+    }
+    return \@arr;
+}
+
+# stonith resources are in the Resources section of pcs status output and look like this:
+#   st_ilo_sc1c01n11       (stonith:fence_ilo4):   Started sc1c01n12
+#   st_ilo_sc1c01n12       (stonith:fence_ilo4):   Started sc1c01n11
+#   mon_ilo_sc1c01n11 (lsb:mon_ilo_sc1c01n11): Started sc1c01n11
+#   mon_ilo_sc1c01n12 (lsb:mon_ilo_sc1c01n12): Started sc1c01n12
+sub get_stonith_status {
+    my %stonith_status;
+    my ($resource_status) = $clusterStatus =~ /^Full list of resources:\n\n((.+\n)*)/m if $clusterStatus;
+    my $resources_aref = str2list(\$resource_status) if $resource_status;
+
+    # now, grab only the hash keys we're interested in
+    my $regex = join('|', keys %stonith_resources);
+    for my $line (grep /$regex/, @$resources_aref) {
+        my ($key, $val) = $line =~ /^(.*): ([^:]+)$/;
+        $stonith_status{$key} = $val;
+    }
+    return \%stonith_status;
+}
+
+# parse out the "Daemon Status" section of the cluster config output.
+sub get_daemon_status {
+    my ($daemon_status) = $clusterStatus =~ /^Daemon Status:\n(.*)/sm if $clusterStatus;
+    my @daemons = $daemon_status =~ m|\s+([^:]+):\s+([^/]+).*$|mg if $daemon_status;
+    my %daemons = @daemons;
+    return \%daemons;
+}
+
+# parse out the cluster name from the cluster config.
+sub get_cluster_name {
+    my ($cluster_name) = $clusterConfig =~ /^Cluster Name:\s+(.*)/ if $clusterConfig;
+    return $cluster_name || "(unknown)";
+}
+
+# parse out the "Cluster Properties" section of the cluster config output.
+sub get_cluster_config_href {
+    my $cluster_config_href;
+    my $error_ref = { error => 'ERROR reading cluster config.' };
+    if ( $clusterConfig ) {
+        return $error_ref if $clusterConfig =~ /^ERROR/i;
+        my ($cluster_config) = $clusterConfig =~ /^Cluster Properties:\n(.*)^Node/sm;
+        foreach my $line ( split /\n/, $cluster_config ) {
+            if ( $line =~ /^\s*([^: ]+):\s*(\S+)\s*$/ ) {
+                $cluster_config_href->{$1} = $2;
+            } else {
+                dbg("Did not find cluster config on this line: [$line]");
+            }
+        }
+    }
+    return $cluster_config_href || $error_ref;
+}
+
+# find_product(): return the name of the product using this host's db
+# NOTE: why does this take so long to run? (20+ secs) -- need to to optimize...
+sub find_product {
+    my ($service, $host) = @_;
+    my (@all_dbcs, @unique_dbcs, @dbcs);
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList($service);
+    for my $product (@products) {
+        # ebs does not use hana, but for some reason pulls the hana info from AN's configs. Skip it.
+        next if lc($product->name()) eq 'ebs';
+        push(@all_dbcs,  ariba::Ops::DBConnection->connectionsForProductOfDBServerType([$product], $hanaType));
+    }
+
+    @unique_dbcs = ariba::Ops::DBConnection->uniqueConnectionsByHostAndPort(@all_dbcs);
+    for my $dbc (@unique_dbcs) {
+        next if $dbc->isDR();
+        return (uc($dbc->product->name), $dbc->host) if grep /$host/i, $dbc->realHosts;
+    }
+    return;
+}
+
+sub dbg {
+    my $txt = shift;
+    my $func = (caller(1))[3];
+    return unless $debug;
+    print "(DEBUG) $func: $txt\n";
+}
+
+# generate statsd line and send to statsd
+sub send_to_statsd { 
+    my $influx_data = shift;
+    $influx_data->{measurement} = 'pacemaker_status';
+
+    # dbhost = vip format cluster name (fqdn), host = short form of hostname()
+    my %default_tags = ( dbhost => $dbhost, host => $shortName, service => $service, product => $product_name );
+
+    # add default tags for every line
+    %{$influx_data->{tags}} = ( %default_tags, %{$influx_data->{tags}} ); 
+
+    eval {
+        my $statsd_line = ariba::Ops::Utils::generateStatsDLine($influx_data);
+        ariba::Ops::Utils::sendToStatsD($statsd_line, undef, undef, $debug) if ( $statsd_line );
+    };
+}
+
+main(@ARGV);
+

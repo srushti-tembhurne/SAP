@@ -1,0 +1,264 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/nameserver-check#16 $
+#
+# Check the Internic's nameservers against a good list.
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Constants;
+use ariba::Ops::NetworkUtils qw(hostToAddr addrToHost isIPAddr);
+use ariba::rc::InstalledProduct;
+
+use Net::XWhois;
+use Net::DNS;
+
+# IT did not add the true hostname of the NS to DNS. Here is a mapping.
+
+my %TRUENAMESERVERS = (
+    'ns5.ariba.com' => 'ns5.dnsmadeeasy.com',
+    'ns6.ariba.com' => 'ns6.dnsmadeeasy.com',
+    'ns7.ariba.com' => 'ns7.dnsmadeeasy.com',
+    'ns1.usi.net'   => 'ns-east.cerf.net',
+    'ns2.usi.net'   => 'ns2.sbcidc.com',
+    'ns3.usi.net'   => 'ns-west.cerf.net',
+    'ns4.usi.net'   => 'ns1.sbcidc.com',
+);
+
+
+# This is the list of domains we have, and what we expect the nameservers to be.
+my %DOMAINS = (
+    'ariba.com' => {
+
+        'nameservers' => [ qw(
+            NS5.ARIBA.COM
+            NS6.ARIBA.COM
+            NS7.ARIBA.COM
+            SNV-EXTDNS1.ARIBA.COM
+            PGH-EXTDNS1.ARIBA.COM
+        ) ],
+        'Parser' => {
+            nameservers => 'Name Server:\s+(\S+)',
+        },
+    },
+
+    'aribaasp.com' => {
+
+        'nameservers' => [ qw(
+            NS1.USI.NET
+            NS2.USI.NET
+            NS3.USI.NET
+            NS4.USI.NET
+        ) ],
+        'Parser' => {
+            nameservers => 'Name Server:\s+(\S+)',
+        },
+    },
+
+    'cxml.org' => {
+
+        'nameservers' => [ qw(
+            NS5.ARIBA.COM
+            NS6.ARIBA.COM
+            NS7.ARIBA.COM
+            SNV-EXTDNS1.ARIBA.COM
+            PGH-EXTDNS1.ARIBA.COM
+        ) ],
+
+        'Parser' => {
+            nameservers => 'Name Server:\s+(\S+)',
+        },
+    },
+
+    'sourcingservice.com' => {
+
+        'nameservers' => [ qw(
+            NS5.ARIBA.COM
+            NS6.ARIBA.COM
+            NS7.ARIBA.COM
+            SNV-EXTDNS1.ARIBA.COM
+            PGH-EXTDNS1.ARIBA.COM
+        ) ],
+        'Parser' => {
+            nameservers => 'Name Server:\s+(\S+)',
+        },
+    },
+    '216.109.104.0' => {
+        'nameservers' => [ qw(
+            NS5.ARIBA.COM
+            NS6.ARIBA.COM
+            NS7.ARIBA.COM
+            PGH-EXTDNS1.ARIBA.COM
+            SNV-EXTDNS1.ARIBA.COM
+        ) ],
+        'Domain' => '104.109.216.in-addr.arpa',
+        'Server' => 'whois.arin.net',
+        'Parser' => {
+            nameservers => 'NameServer:\s+(\S+)',
+        },
+    },
+    '216.109.110.0' => {
+        'nameservers' => [ qw(
+            NS5.ARIBA.COM
+            NS6.ARIBA.COM
+            NS7.ARIBA.COM
+            PGH-EXTDNS1.ARIBA.COM
+            SNV-EXTDNS1.ARIBA.COM
+        ) ],
+        'Domain' => '110.109.216.in-addr.arpa',
+        'Server' => 'whois.arin.net',
+        'Parser' => {
+            nameservers => 'NameServer:\s+(\S+)',
+        },
+    },
+    '216.109.108.0' => {
+        'nameservers' => [ qw(
+            NS5.ARIBA.COM
+            NS6.ARIBA.COM
+            NS7.ARIBA.COM
+            PGH-EXTDNS1.ARIBA.COM
+            SNV-EXTDNS1.ARIBA.COM
+        ) ],
+        'Domain' => '108.109.216.in-addr.arpa',
+        'Server' => 'whois.arin.net',
+        'Parser' => {
+            nameservers => 'NameServer:\s+(\S+)',
+        },
+    },
+    '216.109.111.0' => {
+        'nameservers' => [ qw(
+            NS5.ARIBA.COM
+            NS6.ARIBA.COM
+            NS7.ARIBA.COM
+            PGH-EXTDNS1.ARIBA.COM
+            SNV-EXTDNS1.ARIBA.COM
+        ) ],
+        'Domain' => '111.109.216.in-addr.arpa',
+        'Server' => 'whois.arin.net',
+        'Parser' => {
+            nameservers => 'NameServer:\s+(\S+)',
+        },
+    },
+
+);
+
+my $debug = 0;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-d/o) { $debug = 1; };
+    }
+
+    my $me          = ariba::rc::InstalledProduct->new();
+    my %queries     = ();
+
+    for my $domain (sort keys %DOMAINS) {
+
+        # Create a new whois object, and help it out with the registrar for cxml.org
+        my $tries = 0;
+        my $whois;
+        while($tries < 3) {
+            $whois = Net::XWhois->new(
+                'Nocache' => 1,
+                'Domain'  => $DOMAINS{$domain}->{'Domain'} || $domain,
+                'Server'  => $DOMAINS{$domain}->{'Server'} || 'whois.networksolutions.com',
+                'Parser' => $DOMAINS{$domain}->{'Parser'},
+            );
+
+            #
+            # If we don't get at least 2 nameservers back,
+            # initially assume a whois problem.  If we try
+            # 3 times without success, however, switch to
+            # assuming a real problem.
+            #
+            my @ns = $whois->nameservers();
+            last if(@ns == @{$DOMAINS{$domain}->{'nameservers'}});
+            $tries++;
+            sleep 3; # sleep three seconds for a little delay
+        }
+
+        # Build our list, and try to do a lookup of the hosts
+        my %wantedNameservers  = map { lc($_), 1 } @{$DOMAINS{$domain}->{'nameservers'}};
+        my %fetchedNameservers = map { lc($_), 1 } $whois->nameservers();
+        my $dnsResolver = Net::DNS::Resolver->new;
+
+        # First check to make sure all the ones we want exist.
+        for my $nameserver (sort keys %wantedNameservers) {
+
+            $queries{"Nameserver $nameserver for $domain"} = {
+                uiHint => $domain,
+                info => "answer =~ /^ok/",
+                crit => "answer !~ /^ok/",
+                perl => sub {
+
+                    # We didn't fetch at all
+                    if (!defined $fetchedNameservers{$nameserver}) {
+                        return 'not ok - nameserver isn\'t listed in whois record!';
+                    }
+
+                    my $addr = hostToAddr($nameserver);
+
+                    # check that we can do a forward and
+                    # reverse lookup of the nameserver
+                    if (!defined $addr || !isIPAddr($addr)) {
+                        return 'not ok - couldn\'t lookup or invalid host address';
+                    }
+
+                    my $resultDnsQuery = $dnsResolver->search($addr);
+
+                    my $host = undef;
+
+                    if (!defined $resultDnsQuery || !$resultDnsQuery->answer) {
+                        return 'not ok - couldn\'t reverse lookup host address';
+                    }
+
+                    my @hosts = grep {$_->type eq 'PTR' && $_->ptrdname} $resultDnsQuery->answer;
+                    @hosts = map{lc($_->ptrdname)} @hosts;
+
+                    $host = grep {$_ eq lc($nameserver)} @hosts;
+
+                    if (!$host) {
+                        $host = grep { $_ eq $TRUENAMESERVERS{$nameserver} } @hosts;
+                    }
+
+                    if (!$host) {
+                        return "not ok - found host: [", join(', ', @hosts) ,"] isn\'t host: [$nameserver]";
+                    }
+
+                    return 'ok';
+                },
+            };
+        }
+
+        # Now see if we have any extra
+        for my $nameserver (sort keys %fetchedNameservers) {
+
+            next if defined $wantedNameservers{$nameserver};
+
+            $queries{"Nameserver $nameserver for $domain"} = {
+                uiHint => $domain,
+                warn => "answer eq 'is new'",
+                perl => "return 'is new'",
+            };
+        }
+    }
+
+    my $pn = ariba::monitor::StatusPage::commonProduct();
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails(
+        'nameserver-check', $pn, $me->service(), $me->customer(), \%queries
+    );
+
+    $qm->processQueries($debug, $me->default('notify.email'), $sendEmail, $sendPage);
+}
+
+main();
+
+__END__

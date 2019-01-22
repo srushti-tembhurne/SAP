@@ -1,0 +1,68 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/cipherstore-watcher#1 $
+#
+# Verify that cipherstore is started up and working correctly
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Machine;
+use ariba::monitor::StatusPage;
+use ariba::rc::CipherStore;
+
+my $debug = 0;
+
+sub checkCipherstore {
+	my $service = shift;
+
+	my $cipherStore = ariba::rc::CipherStore->new($service);
+
+	if(defined($cipherStore->valueForName("networkEnable"))) {
+		return "up";
+	} else {
+		return "down";
+	}
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+	my $service;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ m/^-e/o) { $sendEmail = 1; }
+		if ($arg =~ m/^-p/o) { $sendPage = 1; }
+		if ($arg =~ m/^-d/o) { $debug = 1; }
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $machine = ariba::Ops::Machine->new($hostname);
+	my $datacenter = $machine->datacenter();
+	my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+	my $status = checkCipherstore($me->service());
+
+	my %queries;
+
+	$queries{"$hostname cipherstore status"} = {
+		crit => "answer eq 'down'",
+		info => "answer eq 'up'",
+		perl => "return '$status'",
+	};
+
+	my $email = $me->default('notify.email');
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails("cipherstore-status", $tab, $me->service(), $me->customer(), \%queries);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

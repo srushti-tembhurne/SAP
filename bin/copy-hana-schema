@@ -1,0 +1,594 @@
+#!/usr/local/bin/perl
+
+use warnings;
+use strict;
+
+use FindBin;
+
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../lib/perl";
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+use lib "$FindBin::Bin/../../../monitor/lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DBConnection;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::OracleClient;
+use ariba::rc::Utils;
+use File::Copy;
+use File::Path qw( rmtree );
+use File::Spec;
+use File::Temp qw/ tempfile tempdir /;
+
+sub main
+{
+    my ($arg, $productName, $hanaSchemaName);	
+    while ($arg = shift(@ARGV)) {
+        if ( $arg =~ /^-product/ ) { $productName = shift(@ARGV); }
+        if ( $arg =~ /^-hanaschema/ ) { $hanaSchemaName = shift(@ARGV); }
+    }
+
+    my $prod = ariba::rc::InstalledProduct->new($productName);
+    my ($majorRelease, $minorRelease)  = split (/s/, $prod->releaseName());
+    if ($majorRelease < 14 ) {
+        exit(0);
+    }
+
+    my ($dbc) = ariba::Ops::DBConnection->connectionsForProductOfDBType(
+        $prod, ariba::Ops::DBConnection->typeMain());
+    my $sidName = uc $dbc->sid();
+    if ( $sidName =~ /PRO/ ){
+        ### this is a production database.  Make sure we are running SSSPRO2
+        ### or SSSPRO10
+        my @validProSids = ("SSSPRO2", "SSSPRO10");
+        my $isValidProSid = 0;
+        foreach my $validProSid (@validProSids) {
+            if ($sidName eq $validProSid) {
+                $isValidProSid = 1;
+            }
+        }
+        if ($isValidProSid == 0) {
+            exit(0);
+        }
+    }  
+
+    my $mon = ariba::rc::InstalledProduct->new('mon');
+    my $tempDir;
+    my $tempSchemaDir;
+    my $fullTempSchemaDir;
+    my $dbh;
+    my $itemToCopy;
+    my $hanaServerName;
+    my $hanaSchemaLocation;
+    my $rootSchemaDir;
+    my $dirToCreate;
+    my $timestamp;
+    my $tmpDirLoc = "/datapump01/hana/tmp";
+    unless(-e $tmpDirLoc) {
+        unless(mkdir($tmpDirLoc, 0777)) {
+            die "Unable to create $tmpDirLoc";
+        }
+        chmod(0777, $tmpDirLoc) or die "Couldn't chmod $tmpDirLoc: $!";
+    }
+    my $tmpDirName;
+    my @itemsReadyToCopy;
+    my $usern = $mon->default("dbainfo.hana.admin.userName");
+    my $password = $mon->default("dbainfo.hana.admin.password");
+    my $thisHost = ariba::Ops::NetworkUtils::hostname();
+    my $path = $ENV{'PATH'};
+    if (index($path, '/usr/local/bin') == -1) {
+        $ENV{'PATH'} = '/usr/local/bin' . ':' . $path;
+    }
+    $dbh = ariba::Ops::OracleClient->newFromDBConnection($dbc);
+    if ( !$dbh->connect() ) {
+        print "Could not connect to database: " . $dbh->error() . "\n";
+        exit(1);
+    }
+    cleanupCompletedCopies($dbh);
+    sleep(1);
+    @itemsReadyToCopy = getLocationsToCopy($dbh, $thisHost, $hanaSchemaName, 1);
+    while($itemToCopy=shift(@itemsReadyToCopy)) {
+        $timestamp = time();
+        setItemToCopying($dbh, $itemToCopy);
+        $hanaServerName = $itemToCopy->{ORM_HANASERVERNAME};
+        $hanaSchemaLocation = $itemToCopy->{ORM_HANASCHEMALOCATION};
+        $tempDir = $tmpDirLoc . "/hana_to_oracle_migration" . $timestamp;
+        unless(-e $tempDir) {
+            unless(mkdir($tempDir, 0777)) {
+                setItemToError($dbh, $itemToCopy, "Unable to create " . $tempDir);
+                die "Unable to create $tempDir";
+            }
+            chmod(0777, $tempDir) or die "Couldn't chmod $tempDir: $!";
+        }
+        $tempSchemaDir = copyHanaSchemaToLocal($hanaServerName,
+        $hanaSchemaLocation, $tempDir, $usern, $password, $dbh, $itemToCopy);
+        $fullTempSchemaDir = $tempDir . "/" . $tempSchemaDir;
+        $rootSchemaDir = "/datapump01/hana/" . $tempSchemaDir;
+        deleteOlderDirectories($rootSchemaDir);
+        sleep(1);
+        unless(-e $rootSchemaDir) {
+            unless(mkdir($rootSchemaDir, 0777)) {
+                setItemToError($dbh, $itemToCopy, "Unable to create " . $rootSchemaDir);
+                die "Unable to create $rootSchemaDir";
+            }
+            chmod(0777, $rootSchemaDir) or die "Couldn't chmod $rootSchemaDir: $!";
+        }
+        $dirToCreate = $rootSchemaDir . "/" . $timestamp;
+        unless(mkdir($dirToCreate, 0777)) {
+            setItemToError($dbh, $itemToCopy, "Unable to create " . $dirToCreate);
+            die "Unable to create $dirToCreate";
+        }
+        chmod(0777, $dirToCreate) or die "Couldn't chmod $dirToCreate: $!";
+        flattenDir($fullTempSchemaDir, $dirToCreate);
+        rmtree($fullTempSchemaDir);
+        replaceEscapeCharacters($dirToCreate);
+        system("chmod -R 777 " . $dirToCreate);
+        setItemToCopied($dbh, $itemToCopy, $dirToCreate);
+        deleteOlderDirectoriesWith($tmpDirLoc, "hana_to_oracle_migration");
+    }
+    $dbh->disconnect();
+    exit(0);    
+}
+
+sub cleanupCompletedCopies
+{
+    my ($dbh) = @_;
+
+    my $selectStatement = "SELECT ORM_HANASCHEMALOCATION, ORM_ORACLESCHEMALOCATION";
+    $selectStatement .= " FROM SCHEMASTOREDEFINEONORACLETAB ";
+    $selectStatement .= " WHERE (";
+    $selectStatement .= " ORM_REDEFINESTATUS=5";
+    $selectStatement .= " OR";	
+    $selectStatement .= " ORM_REDEFINESTATUS=6";
+    $selectStatement .= " OR";	
+    $selectStatement .= " ORM_REDEFINESTATUS=7)";
+    $selectStatement .= " AND";
+    $selectStatement .= " ((SYSDATE - ORM_CREATETIME) < 2)";
+
+    ### Execute the statement in the database
+    my @itemsToDelete = $dbh->executeSql($selectStatement);
+    ### Fetch the data from the result set
+    if ($dbh->error()) {
+        return;
+    }
+
+    my $row;
+    my $tmpDirLoc = "/datapump01/hana/tmp";
+
+    foreach $row (@itemsToDelete) {
+        my ($hanaSchemaLocation, $oracleSchemaLocation) = split /\t/, $row;
+        my $positionOfLastSlash = rindex($hanaSchemaLocation, "/") + 1;
+        my $schemaName;
+        my $timeLocation;
+        my $cmd;
+        my $tmpStr;
+        if ($positionOfLastSlash > 0) {
+            $schemaName = substr($hanaSchemaLocation, $positionOfLastSlash);
+            $positionOfLastSlash = rindex($oracleSchemaLocation, "/") + 1;
+            if ($positionOfLastSlash > 0) {
+                $timeLocation = substr($oracleSchemaLocation, $positionOfLastSlash);
+                if ( -d $oracleSchemaLocation ) {
+                    unlink glob $oracleSchemaLocation . "/*.csv";
+                }
+
+                $tmpStr = $tmpDirLoc;
+                $tmpStr .= "/hana_to_oracle_migration";
+                $tmpStr .= $timeLocation;
+                $tmpStr .= "/";
+                $tmpStr .= $schemaName;
+                if ( -d $tmpStr ) {
+                    rmtree $tmpStr;
+                }
+            }
+        }
+    }
+}
+
+sub getTables
+{
+    my ($hanaSchemaLocation, $hanaServerName, $usern, $password, $destDir) = @_;
+    my $row;
+    my $itemTable;
+    my @retVals;
+
+# get the two character directories
+    my $statDir = $hanaSchemaLocation . "/STATDIR";
+    my $remoteCommand = "mkdir $statDir";
+    my $sshcommand = "ssh $usern\@$hanaServerName \"$remoteCommand\"";
+    ariba::rc::Utils::executeRemoteCommand($sshcommand,$password);
+    $remoteCommand = "ls $hanaSchemaLocation > $hanaSchemaLocation/STATDIR/twoDir.txt";
+    $sshcommand = "ssh $usern\@$hanaServerName \"$remoteCommand\"";
+    ariba::rc::Utils::executeRemoteCommand($sshcommand,$password);
+# transfer twoDir.txt to the destination directory
+    my $ret = ariba::rc::Utils::transferFromSrcToDestNoCheck(
+        $hanaServerName,
+        $usern,
+        "/",
+        $statDir,
+        undef,
+        undef,
+        "/",
+        $destDir,
+        0,
+        0,
+        0,
+        $password,
+    );
+
+#parse through twoDir.txt file and save results in an array
+    my $twoDirFile = $destDir . "/twoDir.txt";
+    my $lenStr = 0;
+    my @twoDirItems;
+
+    open my $IN, "<", $twoDirFile or die "cannot open < $twoDirFile: $!";
+    while (<$IN>) {
+        chomp;
+        $lenStr = length($_);
+        if ($lenStr == 2) {
+            push @twoDirItems, $_;
+            my $subDir = $hanaSchemaLocation . "/" . $_;
+            $remoteCommand = "ls $subDir > $hanaSchemaLocation/STATDIR/$_.txt";
+            $sshcommand = "ssh $usern\@$hanaServerName \"$remoteCommand\"";
+            ariba::rc::Utils::executeRemoteCommand($sshcommand,$password);
+        }
+    }
+    close $IN;
+
+#now, get the STATDIR again which should contain all the information
+    unlink $twoDirFile or die "cannot delete file < $twoDirFile: $!";
+    $ret = ariba::rc::Utils::transferFromSrcToDestNoCheck(
+        $hanaServerName,
+        $usern,
+        "/",
+        $statDir,
+        undef,
+        undef,
+        "/",
+        $destDir,
+        0,
+        0,
+        0,
+        $password,
+    );
+
+#now iterate through the twoDirItems array so that we know which files to look at
+    while(my $twoDirItem=shift(@twoDirItems)) {
+        my $curFile = $destDir . "/" . $twoDirItem . ".txt";
+        open my $IN2, "<", $curFile or die "cannot open < $curFile: $!";
+        while (<$IN2>) {
+            chomp;
+            $itemTable = {};
+            $itemTable->{TABLE_NAME} = $_;
+            $itemTable->{TABLESPACE_NAME} = "ARIBA";
+            push @retVals, $itemTable;
+        }
+        close $IN2;
+        unlink $curFile or die "cannot delete file < $curFile: $!";
+    }
+
+#now remove remote directory
+    $remoteCommand = "rm -rf $hanaSchemaLocation/STATDIR";
+    $sshcommand = "ssh $usern\@$hanaServerName \"$remoteCommand\"";
+    ariba::rc::Utils::executeRemoteCommand($sshcommand,$password);
+
+    return @retVals;
+}
+
+sub getLocationsToCopy
+{
+    my ($dbh, $thisHost, $hanaSchemaName, $numToCopy) = @_;
+    my $row;
+    my $itemToCopy;
+    my @retVals;
+
+    my $lowerCaseHost = lc $thisHost;
+    ### Prepare a SQL statement for execution
+    my $selectStatement = "SELECT ROOTID, ORM_HANASERVERNAME,";
+    $selectStatement .= " ORM_HANASCHEMALOCATION";
+    $selectStatement .= " FROM SCHEMASTOREDEFINEONORACLETAB";
+    $selectStatement .= " WHERE (";
+    $selectStatement .= " ORM_REDEFINESTATUS=1";
+    $selectStatement .= " AND";
+    $selectStatement .= " LOWER(ORM_ORACLESCHEMALOCATION) =";
+    $selectStatement .= "'" . $lowerCaseHost . "'";
+    if (defined $hanaSchemaName) {
+        my $lowerCaseSchemaName = lc $hanaSchemaName;
+        $selectStatement .= " AND";
+        $selectStatement .= " LOWER(ORM_HANASCHEMANAME) =";
+        $selectStatement .= "'" . $lowerCaseSchemaName . "'";
+    }
+    $selectStatement .= ")"; 
+    $selectStatement .= " ORDER BY ORM_CREATETIME";
+
+    ### Execute the statement in the database
+    my $numCopied = 0;
+    my @itemsReadyToCopy = $dbh->executeSql($selectStatement);
+    ### Fetch the data from the result set
+    if ($dbh->error()) {
+        @retVals = ();
+    }
+    else {
+        foreach $row (@itemsReadyToCopy) {
+            my ($rootId, $hanaServerName, $hanaSchemaLocation) = split /\t/, $row;
+            $itemToCopy = {};
+            $itemToCopy->{ROOTID} = $rootId;
+            $itemToCopy->{ORM_HANASERVERNAME} = $hanaServerName;
+            $itemToCopy->{ORM_HANASCHEMALOCATION} = $hanaSchemaLocation;
+            push @retVals, $itemToCopy;
+            setItemToCopying($dbh, $itemToCopy);
+            $numCopied++;
+            last if $numCopied == $numToCopy;
+        }
+    }
+
+    return @retVals;
+}
+
+sub setItemToCopying
+{
+    my ($dbh, $itemToCopy) = @_;
+
+    my $rootId = $itemToCopy->{ROOTID};
+    my $sql = "UPDATE SCHEMASTOREDEFINEONORACLETAB";
+    $sql .= " SET ORM_REDEFINESTATUS = 2";
+    $sql .= " WHERE ROOTID ='".$rootId."'";
+    $dbh->executeSql($sql);
+}
+
+sub setItemToCopied
+{
+    my ($dbh, $itemToCopy, $dirLocation) = @_;
+
+    my $rootId = $itemToCopy->{ROOTID};
+    my $sql = "UPDATE SCHEMASTOREDEFINEONORACLETAB";
+    $sql .= " SET ORM_REDEFINESTATUS = 3,";
+    $sql .= " ORM_ORACLESCHEMALOCATION='" . $dirLocation . "'";
+    $sql .= " WHERE ROOTID ='".$rootId."'";
+    $dbh->executeSql($sql);
+}
+
+sub setItemToError
+{
+    my ($dbh, $itemToCopy, $errorString) = @_;
+
+    my $rootId = $itemToCopy->{ROOTID};
+    my $sql = "UPDATE SCHEMASTOREDEFINEONORACLETAB";
+    $sql .= " SET ORM_REDEFINESTATUS = 3,";
+    $sql .= " ORM_ERRORSTRING='" . $errorString . "'";
+    $sql .= " WHERE ROOTID ='".$rootId."'";
+    $dbh->executeSql($sql);
+}
+
+sub copyHanaSchemaToLocal
+{
+    my ($hanaServerName, $hanaSchemaLocation, $destDir, $remoteUser, $remotePassword, $dbh, $itemToCopy) = @_;
+
+    my $i=rindex($hanaSchemaLocation,"/");
+    my $retStr=substr($hanaSchemaLocation, $i+1);
+    my $dstDir = $destDir . "/" . $retStr;
+
+    unless(-e $dstDir) {
+        unless(mkdir($dstDir, 0777)) {
+            setItemToError($dbh, $itemToCopy, "Unable to create " . $dstDir);
+            die "Unable to create $dstDir";
+        }
+        chmod(0777, $dstDir) or die "Couldn't chmod $dstDir: $!";
+    }
+
+    my $tableName;
+    my $itemTable;
+    my $tableSpaceName;
+    my $twoChar;
+    my $twoCharDir;
+    my $twoCharTableDir;
+    my $sourceHanaLoc;
+    my $numCopied = 0;
+
+    my @allOracleTablesAndNameSpaces = getTables($hanaSchemaLocation, $hanaServerName, $remoteUser, $remotePassword, $dstDir);
+
+    #now iterate through all the tables
+    while($itemTable=shift(@allOracleTablesAndNameSpaces)) {
+        $tableName = $itemTable->{TABLE_NAME};
+        $tableSpaceName = $itemTable->{TABLESPACE_NAME};
+        $twoChar = substr $tableName, 0, 2;
+        $twoCharDir = $dstDir . "/" . $twoChar;
+        unless(-e $twoCharDir) {
+            unless(mkdir($twoCharDir, 0777)) {
+                setItemToError($dbh, $itemToCopy, "Unable to create " . $twoCharDir);
+                die "Unable to create $twoCharDir";
+            }
+            chmod(0777, $twoCharDir) or die "Couldn't chmod $twoCharDir: $!";
+        }
+
+        $twoCharTableDir = $dstDir . "/" . $twoChar . "/" . $tableName;
+        unless(-e $twoCharTableDir) {
+            unless(mkdir($twoCharTableDir, 0777)) {
+                setItemToError($dbh, $itemToCopy, "Unable to create " . $twoCharTableDir);
+                die "Unable to create $twoCharTableDir";
+            }
+            chmod(0777, $twoCharTableDir) or die "Couldn't chmod $twoCharTableDir: $!";
+        }
+        $sourceHanaLoc = $hanaSchemaLocation . "/" . $twoChar . "/" . $tableName;
+        my $ret = ariba::rc::Utils::transferFromSrcToDestNoCheck(
+            $hanaServerName,
+            $remoteUser,
+            "/",
+            $sourceHanaLoc,
+            undef,
+            undef,
+            "/",
+            $twoCharTableDir,
+            0,
+            0,
+            0,
+            $remotePassword,
+        );
+        $numCopied = $numCopied + 1;
+        unless ($numCopied % 5) {
+            sleep(1);
+        }
+    }
+    return $retStr;
+}
+
+sub replaceEscapeCharacters {
+    my ($dir) = @_;
+    my $numCopied = 0;
+
+    opendir(DH, $dir);
+    my @files = readdir(DH);
+    closedir(DH);
+    for my $file ( @files ) {
+        my $result = index($file, ".csv");
+        if ($result != -1) {
+            my $fullPathFile = $dir . "/" . $file;
+            my $fullPathFileTmp = $fullPathFile . ".tmp";
+            open my $IN, "<", $fullPathFile or die "cannot open < $fullPathFile: $!";
+            open my $OUT, ">", $fullPathFileTmp or die "cannot open < $fullPathFileTmp: $!";
+
+            my $newStr = "";
+            my $offset = 0;
+            my $quoteResult = 1;
+            my $nResult = 1;
+            my $rResult = 1;
+            my $tResult = 1;
+            my $partStr = "";
+            my $lenStr = 0;
+
+            while (<$IN>) {
+                chomp;
+                $lenStr = length($_);
+                $newStr = "";
+                $offset = 0;
+                $result = 1;
+                $quoteResult = 1;
+                $nResult = 1;
+                $rResult = 1;
+                $tResult = 1;
+                $partStr = "";
+                while (($result > 0) && ($offset < $lenStr)) {
+                    $result = index($_, "\\", $offset);
+                    if ($result == -1) {
+                        $partStr = substr($_, $offset);
+                        $newStr .= $partStr;
+                    } else {
+                        $partStr = substr($_, $offset, $result - $offset);
+                        $newStr .= $partStr;
+                        if (($result + 1) == $lenStr) {
+                            $newStr .= "\\";
+                        } else {
+                            $quoteResult = index($_, "\"", $result + 1);
+                            $nResult = index($_, "n", $result + 1);
+                            $rResult = index($_, "r", $result + 1);
+                            $tResult = index($_, "t", $result + 1);
+                            if ($quoteResult == ($result + 1)) {
+                                $newStr .= "\"\"";
+                            } elsif ($nResult == ($result + 1)) {
+                                $newStr .= "\\n";
+                            } elsif ($rResult == ($result + 1)) {
+                                $newStr .= "\\r";
+                            } elsif ($tResult == ($result + 1)) {
+                                $newStr .= "\\t";
+                            } else {
+                                $partStr = substr($_, $result + 1, 1);
+                                $newStr .= $partStr;
+                            }
+                        }
+                        $offset = $result + 2;
+                    }
+                }
+                $newStr .= "|\n";
+                print $OUT $newStr;
+            }
+            close $IN;
+            close $OUT;
+
+            unlink $fullPathFile;
+            copy $fullPathFileTmp, $fullPathFile;
+            unlink $fullPathFileTmp;
+        }
+        $numCopied = $numCopied + 1;
+        unless ($numCopied % 5) {
+            sleep(1);
+        }
+    }
+}
+
+sub flattenDir {
+    my ($fromDir, $toDir) = @_;
+
+    my $tableDir = "";
+    my $dataFile = "";
+    my $dataFile2 = "";
+    my $twoCharacterDir = "";
+    my $numCopied = 0;
+
+    chdir($fromDir) or die "Unable to enter dir $fromDir:$!\n";
+    opendir(DIR, ".") or die "Unable to open $fromDir:$!\n";
+    my @names = readdir(DIR) or die "Unable to read $fromDir:$!\n";
+    closedir(DIR);
+
+    foreach my $name (@names){
+        next if ($name eq ".");
+        next if ($name eq "..");
+
+        if (-d $name) {
+            $twoCharacterDir = $fromDir . "/" . $name;
+            chdir($twoCharacterDir);
+            opendir(DIR, ".");
+            my @names2 = readdir(DIR);
+            closedir(DIR);
+
+            foreach my $name2 (@names2){
+                next if ($name2 eq ".");
+                next if ($name2 eq "..");
+
+                if (-d $name2) {
+                    $tableDir = $twoCharacterDir . "/" . $name2;
+                    chdir($tableDir);
+                    $dataFile = $tableDir . "/" . "data.csv";
+                    $dataFile2 = $toDir . "/" . $name2 . ".csv";
+                    copy $dataFile, $dataFile2;
+                    unlink glob $tableDir . "/*";
+                }
+                chdir($twoCharacterDir);
+            }
+        }
+        chdir($fromDir);
+        $numCopied = $numCopied + 1;
+        unless ($numCopied % 5) {
+            sleep(1);
+        }
+    }
+}
+
+sub deleteOlderDirectories
+{
+    my($dirToStart) = @_;
+
+    my $cmd = "";
+    $cmd .= "find ";
+    $cmd .= $dirToStart;
+    $cmd .= " -type d -ctime +1 -exec rm -rf {} \\;";
+
+    system($cmd);
+}
+
+sub deleteOlderDirectoriesWith
+{
+    my($dirToStart, $startingWith) = @_;
+
+    my $cmd = "";
+    $cmd .= "find ";
+    $cmd .= $dirToStart;
+    $cmd .= "/";
+    $cmd .= $startingWith;
+    $cmd .= "*";
+    $cmd .= " -type d -ctime +1 -exec rm -rf {} \\;";
+
+    system($cmd);
+}
+
+main();
+

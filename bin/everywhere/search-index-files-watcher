@@ -1,0 +1,111 @@
+#!/usr/local/bin/perl -w
+
+# Following: S1 CR#1-C86163, we need to monitor number of search index files and alert if there are too many.
+# This query should be run for Buyer task servers and count number of directories under: /var/tmp/buyer/searchIndex
+# TMID: 150805
+
+use strict;
+use warnings;
+
+use lib "/usr/local/ariba/lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::CFEngine::MonitoringGlueUtils;
+
+my $indexDir = '/var/tmp/buyer/searchIndex';
+
+my $debug = 0;
+
+sub usage {
+	my $error = shift;
+
+	print <<USAGE;
+	Usage: $0 [-e|-p|-d|-h]
+
+	-e    Enables sending of email for monitor query.
+	-p    Enables sending of pages for monitor query.
+	-d    Turns on debug mode.
+	-h    Shows this help.
+
+USAGE
+
+	print "(error) $error\n" if ($error);
+
+	exit();
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $productName = 'buyer';
+
+	while (my $arg = shift) {
+		if ($arg =~ /^-h$/o) { usage();         next; }
+		if ($arg =~ /^-d$/o) { $debug++;        next; }
+		if ($arg =~ /^-e$/o) { $sendEmail++;    next; }
+		if ($arg =~ /^-p$/o) { $sendPage++;     next; }
+
+		usage("Invalid argument: $arg");
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $cluster = $me->currentCluster();
+	my $service = $me->service();
+	my $email = $me->default('notify.email');
+
+	my $machine = ariba::Ops::Machine->new();
+	my $hostname = $machine->hostname();
+
+	#my $monserver = ariba::Ops::CFEngine::MonitoringGlueUtils::monitorServer();
+	my $monserver;
+
+	my %queries;
+	
+	my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+	exit(0) unless @products;
+
+	for my $product (@products) {
+		next unless $product->name() eq $productName;
+
+		die "Not a buyertask role\n" unless $product->servesRoleInCluster($hostname, 'buyertask', $cluster);
+		
+		$monserver = ($product->hostsForRoleInCluster('monitor', $product->currentCluster()))[0];
+
+		$queries{"$hostname:$indexDir"} = {
+			'info'    => "!defined(answer) || answer eq '' || answer >= 0",
+			'warn'    => "answer >= 4",
+        	'crit'    => "answer >= 6",
+		    'perl'    => sub { return main::checkStatus(); },
+			'format'  => "%d\n",
+			'uiHint'  => "search-index-files",
+			'severity'    => 1,
+			'description' => "Number of search index versions on the local filesystem. If there are too many, this means that CatSearch nodes are not delteting the old index versions.",
+			'correctiveActions' => [
+				'Ops' => 'Check the disk usage on the box. If it is low, escalate',
+				'Engr' => 'Check why CatSearch nodes are not deleting old indexes properly',
+			],
+		};
+
+	}
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails(
+		"search-index-files-$hostname", $productName, $service, undef, \%queries);
+	$qm->setUiManager('catalog-status');
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monserver);
+}
+
+sub checkStatus() {
+	opendir my $dh, $indexDir or warn "Couldn't open $indexDir: $!\n";
+	my @indexDirs = readdir $dh;
+	print "@indexDirs\n" if $debug;
+	closedir $dh;
+	@indexDirs = grep { $_ !~ /^\.+$/ } @indexDirs;	# ignore . and ..
+	return(scalar(@indexDirs));
+}
+
+main(@ARGV);
+
+__END__

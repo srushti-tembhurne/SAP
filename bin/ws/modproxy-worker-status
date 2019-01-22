@@ -1,0 +1,164 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::rc::RolesManager;
+use Data::Dumper;
+use LWP::Simple;
+use YAML;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my %queries;
+    my $mon = ariba::rc::InstalledProduct->new(); # for emailing
+    my @wsProds = qw{ ssws mws };
+
+    foreach my $wsProd ( @wsProds ){
+        my $ws = ariba::rc::InstalledProduct->new( $wsProd, $mon->service());
+        next unless ( $ws->docRoot);
+
+        $queries{'modproxy worker status '.$wsProd} = {
+            warn                            => 'numrows > 0 and answer =~ /Warn/',
+            crit                            => 'numrows > 0 and answer =~ /Crit/',
+            ticketOnWarnOpenAfterMinutes    => 1,
+            perl                            => sub { return runQuery( $ws ); },
+            correctiveActions => [
+                Ops                         => 'Please look into the node on the webserver.',
+            ],
+            description                     => "modproxy worker status for given webserver, app, tasknode",
+	    timeout                         => 600,
+        };
+
+        my $email = $mon->default('notify.email');
+        my $qm = ariba::monitor::QueryManager->newWithDetails('modproxy-worker-status', $ws->name(), $ws->service(), $ws->customer(), \%queries);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+
+}
+
+sub runQuery {
+    my $ws = shift;
+    my $wsName = shift || 'ssws';
+    my $dataRef = {}; # holds data of nodes returing non-OK status
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+    
+    # the purpose of this tmpFile is to store the result from last run
+    # if node status is bad for 2 consecutive tries then we'll raise a crit.
+    my $tmpFile = "/tmp/modproxy-worker-status.tmp";
+    if ( -f $tmpFile ) {
+        $dataRef = eval{ YAML::LoadFile( $tmpFile ); };
+        $dataRef = {} unless ( $dataRef ); # if loading should fail, we can't leave $ref being undef
+    }
+
+    my $rolesMgr = ariba::rc::RolesManager->new( $ws->configDir(), $wsName, $ws->service(),  $ws->buildName() );
+    my $role = ( $wsName eq 'ssws' ) ? 'ss-webserver' : 'mwswebserver';
+    my @webservers = $rolesMgr->hostsForRoleInCluster( $role, "primary" );
+    my $port = $ws->default( "WebServerHTTPPort" );
+    my @answers;
+
+    for my $webserver ( @webservers ) {
+        my $url = "http://$webserver:$port/balancer-manager";
+        my $content = qx(curl -s $url | grep "href" | sed "s/<[^>]*>/ /g");
+        $query->setUrl( $url );
+        print "content: `$content` \n" if ($debug > 1);
+        unless ( $content ) {
+            push @answers, "Could not fetch mod proxy from $webserver: Warn";
+            next;
+        }
+        push @answers, parseAndUpdate( $dataRef, $content, $webserver );
+    }
+
+    YAML::DumpFile( $tmpFile, $dataRef );
+    return join( "\n", sort @answers );
+}
+
+sub  trim { my $s = shift; $s =~ s/^\s+|\s+$//g; return $s };
+sub  trimBraces { my $s = shift; $s =~ s/^\[+|\]+$//g; return $s };
+
+# This sub will parse HTML, update the reference, then populates warn / crit conditions into an array and return it.
+sub parseAndUpdate {
+    my ( $ref, $content, $webserver ) = @_;
+    my @lines = split( /\n/, $content );
+
+    my $app;
+    my @answers;
+
+    foreach(@lines)
+    {
+        my $line = trim($_);
+        my @a = split ' ', $line;
+        if (index($line, "LoadBalancer") == 0)
+        {
+            $app=trimBraces($a[-1]);
+        }
+        elsif (index($line, "https") == 0)
+        {
+            my $taskNode = $a[1];
+            my $status = $a[5];
+
+            next if ($taskNode eq "XX" || $taskNode eq "XX*XX");
+            
+            if ( my $prevStatus = $ref->{ $webserver }->{ $app }->{ $taskNode }->{ status } ) {
+                unless ( $prevStatus eq "Ok" || $prevStatus eq "Err" ) { # precautious check on inadvertent autovivification
+                    unless ( $status eq "Ok" || $status eq "Err" ) {
+                        push @answers, "Crit: $webserver $app $taskNode: $status";              # status wasn't OK / Recovering for two consecutive times
+                        $ref->{ $webserver }->{ $app }->{ $taskNode } = { status => $status };  # just in case the status may have changed from error1 to error2
+                        next;
+                    }
+                    else {
+                        delete $ref->{ $webserver }->{ $app }->{ $taskNode };
+                        next;
+                    }
+                }
+            }
+            else {
+                unless ( $status eq "Ok" || $status eq "Err" ) {
+                    #push @answers, "Warn: $webserver $app $taskNode: $status"; # status didn't exist and not OK or Recovering
+                    $ref->{ $webserver }->{ $app }->{ $taskNode } = { status => $status };
+                }
+            }
+        }
+        # print $line;
+    }
+    
+    return @answers;
+}
+
+main(@ARGV);
+
+__END__

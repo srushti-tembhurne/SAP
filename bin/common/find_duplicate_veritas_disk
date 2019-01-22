@@ -1,0 +1,170 @@
+#!/usr/local/bin/perl -w
+
+# $Id: $
+
+use strict;
+use FindBin;
+use lib "/usr/local/ariba/lib";
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Machine;
+
+my $debug = 0;
+my %influx_data = ();
+
+sub usage {
+	my $error = shift;
+
+	print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+	-e    Enables sending of email for monitor query.
+	-p    Enables sending of pages for monitor query.
+	-d    Turns on debug mode.
+	-h    Shows this help.
+
+USAGE
+
+	print "(error) $error\n" if ($error);
+
+	exit();
+}
+
+sub run {
+	my $cmd = shift;
+
+	print "Running $cmd\n" if ($debug);
+
+	open(STDERR, ">/dev/null"); # Avoid spew from STDERR
+	my $output = `$cmd`;
+
+	print "Output: $output\n" if ($debug);
+
+	return $output;
+}
+
+
+
+sub findDuplicateDisk {
+
+	my $cmd = 'vxdisk  -o alldgs -e list -q';
+
+	my $diskList = run($cmd);
+
+#	$diskList = <<EOF;
+#DEVICE       TYPE            DISK         GROUP        STATUS
+#cciss/c0d0   auto:none       -            -            online invalid
+#3pardata0_0  auto:cdsdisk    3pardata0_0  archbakdg    online thinrclm
+#3pardata0_0_1 auto:cdsdisk    3pardata0_0_1  ora507dg     online
+#3pardata0_0_2 auto:cdsdisk    3pardata0_0_2  ora507dg     online
+#3pardata0_0_3 auto:cdsdisk    3pardata0_0_3  ora507dg     online
+#3pardata0_0_4 auto:cdsdisk    -            (vxfendg)    online
+#3pardata0_0_5 auto:cdsdisk    -            (vxfendg)    online
+#3pardata0_0_6 auto:cdsdisk    -            (vxfendg)    online
+#3pardata0_0_7 auto:cdsdisk    3pardata0_0_7  ora507dg     online
+#3pardata0_0_8 auto:cdsdisk    3pardata0_0_8  ora507dg     online
+#3pardata0_0_9 auto:cdsdisk    3pardata0_0_9  ora507dg     online
+#3pardata0_0_10 auto:cdsdisk    3pardata0_0_10  ora507dg     online
+#3pardata0_0_11 auto:cdsdisk    3pardata0_0_11  ora507dg     online
+#3pardata0_0_12 auto:cdsdisk    3pardata0_0_12  ora507dg     online
+#3pardata0_0_13 auto:cdsdisk    3pardata0_0_13  ora507dg     online
+#3pardata0_0_14 auto:cdsdisk    3pardata0_0_14  ora507dg     online
+#3pardata0_0_15 auto:cdsdisk    3pardata0_0_15  ora507dg     online
+#3pardata0_0_16 auto:cdsdisk    3pardata0_0_16  ora507dg     online
+#3pardata0_0_17 auto:cdsdisk    3pardata0_0_17  ora507dg     online
+#3pardata0_0_18 auto:cdsdisk    3pardata0_0_18  archbakdg    error
+#3pardata0_0_18 auto:cdsdisk    -            -            error
+#3pardata0_0_19 auto:cdsdisk    3pardata0_0_19  ora507dg     online
+#3pardata0_0_20 auto:cdsdisk    3pardata0_0_20  oraadnocdg   online
+#3pardata0_0_21 auto:cdsdisk    3pardata0_0_21  ora507dg     online
+#3pardata0_0_23 auto:cdsdisk    3pardata0_0_23  ora507dg     online
+#3pardata0_0_24 auto:cdsdisk    3pardata0_0_24  ora507dg     online
+#
+#EOF
+	print "diskList : $diskList \n" if($debug);
+
+	my @disks;
+	if($diskList) {
+
+		foreach my $line (split(/\n/, $diskList)) {
+			next unless $line;
+			my @columns = split(/\s+/, $line);
+			push(@disks,$columns[0]);	
+		}
+
+		my %seen = ();
+		my @dup = map { 1==$seen{$_}++ ? $_ : () } @disks;
+		if(scalar(@dup) > 0) {
+			print "Duplicate Disk found : @dup \n" if($debug);
+			$influx_data{'data'}->{'result'} = "@dup";
+			return ("@dup");
+		}else {
+			print "No Duplicate Disk found \n" if($debug);
+			$influx_data{'data'}->{'result'} = "NONE";
+			return "NONE";
+		}
+	}
+
+
+
+
+}
+
+
+
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while (my $arg = shift) {
+		if ($arg =~ /^-h/o) { usage(); 			next; }
+		if ($arg =~ /^-d/o) { $debug++; 		next; }
+		if ($arg =~ /^-e/o) { $sendEmail = 1; 	next; }
+		if ($arg =~ /^-p/o) { $sendPage = 1; 	next; }
+
+		usage("Invalid argument: $arg");
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $service = $me->service();
+	my $machine = ariba::Ops::Machine->new();
+	my $datacenter = $machine->datacenter();
+	my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+	my %queries;
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+
+	$influx_data{'measurement'} = 'veritas_duplicate_disk';
+	$influx_data{'tags'} = { host => $hostname, service => $service, product => $datacenter};
+	
+
+	$queries {"Duplicate Veritas Disk in $hostname"} = {
+		crit => 'answer != NONE',
+		processAnswer  => sub { main::findDuplicateDisk() },		
+		correctiveActions => [
+                 	Ops => "Please notify SA Team",
+       		 ],
+
+	};
+
+
+	my $email = $me->default('notify.email');
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails('veritas-disk-state', $tab, $me->service(), $me->customer(), \%queries);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+	eval {
+			my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+			ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line);
+	};	
+}
+
+main(@ARGV);
+
+__END__
+

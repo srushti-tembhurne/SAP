@@ -1,0 +1,261 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::Product;
+use ariba::rc::Utils;
+use ariba::monitor::QueryManager;
+use ariba::Ops::ProcessTable;
+use ariba::monitor::OutageSchedule;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Machine;
+use Linux::Smaps;
+
+my $debug = 0;
+
+my $hostname = ariba::Ops::NetworkUtils::hostname();
+
+sub usage {
+    my $msg = shift;
+
+    print "Usage error: $msg\n\n" if $msg;
+
+    print "          [-customer <customer>]\n";
+    print "          [-service <service>]\n";
+    print "          [-product <product>]\n";
+    print "          [-d] Debug\n";
+    print "          [-e] Send email\n";
+    print "          [-p] Send page\n";
+
+    exit(1);
+}
+
+sub _appPidFromRowInPidFile {
+    my $row = shift;
+    my $pidFile = shift; 
+    my $pid; 
+
+    if (open(my $fh, "< $pidFile")) {
+        my @pids = <$fh>; 
+        close($fh);
+
+        chomp($pid = $pids[$row - 1]) if (scalar(@pids) >= $row);
+    }
+
+    return $pid;
+}
+
+sub appPidFromKrPidFile {
+    my $krPidFile = shift; 
+
+    return _appPidFromRowInPidFile(2, $krPidFile);
+}
+
+sub main {
+    my $sendEmail   = 1;
+    my $sendPage    = 0;
+    my $service     = undef;
+    my $productName;
+    my $customer;
+
+    while (my $arg = shift(@ARGV)) {
+        if( $arg =~ /^-e$/o )       { $sendEmail = 1; next; };
+        if( $arg =~ /^-p$/o )       { $sendPage = 1; next;};
+        if( $arg =~ /^-d$/o )       { $debug = 1; next;};
+        if( $arg =~ /^-customer$/o ){ $customer = shift(@ARGV); next;};
+        if( $arg =~ /^-service$/o  ){ $service = shift(@ARGV); next;};
+        if( $arg =~ /^-product$/o  ){ $productName = shift(@ARGV); next;};
+
+        usage("Invalid argument");
+    }
+
+    usage("Need a service") unless ($service);
+    usage("Need a product") unless ($productName);
+
+    my ($product) = ariba::rc::InstalledProduct->installedProductsList($service, $productName, $customer);
+
+    my %pidToNodeMap = ();
+    my @pidList = ();
+
+    $customer = $product->customer();
+
+    my %queries  = ();
+    my %computingQueries  = ();
+
+    # Walk the process table.
+    my $processTable = ariba::Ops::ProcessTable->new();
+    my $instanceName = 'flume-tail-agent';
+    my $name = 'FlumeTailAgent'.'@'.$hostname;
+  
+    my $processStatus;
+    my $uiHint = "LTA-".$hostname;
+
+    my $pid = getPidforProcess($instanceName);
+    if (defined $pid){
+        $processStatus = 'up';
+    }else {
+        print "$instanceName is not running on $hostname\n";
+        $processStatus = 'down';
+    }
+
+    $queries{"$name"} = {
+        info       => "answer =~ /up/i",
+        crit       => "answer =~ /down/i",
+        severity   => 1,
+        staleInterval => 600,   # don't go stale for 10 minutes
+        perl       => sub { return $processStatus; },
+        uiHint     => $uiHint,
+    };
+
+    # fill in
+    my $procData = $processTable->dataForProcessID($pid);
+
+    # maxheap
+    ##my $maxMemory = int($instance->maxInstanceMemory() / 1024);
+    my $maxMemory = 1024*1024;   ##TBL need to check             
+
+    if (defined $procData->{'privateMemSize'}) {
+
+        my $warn = $maxMemory;
+        my $crit = $maxMemory * 1.20;
+
+        $queries{"$name RSS mem size in KBytes"} = {
+            'recordMaxResults' => 20000,
+            'recordDataType' => 'gauge',
+            'recordOnError' => 1,
+            'uiHint' => $uiHint,
+            'info' => 'answer > -1',
+            'warn' => "answer >= $crit",
+            'perl' => "return $procData->{'privateMemSize'}",
+        };
+
+        if( -r "/proc/$pid/smaps") {
+            my $smap = Linux::Smaps->new($pid);
+            my $privateMemory = $smap->private_clean + $smap->private_dirty;
+            my $sharedMemory = $smap->shared_clean + $smap->shared_dirty;
+
+            $queries{"$name private mem size in KBytes"} = {
+                'recordMaxResults' => 20000,
+                'recordDataType' => 'gauge',
+                'recordOnError' => 1,
+                'uiHint' => $uiHint,
+                'info' => 'answer > -1',
+                'warn' => "answer >= $warn",
+                'perl' => "return $privateMemory",
+            };
+
+            $queries{"$name shared mem size in KBytes"} = {
+                'recordMaxResults' => 20000,
+                'recordDataType' => 'gauge',
+                'recordOnError' => 1,
+                'uiHint' => $uiHint,
+                'info' => 'answer > -1',
+                'perl' => "return $sharedMemory",
+            };
+        }
+    }
+    if ($procData->{'time'}) {
+
+        my $samples   = 4;
+        my $warn      = 25;
+        my $crit      = 40;
+        my $queryName = "$name CPU time used";
+
+        # Flume uses a lot of cpu as it tails thousands of files    
+        if ($name =~ /^Flume-/i) {
+            $warn = 40; 
+            $crit = 70;
+        }
+
+        $queries{$queryName} = {
+            'recordMaxResults' => 20000,
+            'recordDataType' => 'counter',
+            'perl' => "return $procData->{'time'} / getCpuCount() / 10000.0",
+            'uiHint' => "ignore",
+            'info' => 'answer > -1',
+            'recordDataUnits' => "per sec",
+            'recordOnError' => 1,
+        };
+
+        my $cdbName = ariba::monitor::Query->generateInstanceName($queryName, $product->name(), 
+                                   $product->customer(),$product->currentCluster());
+
+        $computingQueries{"$name percent CPU usage "} = {
+            'uiHint' => $uiHint,
+            'info' => 'answer > -1',
+            'crit' => "answer >= $crit",
+            'warn' => "answer >= $warn",
+            'extractRecorded'=> "average($cdbName, +3)",
+            'format' => "%.2f%%",
+        };
+
+        $pidToNodeMap{ $name } = $pid;
+    }
+
+    exit unless(keys(%queries));
+
+    my $email = $product->default('ops.notify.email') || $product->default('notify');
+    my $monserver = ($product->hostsForRoleInCluster('monitor', $product->currentCluster()))[0];
+
+    my $q = ariba::monitor::QueryManager->newWithDetails("Flume Tail Agent",$productName, $product->service(), $product->customer(), $product->currentCluster(), \%queries);
+    $q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monserver);
+
+    my $computingQM = ariba::monitor::QueryManager->newWithDetails("Flume Tail Agent",$productName, $product->service(),$product->customer(), $product->currentCluster(), \%computingQueries);
+    $computingQM->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monserver);
+
+    my  @queryObjList = $computingQM->queries();
+
+    foreach  my $tmpQueryObj ( @queryObjList ) {
+        my $status = $tmpQueryObj->status();
+        if ( $status =~ /crit/i  )  {
+            my $nodeName = ((split (" ", $tmpQueryObj->queryName() ))[0]);
+            my $pid = $pidToNodeMap{ $nodeName };
+            push ( @pidList,$pid ) ;
+        }
+    }
+
+    if ( @pidList ) {
+        takeThreadDump( \@pidList );
+    }
+}
+
+sub getCpuCount() {
+    my $me = ariba::Ops::Machine->new($hostname);
+    return $me->cpuCount() || 1;
+}
+
+sub takeThreadDump() {
+
+    my $pidListRef = shift;
+    my $signal = 3;
+
+    for ( my $tmpItr = 1 ; $tmpItr <= 3; $tmpItr++ ) {
+        foreach my $tmpPid ( @$pidListRef ) {
+            ariba::Ops::ProcessTable->sendSignal( $tmpPid, $signal );
+        }
+        sleep(30);
+    }
+}
+
+sub getPidforProcess{
+    my $name = shift;
+
+    my $cmd = "ps -ef|grep $name|grep -v grep";
+    my @output;
+    ariba::rc::Utils::executeLocalCommand($cmd, undef, \@output, undef, 1);
+
+    return unless($output[0]);
+    my (undef,$pid) = split ('\s+', $output[0]);
+
+    return $pid;
+}
+
+main();
+
+__END__

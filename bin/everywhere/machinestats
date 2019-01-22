@@ -1,0 +1,139 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+
+use lib "/usr/local/ariba/lib";
+
+use ariba::Ops::Utils;
+use ariba::Ops::DateTime;
+
+# We want to grab the basic performance stats in one report
+# tmid: 154210
+
+sub usage {
+	my $error = shift;
+
+	print <<USAGE;
+Usage: $0 [-f <output_file>] [-e <email_address>]
+       By default, the tool will save report to a file in the current dir. Use:
+         -f  to override the filename
+         -e  send report as email
+
+USAGE
+
+	print "(error) $error\n" if ($error);
+	exit();
+}
+
+sub main {
+	my ($sendEmail, $emailAddress, $fileName);
+
+	while (my $arg = shift) {
+		if ($arg =~ /^-h$/o) { usage(); next; }
+		if ($arg =~ /^-e$/o) { $sendEmail = 1; $emailAddress = shift; next; }
+		if ($arg =~ /^-f$/o) { $fileName = shift; next; }
+
+		usage("Invalid argument: $arg");
+	}
+
+	# Not too much output.
+	my @commands = (
+		'/usr/bin/uptime',              # uptime, load average (free)
+		'/usr/bin/free',	        # overall memory usage (buffer, used, etc), swap usage
+		'/usr/bin/vmstat 5 2',          # paging (vmstat) (two runs)
+		'/usr/bin/iostat 5 2',          # iostat (all devices, show filesystems, two runs)
+		'/bin/ps -el',                  # processes stats
+		'/bin/ps -e -o args,pid,pcpu,rss,uid,start,time,stat,sz,wchan',  # processes stats
+		'/bin/netstat -an --program',   # show network connections
+	);
+
+	my $hostname = `hostname`;
+	chomp($hostname);
+	my $header = "# machinestats report for $hostname\n";
+	my $separator = "\n# ===== " . localtime() . " ======\n";
+
+	print "Generating the report...\n";
+	my $report = $header . $separator . "Start script\n";
+
+	# Execute the commands.
+	foreach my $command (@commands) {
+		$report .= $separator;
+		$report .= "# $command\n\n";
+		$report .= `$command`;
+	}
+
+	# tmid 202385
+	# Include gstack info for hana server processes.
+	my $psResult = `/bin/ps auxww | /bin/grep "hdb" | /bin/grep "server" | /bin/grep -v "grep" | /usr/bin/awk '{ print \$2  }'`;
+	my @pidList = split("\n", $psResult);
+	if (@pidList > 0) {
+		$report .= $separator . "# gstack info, hana server pid count=" . @pidList . "\n";
+
+		# Check if user is 'root'.
+		if ( $< != 0 ) {
+			print "\nRe-execute this script as root user to get gstack info for hana server processes\n\n"; 
+			$report .= "\nNote: user not root\n";
+		}
+
+		foreach my $pid (@pidList) {
+			$report .= "\npid=$pid\n";
+			$report .= `/usr/bin/gstack $pid`;
+		}
+	}
+
+	# tmid 179456
+	# Include pstack info for http processes.
+	$psResult = `/bin/ps auxww | /bin/grep "httpd" | /bin/grep -v "grep" | /usr/bin/awk '{ print \$2  }'`;
+	@pidList = split("\n", $psResult);
+	$report .= $separator . "# pstack info, http pid count=" . @pidList . "\n";
+	foreach my $pid (@pidList) {
+		$report .= "\npid=$pid\n";
+		$report .= `/usr/bin/pstack $pid`;
+	}
+
+	# Execute lsof command which can be in '/usr/sbin/lsof' or '/usr/bin/lsof'
+	# Options to include: -n
+	my $lsofCommand = '/usr/sbin/lsof';
+	if (! -x $lsofCommand) {
+		$lsofCommand = '/usr/bin/lsof';
+	}
+	if (! -x $lsofCommand) {
+		$report .= $separator;
+		$report .= "# Error:  lsof program not found\n\n";
+	}
+	else {
+		$report .= $separator;
+		$report .= "# $lsofCommand -n\n\n";
+		$report .= `$lsofCommand -n`;
+	}
+
+	$report .= "$separator" . "End script\n";
+
+	if ($sendEmail) {
+		print "Sending the report to: $emailAddress\n";
+
+		my $from = 'nobody@ariba.com';
+		my $to = $emailAddress;
+		my $subj = $header;
+		my $body = $report;
+		my $cc;
+		my $replyto = $from;
+		
+		ariba::Ops::Utils::email($to, $subj, $body, $cc, $from, $replyto);
+
+	} else {
+		$fileName = $fileName || 'machinestats-' . $hostname . '-' . ariba::Ops::DateTime::datestamp() . '.txt';
+		print "Saving report to $fileName\n";
+
+		open my $fh, '>', $fileName or die "Can't open $fileName: $!\n";
+		print $fh $report;
+		close $fh;
+	}
+	
+	print "Done\n";
+}
+
+main(@ARGV);
+
+__END__

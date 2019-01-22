@@ -1,0 +1,152 @@
+#!/usr/local/bin/perl
+#
+# $Id: $
+#
+# cron script to get iptables rule counts from safeguard.ariba.com.
+# This information is useful mainly for System Admins.
+# safeguard.ariba.com POSTs via HTTPS the rule count every hour to ops.ariba.com
+# the rule count is retrieved from ops.ariba.com via HTTPS. 
+#
+
+use strict;
+use warnings;
+
+use File::Basename;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+use ariba::Ops::Constants;
+use ariba::Ops::Logger;
+use ariba::Ops::ServiceController;
+use ariba::rc::InstalledProduct;
+
+use Data::Dumper;
+
+use POSIX qw{ strftime };
+
+my $debug = 0;
+
+# Set up logger
+my $logger = ariba::Ops::Logger->logger();
+my $log_dir = ariba::Ops::Constants->toolsLogDir();
+my $log_filename = "$log_dir/check-iptables-count.log";
+$logger->setLogFile($log_filename);
+# append to logger file
+my $LOGGER;
+open $LOGGER, '>>', $log_filename;
+$logger->setFh($LOGGER);
+# dont print to screen
+$logger->setQuiet(1);
+
+sub main {
+
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    # Queries object
+    my %q;
+
+    while(my $arg = shift) {
+        if($arg =~ /^-d$/i) { $debug++; }
+        if($arg =~ /^-e$/i) { $sendEmail=1; }
+        if($arg =~ /^-p$/i) { $sendPage=1; }
+    }
+
+    my $me = ariba::rc::InstalledProduct->new('mon');
+
+    my $service = $me->service();
+    my $date = strftime("%Y-%m-%d", localtime());
+
+    $logger->info("Started check-iptables-count debug: $debug");
+
+    my $post_str = "";
+    my $rule_count = call_wget( \$post_str );
+    $logger->info("Iptables rules count: $rule_count");
+
+    my $warn_count = 30000;
+    my $crit_count = 40000;
+
+    if(ariba::Ops::ServiceController::isProductionServicesOnly($service)) {
+        $logger->debug("Getting iptables count") if $debug;
+        $q{'Safeguard iptables rules count'} = {
+            perl => sub { return $rule_count; },
+            info => "defined(answer) && answer < $warn_count",
+            warn => "!defined(answer) || answer >= $warn_count",
+            crit => "defined(answer) && answer >= $crit_count",
+            recordMaxResults => 4000,
+        };
+    }
+
+    # Create monitoring tab and display the queries
+    my $tab = "mon";
+    my $email = $me->default('notify.email');
+    my $qm = ariba::monitor::QueryManager->newWithDetails("safeguard", $tab, $me->service(), $me->customer(), \%q);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+    $logger->info("Completed check-iptables-count debug: $debug");
+
+    exit 0;
+}
+
+
+# call_wget - perform wget with post data string referenced by $post_str_ref
+sub call_wget {
+    my ($post_str_ref) = @_;
+
+    my $post_file_name = '/var/tmp/count_post_file';
+    my $ret_file_name = '/var/tmp/count_ret_file';
+    my $POSTFILE;
+
+    my $status_str;
+
+    # open file with the POST data
+    if (!open $POSTFILE, '>', $post_file_name) {
+         $status_str = "Couldn't open '$post_file_name' for write: $!";
+         $logger->error($status_str);
+         return '';
+    }
+
+    print $POSTFILE $$post_str_ref;
+    close $POSTFILE;
+
+    my @output = ();
+    # don't print command out to the screen
+    $main::quiet = 1;
+    my $centaurus_ip_addr = '10.163.2.39';
+    my $program = 'get_rule_count';
+    my $command = "wget --no-check-certificate https://$centaurus_ip_addr/cgi-bin/$program " .
+                      "--output-document=$ret_file_name";
+    ariba::rc::Utils::executeLocalCommand($command, undef, \@output, undef, 1);
+
+    # check for a 200 status for the wget
+    my $is_ok = 0;
+    foreach my $line (@output) {
+        if ( $line =~ /200 OK/ ) {
+            $is_ok = 1;
+        }
+    }
+    if (!$is_ok) {
+        $status_str = "Did not receive 200 OK from wget to centaurus";
+        $logger->error($status_str);
+    }
+
+    # open up the response from centaurus
+    my $RETFILE;
+    if (!open $RETFILE, '<', $ret_file_name) {
+        my $status_str = "Couldn't open '$post_file_name' for read: $!";
+        $logger->error($status_str);
+        return '';
+    }
+    my $ret_str = <$RETFILE>;
+    close $RETFILE;
+
+    return $ret_str;
+
+}
+
+main(@ARGV);
+
+

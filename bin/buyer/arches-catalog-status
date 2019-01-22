@@ -1,0 +1,574 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/buyer/arches-catalog-status#11 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::AQLConnection;
+use ariba::Ops::AQLClient;
+use ariba::monitor::OutageSchedule;
+use XML::XPath;
+use Time::Local;
+
+my $maxResults = 35040; # one year running 4 times an hour
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -metrics Run queries for search client and publish metrics
+    -errors  Run queries for per-realm publish errors
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $quiet = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $metrics = 0;
+    my $errors = 0;
+
+    while(my $arg=shift(@ARGV)) {
+            print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+            if ($arg =~ /^-metrics/o) { $metrics = 1; };
+            if ($arg =~ /^-errors/o) { $errors = 1; };
+            if ($arg =~ /^-d/o) { $debug = 1; };
+            if ($arg =~ /^-e/o) { $sendEmail = 1; };
+            if ($arg =~ /^-p$/o) { $sendPage = 1; };
+    }
+
+    usage("-metrics or -errors required") unless $metrics || $errors;
+    usage("-metrics or -errors required, not both") if $metrics && $errors;
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+    my $email = $me->default('notify.email');
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList($service, "buyer");
+    unless (@products) {
+        exit(0);
+    }
+
+    for my $product (@products) {
+        my $skip = 0;
+        my %queries  = ();
+        my $outage = ariba::monitor::OutageSchedule->new('daily 22:00-02:00');
+        my $globalTaskChecked = 0;
+    
+        for my $instance ($product->appInstancesInCluster($cluster)) {
+            my $instanceName = $instance->instanceName();
+            $instanceName .= ", " . $instance->logicalName() if $instance->logicalName();
+            my $community = $instance->community();
+            my $serverRoles = $instance->serverRoles();
+
+            my $instanceIsUI;
+            my $instanceIsGlobalTask;
+
+            if ($serverRoles =~ m|AribaUI|) {
+                $instanceIsUI = 1;
+            } elsif ($serverRoles =~ m|GlobalTask|) {
+                $instanceIsGlobalTask = 1;
+            }
+
+            unless ($instanceIsUI || $instanceIsGlobalTask) {
+                next;
+            }
+
+            my $uiHint;
+            if ($community) {
+                $community = "community $community";
+            } else {
+                $community = "default community";
+            }
+            $uiHint = "$community/" . $instance->appName();
+
+            my $testSearchClientUrl = $instance->archesCatalogSearchClientStatusMonitorURL();
+            my $testPublishMetricsUrl = $instance->archesCatalogPublishMetricsMonitorUrl();
+            my $testPerRealmPublishUrl = $instance->archesCatalogPerRealmPublishMonitorUrl();
+
+            if ($instanceIsUI && $metrics) {
+                print "$instanceName (client search) = $testSearchClientUrl\n" if ($debug);
+                my $searchClientStatus = fetchUrl($testSearchClientUrl);
+
+                my ( $averageSearchTime, $ninetyPercentileSearchTime, $searchCount, $slowSearchCount,
+                        $failedSearchCount, $averageTypeaheadSearchTime, $ninetyPercentileTypeaheadSearchTime,
+                        $typeaheadSearchCount, $slowTypeaheadSearchCount, $failedTypeaheadSearchCount);
+
+                my $severity = undef;
+                my $format = undef;
+                my $globalTaskChecked = 0;
+                my $slowSearchCountPercent = 0;
+                my $failedSearchCountPercent = 0;
+                my $slowTypeaheadSearchCountPercent = 0;
+                my $failedTypeaheadSearchCountPercent = 0;
+
+                if($searchClientStatus->error()) {
+                    my $urlError;
+                    my $error = $searchClientStatus->error();
+                    chomp($error);
+                    if( $searchClientStatus->isDown() ) {
+                        $urlError = "This node is currently unreachable [$error]";
+                    } else {
+                        $urlError = "Error: $error";
+                    }
+
+                    $averageSearchTime = $urlError;
+                    $ninetyPercentileSearchTime = $urlError;
+                    $searchCount = $urlError;
+                    $slowSearchCount = $urlError;
+                    $failedSearchCount = $urlError;
+                    $averageTypeaheadSearchTime = $urlError;
+                    $ninetyPercentileTypeaheadSearchTime = $urlError;
+                    $typeaheadSearchCount = $urlError;
+                    $slowTypeaheadSearchCount = $urlError;
+                    $failedTypeaheadSearchCount = $urlError;
+                } else {
+                    $averageSearchTime = $searchClientStatus->averageSearchTime();
+                    $ninetyPercentileSearchTime = $searchClientStatus->NinetyPercentileSearchTime();
+                    $searchCount = $searchClientStatus->searchCount();
+                    $slowSearchCount = $searchClientStatus->slowSearchCount();
+                    $failedSearchCount = $searchClientStatus->failedSearchCount();
+                    $averageTypeaheadSearchTime = $searchClientStatus->averageTypeaheadSearchTime();
+                    $ninetyPercentileTypeaheadSearchTime = $searchClientStatus->ninetyPercentileTypeaheadSearchTime();
+                    $typeaheadSearchCount = $searchClientStatus->typeaheadSearchCount();
+                    $slowTypeaheadSearchCount = $searchClientStatus->slowTypeaheadSearchCount();
+                    $failedTypeaheadSearchCount = $searchClientStatus->failedTypeaheadSearchCount();
+
+                    #
+                    # Calculate percentage
+                    #
+                    if ($slowSearchCount > 0 && $searchCount > 0) {
+                        $slowSearchCountPercent = ($slowSearchCount / $searchCount) * 100;
+                    }
+                    if ($failedSearchCount > 0 && $searchCount > 0) {
+                        $failedSearchCountPercent = ($failedSearchCount / $searchCount) * 100;
+                    }
+                    if ($slowTypeaheadSearchCount > 0 && $typeaheadSearchCount > 0) {
+                        $slowTypeaheadSearchCountPercent = ($slowTypeaheadSearchCount / $typeaheadSearchCount) * 100;
+                    }
+                    if ($failedTypeaheadSearchCount > 0 && $typeaheadSearchCount > 0) {
+                        $failedTypeaheadSearchCountPercent = ($failedTypeaheadSearchCount / $typeaheadSearchCount) * 100;
+                    }
+                }
+
+                $queries{"$instanceName Average Search Time"} = {
+                    'uiHint' => $uiHint,
+                    'format' => '%.2f ms',
+                    #'crit' => 'answer =~ /^Error/i || (answer > 1000 && previousAnswer > 1000)',
+                    'crit' => '(answer =~ /^Error/i && previousAnswer =~ /^Error/i  && answer !~ /0.00 ms/i) || (answer > 1000 && previousAnswer > 1000)',
+		    'warn' => 'answer =~/warning/i',
+                    'severity' => 2,
+                    'perl' => sub { $averageSearchTime },
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType' => 'gauge',
+                    'recordItem' => 'answer',
+                    'correctiveActions' => [
+                        Ops => "Raise a defect with engineering",
+                    ],
+                };
+
+                $queries{"$instanceName Ninety Percentile Search Time"} = {
+                    'uiHint' => $uiHint,
+                    'format' => '%.2f ms',
+                    #'crit' => 'answer =~ /^Error/i || (answer > 4000 && previousAnswer > 4000)',
+                    'crit' => '(answer =~ /^Error/i && previousAnswer =~ /^Error/i  && answer !~ /0.00 ms/i) || (answer > 1000 && previousAnswer > 1000)',
+		    'warn' => 'answer =~/warning/i',
+                    'severity' => 2,
+                    'perl' => sub { $ninetyPercentileSearchTime },
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType' => 'gauge',
+                    'recordItem' => 'answer',
+                };
+
+                $queries{"$instanceName Search Count"} = {
+                    'uiHint' => $uiHint,
+                    'perl' => sub { $searchCount },
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType' => 'gauge',
+                    'recordItem' => 'answer',
+                };
+
+                $queries{"$instanceName Slow Search Count"} = {
+                    'uiHint' => $uiHint,
+                    'perl' => sub { $slowSearchCount},
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType' => 'gauge',
+                    'recordItem' => 'answer',
+                };
+
+                $queries{"$instanceName Slow Search Count Percent"} = {
+                    'uiHint' => $uiHint,
+                    'format' => '%.2f%%',
+                    'perl' => sub { $slowSearchCountPercent },
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType' => 'gauge',
+                    'recordItem' => 'answer',
+                };
+
+                $queries{"$instanceName Failed Search Count"} = {
+                    'uiHint' => $uiHint,
+                    #'crit' => 'answer =~ /^Error/i || (answer > 20 && previousAnswer > 20)',
+                    'crit' => '(answer =~ /^Error/i && previousAnswer =~ /^Error/i  && answer !~ /This node is currently unreachable/i) || (answer > 1000 && previousAnswer > 1000)',
+		    'warn' => 'answer =~/warning/i',
+                    'severity' => 2,
+                    'perl' => sub { $failedSearchCount },
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType' => 'gauge',
+                    'recordItem' => 'answer',
+                    'correctiveActions' => [
+                        Ops => "Raise a defect with engineering",
+                    ],
+                };
+
+                $queries{"$instanceName Failed Search Count Percent"} = {
+                    'uiHint' => $uiHint,
+                    'format' => '%.2f%%',
+                    'perl' => sub { $failedSearchCountPercent },
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType' => 'gauge',
+                    'recordItem' => 'answer',
+                };
+
+                $queries{"$instanceName Average Type Ahead Search Time"} = {
+                    'uiHint' => $uiHint,
+                    'format' => '%.2f ms',
+                    #'crit' => 'answer =~ /^Error/i || (answer > 300 && previousAnswer > 300)',
+                    'crit' => '(answer =~ /^Error/i && previousAnswer =~ /^Error/i  && answer !~ /0.00 ms/i) || (answer > 1000 && previousAnswer > 1000)',
+                    'severity' => 2,
+                    'perl' => sub { $averageTypeaheadSearchTime },
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType' => 'gauge',
+                    'recordItem' => 'answer',
+                    'correctiveActions' => [
+                        Ops => "Raise a defect with engineering",
+                    ],
+                };
+
+                $queries{"$instanceName Ninety Percentile Type Ahead Search Time"} = {
+                    'uiHint' => $uiHint,
+                    'format' => '%0.2f ms',
+                    #'crit' => 'answer =~ /^Error/i || (answer > 1000 && previousAnswer > 1000)',
+                    'crit' => '(answer =~ /^Error/i && previousAnswer =~ /^Error/i && answer !~ /0.00 ms/i) || (answer > 1000 && previousAnswer > 1000)',
+		    'warn' => 'answer =~/warning/i',
+                    'severity' => 2,
+                    'perl' => sub { $ninetyPercentileTypeaheadSearchTime },
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType' => 'gauge',
+                    'recordItem' => 'answer',
+                    'correctiveActions' => [
+                        Ops => "Raise a defect with engineering",
+                    ],
+                };
+
+                $queries{"$instanceName Type Ahead Search Count"} = {
+                    'uiHint' => $uiHint,
+                    'perl' => sub { $typeaheadSearchCount },
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType' => 'gauge',
+                    'recordItem' => 'answer',
+                };
+
+                $queries{"$instanceName Slow Type Ahead Search Count"} = {
+                    'uiHint' => $uiHint,
+                    'perl' => sub { $slowTypeaheadSearchCount},
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType' => 'gauge',
+                    'recordItem' => 'answer',
+                };
+
+                $queries{"$instanceName Slow Type Ahead Search Count Percent"} = {
+                    'uiHint' => $uiHint,
+                    'format' => '%.2f%%',
+                    'perl' => sub { $slowTypeaheadSearchCountPercent },
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType' => 'gauge',
+                    'recordItem' => 'answer',
+                };
+
+                $queries{"$instanceName Failed Type Ahead Search Count"} = {
+                    'uiHint' => $uiHint,
+                    #'crit' => 'answer =~ /^Error/i || (answer > 20 && previousAnswer > 20)',
+                    'crit' => '(answer =~ /^Error/i && previousAnswer =~ /^Error/i && answer !~ /This node is currently unreachable/i) || (answer > 1000 && previousAnswer > 1000)',
+		    'warn' => 'answer =~/warning/i',
+                    'severity' => 2,
+                    'perl' => sub { $failedTypeaheadSearchCount },
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType' => 'gauge',
+                    'recordItem' => 'answer',
+                    'correctiveActions' => [
+                        Ops => "Raise a defect with engineering",
+                    ],
+                };
+
+                $queries{"$instanceName Failed Type Ahead Search Count Percent"} = {
+                    'uiHint' => $uiHint,
+                    'format' => '%.2f%%',
+                    'perl' => sub { $failedTypeaheadSearchCountPercent },
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType' => 'gauge',
+                    'recordItem' => 'answer',
+                };
+            }
+
+#
+# Sample output of archesClientStatus
+# QA service: http://app1010.lab1.ariba.com:24507/Buyer/Main/ad/archesClientStatus/BuyerMonitorActions?awpwd=awpwd
+# <xml>
+# <AverageSearchTime>0.0</AverageSearchTime>
+# <NinetyPercentileSearchTime>-1</NinetyPercentileSearchTime>
+# <SearchCount>0</SearchCount>
+# <SlowSearchCount>0</SlowSearchCount>
+# <FailedSearchCount>0</FailedSearchCount>
+# <AverageTypeaheadSearchTime>0.0</AverageTypeaheadSearchTime>
+# <NinetyPercentileTypeaheadSearchTime>-1</NinetyPercentileTypeaheadSearchTime>
+# <TypeaheadSearchCount>0</TypeaheadSearchCount>
+# <SlowTypeaheadSearchCount>0</SlowTypeaheadSearchCount>
+# <FailedTypeaheadSearchCount>0</FailedTypeaheadSearchCount>
+# </xml>
+#
+
+            if ($instanceIsGlobalTask) {
+                next if $globalTaskChecked;
+
+                if ($metrics) {
+                    print "$instanceName (publish metrics) = $testPublishMetricsUrl\n" if ($debug);
+                    my $publishMetrics = fetchUrl($testPublishMetricsUrl);
+
+                    my ( $oldestPendingPublish, $pendingPublishCount, $failedPublishCount, $hoursDiff);
+
+                    my $severity = undef;
+                    my $slowSearchCountPercent = 0;
+                    my $failedSearchCountPercent = 0;
+                    my $slowTypeaheadSearchCountPercent = 0;
+                    my $failedTypeaheadSearchCountPercent = 0;
+
+                    if($publishMetrics->error()) {
+                        my $urlError;
+                        my $error = $publishMetrics->error();
+                        chomp($error);
+                        if( $publishMetrics->isDown() ) {
+                            $urlError = "Error: This node is currently unreachable [$error]";
+                        } else {
+                            $urlError = "Error: $error";
+                        }
+
+                        $oldestPendingPublish = $urlError;
+                        $pendingPublishCount = $urlError;
+                        $failedPublishCount = $urlError;
+                    } else {
+                        $oldestPendingPublish = $publishMetrics->oldestPendingPublish();
+                        $pendingPublishCount = $publishMetrics->pendingPublishCount();
+                        $failedPublishCount = $publishMetrics->failedPublishCount();
+
+                        if ($oldestPendingPublish) {
+                            # sample time returned from DA, in millisecods: 1412634373000
+                            # need to convert seconds
+
+                            my $now = time();
+                            $hoursDiff = ($now - ($oldestPendingPublish / 1000)) / (60 * 60);
+                        }
+                    }
+
+                    $queries{"Oldest Pending Publish"} = {
+                        'uiHint' => $uiHint,
+                        'format' => '%d hours ago',
+                        #'crit' => 'answer =~ /^Error/i || (answer > 23 && previousAnswer > 23)',
+                        'crit' => '(answer =~ /^Error/i && previousAnswer =~ /^Error/i ) || (answer > 1000 && previousAnswer > 1000)',
+		    	'warn' => 'answer =~/warning/i',
+                        'severity' => 2,
+                        'perl' => sub { $hoursDiff; },
+                        'recordMaxResults' => $maxResults,
+                        'recordDataType' => 'gauge',
+                        'recordItem' => 'answer',
+                        'correctiveActions' => [
+                            Ops => "Raise a defect with engineering",
+                        ],
+                    };
+
+                    $queries{"Pending Publish Count"} = {
+                        'uiHint' => $uiHint,
+                        'perl' => sub { $pendingPublishCount},
+                        'recordMaxResults' => $maxResults,
+                        'recordDataType' => 'gauge',
+                        'recordItem' => 'answer',
+                    };
+
+                    $queries{"Failed Publish Count"} = {
+                        'uiHint' => $uiHint,
+                        'perl' => sub { $failedPublishCount },
+                        'recordMaxResults' => $maxResults,
+                        'recordDataType' => 'gauge',
+                        'recordItem' => 'answer',
+                    };
+                }
+
+                if ($errors) {
+                    print "$instanceName (per realm publish): $testPerRealmPublishUrl\n" if ($debug);
+                    my ($error, $xp) = processUrl($testPerRealmPublishUrl);
+                    my $realmsErrorsSet = $xp->find("//Realm") unless $error;
+                    my %allRealmsErrors = ();
+
+                    unless ($error) {
+                        my $errorResults;
+                        my $crit;
+
+                        foreach my $node ($realmsErrorsSet->get_nodelist) {
+                            my $id =  $node->getAttribute('ID');
+                            my $realmSet = $xp->find("//Realm[\@ID='".$id."']/*") unless $error;
+                            foreach my $rs ($realmSet->get_nodelist) {
+                                my $value = $rs->string_value;
+                                $allRealmsErrors{$id}{'ErrorCount'} = $value;
+                            }
+                        }
+                        foreach my $r ( keys %allRealmsErrors) {
+                            my $results = $allRealmsErrors{$r}{'ErrorCount'};
+
+                            if ($results > 0) {
+                                $errorResults .= "$r: $results\n";
+                                $crit = 1;
+                            }
+                        }
+
+                        $queries{"Realms with errors"} = {
+                            'uiHint' => $uiHint,
+                            'crit' =>  "numrows > 3",
+                            'severity' => 2,
+                            'perl' => sub { return $errorResults },
+                            'correctiveActions' => [
+                                Ops => "Raise a defect with engineering",
+                            ],
+                        };
+                    }
+                }
+                $globalTaskChecked = 1;
+            }
+        }
+#
+# Sample output of publishStatus 
+# QA service: http://app1010.lab1.ariba.com:24510/Buyer/Main/ad/publishStatus/BuyerMonitorActions?awpwd=awpwd
+# <xml>
+# <OldestPendingPublish>Fri Sep 26 16:09:27 PDT 2014</OldestPendingPublish>
+# <PendingPublishCount>0</PendingPublishCount>
+# <FailedPublishCount>0</FailedPublishCount>
+# </xml>
+#
+# Sample out put of publishErrorsPerRealm
+# QA service: http://app1010.lab1.ariba.com:24510/Buyer/Main/ad/publishErrorsPerRealm/BuyerMonitorActions?awpwd=awpwd
+# <Realm ID="mm-p2pTeSap">
+# <ErrorCount>0</ErrorCount>
+# </Realm>
+# <Realm ID="CSRealmTest21">
+# <ErrorCount>0</ErrorCount>
+# </Realm>
+# <Realm ID="old-mm1-p2pTeSapSC">
+# <ErrorCount>0</ErrorCount>
+# </Realm>
+# <Realm ID="CSRealmTest3">
+# <ErrorCount>0</ErrorCount>
+# </Realm>
+# ...
+#
+
+        my $q = ariba::monitor::QueryManager->newWithDetails(
+                "arches-catalog-status", $product->name(), $service, $product->customer(), \%queries
+        );
+        $q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub fetchUrl {
+    my $url = shift;
+    my $timeout = shift || 45;
+
+    my $monUrl = ariba::monitor::Url->new($url);
+    $monUrl->setTimeout($timeout);
+    my @results = $monUrl->request();
+
+    my $property;
+    my $value;
+
+    #
+    # Handle the case of url being down
+    #
+    my $error = $monUrl->error();
+    if ($error) {
+        $monUrl->setIsDown(1);
+        return $monUrl;
+    } 
+
+    $monUrl->setIsDown(0);
+    my $inError = 0;
+    my $errorMsg = '';
+    for my $line (@results) {
+        if ($line eq '</Error>') {
+            $inError = 0;
+        } elsif ($line eq '<Error>') {
+            $inError = 1;
+        } elsif ($inError) {
+            $errorMsg .= $line . ' ';
+        } elsif ($line =~ m|<(\w+)>\s*(.*)\s*</(\w+)>|i) {
+            next if ($1 ne $3);
+
+            $property = lcfirst($1);
+            $value = $2;
+
+            $monUrl->setAttribute($property, $value);
+        } elsif ($line !~ m/<|>/) {
+            chomp($line);
+            $monUrl->setResults($line);
+        }
+    }
+    $monUrl->setError($errorMsg) if ($errorMsg);
+
+    return $monUrl;
+}
+
+sub processUrl {
+    my $url= shift;
+    my $xp;
+    my $eMessage;
+
+    my $status = ariba::monitor::Url->new($url);
+    $status->setUseOutOfBandErrors(1);
+
+    if (defined $status->error()) {
+        $eMessage = "ERROR: $status->error()\n";
+
+        return ($eMessage, $xp);
+    } 
+
+    my $xmlString = $status->request();
+    $xp = XML::XPath->new(xml => $xmlString);
+
+    if ($@) {
+        $eMessage = "ERROR: XML Parsing failed\n";
+    } else {
+        $eMessage = "ERROR: Invalid xml data as Realm is missing: $xmlString\n"  unless ($xmlString =~ m/Realm/);
+    }
+
+    print "$eMessage\n" if $debug && $eMessage;
+
+    return ($eMessage, $xp);
+}
+
+main();

@@ -1,0 +1,608 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/on-call/show-schedule#41 $
+# List all contact info in the db as a cgi program or command line
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Constants;
+use ariba::Oncall::Person;
+use ariba::Ops::DateTime;
+use ariba::monitor::StatusPage;
+
+use ariba::Oncall::Schedule;
+use ariba::Oncall::Display;
+use Data::Dumper;
+use Time::Local;
+use Date::Calc;
+
+use POSIX qw{ strftime };
+use Time::HiRes qw{ time };
+
+my $start = time;
+
+my $OCRURL = "http://ops.ariba.com/documentation/prodops/archive/ocreports";
+my $SRE_DAILY = "http://ops.ariba.com/documentation/SRE/daily";
+my $useHTML = 0;
+
+## Deploy date for updated on-call format
+my $updatedOnCallDeployDate = ariba::Ops::Constants->updatedoncallformat();
+
+## "Enumerations" for hilight control
+my $HIGHLIGHT_NONE   = 0;
+my $HIGHLIGHT_SHIFT1 = 1;
+my $HIGHLIGHT_SHIFT2 = 2;
+my $HIGHLIGHT_SHIFT3 = 3;
+
+sub main {
+    if($ARGV[0] && $ARGV[0] =~ /^-html/) {
+        $useHTML=1;
+        shift(@ARGV);
+    }
+
+    my $colorOrange = ariba::monitor::StatusPage::colorToRGB("orange");
+    my $colorRed = ariba::monitor::StatusPage::colorToRGB("red");
+    my $colorYellow = ariba::monitor::StatusPage::colorToRGB("yellow");
+    my $colorGreen = ariba::monitor::StatusPage::colorToRGB("green");
+    my $colorLightBlue = ariba::monitor::StatusPage::colorToRGB("steel-blue");
+    my $colorBabyBlue = ariba::monitor::StatusPage::colorToRGB("baby-blue");
+    my $colorTan = ariba::monitor::StatusPage::colorToRGB("tan");
+    my $colorPurple = ariba::monitor::StatusPage::colorToRGB("purple");
+
+    my $display = ariba::Oncall::Display->new($useHTML);
+    $display->printHeaders();
+
+    if ($display->isHTML() || $useHTML) {
+        print "<font size=5 face=Helvetica>Ariba Network Operations On-Site Schedule</font><br>";
+        print "<font size=3 face=Helvetica><a href=",$display->contactLink(),">See Staff Contact Information</a></font><hr>";
+        print "<font size=5 face=Helvetica>Read this first: <a href=\"http://ops.ariba.com/documentation/prodops/common/contacting_prodops.html\">How to Contact SRE onshift</a>.</font><br><br>";
+        print "<font size=2 face=Helvetica>Send all long emails to <a href=\"mailto:" . ariba::Ops::Constants->operationsEmailAddress() . "\">" . ariba::Ops::Constants->operationsEmailAddress() . "</a>.<br>";
+        print "Send all pages to <a href=\"mailto:" . ariba::Ops::Constants->operationsPagerAddress() . "\">" . ariba::Ops::Constants->operationsPagerAddress() . "</a>.<br></font>";
+    }
+
+    my ($hour,$mday,$mon,$year) = (localtime(time))[2,3,4,5];
+    my ($yesterdayHour,$yesterdayMday,$yesterdayMon,$yesterdayYear) = (localtime(time() - 86400))[2,3,4,5];
+    $mon++;
+    $yesterdayMon++;
+    $year+=1900;
+    $yesterdayYear+=1900;
+
+    my $calmonth = $display->param('month') || $ARGV[0] || $mon;
+    my $calyear  = $display->param('year')  || $ARGV[1] || $year;
+
+    my $sched = ariba::Oncall::Schedule->new($calmonth,$calyear);
+    my $switchHour = ariba::Oncall::Schedule->switchHour();
+    my $europeSwitchHour = ariba::Oncall::Schedule->europeSwitchHour();
+    my $blrSwitchHour = ariba::Oncall::Schedule->blrSwitchHour();
+
+    open CAL, "/usr/bin/cal $calmonth $calyear |" or die $!;
+    my $calheader = <CAL>;
+    $calheader =~ s/\s+//o;
+
+    my $junk = <CAL>;
+
+    my $r = 0;
+    my @cal = ();
+
+    while(<CAL>){   
+        my @cols;
+        @cols= (/(..)\s?(..)?\s?(..)?\s?(..)?\s?(..)?\s?(..)?\s?(..)?/o);
+
+        for(my $x=0; $x<=6;$x++){
+            unless (defined($cols[$x])){
+                $cols[$x] = "";
+            }
+        }
+
+        last if $cols[0] eq $cols[6];
+
+        my $c = 0;
+        for my $col (@cols){
+            $col =~ s/\s//og;
+
+            $cal[$r][$c++] = $col;
+        }
+        $r++;
+    }
+
+    printHeader(
+        $display,$calmonth,$calyear,
+        "Schedule for $calheader",
+        sprintf("On-site shifts span from %02d:00 Pacific to %02d:00 Pacific.<br>", $switchHour, $europeSwitchHour) .
+        sprintf("If an BLR SRE shift #1 person is listed, the primary on-site responsibility passes to the BLR person at %02d:00 Pacific.<br>", $europeSwitchHour) .
+        sprintf("If an BLR SRE shift #2 person is listed, the primary on-site responsibility passes to the BLR person at %02d:00 Pacific.<br>", $blrSwitchHour)
+    );
+
+    if ($display->isHTML() || $useHTML) {
+        print "<table>";
+        print "<tr><td bgcolor=$colorRed width=20 border=1>&nbsp;</td><td><font size=2 face=Helvetica>SRE primary point of contact (currently on-site).</font></td></tr>\n";
+        print "<tr><td bgcolor=$colorYellow width=20 border=1>&nbsp;</td><td><font size=2 face=Helvetica>SRE secondary point of contact (currently backup on-site).</font></td></tr>\n";
+
+        print "<tr><td bgcolor=$colorGreen width=20 border=1>&nbsp;</td><td><font size=2 face=Helvetica>Sysadmin primary point of contact (SRE use only).</font></td></tr>\n";
+        print "<tr><td bgcolor=$colorTan width=20 border=1>&nbsp;</td><td><font size=2 face=Helvetica>Netadmin primary point of contact (SRE use only).</font></td></tr>\n";
+        print "<tr><td bgcolor=$colorLightBlue width=20 border=1>&nbsp;</td><td><font size=2 face=Helvetica>DBA primary point of contact (SRE use only).</font></td></tr>\n";
+        print "<tr><td bgcolor=$colorBabyBlue width=20 border=1>&nbsp;</td><td><font
+size=2 face=Helvetica>Tools primary point of contact (Ops use only).</font></td></tr>\n";
+        print "<tr><td bgcolor=$colorPurple width=20 border=1>&nbsp;</td><td><font
+size=2 face=Helvetica>Deployment primary point of contact (Ops use only).</font></td></tr>\n";
+
+        print "<tr><td width=20 border=0>&nbsp;</td></tr>\n";
+        print "<tr><td bgcolor=$colorOrange width=20 border=1>&nbsp;</td><td><font size=2 face=Helvetica>Marks events happening today.</font></td></tr>\n";
+        print "</table><br>" ;
+
+        print "<font size=4 face=Helvetica><a href=\"http://development.ariba.com/ASM_Suite/MasterSchedule_HF.xls\">Development HF schedule.</a></font><br>";
+        print "<font size=4 face=Helvetica><a href=\"http://development.ariba.com/ASM_Suite/MasterSchedule.xls\">Development SP schedule.</a></font><br><br>";
+        print "<font size=4 face=Helvetica><a href=\"http://ops.ariba.com/documentation/network-admin/isp-maintenance-calendar\">ISP Maintenance schedule.</a></font><br><br>";
+
+        my @months = ariba::Oncall::Schedule->months();
+        print "<font size=4 face=Helvetica><a href=\"$SRE_DAILY/$year/$months[$mon-1]\">SRE Daily reports</a></font><br><br>";
+        print "<table border=1 cellspacing=0 cellpadding=1>\n";
+        print "<tr bgcolor=#CCCCCC align=center>";
+        print "<td><b><font size=2 face=Helvetica>Sunday</font></b></td>\n";
+        print "<td><b><font size=2 face=Helvetica>Monday</font></b></td>\n";
+        print "<td><b><font size=2 face=Helvetica>Tuesday</font></b></td>\n";
+        print "<td><b><font size=2 face=Helvetica>Wednesday</font></b></td>\n";
+        print "<td><b><font size=2 face=Helvetica>Thursday</font></b></td>\n";
+        print "<td><b><font size=2 face=Helvetica>Friday</font></b></td>\n";
+        print "<td><b><font size=2 face=Helvetica>Saturday</font></b></td>\n";
+        print "</tr>";
+            
+        for (my $dr = 0; $dr < $r; $dr++) {
+            print '<tr valign=top>';
+
+            for (my $c = 0; $c < 7; $c++) {
+
+                my $highlight = $HIGHLIGHT_NONE;
+                my $calday = $cal[$dr][$c];
+
+                if ($calday){
+                    if (($hour < $switchHour) && $calday == $yesterdayMday && 
+                            $yesterdayMon == $calmonth && $yesterdayYear == $calyear) {
+                        $highlight = $HIGHLIGHT_SHIFT1;
+                    }
+
+                    if (($hour >= $switchHour) && $calday == $mday  &&
+                            $mon == $calmonth && $year == $calyear) {
+                        $highlight = $HIGHLIGHT_SHIFT1;
+                    }
+                }
+
+                print '<td bgcolor="#EEEEEE">';
+
+                print "<table cellspacing=0 border=0 width=100% valign=top>\n";
+                print "<tr><td align=right><font face=Helvetica size=2>$calday</font></td></tr>\n";
+
+                if ($calday) {
+                    if($highlight && 
+                        $sched->primaryForShiftAndDay(
+                            $sched->shift2Name(), $calday) && 
+                        ariba::Oncall::Schedule->inShift2Time())
+                    {
+                        $highlight = $HIGHLIGHT_SHIFT2;
+                    }
+                    if($highlight && 
+                        $sched->primaryForShiftAndDay(
+                            $sched->shift3Name(), $calday) && 
+                        ariba::Oncall::Schedule->inShift3Time())
+                    {
+                        $highlight = $HIGHLIGHT_SHIFT3;
+                    }
+
+## Shift1:
+                    printHTMLPerson($display,
+                        $sched->primaryForShiftAndDay(
+                            $sched->shift1Name(), $calday) || "unknown",
+                        $colorRed,
+                        $highlight == $HIGHLIGHT_SHIFT1,
+                        2,
+                        "(shift1)")
+                    if ( $sched->primaryForShiftAndDay(
+                            $sched->shift1Name(), $calday) );
+                    
+## Shift2:
+                    printHTMLPerson($display,
+                        $sched->primaryForShiftAndDay(
+                            $sched->shift2Name(), $calday),
+                        $colorRed,
+                        $highlight == $HIGHLIGHT_SHIFT2,
+                        2,
+                        "(Shift2)")
+                    if ( $sched->primaryForShiftAndDay(
+                            $sched->shift2Name(), $calday) );
+
+## Shift3:
+                    printHTMLPerson($display,
+                        $sched->primaryForShiftAndDay(
+                            $sched->shift3Name(), $calday),
+                        $colorRed,
+                        $highlight == $HIGHLIGHT_SHIFT3,
+                        2,
+                        "(Shift3)")
+                    if ( $sched->primaryForShiftAndDay(
+                            $sched->shift3Name(), $calday) );
+
+## Backup shift1:
+                    printHTMLPerson($display,
+                        $sched->backupForDay($calday),
+                        $colorYellow,
+                        $highlight == $HIGHLIGHT_SHIFT1,
+                        1,
+                        "(Backup)")
+                    if ($sched->backupForDay($calday));
+
+                    printHTMLPerson($display,
+                        $sched->backup2ForDay($calday),
+                        $colorYellow,
+                        $highlight == $HIGHLIGHT_SHIFT2,
+                        1,
+                        "(Backup2)")
+                        
+                    if ($sched->backup2ForDay($calday));
+
+                    printHTMLPerson($display,
+                        $sched->backup3ForDay($calday),
+                        $colorYellow,
+                        $highlight == $HIGHLIGHT_SHIFT3,
+                        1,
+                        "(Backup3)")
+                    if ($sched->backup3ForDay($calday));
+
+                    printHTMLPerson($display, $sched->sysadminForDay($calday), $colorGreen, $highlight, 1, "(SA)");
+
+                    printHTMLPerson($display, $sched->netadminForDay($calday), $colorTan, $highlight, 1, "(Network)");
+
+                    printHTMLPerson($display, $sched->dbaForDay($calday), $colorLightBlue, $highlight, 1, "(DBA)");
+
+                    printHTMLPerson($display, $sched->toolsForDay($calday), $colorBabyBlue, $highlight, 1, "(Tools)");
+ 
+                    printHTMLPerson($display, $sched->deploymentForDay($calday), $colorPurple, $highlight, 1, "(Deployment)");
+
+
+                    my $primaryDeveloper  = ariba::Oncall::Person->new($sched->primaryDeveloperForDay($calday));
+                    my $backupDeveloper  = ariba::Oncall::Person->new($sched->backupDeveloperForDay($calday));
+
+                    if (defined($primaryDeveloper) && $primaryDeveloper->attribute('fullname')) {
+                        print "<a href=",$display->contactLink($sched->primaryDeveloperForDay($calday)),">";
+                        print "<font size=1 face=Helvetica>",$primaryDeveloper->attribute('fullname');
+
+                        if ($primaryDeveloper->attribute('oncall-product')) {
+                            print " - ",$primaryDeveloper->attribute('oncall-product');
+                        }
+                        print "</font></a>";
+                    } else {
+                        print '&nbsp;';
+                    }
+                    print "</td></tr>\n";
+                    print '<tr align=right><td>';
+
+                    if (defined($backupDeveloper) && $backupDeveloper->attribute('fullname')) {
+                        print "<a href=",$display->contactLink($sched->backupDeveloperForDay($calday)),">";
+                        print "<font size=1 face=Helvetica>",$backupDeveloper->attribute('fullname');
+                        if ($backupDeveloper->attribute('oncall-product')) {
+                                                        print " - ",$backupDeveloper->attribute('oncall-product');
+                                                }
+                        print "</font></a>";
+                    } else {
+                        print '&nbsp;';
+                    }
+                    print "</td></tr>\n";
+
+                    if($highlight) {
+                        print "<tr align=right><td bgcolor=$colorOrange>";
+                    } else {
+                        print "<tr align=right><td>";
+                    }
+
+                    #
+                    # check to see if there is an OCReport
+                    #
+                    if(($year > $calyear) ||
+                       ($year==$calyear && 
+                        $mon > $calmonth) ||
+                       ($year==$calyear &&
+                        $mon == $calmonth &&
+                        $mday > $calday)
+                    ) {
+                        my ($shift3Format, $path) = getOcrPath( $sched ,$calday);
+                        print "<font size=1 face=Helvetica>";
+
+                        if ($shift3Format == 1) {
+                            print "On Site Reports: ";
+                            my $p = scalar(@$path);
+
+                            for my $i (1..$p) {
+                                print "<a href=\"$OCRURL/$path->[$i-1]\">$i</a>&nbsp;";
+                            }
+                            print "<br><br>\n";
+                        } else {
+                            print "<a href=\"$OCRURL/$path->[0]\">On Site Report</a><br><br>\n"; 
+                        }
+                        print "</font>\n";
+                    }
+
+                    if ($sched->commentForDay($calday)) {
+                        my $comment=$sched->commentForDay($calday);
+                        $comment =~ s/,/<br>/og;
+                        print '<font size=1 face=Helvetica>',$comment,'</font>';
+                    }
+
+                    if ($sched->unixTimeForDay($calday) < time()) {
+                        print "<br><font size=1 face=Helvetica><a href=\"";
+                        print $sched->pageStatusURLForDay($calday);
+                        print "&shortFormat=1\">page requests</a></font>";
+                    }
+
+                    print '<br><font size=1 face=Helvetica>';
+                    print qq`<a href="production-changes?startDate=$calyear-$calmonth-$calday">`;
+                    print 'production changes</a></font>';
+
+                    print "</td></tr>\n";
+                } 
+            
+                print "</table>\n";
+                print '</td>';
+            }
+            print "</tr>\n";
+        }
+        print "</table>\n"; 
+
+    } else {
+
+        #
+        # XXX -- todo - this should use Term.pm and display in a nicer format
+        #
+
+        for (my $day = 1; $day <= $sched->days(); $day++) {
+            my $highlight = 0;
+
+            if (($hour < $switchHour) && $day == $yesterdayMday &&
+                $yesterdayMon == $calmonth && $yesterdayYear == $calyear ) {
+                $highlight = 1;
+            }
+            if (($hour >= $switchHour) && $day == $mday && 
+                $mon == $calmonth && $year == $calyear ) {
+                $highlight = 1;
+            }
+
+            next unless ( $sched->primaryForShiftAndDay( $sched->shift1Name(), $day )
+                || $sched->commentForDay($day) );
+
+            my $primary = ariba::Oncall::Person->new($sched->primaryForShiftAndDay(
+                    $sched->shift1Name(), $day));
+            my $europe = ariba::Oncall::Person->new($sched->primaryForShiftAndDay(
+                    $sched->shift2Name(), $day));
+            my $blr = ariba::Oncall::Person->new($sched->primaryForShiftAndDay(
+                    $sched->shift3Name(), $day));
+            my $backup  = ariba::Oncall::Person->new($sched->backupForDay($day));
+
+            my $sysadmin  = ariba::Oncall::Person->new($sched->sysadminForDay($day));
+            my $netadmin  = ariba::Oncall::Person->new($sched->netadminForDay($day));
+            my $dba  = ariba::Oncall::Person->new($sched->dbaForDay($day));
+            my $tools  = ariba::Oncall::Person->new($sched->toolsForDay($day));
+            my $deployment  = ariba::Oncall::Person->new($sched->deploymentForDay($day));
+
+            my $primaryDeveloper  = ariba::Oncall::Person->new($sched->primaryDeveloperForDay($day));
+            my $backupDeveloper  = ariba::Oncall::Person->new($sched->backupDeveloperForDay($day));
+
+            my $primaryNotation = "(p)";
+            if($blr) {
+                $primaryNotation = "(shift1)";
+            }
+            my $blrNotation = "(shift3)";
+
+                        if($europe) {
+                            $primaryNotation = "(shift1)";
+                        }
+                        my $europeNotation = "(shift2)";
+
+            if ($highlight) {
+                # print "\e[1;33;41m"; # highlight today in red
+                print 'now> ';
+                if($blr) {
+                    if($sched->inShift3Time()) {
+                        $blrNotation = "(shift3, ONCALL)";
+                    } elsif ($sched->inShift2Time() ){
+                        $europeNotation = "(shift2, ONCALL)";
+                    } else {
+                        $primaryNotation = "(shift1, ONCALL)";
+                    }
+                }
+                if($europe) {
+                    if($sched->inShift2Time()) {
+                        $europeNotation = "(shift2, ONCALL)";
+                    } elsif ($sched->inShift3Time() ){
+                        $blrNotation = "(shift3, ONCALL)";
+                    } else {
+                        $primaryNotation = "(shift1, ONCALL)";
+                    }
+                }
+            } else {
+                # print '     ';
+            }
+
+            print "$day: ";
+
+            printTextPerson($primary, "$primaryNotation ");
+            printTextPerson($europe, "$europeNotation ");
+            printTextPerson($blr, "$blrNotation ");
+            printTextPerson($backup, "(b)");
+
+            printTextPerson($sysadmin, "(a)");
+            printTextPerson($netadmin, "(n)");
+            printTextPerson($dba, "(d)");
+            printTextPerson($tools, "(t)");
+            printTextPerson($deployment, "(z)");
+
+            if (defined($primaryDeveloper) && $primaryDeveloper->attribute('fullname')) {
+                print ' ', $primaryDeveloper->attribute('fullname');
+                if ($primaryDeveloper->attribute('oncall-product')) {
+                    print " - ",$primaryDeveloper->attribute('oncall-product');
+                }
+            }
+            if (defined($backupDeveloper) && $backupDeveloper->attribute('fullname')) {
+                print ' ', $backupDeveloper->attribute('fullname');
+                if ($backupDeveloper->attribute('oncall-product')) {
+                                        print " - ",$backupDeveloper->attribute('oncall-product');
+                                }
+            }
+            if ($sched->commentForDay($day)) {
+                print ' # '.$sched->commentForDay($day);
+            }
+            # if($highlight) {
+            #   print "\e[m"; # reset to normal text
+            # }
+            print "\n"
+        }
+    }
+
+    ## In case of future issues with this script, this info will help troubleshoot:
+    my $now = strftime( '%Y-%m-%d %H:%M:%S', localtime );
+    print "<HR>Page generated '$now' ";
+    my $runtime = time - $start;
+    print "in '$runtime' seconds<BR>";
+    ## For debugging:
+#    print STDERR "Ran in '$runtime' seconds.\n";
+}
+
+sub printHTMLPerson {
+    my $display = shift;
+    my $personUserName = shift;
+    my $color = shift || "white";
+    my $isHighlighted = shift || 0;
+    my $size = shift || 1;
+    my $tag = shift || undef;
+
+    my $person = ariba::Oncall::Person->new($personUserName);
+
+    my $style = "i";
+    $style = "b" if $size > 1;
+
+    if ($isHighlighted) {
+        print "<tr align=right><td bgcolor=$color>";
+    } else {
+        print "<tr align=right><td>";
+    }
+
+    if ( defined($person) && $person->attribute('fullname')) {
+        print "<a href=",$display->contactLink($personUserName),">";
+        print "<$style><font size=$size face='Helvetica'>",$person->attribute('fullname');
+        print " <small>$tag</small>" if $tag;
+        print "</font></$style></a>";
+    } elsif ( $personUserName ) {
+        print "<$style><font size=$size face='Helvetica'>" . $personUserName;
+        print " <small>$tag</small>" if $tag;
+        print "</font></$style>";
+    } else {
+        print '&nbsp;';
+    }
+    print "</td></tr>\n";
+}
+
+sub printTextPerson {
+    my $person = shift;
+    my $tag = shift;
+
+    if (defined($person)) {
+        if($person->attribute('fullname')) {
+            print ' ', $person->attribute('fullname');
+        } else {
+            print $person->instance();
+        }
+        print ' ' . $tag;
+    }
+}
+
+sub printHeader {
+    my ($display,$mon,$yr,$header,$subheader) = @_;
+    my ($nextmon,$nextyr,$prevmon,$prevyr);
+
+    if ($mon == 12) {
+        $nextmon = 1;
+        $nextyr = $yr + 1;
+    } else {
+        $nextmon = $mon + 1;
+        $nextyr = $yr;
+    }
+
+    if ($mon == 1) {
+        $prevmon = 12;
+        $prevyr = $yr - 1;
+    } else {
+        $prevmon = $mon - 1;
+        $prevyr = $yr;
+    }
+        
+    if ($display->isHTML() || $useHTML) {
+        print '<br>';
+        print '<a href="', $display->scheduleLink($prevmon, $prevyr), '">';
+        print "[$prevmon/$prevyr]</a> ";
+        print "<b><font size=5 face=Helvetica>$header</font></b>";
+        print '<a href="', $display->scheduleLink($nextmon, $nextyr), '">';
+        print " [$nextmon/$nextyr]</a>";
+        print "<br>\n"; 
+        print "$subheader<br><br>\n";   
+    } else { 
+        print "\n$header\n";
+        print "$subheader\n\n";
+    }
+}
+
+sub getOcrPath {
+        my $sched = shift;
+        my $day = shift;
+        my $shift = 3;
+        my $path;
+        my $shift3Format = 0;
+        my @paths;
+        my $datestr;
+
+        my @months = ariba::Oncall::Schedule->months();
+
+        my ($start, $end) = $sched->shiftTimeRangeForDay($day);
+
+        my @endtime = localtime($end);
+        my $mon = $months[$endtime[4]];
+        my $year = $endtime[5] + 1900;
+
+        #
+        # End date is > the deploy date for updated on-call changes
+        # Display calender On Site Reports in the new format (3 report links per day)
+        #
+        if ($end > $updatedOnCallDeployDate) {
+            $shift3Format = 1;
+
+            for (my $i = 1; $i < $shift+1; $i++) {
+                if ($i == 1) {
+                    ## Use $start value for shift#1 since end date is w/in the same shift day
+                    $datestr = ariba::Ops::DateTime::prettyTime($start);
+                    my @starttime = localtime($start);
+                    $mon = $months[$starttime[4]];
+                    $year = $starttime[5] + 1900;
+                } else {
+                    $datestr = ariba::Ops::DateTime::prettyTime($end);
+                    $mon = $months[$endtime[4]];
+                    $year = $endtime[5] + 1900;
+                }
+                $datestr =~ s/ .*//g;
+                $path = "$year/$mon/$datestr" . "_$i.txt";
+                push(@paths, $path);
+            }
+            return ($shift3Format, \@paths);
+        }
+
+        $datestr = ariba::Ops::DateTime::prettyTime($end);
+        $datestr =~ s/ .*//g;
+
+        ## $end is < updatedOnCallDeployDate 
+        $path = "$year/$mon/$datestr.txt";
+        push(@paths, $path);
+
+        return ($shift3Format, \@paths);
+}
+
+main();
+
+__END__

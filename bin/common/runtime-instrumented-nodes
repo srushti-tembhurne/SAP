@@ -1,0 +1,52 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+use Data::Dumper;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+
+main(@ARGV);
+
+sub main
+{
+    my $debug = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-d/) { $debug++; next; }
+    }
+
+    my $me      = ariba::rc::InstalledProduct->new();
+    my $service = $me->service();
+
+    ### all the installed products of service
+    my @products = ariba::rc::InstalledProduct::installedProductsList($service);
+
+    foreach my $product (@products)
+    {
+        ### Skip the product, if the product do not support instrumentation nodes functionality
+        my $instrumented_config = $product->runtime_instrumentation_config();
+        next unless ($instrumented_config);
+
+        ### Setup monitor
+        my @file_contents = keys %{$product->runtime_instrumented_instances()};
+        next unless (scalar (@file_contents));
+
+        my %queries;
+        foreach my $line (@file_contents)
+        {
+            $queries{$line} = {
+                                info => 'answer',
+                                perl => sub { return "on" if $line },
+                               };
+        }
+
+        ### Expando
+        my $email = $me->default('notify.email');
+        my $qm = ariba::monitor::QueryManager->newWithDetails("instrumented-nodes", $product->name(), $product->service(), $product->customer(), \%queries, undef);
+        $qm->processQueries($debug, $email);
+    }
+}

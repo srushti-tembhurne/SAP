@@ -1,0 +1,109 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/fusionio-status#4 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::CircularDB;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::monitor::misc;
+use ariba::monitor::OutageSchedule;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $debug = 0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; };
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+
+	my $cluster = $me->currentCluster();
+	my $ws = ($me->hostsForRoleInCluster("monserver", $cluster))[0];
+	my $port = $me->default("WebServerHTTPPort");
+
+	my $warn;
+	my $crit;
+
+	for my $datacenter ( @dataCenters ) {
+
+		my %matchDatacenter = (
+			status               => 'inservice',
+			datacenter           => $datacenter,
+			monitoringDatacenter => '',
+			providesServices     => 'fusionio',
+		);
+
+		my %matchMonitoringDatacenter = (
+			status                => 'inservice',
+			monitoringDatacenter  => $datacenter,
+			providesServices     => 'fusionio',
+		);
+
+		my @machines = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+		@machines    = (@machines, ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+
+		next unless @machines;
+
+		my %queries = ();
+
+		for my $machine (@machines) {
+			my $hostname = $machine->hostname();
+
+			my $cdbPrefix;
+
+			$cdbPrefix = "snmp/$hostname";
+			my $cdbs = ariba::monitor::CircularDB->listDBs($cdbPrefix, "FusionIO");
+
+			for my $cdb (@$cdbs) {
+				my $file = $cdb->name();
+				my @path = split(/\//, $file);
+				my $name = pop(@path);
+				$file =~ s/[\s()]/_/g;
+
+				my ($info, $warn, $crit, $format);
+
+				if($name =~ m/Percent Life Remaining/) {
+					$info = "answer eq '' or answer > -1";
+					$warn = "answer eq '' or answer < 30";
+					$crit = "answer ne '' and answer < 10";
+					$format = "%d%%\n",
+				} else {
+					$info = "answer eq '' or answer == 0",
+					$crit = "answer ne '' and answer == 1",
+				}
+		
+				$queries{"$hostname $name"} = {
+					format => $format,
+					uiHint => $hostname,
+					info => $info,
+					warn => $warn,
+					crit => $crit,
+					extractRecorded => "average(snmp/$file, 1)",
+				};
+			}
+		}
+
+		my $email = $me->default('notify.email');
+
+		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+		my $q = ariba::monitor::QueryManager->newWithDetails("fusionio", $pn, $me->service(), $me->customer(), \%queries);
+		$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+main();
+
+__END__

@@ -1,0 +1,193 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/mon/cdb-check#4 $
+#
+# Checks circular database files for integrity and readability.
+#
+
+use strict;
+use FindBin;
+
+use lib "/usr/local/ariba/lib";
+use lib "$FindBin::Bin/../../lib"; 
+
+use ariba::util::Simplefind;
+use ariba::monitor::CircularDB; 
+
+my $debug = 0;
+my $warn = 0;
+
+sub collectCdbFiles { 
+	my @cdbPaths = @_; 
+	my %cdbFiles;
+	my $cdbExtension = quotemeta('.cdb');
+
+	foreach my $path (@cdbPaths) { 
+		print "Looking at $path\n";
+
+		my @files;
+
+		if (-d $path) { 
+			my $sf = ariba::util::Simplefind->new($path); 
+			@files = grep(/$cdbExtension$/, $sf->find());
+		} elsif (-f $path) { 
+			push(@files, $path);
+		} else { 
+			print "\tignored as it is not a directory or file.\n"; 
+			next;
+		}
+
+		map { $cdbFiles{$_} = 1; } @files; 
+		print "\tfound ", scalar(@files), " cdb file(s)\n";
+	}
+
+	my @cdbFiles = sort(keys(%cdbFiles));
+	return \@cdbFiles;
+}
+
+sub checkCdbFiles {
+	my $cdbFilesRef = shift;
+	my %cdbFileErrors;
+	my $errorCount = 0;
+
+	print "Checking ", scalar(@$cdbFilesRef), " cdb file(s)\n"; 
+
+	foreach my $cdbFile (@$cdbFilesRef) {
+		$cdbFile = "./$cdbFile" unless ($cdbFile =~ /^[\/|\.]/);
+		print "Checking $cdbFile\n" if ($debug);
+		my @errors; 
+		my $cdb = ariba::monitor::CircularDB->new($cdbFile);
+
+		# Check header
+		print "\tchecking header\n" if ($debug);
+		my @headerErrors = $cdb->checkHeader(); 
+		push(@errors, @headerErrors) if (@headerErrors);
+
+		# Check integrity / readability
+		my $numRecords = $cdb->numRecords(); 
+		my $numRecordsToTest = ($numRecords >= 10) ? 10 : $numRecords; 
+		if ($numRecordsToTest) { 
+			print "\treading first $numRecordsToTest record(s)\n" if ($debug);
+			my @records = $cdb->readRecords(undef, undef, -$numRecordsToTest); 
+			push(@errors, "Failed to read first $numRecordsToTest record(s)") unless (scalar(@records) == $numRecordsToTest); 
+
+			print "\treading last $numRecordsToTest record(s)\n" if ($debug);
+			@records = $cdb->readRecords(undef, undef, $numRecordsToTest); 
+			push(@errors, "Failed to read last $numRecordsToTest record(s)") unless (scalar(@records) == $numRecordsToTest); 
+
+			print "\treading all $numRecords record(s)\n" if ($debug); 
+			@records = $cdb->readRecords(); 
+			push(@errors, "Read only " . scalar(@records) . " record(s) from a total of $numRecords record(s)") unless (scalar(@records) == $numRecords); 
+
+			my $undefTimeCount = 0; 
+			my $dupDateCount = 0;
+			my $undefValueCount = 0;
+			my $counterWrapCount = 0;
+			my $badDateCount = 0;
+			my $prevValue = -1;
+			my $prevDate = -1;
+			my %allDates;
+			foreach my $record (@records) { 
+				my $date = $record->[0];
+				my $value = $record->[1];
+
+				$undefTimeCount++ unless defined($date);
+
+				unless(defined($allDates{$date})) {
+					$allDates{$date} = 1;
+				} else {
+					$dupDateCount++;
+				}
+
+				unless(defined($value)) {
+					$undefValueCount++;
+				}
+
+				if ($cdb->dataType() eq "counter" && $value < $prevValue) {
+					$counterWrapCount++;
+				}
+
+				if ($date < $prevDate) {
+					$badDateCount++;
+				}
+
+				$prevDate = $date;
+				$prevValue = $value;
+			}
+			push(@errors, "There are $undefTimeCount record(s) with undefined time value") if ($undefTimeCount);
+			push(@errors, "There are $badDateCount record(s) with out-of-order dates") if ($badDateCount);
+			push(@errors, "WARN: There are $undefValueCount record(s) with undefined value") if ($undefValueCount && $warn);
+			push(@errors, "WARN: There are $dupDateCount record(s) with same date entry") if ($dupDateCount && $warn);
+			push(@errors, "INFO: There are $counterWrapCount record(s) with counter wraps") if ($counterWrapCount && $warn);
+		}
+
+		# Store errors if any
+		foreach my $error (@errors) {
+			$cdbFileErrors{$cdbFile} = [] unless ($cdbFileErrors{$cdbFile});
+			push(@ { $cdbFileErrors{$cdbFile} }, $error);
+			$errorCount++;
+		}
+	}
+
+	return \%cdbFileErrors;
+}
+
+sub printCdbFileErrors {
+	my $cdbFileErrorsRef = shift; 
+
+	print "Errors were found in ", scalar(keys(%$cdbFileErrorsRef)), " cdb file(s).\n"; 
+
+	foreach my $cdbFile (sort(keys(%$cdbFileErrorsRef))) { 
+		my @errors = @{ $cdbFileErrorsRef->{$cdbFile} };
+		print "\nFile: $cdbFile\n"; 
+		print "Errors: ", join(', ', @errors), "\n";
+	}
+}
+
+sub usage {
+	my $err = shift; 
+	
+	print "Usage: $0 [-d|-h] <cdbPath...>\n";
+	print "Checks circular database files for integrity and readability\n\n"; 
+	print "\t-d         Turn on debug mode.\n"; 
+	print "\t-w         Show warnings and info alerts.\n";
+	print "\t-h         Show this help.\n"; 
+	print "\t<cdbPath>  List of directories with cdb files to check\n"; 
+	print "\t           or a single cdb file path\n"; 
+	print "\nError: $err\n" if ($err);
+
+	exit();
+}
+
+sub main {
+	my @cdbPaths;
+	
+	while (my $arg = shift) {
+		if ($arg =~ /^-d/) { $debug++;	next; }
+		if ($arg =~ /^-w/) { $warn = 1;	next; }
+		if ($arg =~ /^-/) { usage(); 	next; }
+		push(@cdbPaths, $arg);	
+	}
+
+	# Check usage
+	usage('Must specify at least one cdb file or dir') unless (@cdbPaths); 
+
+	# Collect cdb files
+	my $cdbFilesRef = collectCdbFiles(@cdbPaths); 
+	unless (@$cdbFilesRef) { 
+		print "No cdb files found in provided paths\n";
+		exit(); 
+	}
+
+	# Check cdb files for errors
+	my $cdbFileErrorsRef = checkCdbFiles($cdbFilesRef);
+
+	# Display errors
+	if (%$cdbFileErrorsRef) { 
+		printCdbFileErrors($cdbFileErrorsRef);
+	} else {
+		print "No errors found.\n"; 
+	}
+} 
+
+main(@ARGV);

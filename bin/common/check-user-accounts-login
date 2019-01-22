@@ -1,0 +1,120 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/check-user-accounts-login#2 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::CipherStore;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Startup::Common;
+
+my $debug = 0;
+
+sub usage {
+	my $error = shift; 
+
+	print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+	-d    Turns on debug mode. 
+	-h    Shows this help.
+
+USAGE
+
+	print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+	while (my $arg = shift) {
+		if ($arg =~ /^-h$/o) { usage();         next; }
+		if ($arg =~ /^-d$/o) { $debug++;        next; }
+
+		usage("Invalid argument: $arg");
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $service = $me->service();
+
+	my $logFile = "/tmp/$service/mon/account-login.log";
+
+	open(LOG, ">", $logFile) || die "Could not open $logFile, $!\n";
+
+	foreach my $p (qw(an buyer s4)) {
+		my @hosts;
+		my @roles;
+		my $product = ariba::rc::InstalledProduct->new($p, $service);
+		my $productName = $product->name();
+
+		next unless (ariba::rc::InstalledProduct->isInstalled($p, $service));
+
+		my $logsDir = ariba::Ops::Startup::Common::logsDirForProduct($product);
+		my $archiveDir = ariba::Ops::Constants::archiveLogDir($service, $productName);
+
+		#
+		# Product server role types:
+		#	S4:		asmadmin
+		#	Buyer:	buyeradmin
+		#	AN:		adminapps
+		#
+
+		if ($productName =~ /^(s4|buyer)$/) {
+			@roles = grep { $_ =~ /admin$/ } $product->allRolesInCluster('primary');
+
+			foreach my $r (@roles) {
+				push(@hosts, $product->hostsForRoleInCluster($r, 'primary'));
+			}
+		} elsif ($productName =~ /^an$/) {
+			@roles = grep { $_ =~ /^adminapps/ } $product->allRolesInCluster('primary');
+
+			foreach my $r (@roles) {
+				push(@hosts, $product->hostsForRoleInCluster($r, 'primary'));
+			}
+		}
+		getLoginLogs(\@hosts, $productName, $service, $logsDir, $archiveDir);
+	}
+	close(LOG);
+}
+
+sub getLoginLogs {
+	my $hosts = shift;
+	my $product = shift;
+	my $service = shift;
+	my $logsDir = shift;
+	my $archiveDir = shift;
+	my $command;
+	my @output;
+
+	my $cipher = ariba::rc::CipherStore->new($service);
+	my $thisUser = "svc" . $service;
+	my $password = $cipher->valueForName($thisUser);
+
+	foreach my $h (@{$hosts}) {
+		if ($product =~ /^(s4|buyer)/) {
+			$command = "ssh $thisUser\@$h '/usr/local/ariba/bin/check-user-accounts-login-files $product $service " .
+					"$logsDir $archiveDir'"; 
+		} elsif ($product =~ /^an/) {
+			$command = "ssh $thisUser\@$h '/usr/local/ariba/bin/check-user-accounts-login-files $product $service " .
+				"$logsDir $archiveDir'";
+		}
+		
+		if ($debug) {
+			print "$command\n";
+		} else {
+			ariba::rc::Utils::executeRemoteCommand($command, $password, 0, undef, undef, \@output);
+
+			foreach my $line (@output) {
+				if ($line =~ /\S/) {
+					print LOG "$product:" . $line . "\n";
+				}
+			}
+		}
+	}
+}
+
+main(@ARGV);
+
+__END__

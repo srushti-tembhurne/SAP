@@ -1,0 +1,137 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/esig/esig-status#8 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use File::Path;
+use Crypt::OpenSSL::RSA;
+use Crypt::OpenSSL::X509 qw(FORMAT_ASN1);
+use LWP::UserAgent;
+use MIME::Base64;
+
+use ariba::Crypto::Certificate;
+use ariba::monitor::QueryManager;
+use ariba::Ops::MIMEHelper;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub main {
+
+	my $sendEmail = 0;
+        my $sendPage  = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; };
+		if ($arg =~ /^-d/o) { $debug = 1; };
+	}
+
+	my $me	    = ariba::rc::InstalledProduct->new();
+	my $prod    = ariba::rc::InstalledProduct->new('esig', $me->service());
+
+	my %queries = ();
+
+	for my $instance ($prod->appInstancesInCluster($me->currentCluster())) {
+
+		my $host = $instance->host();
+		my $url  = sprintf('http://%s:%d/%s', $host, $instance->securePort(), 'ad/monitorSignature');
+
+		my ($timestamp, $verified, $notAfter) = checkESigStatus($url);
+
+		$queries{"$host smart card age of signing"} = {
+			noRowCount => 1,
+			format => "%d second(s) ago\n",
+			info => "answer <= 15 && answer > 0",
+			warn => "answer < 30 && answer > 15",
+			crit => "answer >= 30 ",
+			perl => "return time() - $timestamp",
+		};
+
+		$queries{"$host smart card signature validity"} = {
+			noRowCount => 1,
+			info => "answer eq 'ok'",
+			crit => "answer ne 'ok'",
+			perl => "return $verified ? 'ok' : 'not ok'",
+		};
+
+		$queries{"$host smart card days to expire for certificate"} = {
+			noRowCount => 1,
+			format => "%d days\n",
+			info => "answer >= 20",
+			warn => "answer < 20",
+			crit => "answer < 10 ",
+			perl => "return $notAfter",
+		};
+	}
+
+	my $email = $me->default('notify.email');
+
+	my $q = ariba::monitor::QueryManager->newWithDetails("esig-status", $prod->name(), $me->service(), undef, \%queries);
+	$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+# this takes in a url to check, and parses steve's monitorSignature format.
+# returns: timestamp of signed, valid signature (boolean), timestamp of expire
+# date of certificate
+sub checkESigStatus {
+	my $url  = shift;
+
+	# to check the date
+	my $cert = ariba::Crypto::Certificate->new();
+
+	# this will hold the 3 mime parts
+	my @parts  = ();
+
+	# Create our parser object - don't output any temporary files to disk.
+	my $parser = MIME::Parser->new();
+	   $parser->output_under('/tmp');
+	   $parser->tmp_recycling(1);
+	   $parser->tmp_to_core(1);
+	   $parser->use_inner_files(1);
+
+	my $ua  = LWP::UserAgent->new();
+	my $req = HTTP::Request->new('GET', "$url/ad/monitorSignature");
+	my $res = $ua->send_request($req);
+
+	if (!defined $res || $res->is_error() || !$res->content()) {
+		return (-1, 0, -1);
+	}
+
+	# content-type needs to be passed to the parser.
+	my $entity  = $parser->parse_data(join("\n",
+		"Content-Type: " . $res->header('Content-Type'),
+		'',
+		$res->content()
+	));
+
+	ariba::Ops::MIMEHelper->parseMultipart($parser, $entity, \@parts);
+
+	my ($data, $pkcs1, $signingCert) = @parts;
+
+	my $message   = decode_base64($data->body_as_string());
+	my $signature = decode_base64($pkcs1->body_as_string());
+
+	# this comes in as base64 encoded DER/ASN1 certificate
+	my $x509 = Crypt::OpenSSL::X509->new_from_string( decode_base64($signingCert->body_as_string()), FORMAT_ASN1 );
+
+	# hand the public key to the RSA module for verification.
+	my $rsa = Crypt::OpenSSL::RSA->new_public_key($x509->pubkey()) or 
+		die "Unable to create public key object: $!";
+
+        # Verify the signature
+	my $verify = $rsa->verify($message, $signature) || 0;
+
+	# remove temporary files
+	$parser->filer()->purge();
+	rmdir($parser->filer()->output_dir());
+
+	return ($message, $verify, $cert->daysToCertExpireTimeForX509($x509));
+}
+
+main();
+
+__END__

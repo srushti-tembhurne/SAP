@@ -1,0 +1,381 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/on-call/notify-schedule#18 $
+# cron job that notifies people about upcoming scheduling
+# notify tomorrow's person today
+# if today is friday also notify weekend and monday people
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use ariba::Ops::Constants;
+use ariba::Oncall::Display;
+use ariba::Oncall::Schedule;
+use ariba::Oncall::OperationsEngineer;
+use ariba::Oncall::DevelopmentEngineer;
+use ariba::Ops::Utils;
+
+my $debug = 0;
+
+# strings used throughout this script
+## Primaries and backups can have anywhere from 0 - 3 users.  Hopefully
+## there's at least 1 ...
+my ($PRIMARY1, $PRIMARY2, $PRIMARY3, $BACKUP1, $BACKUP2, $BACKUP3) =
+    ('shift1', 'shift2', 'shift3', 'backup1', 'backup2', 'backup3');
+
+my ($SYSADMIN, $NETADMIN, $TOOLS, $DBA, $PRIMARY_DEVELOPER, $BACKUP_DEVELOPER) =
+    ('sysadmin', 'network admin', 'tools developer', 'dba', 'primary developer', 'backup developer');
+
+# abbreviated ops role
+my ($sysadminAbbr, $netadminAbbr, $toolsAbbr, $dbaAbbr) = ('SYS', 'NET', 'TOOLS', 'DBA');
+
+# notification type flags for sendOCNotification
+my $PAGE  = 1;
+my $EMAIL = 2;
+
+my $DAY = 24*60*60;
+
+sub main {
+    # figure out whose shift starts today at switchHour
+    my $dayOfWeek = (localtime(time))[6];
+
+    my $now = $ARGV[0] || time();
+
+    #
+    # This code can be uncommented to send end of shift pages
+    #
+    # notify('yesterday', $now - $DAY);
+    notify('today', $now);
+    notify('tomorrow', $now + $DAY);
+   
+    # if today is friday figure out who is on on sunday and monday
+    # We already printed saturday above
+
+    if ($dayOfWeek == 5 ) {
+        notify('this sunday', $now + (2 * $DAY));
+        notify('next monday', $now + (3 * $DAY));
+    }
+}
+
+sub notify {
+    my ($dayTag,$timeVal) = @_;
+
+    my ($year,$mon,$day,$dayOfWeek,$hour) = (localtime($timeVal))[5,4,3,6,2];
+    $mon++;
+    $year += 1900;
+
+    my $sched    = ariba::Oncall::Schedule->new($mon,$year);
+
+    ## TMID: 142620
+    if ( $sched->inShift2Time() && $hour < $sched->blrSwitchHour() ){
+        ## When we're in shift 2 we are after midnight but schedule wise we're
+        ## still in the previous day:
+        $day -= 1;
+    }
+
+    ## $primary == shift1
+    my $primary  = ariba::Oncall::OperationsEngineer->new(
+        $sched->primaryForShiftAndDay($sched->shift1Name(), $day));
+    my $shift2   = ariba::Oncall::OperationsEngineer->new(
+        $sched->primaryForShiftAndDay($sched->shift2Name(), $day));
+    my $shift3   = ariba::Oncall::OperationsEngineer->new(
+        $sched->primaryForShiftAndDay($sched->shift3Name(), $day));
+
+    my $backup   = ariba::Oncall::OperationsEngineer->new($sched->backupForDay($day));
+    my $backup2  = ariba::Oncall::OperationsEngineer->new($sched->backup2ForDay($day));
+    my $backup3  = ariba::Oncall::OperationsEngineer->new($sched->backup3ForDay($day));
+
+    my $sysadmin = ariba::Oncall::OperationsEngineer->new($sched->sysadminForDay($day));
+    my $netadmin = ariba::Oncall::OperationsEngineer->new($sched->netadminForDay($day));
+    my $dba      = ariba::Oncall::OperationsEngineer->new($sched->dbaForDay($day));
+    my $tools    = ariba::Oncall::OperationsEngineer->new($sched->toolsForDay($day));
+
+    my $primaryDeveloper  
+        = ariba::Oncall::DevelopmentEngineer->new($sched->primaryDeveloperForDay($day));
+    my $backupDeveloper  
+        = ariba::Oncall::DevelopmentEngineer->new($sched->backupDeveloperForDay($day));
+
+    my $dayname = ("Sun","Mon","Tue","Wed","Thu","Fri","Sat")[$dayOfWeek];
+    my $nullReplyTo = ariba::Ops::Constants->nullReplyTo();
+
+    if (($dayTag eq 'yesterday') && ($primary->hasPagerEmail())) {
+
+        if ($mon < 10) {
+            $mon    = "0". $mon;
+        }
+
+        if ($day < 10) {
+            $day    = "0". $day;
+        }
+
+        $primary->sendPage("Your oncall shift is about to end, post your report ASAP.","",$nullReplyTo) unless $debug;
+    }
+
+    my $when = "$dayTag ($dayname $mon/$day)";
+
+    if ($dayTag eq 'today') {
+
+        if ($primary->hasPagerEmail()) {
+
+            ## Notify primary and backup for 3 shifts:
+            ## Only notify others for SNV/shif1 once per day
+            ## Because this script runs an hour before shift1Time, we need
+            ##  to adjust.  If we're in shift3, it's before 10AM PST so we
+            ##  need to notify shift1, same for the other shifts
+            if ( $sched->inShift3Time() ){
+                sendOCNotification($PRIMARY1, $primary, $backup, $sched,
+                    $dayTag, $PAGE, $sched->switchHour());
+                sendOCNotification($BACKUP1, $backup, $primary, $sched,
+                    $dayTag, $PAGE, $sched->switchHour());
+                sendOCNotificationAlt($PRIMARY1, $primary, $backup, $dba,
+                    $netadmin, $sysadmin, $tools, $sched, $dayTag, $PAGE);
+                sendOCNotificationAlt($BACKUP1, $backup, $primary, $dba,
+                    $netadmin, $sysadmin, $tools, $sched, $dayTag, $PAGE);
+                sendOCNotification($PRIMARY_DEVELOPER, $primaryDeveloper, $primary, $sched,
+                    $dayTag, $PAGE, $sched->switchHour());
+                sendOCNotification($BACKUP_DEVELOPER, $backupDeveloper, $primary, $sched,
+                    $dayTag, $PAGE, $sched->switchHour());
+            } elsif ( $sched->inShift1Time() ){
+                sendOCNotification($PRIMARY2, $shift2, $backup2, $sched, $dayTag,
+                    $PAGE, $sched->europeSwitchHour());
+                sendOCNotification($BACKUP2, $backup2, $shift2, $sched, $dayTag,
+                    $PAGE, $sched->europeSwitchHour());
+                sendOCNotificationAlt($PRIMARY2, $shift2, $backup2, $dba,
+                    $netadmin, $sysadmin, $tools, $sched, $dayTag, $PAGE);
+                sendOCNotificationAlt($BACKUP2, $backup2, $shift2, $dba,
+                    $netadmin, $sysadmin, $tools, $sched, $dayTag, $PAGE);
+            } else { ## inShift2Time must be true
+                sendOCNotification($PRIMARY3, $shift3, $backup3, $sched, $dayTag,
+                    $PAGE, $sched->blrSwitchHour());
+                sendOCNotification($BACKUP3, $backup3, $shift3, $sched, $dayTag,
+                    $PAGE, $sched->blrSwitchHour());
+                sendOCNotificationAlt($PRIMARY3, $shift3, $backup3, $dba,
+                    $netadmin, $sysadmin, $tools, $sched, $dayTag, $PAGE);
+                sendOCNotificationAlt($BACKUP3, $backup3, $shift3, $dba,
+                    $netadmin, $sysadmin, $tools, $sched, $dayTag, $PAGE);
+            }
+
+
+            my $mesg = "\n" .
+                "Starting at " . $sched->switchTime() . 
+                " today this is the on-call Ops staff:\n\n";
+
+            $mesg .= $PRIMARY1 . ': '. $primary->attribute('fullname') . "\n";
+            $mesg .= $PRIMARY2 . ': '. $shift2->attribute('fullname') . "\n"
+                if defined $shift2;
+            $mesg .= $PRIMARY3 . ': '. $shift3->attribute('fullname') . "\n"
+                if defined $shift3;
+
+            $mesg .= $BACKUP1 . ': '. $backup->attribute('fullname')."\n" if defined($backup);
+            $mesg .= $BACKUP2 . ': '. $backup2->attribute('fullname')."\n" if defined($backup2);
+            $mesg .= $BACKUP3 . ': '. $backup3->attribute('fullname')."\n" if defined($backup3);
+
+            $mesg .= $SYSADMIN . ': '. $sysadmin->attribute('fullname')."\n" if defined($sysadmin);
+
+            $mesg .= $NETADMIN . ': '. $netadmin->attribute('fullname')."\n" if defined($netadmin);
+
+            $mesg .= $DBA . ': '. $dba->attribute('fullname')."\n" if defined($dba);
+
+            $mesg .= $TOOLS  . ': '. $tools->attribute('fullname')."\n" if defined($tools);
+
+            $mesg .= $PRIMARY_DEVELOPER . ': '.$primaryDeveloper->attribute('fullname')."\n" 
+                    if (defined($primaryDeveloper) && $primaryDeveloper->instance());
+
+            $mesg .= $BACKUP_DEVELOPER . ': '.$backupDeveloper->attribute('fullname')."\n" 
+                    if (defined($backupDeveloper) && $backupDeveloper->instance());
+
+            $mesg .= "\nSee ".ariba::Ops::Constants->webServer()." for contact information\n";
+
+            if ($debug) {
+                print "would send email to jon about schedule\n'\n$mesg\n'\n";
+            } else {
+                ariba::Ops::Utils::email(
+                        ariba::Ops::Constants->operationsOncallNotificationAddress(),
+                        $primary->attribute('fullname').' on-call at '.$sched->switchTime(),
+                        $mesg
+                        );
+            }
+
+        } else {
+
+            if ($debug) {
+                print "would send email\n";
+            } else {
+                ariba::Ops::Utils::email(ariba::Ops::Constants->operationsEmailAddress,
+                    'No one on-call at ' . $sched->switchTime() . 'today!!!',
+                    "No one is assigned to be on call $when"
+                );
+            }
+        }
+    }
+
+    if ($dayTag =~ /^(?:tomorrow|this sunday|next monday)$/) {
+
+        ## Because this runs an hour before shift 1 time, we need
+        ##  to see if we're in shift 3
+        if ( ariba::Oncall::Schedule->inShift3Time() ){
+        ## We'll be runing this script 3x per day, only notify these folks once ...
+            if ($primary->hasEmail()) {
+                sendOCNotification($PRIMARY1, $primary, $backup, $sched, $when,
+                    $EMAIL, $sched->switchHour());
+                sendOCNotification($PRIMARY2, $shift2, $backup2, $sched, $dayTag,
+                    $EMAIL, $sched->europeSwitchHour());
+                sendOCNotification($PRIMARY3, $shift3, $backup3, $sched, $dayTag,
+                    $EMAIL, $sched->blrSwitchHour());
+                sendOCNotification($BACKUP1, $backup, $primary, $sched, $dayTag,
+                    $EMAIL, $sched->switchHour());
+                sendOCNotification($BACKUP2, $backup2, $shift2, $sched, $dayTag,
+                    $EMAIL, $sched->europeSwitchHour());
+                sendOCNotification($BACKUP3, $backup3, $shift3, $sched, $dayTag,
+                    $EMAIL, $sched->blrSwitchHour());
+                ## Send all 3 shifts notification of the other on-call people
+                sendOCNotificationAlt($PRIMARY1, $primary, $backup, $dba, $netadmin,
+                    $sysadmin, $tools, $sched, $dayTag, $EMAIL);
+                sendOCNotificationAlt($BACKUP1, $backup, $primary, $dba, $netadmin,
+                    $sysadmin, $tools, $sched, $dayTag, $EMAIL);
+                sendOCNotificationAlt($PRIMARY2, $shift2, $backup2, $dba, $netadmin,
+                    $sysadmin, $tools, $sched, $dayTag, $EMAIL);
+                sendOCNotificationAlt($BACKUP2, $backup2, $shift2, $dba, $netadmin,
+                    $sysadmin, $tools, $sched, $dayTag, $EMAIL);
+                sendOCNotificationAlt($PRIMARY3, $shift3, $backup3, $dba, $netadmin,
+                    $sysadmin, $tools, $sched, $dayTag, $EMAIL);
+                sendOCNotificationAlt($BACKUP3, $backup3, $shift3, $dba, $netadmin,
+                    $sysadmin, $tools, $sched, $dayTag, $EMAIL);
+                sendOCNotification($PRIMARY_DEVELOPER, $primaryDeveloper, $primary,
+                    $sched, $when, $EMAIL, $sched->switchHour());
+                sendOCNotification($BACKUP_DEVELOPER, $backupDeveloper, $primary,
+                    $sched, $when, $EMAIL, $sched->switchHour());
+            } else {
+                if ($debug) {
+                    print "would send email\n";
+                } else {
+                    ariba::Ops::Utils::email(ariba::Ops::Constants->operationsEmailAddress(),
+                            "No one on-call $when",
+                            "No one is assigned to be on call $when\n" .
+                            "See " . ariba::Ops::Constants->webServer()." for full schedule.\n" .
+                            "Edit schedule in " . $sched->fileName()
+                            );
+                }
+            }
+        }
+    }
+}
+
+my %NOTIFY_TABLE = (
+    $PRIMARY1 => $BACKUP1,
+    $BACKUP1 => $PRIMARY1,
+    $PRIMARY2 => $BACKUP2,
+    $BACKUP2 => $PRIMARY2,
+    $PRIMARY3 => $BACKUP3,
+    $BACKUP3 => $PRIMARY3,
+    $PRIMARY_DEVELOPER => 'ops primary',
+    $BACKUP_DEVELOPER => 'ops primary',
+);
+
+sub sendOCNotification {
+    my $type             = shift;
+    my $personToNotify   = shift;
+    my $otherPerson      = shift;
+    my $sched            = shift;
+    my $when             = shift;
+    my $notificationType = shift;
+    my $switchTime       = shift;
+
+    return unless (defined($personToNotify) && $personToNotify->instance());
+
+    if ($debug) {
+        print "sendOCNotification: doing ", $personToNotify->instance(), " for $type\n";
+    }
+
+    my $mesg = "You are $type on-call at " . $switchTime . ":00 $when.\n";
+
+    my $otherType = $NOTIFY_TABLE{$type};
+
+    if ($notificationType == $EMAIL) {
+
+        if ($personToNotify->hasEmail()) {
+            $mesg .= "$otherType is " . $otherPerson->attribute('fullname') . "\n" if $otherPerson; 
+            $mesg .= "See " . ariba::Ops::Constants->webServer() . " for full schedule";
+
+            if ($debug) {
+                print "Would email: ", $personToNotify->instance(), "\non-call $when\n$mesg\n\n";
+            } else {
+                $personToNotify->sendEmail("on-call $when", $mesg);
+            }
+        }
+
+    } else { # $notificationType == $PAGE
+        if ($personToNotify->hasPagerEmail()) {
+
+            if ($personToNotify->carriesFloatingPager()) {
+
+                $mesg = $personToNotify->attribute('fullname') . 
+                    " is on-call at " . $switchTime . 
+                    ":00 today, hand pager to him";
+
+            } else {
+                $mesg .= "$otherType is " . $otherPerson->attribute('fullname') . 
+                    "[" . $otherPerson->attribute('cell-phone') . "]" if $otherPerson;
+
+            }
+
+            if ($debug) {
+                print "Would page: ", $personToNotify->instance() ,"\n$mesg\n\n";
+            }else {
+                $personToNotify->sendPage('',$mesg, ariba::Ops::Constants->nullReplyTo());
+            }
+        }
+    }
+}
+
+sub sendOCNotificationAlt {
+    my $type             = shift;
+    my $personToNotify   = shift;
+    my $otherPerson      = shift;
+    my $dbaAlt           = shift;
+    my $netadminAlt      = shift;
+    my $sysadminAlt      = shift;
+    my $toolsAlt         = shift;
+    my $sched            = shift;
+    my $when             = shift;
+    my $notificationType = shift;
+
+    return unless (defined($personToNotify) && $personToNotify->instance());
+
+    if ($debug) {
+        print "sendOCNotificationAlt: doing ", $personToNotify->instance(), " for $type\n";
+    }
+
+    my $mesgAltRoles = "Alternate on-call " . "$when:\n";
+    $mesgAltRoles .= "$dbaAbbr: " . $dbaAlt->attribute('username') . "[" . $dbaAlt->attribute('cell-phone') . "]\n" if $dbaAlt;
+    $mesgAltRoles .= "$netadminAbbr: " . $netadminAlt->attribute('username') . "[" . $netadminAlt->attribute('cell-phone') . "]\n" if $netadminAlt;
+    $mesgAltRoles .= "$sysadminAbbr: " . $sysadminAlt->attribute('username') . "[" . $sysadminAlt->attribute('cell-phone') . "]\n" if $sysadminAlt;
+    $mesgAltRoles .= "$toolsAbbr: ". $toolsAlt->attribute('username') . "[" . $toolsAlt->attribute('cell-phone') . "]\n" if $toolsAlt;
+
+    if ($notificationType == $EMAIL) {
+
+        if ($personToNotify->hasEmail()) {
+            $mesgAltRoles .= "See " . ariba::Ops::Constants->webServer() . " for full schedule";
+
+            if ($debug) {
+                print "Would email: ", $personToNotify->instance(), "\non-call $when\n$mesgAltRoles\n\n";
+            } else {
+                $personToNotify->sendEmail("on-call $when", $mesgAltRoles);
+            }
+        }
+
+    } else { # $notificationType == $PAGE
+        if ($personToNotify->hasPagerEmail()) {
+
+            if ($debug) {
+                print "Would page: ", $personToNotify->instance() ,"\n$mesgAltRoles\n\n";
+            }else {
+                $personToNotify->sendPage('',$mesgAltRoles, ariba::Ops::Constants->nullReplyTo());
+            }
+        }
+    }
+}
+
+main();
+
+__END__

@@ -1,0 +1,88 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/dba/alert-log#38 $
+#
+# This script parses the oracle alert log file. It will page people if
+# it sees something bad in the alert logs.
+#
+# This script can be run as 'monprod' unix user.
+# It does not need to know any passwords.
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::LogParser::VCSLogParser;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::monitor::StatusPage;
+
+my $debug = 0;
+
+sub getFirstClusterForDatacenter {
+	my $datacenter = shift;
+		
+	my %machinesCriteria = (
+		'os' => 'redhat',
+		'status' => 'inservice',
+		'datacenter' => $datacenter,
+		'providesServices' => 'cluster',
+	);
+
+	my @machines = ariba::Ops::Machine->machinesWithProperties(%machinesCriteria);
+	return undef unless (scalar(@machines));
+	@machines = sort {$a->instance() cmp $b->instance()} @machines;
+
+	return shift @machines;
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; };
+		if ($arg =~ /^-d/o) { $debug = 1; };
+	}
+
+	my $me          = ariba::rc::InstalledProduct->new();
+	my $service     = $me->service();
+	my $hostname    = ariba::Ops::NetworkUtils::hostname();
+	my $machine     = ariba::Ops::Machine->new($hostname);
+	my $datacenter  = $machine->datacenter();
+	my $tab         = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+	my $cluster     = getFirstClusterForDatacenter($datacenter);
+
+	# Only the first cluster machine in the datacenter will run this script since
+	# we only need to parse the log once
+	return 0 if ($cluster->instance() ne $machine->instance());
+
+	my $vcsLogParser = ariba::Ops::LogParser::VCSLogParser->new();
+	$vcsLogParser->setDebug($debug);
+	$vcsLogParser->parseLog();
+
+	my %queries;
+	$queries{"VCS log on $hostname"} = {
+		info    => "numrows > -1",
+		crit    => $vcsLogParser->errorCount() > 0,
+		warn    => $vcsLogParser->warningCount() > 0,
+		perl    => sub { $vcsLogParser->allResults(); },
+	};
+
+	my $email = $me->default('notify') || $me->default('notify.email');
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails(
+		'VCS System', $tab, $service, undef, \%queries
+	);
+
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+main();
+
+__END__

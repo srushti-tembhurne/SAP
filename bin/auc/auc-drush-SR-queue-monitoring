@@ -1,0 +1,123 @@
+#!/usr/local/bin/perl
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+require "geturl";
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use JSON;
+use Pod::Usage;
+use Getopt::Long;
+use Data::Dumper;
+
+
+my $debug = 0;
+
+my($mon,$me,$siteurl,$url,@results,$decoded_json);
+ 
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    
+    GetOptions(
+        "help|h" => sub { pod2usage(1); },
+        "debug|d+" => \$debug,
+        "e" => \$sendEmail,
+        "p" => \$sendPage,
+    );
+
+    $mon = ariba::rc::InstalledProduct->new('mon');
+    $me = ariba::rc::InstalledProduct->new('community', $mon->service());
+    $siteurl = $me->default('SiteURLSecure');
+    chomp($siteurl);
+	print "siteurl : $siteurl \n" if($debug);
+    my $interval = 60*60;
+    my $start_time = `date +%s` - $interval; 
+    $url = "$siteurl/internal/ariba-limited-retry-queue-manager-monitor.php?queue_name=auc_auto_post_sr&start_ts=\'$start_time\'&duration_sec=\'$interval\'";
+	#https://svcdevauc.lab1.ariba.com/internal/ariba-limited-retry-queue-manager-monitor.php?queue_name=auc_auto_post_sr&start_ts=1536591707&duration_sec=3600
+    eval { geturl("-e","-q","-timeout", '60', "-results",\@results,$url) };
+    if ($@) {
+	    @results = ("URL error");
+	    $decoded_json->{'timed_out'} = "invalid url $url";
+    } else {
+        my $json = join('',@results);
+        eval { $decoded_json = JSON::decode_json($json); };
+        if ($@) {
+		    @results=("Invalid JSON");
+	            $decoded_json->{'timed_out'} = "JSON error $json";
+        }
+    }
+
+print "url [ $url ] result ".Dumper($decoded_json) if($debug);
+
+=pod
+$VAR1 = {
+          'succeeded' => '0',
+          'timed_out' => '0',
+          'total' => '0',
+          'failed' => '0'
+        };
+=cut
+
+    my %queries;
+    $queries{'total_task_status'} = {
+                                    crit => "answer < 1",
+			            warn => "answer =~ /(invalid|error)/i",
+                                    severity => 1,
+                                    description => 'Total number of tasks started, completed or errored out',
+                                    correctiveActions => [
+                                          Ops => '1) Send email to AUC Community alias DL ARB AUC_Eng (External) <DL_5419DA6CFD84A00838000005@exchange.sap.corp>'
+                                    ],
+                                    recordMaxResults => 4320,
+				    perl => sub {  return $decoded_json->{'total'}; }, 
+                                  };
+
+    $queries{'job_succeeded'} = {
+                                    crit => "answer < 1",
+			            warn => "answer =~ /(invalid|error)/i",
+                                    severity => 1,
+                                    description => 'Number of times the job ran successfully',
+                                    correctiveActions => [
+                                          Ops => '1) Send email to AUC Community alias DL ARB AUC_Eng (External) <DL_5419DA6CFD84A00838000005@exchange.sap.corp>'
+                                    ],
+                                    recordMaxResults => 4320,
+				    perl => sub {  return $decoded_json->{'succeeded'}; }, 
+                                  };
+
+
+    $queries{'job_failed'} = {
+                                    warn => "answer > 0 or answer =~ /(invalid|error)/i",
+                                    crit => "answer > 2",
+                                    severity => 1,
+				    description => 'Number of times the job failed within the interval',
+			            ticketOnWarnOpenAfterMinutes => 1,
+                                    correctiveActions => [
+                                          Ops => '1) Send email to AUC Community alias DL ARB AUC_Eng (External) <DL_5419DA6CFD84A00838000005@exchange.sap.corp>'
+                                    ],
+                                    recordMaxResults => 4320,
+				    perl => sub {  return $decoded_json->{'failed'}; }, 
+                                  };
+
+    $queries{'job_timed_out'} = {
+                                    crit => "answer > 0",
+			            warn => "answer =~ /(invalid|error)/i",
+				    severity => 1,
+                                    description => 'Number of times the job timed out within the interval',
+                                    correctiveActions => [
+                                          Ops => '1) Send email to AUC Community alias DL ARB AUC_Eng (External) <DL_5419DA6CFD84A00838000005@exchange.sap.corp>'
+                                    ],
+                                    recordMaxResults => 4320,
+				    perl => sub {  return $decoded_json->{'timed_out'}; }, 
+                                  };
+
+
+
+      my $email = $me->default('notify.email');
+      my $qm = ariba::monitor::QueryManager->newWithDetails('Drush auto post SR Queue', $me->name(), $me->service(), $me->customer(), \%queries);
+      $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+                                    
+}
+main();

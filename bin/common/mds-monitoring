@@ -1,0 +1,317 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use Data::Dumper;
+use Getopt::Long qw(:config no_ignore_case_always no_getopt_compat require_order);
+use dmail::LockLib;
+use Data::Dumper;
+use XML::Simple;
+
+use constant {TRUE => 1, FALSE => 0};
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Url;
+use ariba::monitor::QueryManager;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+
+# The full action provided from engineering is given here, for reference.
+
+=pod
+
+  my $action = q(OPs team:  For each "WorkItem" from the response - run additional query below in Buyer's inspector to 
+       determine the severity of the ticket.  Replace <WorkItemId> withe the value in 
+       <WorkItemId> attribute from the response.
+    
+       SELECT s.MSS_ISFULLLOAD 
+           FROM MasterdataServiceSyncStatusTab s, us_MasterDataSyncJobTab j, us_MasterDataSyncWorkItemTab w
+           WHERE s.MSS_PUBLISHID = j.MDS_PAYLOADID AND j.ROOTID = w.MDS_SYNCJOB 
+           AND w.MDS_WORKITEMID = '<WorkItemId>'
+        
+       If above query returns 1, open an S0 ticket in JIRA under CPL project.  Open S1 ticket for all others.
+       Please include the partition number, WorkItemId, Status and PrimaryDocID in the ticket.);
+
+    # The action is modified to take into account the fact that the script runs the SQL and saves the MSS_ISFULLLOAD return
+    # value in the query.  Also note, this string (currently:  2016/09/22) MUST NOT contain newline characters, explicit
+    # or implicit.  The code somewhere breaks at the first newline, and does not "print" the rest.
+    my $action = 
+    "Tickets belong in the JIRA project CPL.  A WorkItem has 5 elements, with a line of '=' characters separating each WorkItem.  " .
+    'Within a WorkItem, MSS_ISFULLLOAD defines the ticket severity:  a 1 is S1, zero is S0.  To keep the number of tickets low, ' .
+    'combine all WorkItems with the same PartitionNumber in one ticket.  Include all elements for all WorkItems in the related ticket.  ';
+
+=cut
+
+# And the action is re-modified.  Per the standup meeting, the entire list of WorkItems will be put in a single S1 ticket.  Engineering
+# will review and create S0 tickets if needed from subsets of the WorkItems.
+my $action = q(Create a single S1 ticket for the CPL project in JIRA.  Copy/paste the full query status information to the ticket in )
+           . q(the description field.);
+my $lockfile;
+sub main
+{
+    my ($debug, $sendEmail, $sendPage, $productName);
+    GetOptions  (
+                    'debug|d'         => \$debug,
+                    'sendemail|e'     => \$sendEmail,
+                    'sendpage|p'      => \$sendPage,
+                    'product|prod=s'  => \$productName,
+                );
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+    my $email = $me->default('notify.email');
+
+    # This script needs to loop over installed products and process appropriately.
+    my @productsList = ariba::rc::InstalledProduct->installedProductsList ($service, $productName);
+    exit (0) unless @productsList;
+
+    my (%queries, $customer);
+
+    PRODLOOP: for my $product (@productsList)
+    {
+        # Set up lock file so only one instance of this script runs at a time.  This may not be really needed, depending on the
+        # crontab time frequency.  And that is to be once every 15 minutes.
+        $lockfile = "/tmp/mds-monitoring-$productName";
+        $customer = $product->customer;
+        $lockfile .= "-$customer" if $customer;
+        if (!dmail::LockLib::requestlock($lockfile,5)) {
+            print STDERR "can't grab lock $lockfile\n";
+            next;
+        }
+
+        # Set up to get data from DB:
+        my @dbcs = ariba::Ops::DBConnection->connectionsFromProducts($product);
+        my $oracleClient = ariba::Ops::OracleClient->newFromDBConnection($dbcs[0]);
+        $oracleClient->connect;
+
+        for my $instance ($product->appInstancesInCluster ($cluster))
+        {
+            next unless $instance;
+
+            # There are now two URLs to connect with, for MDS and a new one for MDSScheduledTask.  Process for the first type,
+            # followed by the second.
+            my $mdsURL = $instance->masterDataServiceStatsURL; # method gets the URL to use for MDS data.
+            next unless $mdsURL; # We can't do anything unless we have a URL!
+            print "current url:  $mdsURL\n" if $debug;
+
+            my $mdsMonitorStats = ariba::monitor::Url->new ($mdsURL);
+            # durable-email-monitoring set a 45 second timeout, the default is 15.  For this script, 5 seconds is probably enough.
+            # The curl response to the URL is nearly instant.
+            my $results = $mdsMonitorStats->request(5);
+            next unless $results; # Seems to me if we get nothing, there's nothing to do.
+            print "\n---returned XML\n", $results, "\n---\n" if $debug;
+
+            my $description = "Master Data Service (MDS) monitoring via direct action URL.\n"
+                              . "This monitors the Status value in MasterDataSyncWorkItem table in Oracle DB, and looks for failed\n"
+                              . "publish requests.  Status with values 2, 3, 5, 7, 9, 12 and 14 are failed publish requests.\n";
+
+            my $sql = q(SELECT s.MSS_ISFULLLOAD 
+                        FROM MasterdataServiceSyncStatusTab s, us_MasterDataSyncJobTab j, us_MasterDataSyncWorkItemTab w
+                        WHERE s.MSS_PUBLISHID = j.MDS_PAYLOADID AND j.ROOTID = w.MDS_SYNCJOB AND w.MDS_WORKITEMID = ?);
+
+            # And the results might be just the string "No result return" which should not be parsed as XML!
+            my $status_ref; 
+            # Second item is the returned value from the SQL, if >= 1, ticket is S0, else S1.  Also, VERY IMPORTANT:  the variables used
+            # in the perl sub, in the query, must be unique, since they are closures and will refer back later for the value.  Since
+            # the subs run well after the query object is built, the value would be whatever the last processed section provides.  The
+            # variables are $workItemStatus and $status in this first section, so they MUST NOT be reused.
+            my ($workItemStatus, $mss_IsFullLoad);
+            # We start with info set to TRUE and crit to FALSE.  Note that status will always be TRUE, to provide the "answer" to
+            # compare with the 3 different status levels.
+            my $rows; # Flag to turn multiRow on or off.
+            if ($results =~ /No result return/)
+            {
+                $rows = FALSE; # Not a multiRow.
+                $workItemStatus = 'Status is OK.';
+            }
+            elsif ($results =~ /404.*Not Found Error/)
+            {
+                $rows = FALSE; # Not a multiRow.
+                $workItemStatus = "The page '$mdsURL' was not found (404 error).";
+            }
+            else
+            {
+                $rows = TRUE;
+                # This is the error case, so info/crit must be reversed:
+                # For XML processing, need to force an array context for the name tag, so the return will match for a single WorkItem
+                # as well as multiple ones.
+                my $name = 'WorkItem';
+                $status_ref = parseXMLDetails ($results, $name);
+                next unless $status_ref; # Again, if no value here, no use in continuing.
+                print "Dump of status data:\n" . Dumper($status_ref) if $debug;
+
+                # Now parse through the returned status data, extracting details needed for the queries.  The simple parsing of the XML
+                # results in a hash with the following structure:
+                #   $status_ref->{WorkItem}->[#]->{***}
+                #       where # will need to be determined dynamically:  scalar (@{$status_ref->{WorkItem}})
+                #       and *** is one of:
+                #                           PrimaryDocID
+                #                           Status
+                #                           WorkItemId
+                #                           PartitionNumber
+                for my $workItemHashRef (@{$status_ref->{WorkItem}})
+                {
+                    # Skip any WorkItem that does not have a Status in the list provided in the description, above.  Note the value
+                    # here may be a string with leading/trailing space.  This guarantees that 2 will never match 12.
+                    next unless $workItemHashRef->{Status} =~ /(^|\s)(2|3|5|7|9|12|14)(\s|$)/;
+                    $mss_IsFullLoad = $oracleClient->executeSql ($sql, [$workItemHashRef->{WorkItemId}]);
+                    # Build a string with the details, to display on the web page:  include the partition number, WorkItemId, Status
+                    # and PrimaryDocID in the ticket.
+                    $workItemStatus .= "WorkItemId: "        . (! ref $workItemHashRef->{WorkItemId} ? $workItemHashRef->{WorkItemId} : 'ERROR:  no WorkItemId')
+                                     . "\nStatus: "          . (! ref $workItemHashRef->{Status} ? $workItemHashRef->{Status} : 'ERROR:  no Status')
+                                     . "\nPartitionNumber: " . (! ref $workItemHashRef->{PartitionNumber} ? $workItemHashRef->{PartitionNumber} : 'ERROR:  no PartitionNumber')
+                                     # If there's no data for a tag pair, then XMLin() places an empty literal hash.
+                                     . "\nPrimaryDocID: "    . (! ref ($workItemHashRef->{PrimaryDocID}) ? $workItemHashRef->{PrimaryDocID} : " N/A ")
+                                     # And this is the result of the DB read.  We convert to the proper severity to use, to avoid confusion.
+                                     . "\nJIRA severity:  "  . ((defined $mss_IsFullLoad && $mss_IsFullLoad > 0) ? 'S0' : 'S1')
+                                     . "\n===================================\n";
+                }
+                # It is possible that the returned XML contained none of the "error case" status values, in which case $workItemStatus will be
+                # emtpy.  If this happens, the info/crit values need to be re-reversed (gah), and a helpful message supplied.  Otherwise, clean
+                # up as before.
+                if ($workItemStatus)
+                {
+                    # The above adds an extra unnecessary delimiter line, remove it here.
+                    $workItemStatus =~ s/===================================\n$//;
+                }
+                else
+                {
+                    $rows = FALSE;
+                    $workItemStatus = "Status is OK.";
+                }
+            }
+
+            # The query will contain data extracted from the XML, if present, or just 'info', for the 'No result return' case.
+            $queries{"MDS status for product $productName"} = {
+                                                                crit              => "(answer eq 'NOT OK' || answer =~ /JIRA severity:|404/) && previousAnswer eq 'NOT OK'",
+                                                                info              => "answer eq 'OK'",
+                                                                perl              => sub {return $workItemStatus =~ /OK\.$/ ? 'OK' : 'NOT OK'},
+                                                                description       => $description,
+                                                                multiRow          => $rows,
+                                                                note              => $workItemStatus,
+                                                                correctiveActions => ['Ops', $action],
+                                                              };
+
+            # This is where we do the Scheduled Task part of MDS monitoring.
+            my ($schedTaskStatus, $stStatus);
+
+            $mdsURL = $instance->masterDataServiceScheduledTaskStatusURL; # method gets the URL to use for MDS Scheduled Task data.
+            # And I suppose it's possible we didn't get a URL here, either, so ...
+            next unless $mdsURL;
+            print "current url:  $mdsURL\n" if $debug;
+
+            my $mdsSchedTaskMonitorStats = ariba::monitor::Url->new ($mdsURL);
+            $results = $mdsSchedTaskMonitorStats->request(5);
+            next unless $results; # Seems to me if we get nothing, there's nothing to do.
+            print "\n---returned XML\n", $results, "\n---\n" if $debug;
+
+            $description = "Master Data Service Scheduled Task monitoring via direct action URL.";
+
+            $stStatus = TRUE;
+
+            if ($results =~ /No result return/)
+            {
+                $rows = FALSE; # Not a multiRow.
+                $schedTaskStatus = 'Status is OK.';
+            }
+            elsif ($results =~ /404.*Not Found Error/)
+            {
+                $rows = FALSE; # Not a multiRow.
+                $schedTaskStatus = "The page '$mdsURL' was not found (404 error).";
+            }
+            else
+            {
+                $rows = TRUE; # Multiple possible rows reported.
+                # For XML processing, need to force an array context for the name tag, so the return will match for a single
+                # MDSScheduledTask as well as multiple ones.
+                my $name = 'MDSScheduledTask';
+                $status_ref = parseXMLDetails ($results, $name);
+                next unless $status_ref; # Again, if no value here, no use in continuing.
+                print "Dump of status data:\n" . Dumper($status_ref) if $debug;
+
+                # Now parse through the returned status data, extracting details needed for the queries.  The simple parsing of the XML
+                # results in a hash with the following structure:
+                #   $status_ref->{MDSScheduledTask}->[#]->{***}
+                #       where # will need to be determined dynamically:  scalar (@{$status_ref->{MDSScheduledTask}})
+                #       and *** is one of:
+                #                           Partition
+                #                           Task
+                #                           Status
+                #                           StartTime
+                #                           EndTime
+                #                           NodeName
+                for my $MDSSchedTaskHashRef (@{$status_ref->{MDSScheduledTask}})
+                {
+                    # Build a string with the details, to display on the web page.
+                    $schedTaskStatus .= "Partition:  "   . (! ref $MDSSchedTaskHashRef->{Partition} ? $MDSSchedTaskHashRef->{Partition} : "NO Partition returned!")
+                                    .  "\nTask:  "       . (! ref $MDSSchedTaskHashRef->{Task}      ? $MDSSchedTaskHashRef->{Task}      : "NO Task returned!")
+                                    .  "\nError:  "      . (! ref $MDSSchedTaskHashRef->{Status}    ? $MDSSchedTaskHashRef->{Status}    : "NO Error returned!")
+                                    .  "\nStartTime:  "  . (! ref $MDSSchedTaskHashRef->{StartTime} ? $MDSSchedTaskHashRef->{StartTime} : "NO StartTime returned!")
+                                    .  "\nEndTime:  "    . (! ref $MDSSchedTaskHashRef->{EndTime}   ? $MDSSchedTaskHashRef->{EndTime}   : "NO EndTime returned!")
+                                    .  "\nNodeName  "    . (! ref $MDSSchedTaskHashRef->{NodeName}  ? $MDSSchedTaskHashRef->{NodeName}  : "NO NodeName returned!")
+                                     . "\n===================================\n";
+                }
+                # I think this also needs to be checked, for the case where $result is XML, but there are not errors.  This may not happen for this particular DA URL
+                # but adding it won't hurt anything and may prevent problems.
+                if ($schedTaskStatus)
+                {
+                    # The above adds an extra unnecessary delimiter line, remove it here.
+                    $schedTaskStatus =~ s/===================================\n$//;
+                }
+                else
+                {
+                    $rows = FALSE;
+                    $schedTaskStatus = 'Status is OK.';
+                }
+            }
+
+            # The query will contain data extracted from the XML, if present, or just 'info', for the 'No result return' case.
+            $queries{"MDS Scheduled Task status for product $productName"} = {
+                                                                                 crit              => "(answer eq 'NOT OK' || answer =~ /JIRA severity:|404/) && previousAnswer eq 'NOT OK'",
+                                                                                 info              => "answer eq 'OK'",
+                                                                                 perl              => sub {return $schedTaskStatus =~ /OK\.$/ ? 'OK' : 'NOT OK'},
+                                                                                 description       => $description,
+                                                                                 note              => $schedTaskStatus,
+                                                                                 multiRow          => $rows,
+                                                                                 correctiveActions => ['Ops', $action],
+                                                                             };
+
+            # When we get here, we have fully processed all there is to know, no need to process any more, so this is the
+            last PRODLOOP; # iteration.  I have been told (emphasis mine):
+                           #        "Pull the XML from *any* node from <host>/Buyer/Main/ad/mdsMonitor/MonitorActions.
+                           #        Produce a *single* alert, and display all 'WorkItem' as data content."
+        }
+    }
+
+    my $queryObject = ariba::monitor::QueryManager->newWithDetails ('Master-Data-Service', $productName, $service, $customer, undef, \%queries);
+    $queryObject->processQueries ($debug, $email, $sendEmail, $sendPage);
+
+    # Don't forget this...
+    dmail::LockLib::releaselock($lockfile);
+}
+
+sub parseXMLDetails
+{
+    my $xml = shift;
+    my $name = shift;
+
+    my $xml_href;
+    eval {
+        $xml_href = XMLin ($xml, ForceArray => [$name]);
+    };
+
+    if ($@ || ref ($xml_href) !~ /hash/i){
+        return 0;
+    }
+
+    return $xml_href;
+}
+
+main();
+
+__END__

@@ -1,0 +1,124 @@
+#!/usr/local/bin/perl -w
+
+# This program enable the user to customize error 560 message on webservers from a monitoring box
+
+# $Id: //ariba/services/monitor/bin/control-error560-pages#3 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../lib/perl";
+
+use ariba::Ops::BusyPageController;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::ProductStatus;
+
+
+sub usage {
+	
+	print "Error: $_[0]\n" if $_[0];
+	print "usage: $0\n";
+	print "	[-help]\n";
+	print "	[-d]\n";
+	print "	[-testing] doesn't execute commands just print them\n";
+	print "	[-customer <customer>]\n";
+	print "	-product <product>\n";
+	print "	-service <service>\n";
+	print "	-<unplanned|planned|rolling>\n";
+	print "		planned       - replace the standard busy page by a customized one\n";
+	print "		unplannned    - replace a customized busy page by the standard one\n";
+	print "		rolling       - replace a customized busy page by the one used during a restart\n";
+	print "\n";
+
+	exit(1);
+
+}
+
+
+sub main {
+
+	my $productName = undef;
+	my $serviceName = undef;
+	my $customerName = undef;
+
+	my $unplanned = 0;
+	my $planned = 0;
+	my $rolling = 0;
+	my $check = 0;
+	my $debug = undef;
+	my $testing = undef;
+	my $force = undef;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; };
+		if($arg =~ /^-help/o){ usage(); };
+		if($arg =~ /^-testing/o){ $testing = 1; };
+		if($arg =~ /^-product/o){ $productName = shift(@ARGV); next; };
+		if($arg =~ /^-service/o){ $serviceName = shift(@ARGV); next; };
+		if($arg =~ /^-customer/o){ $customerName = shift(@ARGV); next; };
+		if($arg =~ /^-planned/o){ $planned = 1; next; };
+		if($arg =~ /^-unplanned/o){ $unplanned = 1; next; };
+		if($arg =~ /^-rolling/o){ $rolling = 1; next; };
+		if($arg =~ /^-force/o){ $force = 1; next; };
+	}
+
+	usage("Need a service.") unless ($serviceName);
+	usage("Need a product.") unless ($productName);
+	usage("Need -unplanned or -planned or -rolling to know what to do.") unless ($unplanned || $planned || $rolling);
+	usage("Args -unplanned, -planned or -rolling cannot be used at the same time.") if ( ($unplanned + $planned + $rolling) > 1);
+
+
+	if ( ariba::rc::Globals::isASPProduct($productName) ) {
+		usage("Need a customer.") unless ($customerName);
+	}
+
+	unless (ariba::rc::InstalledProduct->isInstalled($productName, $serviceName, undef, $customerName)) {
+		print "This is product is not installed.\n";
+		return -1;
+	}
+			  
+	my $product = ariba::rc::InstalledProduct->new($productName, $serviceName, undef, $customerName );
+
+
+
+	my $busyPages = ariba::Ops::BusyPageController->newFromProduct($product);
+
+	$busyPages->setDebug($debug);
+	$busyPages->setTesting($testing);
+
+	if ($planned)  {
+		my $productStatus = ariba::monitor::ProductStatus->newWithDetails($product->name(), $product->service(), $product->customer());
+
+		unless ($productStatus) {
+			print "Error : No product status found for ", $product->name(), "/", $product->service(), "\n";
+			return 0;
+		}
+
+		unless ($productStatus->inPlannedDownTime()) {
+			print "Error : This does not take place during a planned downtime\n";
+			return 0;
+		}
+
+		my $beginning = $productStatus->plannedDownTimeStart();
+		my $duration  = $productStatus->duration();
+
+		unless ($duration) {
+			print "Error : No duration time defined\n";
+			return 0;
+		}
+
+		$busyPages->setPlanned($beginning, $duration, $force);
+
+	} elsif ($unplanned) {
+		$busyPages->setUnplanned($force);
+
+	} elsif ($rolling) {
+		$busyPages->setRolling($force);
+
+	}
+
+}
+
+main();
+
+__END__

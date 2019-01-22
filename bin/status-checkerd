@@ -1,0 +1,121 @@
+#!/usr/local/bin/perl -w
+#
+# background daemon for per-product status
+#
+
+my $vers = '$Id: //ariba/services/monitor/bin/status-checkerd#18 $';
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use ariba::Ops::PersistantObject;;
+use ariba::monitor::QueryManager;
+use ariba::monitor::ProductStatus;
+use ariba::monitor::StatusPage;
+use ariba::monitor::misc;
+use ariba::rc::InstalledProduct;
+
+my $monitorDir = ariba::monitor::misc::monitorDir();
+my $qmDir = ariba::monitor::misc::queryManagerStorageDir();
+my $debug = 0;
+
+sub main {
+
+	ariba::Ops::PersistantObject->enableSmartCache();
+
+	if ( $ARGV[0] && $ARGV[0] =~ /^-d/ ){
+		$debug = 1;
+	}
+
+	# pass service to status
+	my $me      = ariba::rc::InstalledProduct->new();
+	my $service = $me->service();
+
+	my $objectLoads = 0;
+
+	while (1) {
+
+		my %prodStatus = ();
+		my %productCustomerStatus = ();
+
+		checkDir($qmDir, \%prodStatus, \%productCustomerStatus);
+
+		for my $product (sort keys %prodStatus) {
+			my $status = ariba::monitor::StatusPage::computeStatus( $prodStatus{$product} );
+
+			print "DEBUG: $product status $status\n" if $debug;
+
+			my $productStatus = ariba::monitor::ProductStatus->newWithDetails($product, $service);
+			$productStatus->writeStatus($status);
+		}
+
+		for my $product (sort keys %productCustomerStatus) {
+			for my $customer (sort keys %{$productCustomerStatus{$product}}) {
+				my $status = ariba::monitor::StatusPage::computeStatus( $productCustomerStatus{$product}->{$customer} );
+
+				print "DEBUG: $product, $customer status $status\n" if $debug;
+
+				my $productStatus = ariba::monitor::ProductStatus->newWithDetails($product, $service, $customer);
+				$productStatus->writeStatus($status);
+			}
+		}
+
+		my $loads = ariba::Ops::PersistantObject->objectsLoadedFromDisk();
+		print "DEBUG: loaded ", $loads - $objectLoads, " objects\n" if $debug;
+		$objectLoads = $loads;
+
+		sleep(45);
+	}
+}
+
+sub checkDir {
+	my $dir = shift;
+	my $productStatusRef = shift;
+	my $productCustomerStatusRef = shift;
+
+	print "\nDEBUG: checkDir($dir)\n" if $debug;
+
+	opendir(DIR,$dir) || die "can't open $dir $!";
+	my @files = grep(! /^(\..*)/o, readdir(DIR));
+	closedir(DIR);
+
+	for my $file (sort @files){
+
+		if ( -d "$dir/$file" ) {
+			checkDir("$dir/$file", $productStatusRef, $productCustomerStatusRef);
+			next;
+		}
+
+		next unless $file =~ m|\.qm$|;
+
+		# qm sometimes dont have product name set, get it from
+		# directory. This is because they are getting written out
+		# without without locking
+		my $d = $dir;
+		$d =~ s|$qmDir/||;
+		$d =~ s|$monitorDir/||;
+		$d =~ s|([^/]+).*|$1|;
+		my $productName = $d;
+
+		print "DEBUG: checking $dir/$file\n" if $debug;
+
+		my $qm = ariba::monitor::QueryManager->new("$dir/$file");
+		my $status =  $qm->status();
+		my $customer =  $qm->customer();
+
+		next if ($qm->uiHint() && $qm->uiHint() eq "ignore");
+
+		if ($status) {
+			print "DEBUG:   got $file status $status for $productName\n" if $debug;
+
+			$productStatusRef->{$productName}->{$status}++;
+
+			if ($customer) {
+				$productCustomerStatusRef->{$productName}->{$customer}->{$status}++;
+			}
+		}
+	}
+}
+
+main();

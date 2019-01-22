@@ -1,0 +1,240 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/gomez-stats#3 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::StatusPage;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+use ariba::Ops::DateTime;
+use XML::XPath;
+use XML::XPath::XMLParser;
+
+my $debug = 0;
+
+my $listBaseUrl;
+my $detailBaseUrl;
+my $error;
+
+sub getDetails {
+	my $account_id = shift;
+	my $id = shift;
+	my $lastdate = shift;
+
+	my $date = ariba::Ops::DateTime->parseDateFromString("$lastdate GMT");
+	my $enddate = $date->strftime("%D+%H:%M");
+	$date->subtract(("minutes" => 10));
+	my $startdate = $date->strftime("%D+%H:%M");
+
+	my $command = "account_id=$account_id&monitor_id=$id&startdate=$startdate&enddate=$enddate";
+
+	my $gomezUrlString .= "$detailBaseUrl?$command";
+
+	print ("Gomez details url : " . $gomezUrlString . "\n") if ($debug);
+
+	my $url = ariba::monitor::Url->new($gomezUrlString);
+
+	$url->setUseOutOfBandErrors(1);
+	my @urlOutput = $url->request();
+	if (defined($url->error())) {
+		$error = "Error getting details: " . $url->error();
+		return;
+	}
+
+	my $xmlOutput = "@urlOutput";
+
+	if($xmlOutput && $xmlOutput !~ m/<?xml/) {
+		$error = $xmlOutput;
+		return;
+	}
+
+	my $xp = XML::XPath->new(xml => $xmlOutput);
+
+	my $nodeSet = $xp->find('//test');
+
+	my $result = {};
+
+	foreach my $node ($nodeSet->get_nodelist) {
+		my $location = $xp->findvalue('node', $node);
+		my $time = $xp->findvalue('test_rt', $node);
+
+		$result->{$location} = int($time) / 1000;
+	}
+
+	return $result;
+}
+
+sub fetchGomezData {
+	# A monitor product
+	# It's used for retrieving login, password and alertSite url
+	my $mon = shift;
+
+	$listBaseUrl = $mon->default('Ops.Gomez.xmllisturl');
+	$detailBaseUrl = $mon->default('Ops.Gomez.xmldetailurl');
+	my $siteLogin    = $mon->default('Ops.Gomez.login');
+	my $sitePassword = $mon->default('Ops.Gomez.password');
+
+	my $command = "username=$siteLogin&password=$sitePassword";
+
+	my $gomezUrlString = "$listBaseUrl?$command";
+
+	print ("Gomez url used : " . $gomezUrlString . "\n") if ($debug);
+
+	my $url = ariba::monitor::Url->new($gomezUrlString);
+
+	$url->setUseOutOfBandErrors(1);
+	my @urlOutput = $url->request();
+	if (defined($url->error())) {
+		$error = "Error getting list: " . $url->error();
+		return;
+	} 
+
+	my $xmlOutput = "@urlOutput";
+
+	print ("Output String : " . $xmlOutput . "\n") if ($debug);
+	
+	# It parses the xml string.
+	# The xml string should be :
+	#
+	#	<gomez_data>
+	#		<monitor>
+	#			<account_id>ACC_ID</account_id>
+	#			<id>ID1</id>
+	#			<name><![CDATA[NAME1]]></name>
+	#			<lastdate><![CDATA[TIME1]]></lastdate> => M/DD/YYYY HH:MM:SS AM
+	#			<userdata><![CDATA[]]></userdata>
+	#		</monitor>
+	#		<monitor>
+	#			<account_id>ACC_ID</account_id>
+	#			<id>ID2</id>
+	#			<name><![CDATA[NAME2]]></name>
+	#			<lastdate><![CDATA[TIME2]]></lastdate> => M/DD/YYYY HH:MM:SS AM
+	#			<userdata><![CDATA[]]></userdata>
+	#		</monitor>
+	#	</gomez_data>
+
+	if($xmlOutput && $xmlOutput !~ m/<?xml/) {
+		$error = $xmlOutput;
+		return;
+	}
+
+	my $xp = XML::XPath->new(xml => $xmlOutput);
+
+	my $account_id = $xp->findvalue('//monitor[1]/account_id');
+
+	my $nodeSet = $xp->find('/gomez_data/monitor'); 
+
+	my $result = {}; 
+
+	foreach my $node ($nodeSet->get_nodelist) {
+		my $id = $xp->findvalue('id', $node);
+		my $name = $xp->findvalue('name', $node);
+		my $lastdate = $xp->findvalue('lastdate', $node);
+		next if $name =~ m/data/;
+		$result->{$name} = getDetails($account_id, $id, $lastdate);
+	}
+	
+	return $result;
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	$debug = 0;
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; };
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $email = $me->default('notify.email');
+
+	my $pn = ariba::monitor::StatusPage::commonProduct();
+
+	my $result = fetchGomezData($me);
+
+	my %queryToRecordFetchedData;
+
+	foreach my $host (keys %{$result})	{ 
+	
+		# These are instant values.
+		# We need them to compute the averages ones. 
+		# So these values won't be displayed. They will just be stored.
+		for my $location (keys %{$result->{$host}}) {
+			my $ping = $result->{$host}->{$location};
+    
+			print "($host, $location, $ping)\n" if ($debug);
+			
+			
+			my $queryNameIV = "Gomez instant response time for website $host from $location";
+			$queryToRecordFetchedData{$queryNameIV} = {
+				'recordMaxResults' => 26784,
+				'recordItem' => "answer",
+				'format' => "%0.3f secs",
+
+				'info' => "1",
+
+				'perl' => "$ping",
+			};
+		}
+	}
+
+	# We have to process instant values queries here, otherwise the average values computation 
+	# is not able to use the latest instant values.
+	my $qm = ariba::monitor::QueryManager->newWithDetails("gomez-response-times-for-http-get-record-only", $pn, $me->service(), $me->customer(), \%queryToRecordFetchedData);
+	$qm->setUiHint('ignore');
+
+	$qm->processQueriesUsingServer($debug, $email, 0, 0);
+
+	my %queryToComputeAverageValues; 
+	my $status;
+	if(defined($error)) {
+		$status = "Failed: $error";
+	} else {
+		$status = "Success";
+	}
+
+	$queryToComputeAverageValues{"Data fetched from Gomez status"} = {
+		error => $error,
+		perl => sub { return $status; },
+	};
+
+	foreach my $host ( keys %{$result})	{ 
+	
+		# Then we compute average values
+		for my $location (keys %{$result->{$host}}) {
+			my $queryNameIV = "Gomez instant response time for website $host from $location";
+			my $queryNameAV = "Gomez avg response time for $host from $location";	
+			my $cdbName = ariba::monitor::Query->generateInstanceName($queryNameIV, $pn);
+			
+			$queryToComputeAverageValues{$queryNameAV} = {
+				'recordMaxResults' => 26784,
+				'recordItem' => "answer",
+				'format' => "%0.3f secs",
+				info => "1",
+
+				#XXX 
+				#'info' => "answer >= 0.8",
+				#'warn' => "answer >= 2",
+				#'crit' => "answer >= 8",
+
+				'extractRecorded' => "average($cdbName, +3)",
+			};
+		}
+
+	}
+
+	my $q = ariba::monitor::QueryManager->newWithDetails("network-gomez", $pn, $me->service(), $me->customer(), \%queryToComputeAverageValues);
+
+	$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+	
+}
+
+main();
+
+__END__

@@ -1,0 +1,178 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/dba/resync-rows#5 $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DBConnection;
+use ariba::Ops::DBUtils;
+use ariba::Ops::OracleClient;
+
+my $debug = 0;
+
+$| = 1;
+
+sub main {
+	my ($productName, $service, $schema, $sourceTable, $rowidfile, @rowIds, $keepTempTable);
+
+	while (my $arg = shift(@ARGV)) {
+
+		if ($arg =~ /^-product/o)   { $productName = shift(@ARGV); next };
+		if ($arg =~ /^-service/o)   { $service = shift(@ARGV); next };
+		if ($arg =~ /^-schema/o)    { $schema = uc(shift(@ARGV)); next };
+		if ($arg =~ /^-table/o)     { $sourceTable = uc(shift(@ARGV)); next };
+		if ($arg =~ /^-rowidfile/o) { $rowidfile = shift(@ARGV); next };
+		if ($arg =~ /^-keepTemp/o)  { $keepTempTable = 1; next };
+		if ($arg =~ /^-d/o)         { $debug = 1; next };
+	}
+
+	my $me	     = ariba::rc::InstalledProduct->new();
+	my $product  = ariba::rc::InstalledProduct->new($productName, $service);
+
+	ariba::rc::Passwords::initialize($product->service());
+
+	# pull in the rows to match on.
+	open  ROWIDS, $rowidfile or die $!;
+	while (my $line = <ROWIDS>) {
+		chomp($line);
+		push @rowIds, $line;
+	}	
+	close ROWIDS;
+
+	for my $dbc (ariba::Ops::DBConnection->connectionsForProductOfDBType($product, ariba::Ops::DBConnection->typeMain())) {
+
+		# XXX
+		next unless uc($dbc->user()) eq $schema;
+
+		my $oc = ariba::Ops::OracleClient->newFromDBConnection($dbc);
+
+		$oc->connect();
+
+		my $dbh = $oc->handle();
+
+		# this is required for the BLOB reads
+		$dbh->{'LongReadLen'} = 31 * 1024 * 1024;
+		$dbh->{'LongTruncOk'} = 0;
+		$dbh->{'AutoCommit'}  = 0;
+		$dbh->{'RaiseError'}  = 1;
+
+		my @columnNames    = ();
+		my @blobColumns    = ();
+
+		my $destTable      = 'TEMP_' . $sourceTable;
+		my $columnsInTable = ariba::Ops::DBUtils::findColumnsForTable($dbh, $schema, $sourceTable);
+
+		printf("About to start work on %s - %s, schema: %s, table: [%s]\n",
+			$product->name(), uc($dbc->sid()), $schema, $sourceTable
+		);
+
+		# weed out the blob entries, because we need to manually
+		# select each of them.
+		for my $column (@$columnsInTable) {
+
+			if ($column->[1] =~ /BLOB/) {
+				push @blobColumns, $column->[0];
+			} else {
+				push @columnNames, $column->[0];
+			}
+		}
+
+		my $createTableSQL = join("\n", 
+			"CREATE TABLE $destTable (",
+			join("\n", map { sprintf("\t%s %s %s,", @$_) } @$columnsInTable),
+			"\tCONSTRAINT ${destTable}_PK PRIMARY KEY (ID)",
+			")\n"
+		);
+
+		if ($debug) {
+			print "\nWill create table:\n";
+			print $createTableSQL;
+			print "\n";
+		}
+		
+		# create the table or bail.
+		# for testing - $dbh->do("DROP TABLE $destTable");
+		$dbh->do($createTableSQL) or die "Couldn't create table, might it already exist?: $destTable: " . $dbh->errstr() . "\n";
+		$dbh->commit();
+
+		# this builds the list to hand to prepare below. everything but blobs.
+		my $nonBlobColumnsSQL = join(', ', @columnNames);
+
+		# copy to temp table
+		eval {
+			ariba::Ops::DBUtils::copyRowToTable($dbh, $sourceTable, $destTable, $nonBlobColumnsSQL, \@blobColumns, \@rowIds);
+			my $verify = ariba::Ops::DBUtils::verifyRowCopy ($dbh, $sourceTable, $destTable, $nonBlobColumnsSQL, \@columnNames, \@rowIds);
+
+			if ( $verify ) {
+				ariba::Ops::DBUtils::deleteRowsFromTable($dbh, $sourceTable, \@rowIds);
+
+				$dbh->commit();
+			} else {
+				die "Verify failed\n";
+			}
+		};
+
+		if ($@) {
+			warn "Failed to commit because: [$@] - rolling back and exiting.";
+			eval { $dbh->rollback() };
+
+			warn "Failed on rollback! Severe problem!: [$@]" if $@;
+		}
+
+		# and back again
+		eval {
+
+			ariba::Ops::DBUtils::copyRowToTable($dbh, $destTable, $sourceTable, $nonBlobColumnsSQL, \@blobColumns, \@rowIds);
+			my $verify = ariba::Ops::DBUtils::verifyRowCopy ($dbh, $destTable, $sourceTable, $nonBlobColumnsSQL, \@columnNames, \@rowIds);
+
+			if ( $verify ) {
+
+				unless ($keepTempTable) {
+					ariba::Ops::DBUtils::deleteRowsFromTable($dbh, $destTable, \@rowIds);
+				}
+
+				$dbh->commit();
+			} else {
+				die "Verify failed\n";
+			}
+		};
+
+		if ($@) {
+			warn "Failed to commit because: [$@] - rolling back and exiting.";
+			eval { $dbh->rollback() };
+
+			warn "Failed on rollback! Severe problem!: [$@]" if $@;
+		}
+
+		unless ($keepTempTable) {
+			$dbh->do("DROP TABLE $destTable") or die "Couldn't drop table: $destTable: " . $dbh->errstr() . "\n";
+			$dbh->commit();
+		}
+	}
+}
+
+sub usage {
+
+	print "Error: $_[0]\n" if $_[0];
+	print "usage: $0 [-d|-h] -product <prod> -service <service> -schema <schema> -table <table> -rowidfile <file> -keepTemp\n";
+	print "          [-d] debug\n";
+	print "          [-h] this help\n";
+	print "          -product Operations product name.\n";
+	print "          -service Service to run against.\n";
+	print "          -schema  Schema to use - ex: anlive1.\n";
+	print "          -table   Table to work on.\n";
+	print "          -rowidfile File to extract row ids from - one per line.\n";
+	print "          -keepTemp  Keep the temporary table.\n";
+	exit(1);
+}
+
+main();
+
+__END__
+

@@ -1,0 +1,154 @@
+#!/usr/local/bin/perl -w
+#
+# cron job that updates the oncall pager email alias
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib"; 
+
+use ariba::Oncall::Display;
+use ariba::Oncall::Schedule;
+use ariba::Oncall::Person;
+use ariba::Ops::Constants;
+use ariba::Ops::NetworkUtils;
+use ariba::rc::Utils;
+use ariba::rc::CipherStore;
+use ariba::rc::InstalledProduct;
+
+use Date::Calc; ## For Days_in_Month
+
+my $me = ariba::rc::InstalledProduct->new();
+
+sub main{
+    $ENV{'PATH'}="$ENV{'PATH'}:/usr/local/bin";
+
+    #figure out whose shift starts today at the switchHour 
+
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+    $mon++;
+    $year+=1900;
+
+    ## Adjust for midnight shift:
+    if ( $hour >= 0 && $hour < 11 ){
+        ## We need to adjust time at month, year and shift boundaries:
+        ## Adjust for month and/or year change:
+        if ( $yday == 0 ){ ## First day of the year, Jan 1
+            $year--;
+            $mon = 12;  ## ariba::Oncall::Schedule->new uses this, if month is passed, it uses 1 - 12
+            $mday = Date::Calc::Days_in_Month( $year, $mon ); ## Basically getting the last day of last year
+        } elsif ( $yday && $mday == 1 ){ ## Not first day of the year but first day of a month
+            $mon--;
+            $mday = Date::Calc::Days_in_Month( $year, $mon ); ## # days in month == last day of month
+        } else {
+            $mday -= 1;
+        }
+    }
+
+    my $sched = ariba::Oncall::Schedule->new($mon,$year);
+
+    my $shift2switch = $sched->europeSwitchHour();
+    my $shift3switch = $sched->blrSwitchHour();
+
+    my $primary = ariba::Oncall::Person->new($sched->primaryForDay($mday));
+    my $europePrimary = ariba::Oncall::Person->new($sched->europePrimaryForDay($mday));
+    my $blrPrimary = ariba::Oncall::Person->new($sched->blrPrimaryForDay($mday));
+    my $backup = ariba::Oncall::Person->new($sched->backupForDay($mday));
+    my $primaryDeveloper = ariba::Oncall::Person->new($sched->primaryDeveloperForDay($mday));
+    my $backupDeveloper = ariba::Oncall::Person->new($sched->backupDeveloperForDay($mday));
+
+    ## We run these 1 minute before and again 1 minute after shift change
+    if( ( $hour >= $shift2switch - 1 ) && ( $hour <= $shift2switch + 1 )  ) {
+        #
+        # if we don't have a europe primary, don't do anything
+        #
+        exit unless($europePrimary);
+
+        #
+        # we are changing for europe time, so set primary based on who is
+        # in Europe
+        #
+        $primary = $europePrimary;
+    }
+
+    ## We run these 1 minute before and again 1 minute after shift change
+    if( ( $hour >= $shift3switch - 2 ) && ( $hour <= $shift3switch + 2 )  ) {
+
+        #
+        # if we don't have a BLR primary, don't do anything
+        #
+        exit unless($blrPrimary);
+
+        #
+        # we are changing for BLR time, so set primary based on who is
+        # in BLR
+        #
+        $primary = $blrPrimary;
+    }
+
+    my @hosts = ( $me->hostsForRoleInCluster('ackparser', 'primary'), 
+                    $me->hostsForRoleInCluster('ackparser', 'secondary') );
+
+    for my $host ( @hosts ) {
+
+        createAliasesOnHost($host,
+                ariba::Ops::Constants->oncallPagerAliasFile(),
+                $primary->pagerEmail(),
+                $backup->pagerEmail() || "",
+                ariba::Ops::Constants->operationsEmailNotificationAddress());
+
+        createAliasesOnHost($host,
+                ariba::Ops::Constants->developmentOncallPagerAliasFile(),
+                (defined($primaryDeveloper) && $primaryDeveloper->pagerEmail()) || "",
+                (defined($backupDeveloper) && $backupDeveloper->pagerEmail()) || "",
+                ariba::Ops::Constants->developmentEmailNotificationAddress());
+
+    }
+
+}
+
+sub createAliasesOnHost {
+    my ($server, $remotefile, @addresses) = @_;
+
+    my $localTempfile = "/tmp/update-aliases-$$";
+    my $remoteTempfile = "/tmp/from-a-remote-update-aliases-$$";
+
+    open(FILE,"> $localTempfile") || die "Can't write $localTempfile $!\n";
+    print FILE "# created by $0 on ",ariba::Ops::NetworkUtils::hostname(), " at ",`date`;
+    print FILE join("\n",@addresses),"\n";
+    close(FILE);
+
+    my $timeout = 300;
+    my $coderef;
+
+
+    my $cipherStore = ariba::rc::CipherStore->new( $me->service() );
+    my $user = $ENV{'USER'} || $ENV{'LOGNAME'};
+    my $password = $cipherStore->valueForName($user);
+    my $master = undef;
+
+    my @output;
+
+    my $command = "scp -q $localTempfile $user\@$server:$remoteTempfile";
+
+    ariba::rc::Utils::sshCover($command, $password, undef, $timeout, \@output);
+
+    if ( "@output" =~ /ERROR/ ) {
+        print join("\n", @output) ,"\n";
+        exit(1);
+    }
+
+    $command = "ssh $user\@$server \"cp $remoteTempfile $remotefile; rm $remoteTempfile\"";
+
+    ariba::rc::Utils::sshCover($command, $password, undef, $timeout, \@output);
+
+    if ( "@output" =~ /ERROR/ ) {
+        print join("\n", @output) ,"\n";
+        exit(1);
+    }
+
+    unlink $localTempfile;
+}
+
+main(@ARGV);

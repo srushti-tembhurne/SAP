@@ -1,0 +1,366 @@
+#!/usr/local/bin/perl -w
+
+#
+# Create "nopage" objects, PageFilters
+# $Id: //ariba/services/monitor/bin/page/nopage#21 $
+#
+
+use strict;
+use FindBin;
+use lib ("$FindBin::Bin/../../lib");
+
+use ariba::Ops::PageFilter;
+use Date::Parse;
+
+
+my $from = 'nobody@ariba.com';
+my $to_slack = 'p6a0i7e2m7i0y3l1@sap-ariba.slack.com';
+my $to = 'an_ops_sre_ariba@sap.com'.','.$to_slack;
+my $replyto = $to;
+my $precedence;
+
+sub matchFiltersToCustomers {
+    my $filtersRef = shift;
+    my $customersRef = shift;
+
+    my %filtersPerCustomers = ();
+
+    foreach my $filter (@$filtersRef) {
+        $filtersPerCustomers{$filter->customer()}++;
+    }
+
+
+    return 0 if (scalar(keys (%filtersPerCustomers)) != scalar(@$customersRef));
+
+    my $result = 1;
+
+    for my $filterCustomer (keys(%filtersPerCustomers)) {
+        if ($filtersPerCustomers{$filterCustomer} > 1) {
+            $result = 0;
+            last;
+        }
+    }
+
+    return $result;
+}
+
+#    FUNCTION: convert epoch from string in YYYY-MM-DD HH:MM format
+#   ARGUMENTS: string of date format
+#     RETURNS: time in epoch format if successful, undef otherwise
+sub findEpoch {
+    my $string = shift;
+    ( $string =~ /^\d{4}-\d{2}-\d{2}:\d{2}:\d{2}$/ ) ? str2time( $string ) : undef;
+}
+
+sub main {
+    my $debug = 0;
+    my $email = 1;
+
+    my $ttl;
+    my $product;
+    my $service = "";
+    my @customers;
+    my $program = "";
+    my $text = "";
+    my $note;
+    my $remove = 0;
+    my @removeIds = ();
+    my $removeAll = 0;
+    my $list = 0;
+    my $startString = "";
+    my $startEpoch = "";
+    my $requestor;
+    my $report =  0;
+
+    my $user = (getpwuid($<))[0];
+    if($user !~ /^mon/) {
+        print "nopage must be run as the monitoring user.\n";
+        exit(1);
+    }
+
+    my $executed_cmd = "$0 @ARGV";
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-h$/) { usage();}
+        if ($arg =~ /^-d$/) { $debug = 1; $email=0; next;}
+        if ($arg =~ /^-user$/) { $requestor= shift(@ARGV);next;}
+        if ($arg =~ /^-ttl$/) { $ttl = shift(@ARGV); next;}
+        if ($arg =~ /^-start$/) { $startString = shift(@ARGV); next;}
+        if ($arg =~ /^-product$/) { $product = shift(@ARGV); next;}
+        if ($arg =~ /^-program$/) { $program = shift(@ARGV); next;}
+        if ($arg =~ /^-service$/) { $service = shift(@ARGV); next;}
+        if ($arg =~ /^-customer$/) { @customers = sort(split(/,/, shift(@ARGV))); next;}
+        if ($arg =~ /^-note$/) { $note = shift(@ARGV); next;}
+        if ($arg =~ /^-text$/) { $text = shift(@ARGV); next;}
+        if ($arg =~ /^-removeAll$/i) { $remove = 1; $removeAll = 1; next;}
+        if ($arg =~ /^-ls$|^-list$/i) { $list = 1; next; }
+        if ($arg =~ /^-report$/i) { $report = 1; $list = 1;next; }
+        if ($arg =~ /^-remove$/) { 
+            $remove = 1;
+            if($ARGV[0] and $ARGV[0] !~ /^-/) {
+                @removeIds = split(/,/, shift(@ARGV));
+            }
+        }
+        if ($arg !~ /^-/) { usage(); }
+    }
+
+    $ttl = 60 unless($ttl || $list || $remove);
+
+    if ( $debug ) {
+        print "\n";
+        print "     user: $requestor \n" if $requestor;
+        print "      ttl: $ttl mins\n" if $ttl;
+        print "    start: $startString\n" if $startString;
+        print "  program: $program\n" if $program;
+        print "  product: $product\n" if $product;
+        print "  service: $service\n" if $service;
+        print " customer(s): " . join(", ", @customers) . "\n" if scalar(@customers);
+        print "     text: $text\n" if $text;
+        print "     note: $note\n" if $note;
+        print "   remove: $remove\n";
+        print "removeIDs: ", join(",", @removeIds), "\n" if @removeIds;
+        print "removeAll: $removeAll\n";
+        print "\n";
+    }
+
+    unless ( $requestor ) {
+        if ( !$list && !$remove ) {
+            usage ( "Error: You must include the user name for setting page filter\n" );
+        }
+    } else {
+        if ( validateUser( $requestor ) ) {
+            print STDERR "Error: The user name should have only alphanumeric characters. \n";
+            print STDERR "Please review the entered user name \"$requestor\" and try again with the correct user name.\n";
+            exit ( 1 );
+        }
+    }
+
+    unless ( $remove || $list || $note || $report) {
+        usage( "You must include a note with your page filter that describes why it is being created. \n" );
+    }
+
+    unless ( $program || $product || $service || scalar(@customers) || $text || $list || @removeIds ) {
+        usage( "Error: You must use at least one filter.\n" );
+    }
+
+    unless ($list || $remove || $ttl > 0 || $report) {
+        usage( "Error: ttl must be greater than 0!\n" );
+    }
+
+    if ( $startString ) {
+        $startEpoch = findEpoch( $startString );
+        unless ( $startEpoch ) {
+            usage( "Error: please check the format of -start argument\n" );
+        }
+    }
+
+    $ttl *= 60 if $ttl;   #we want seconds for real
+
+    # Remove a pageFilter from it's backing store.
+    if ($remove || $list) {
+
+        my @filters;
+
+        # if pagefilter IDs were specified, remove them all
+        if (@removeIds) {
+            @filters = map { ariba::Ops::PageFilter->new($_) } 
+            grep { ariba::Ops::PageFilter->objectWithNameExists($_) } 
+            @removeIds;
+
+            # otherwise maintain old behaviour of matching on categories
+        } else {
+            push(@customers, '') unless (scalar(@customers));
+            $program = quotemeta(quotemeta($program)) if ($program);
+            $text = quotemeta(quotemeta($text)) if ($text);
+            foreach my $customer (@customers) {
+                push( @filters, ariba::Ops::PageFilter->objectsWithProperties(
+                        'ttl'      => $ttl, 
+                        'sendingProgram'  => $program,
+                        'product'  => $product,
+                        'service'  => $service,
+                        'customer' => $customer,
+                        'text'     => $text,
+                    ) );
+            }
+
+            if (( ( scalar(@customers) == 1 && scalar (@filters) > 1) || (scalar(@customers) > 1 && !matchFiltersToCustomers(\@filters, \@customers) ) )&& $remove && !$removeAll ) {
+                print "There is more than one filter matching your query!\n";
+                print "Please refine it, or run this program again with -removeAll\n\n";
+                exit;
+            }
+        }
+
+        my $time = localtime();
+        $time =~s/\s+/-/g;
+        my $PAGELIST;
+        my $subject;
+        if($report) {
+            my $me      = ariba::rc::InstalledProduct->new();
+            $service = $me->service();
+            open($PAGELIST,">/tmp/pagelist-$time") or die " can't open /tmp/pagelist-$time : $! \n";
+            if(scalar(@filters)) {
+                $subject = "Page Filters Report for $service DC at $time";
+            }
+            else {
+                $subject = "No Page Filters set for $service at $time";
+            }
+            print $PAGELIST "$subject \n";
+
+        }
+        for my $filter (@filters) {
+
+            if ($remove) {
+                printf("Removing filter: %s\n", $filter->instance());
+                $filter->remove();
+            } else {
+                print "\nPage ID: ";
+                $filter->print();
+                if($report) { 
+                    print $PAGELIST "\nPage ID: ";
+                    $filter->print($PAGELIST);
+                }
+            }
+        }
+
+        if($report) {
+            close($PAGELIST);
+            #Redudant mail function will do it after the initial trail
+            my $body = `cat /tmp/pagelist-$time`;   
+            print "sending email \n";
+            open  SENDMAIL, '| /usr/lib/sendmail -t' or die "Error in sending mail to SRE Page Filter Slack : $!\n";
+            print SENDMAIL "From: $from\n" if $from;
+            print SENDMAIL "To: $to_slack\n";
+            print SENDMAIL "Subject: $subject\n" if $subject;
+            print SENDMAIL "Precedence: $precedence\n" if $precedence;
+            print SENDMAIL "\n";
+            print SENDMAIL "$body\n" if $body;
+            close SENDMAIL;
+
+
+        }   
+
+    } else {
+
+        # Create a new pageFilter
+
+        # make the value 'not undef' so usage later does not generate uninitialized errors.
+        push(@customers, '') unless (scalar(@customers));
+
+        foreach my $customer (@customers) {
+            my $filter = ariba::Ops::PageFilter->newWithDetails(
+                $ttl, $program, $product, $service, $customer, $text, $note, $startEpoch,$requestor
+            );
+
+            $filter->save();
+            $filter->print();
+
+            my $pageid = $filter->instance();
+
+            my $subject = "Page filter set for '$text $note'";
+            my $body = <<EMAILBODY;
+Page Filter set for "$text"
+
+Executed Command : $executed_cmd
+pageid : $pageid
+
+ttl : $ttl secs
+startEpoch: $startEpoch
+Note : $note
+User : $requestor
+Product : $product
+Service : $service
+customer : $customer
+text : $text
+note: $note
+program: $program
+
+P.S : If you want to remove this pagefilter, use the below command
+$0 -remove $pageid
+
+EMAILBODY
+
+if($email) {
+    print "sending email \n";
+    open  SENDMAIL, '| /usr/lib/sendmail -t' or die "Error in sending mail to SRE DL : $!\n";
+    print SENDMAIL "From: $from\n" if $from;
+    print SENDMAIL "To: $to\n";
+    print SENDMAIL "Subject: $subject\n" if $subject;
+    print SENDMAIL "Reply-To: $replyto\n" if $replyto;
+    print SENDMAIL "Precedence: $precedence\n" if $precedence;
+    print SENDMAIL "\n";
+    print SENDMAIL "$body\n" if $body;
+    close SENDMAIL; 
+}
+        }
+    }
+}
+
+sub usage {
+    my $errorString=shift;
+    print "$errorString \n"  if ( $errorString );
+    print "usage: nopage -note <note>  [-help] [-debug] [ -user requestor ] [-ttl mins] [-start YYYY-MM-DD HH:MM] [-remove] [-removeAll] [one or more filters]\n";
+    print "\n";
+    print "Create a PageFilter object used by the paging system\n";
+    print "If an incoming PageRequest matches a PageFilter, it will not be\n";
+    print "sent as a page, but instead downgraded to an email.\n";
+    print "By default a PageFilter lasts for 1 hour.\n";
+    print "\n";
+    print "A PageFilter must have one or more of the following defined:\n";
+    print "\n";
+    print "   -program sending-program\n";
+    print "   -product an|ibx|mon|...\n";
+    print "   -start \"YYYY-MM-DD:HH:MM\" (start date for the filter.  if unspecified, current time)\n";
+    print "   -customer fedex[,transora,...] (only ASP product pages have a customer)\n";
+    print "   -service prod|dev|...\n";
+    print "   -text string (checked against both subject: and body: of PageRequest)\n";
+    print "   -note string (a note describing why a page filter was set)\n";
+    print "   -user string ( the requestor who set the page filter ) \n";
+    print "\n";
+    print "Only one instance of each type of filter can be set per PageFilter\n";
+    print "\n";
+    print "Examples of how to CREATE pagefilters:\n";
+    print "\n";
+    print "Stop all pages from http-watcher for the an for a half hour:\n";
+    print "    nopage -ttl 30 -product an -program http-watcher -note NOTE  -user requestor\n";
+    print "\n";
+    print "Stop all pages from http-watcher for the an for a half hour, starting 2012-05-15 16:00\n";
+    print "    nopage -ttl 30 -product an -program http-watcher -start \"2012-05-15:16:00\" -note NOTE -user requestor\n";
+    print "\n";
+    print "Stop all pages for fedex's aes for 1 hour:\n";
+    print "    nopage -product aes -customer fedex -note NOTE -user requestor \n";
+    print "\n";
+    print "Stop all pages for shareplex event log errors for 1 hour:\n";
+    print "    nopage -text 'event log errors for shareplex' -note NOTE -user requestor\n";
+    print "\n";
+    print "Stop all pages from only a particular type of dispatcher:\n";
+    print "    nopage -product an -text 'ANInboundEDIDispatcher' -note NOTE -user requestor\n";
+    print "\n";
+    print "Stop all pages from keepRunning and cpu-watcher:\n";
+    print "    nopage -program keepRunning -note NOTE -user requestor\n";
+    print "    nopage -program cpu-watcher -note NOTE -user requestor\n";
+    print "\n";
+    print "Examples of how to REMOVE pagefilters:\n";
+    print "\n";
+    print "List all page filters\n";
+    print "    nopage -ls\n";
+    print "Remove one or more pagefilters by id:\n";
+    print "    nopage -remove <pagefilter-id1>,[<pagefilter-id2>,...]\n";
+    print "\n";
+    print "Remove one filters by matching on pagefilter attributes:\n";
+    print "    nopage -remove -ttl 120 -service prod -product s4\n";
+    print "\n";
+    print "Remove multiple filters by matching:\n";
+    print "    nopage -remove -ttl 120 -service prod product aes -removeAll\n";
+    print "\n";
+    exit(1);
+}
+
+sub validateUser {
+
+    my $tmpUser=shift;
+    if ( $tmpUser  =~ m/[^a-zA-Z0-9]/ ) {
+        return ( 1 );
+    }
+    return ( 0 );
+}
+
+main();

@@ -1,0 +1,195 @@
+#!/usr/local/bin/perl -w
+
+# automatically parse pixlogs into directorys.
+
+use strict;
+use File::Path;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use IO::Zlib;
+
+use ariba::Ops::Utils;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Constants;
+
+my $pixsummaryDirBase	= "/var/mon/logs/pix-summaries";
+my $logDirBase	= "/var/log/cisco";
+my $DEBUG	= 0;
+
+sub main {
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-d$/) { $DEBUG = 1; }
+	}
+
+	my $lastday  = time() - 86400;
+	
+	# these were used to pick the most recently made pixlog, prior to
+	# rotation. method changed to picking .1 log post rotation.	
+	# my $mtime = (stat($file))[9];
+	# next unless (($now - $mtime) < 86400) && $file !~ /^pix-n\d-\d\.\d+$/;
+
+	# need this for naming the file, and email subject
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+
+	my $domain;
+
+	if ($hostname =~ /\.bou\.ariba\./) {
+		$domain = 'bou';
+	}
+    elsif ($hostname =~ /\.us1\.ariba\./) {
+        $domain = 'us1';
+    } 
+    else {
+		$domain = 'snv';
+	}
+
+	my ($mon,$day,$year) = (localtime($lastday))[4,3,5];
+
+	# perldoc -f localtime
+	$year += 1900;
+	$mon++;
+
+	# 2003/11/2003-11-10-snv-summary.txt
+	my $outLogDir  = "$pixsummaryDirBase/$year/$mon";
+	my $outFile    = "$year-$mon-$day-$domain-summary.txt";
+
+        unless (-d $outLogDir) {
+                print "\tCreating directory: [$outLogDir]\n" if $DEBUG;
+                File::Path::mkpath($outLogDir) or die "Can't create directory: [$outLogDir]: $!";
+	}
+		
+	# sort and print out the summaries.
+	# removed "$file-summary.txt" - fix later to specify which file
+	open(SUMMARY, ">$outLogDir/$outFile") or die $!;
+
+	# read through the pix directory 
+	chdir $logDirBase or die "Can't get into [$logDirBase]: $!";
+	opendir(DIR, $logDirBase) or die "Can't open [$logDirBase]: $!";
+
+	for my $file (sort readdir(DIR)) {
+
+		# skip unless this is a file
+		next unless $file =~ /^pix-n/;
+		next unless -f $file;
+		
+		# don't operate on zero-length files - later add one line
+		# "nothing for today" note for email.			
+
+		next if -z $file;
+
+		next unless  $file =~ /^pix-n\d-\d\.1(.gz)?$/;
+
+		# skip unless it's less than $daysBack old
+ 		# next unless -M "$logDirBase/$file" < $daysBack;
+
+		if ($DEBUG) {
+			print "Working on:\n";
+			print "[$year/$mon/$day] [$file]\n";
+			print "Will write summary to: [$outLogDir/]\n";
+		}
+	
+		parsePIXLog($file, $domain);
+	}
+
+	close(SUMMARY);
+
+	# reading the file back in for the email
+	open(SUMMARY, "$outLogDir/$outFile") or die $!;
+
+	# avoiding the perl "read file in" new line makes a new element in an
+	# array deal - putting it all in one string
+	local $/ = undef;
+
+	my $summary = <SUMMARY>;
+	close(SUMMARY);
+
+	# copied from bin/on-call/notify-schedule
+	ariba::Ops::Utils::email(
+		ariba::Ops::Constants->operationsSecurityAddress(),
+		"Pixlog summaries for $domain",
+		"This summary is stored on $hostname as $outFile\n\n" .$summary
+	);
+}
+
+sub parsePIXLog {
+	my ($file) = shift(@_);
+	my ($domain) = shift(@_);
+	
+	# these are for accumulating summary data
+	my %sorted = ();
+	my %icmp   = ();
+
+	my $pixfh = IO::Zlib->new($file, 'rb') or die "generate-pixlog-summaries: $!";
+
+	while (my $line = <$pixfh>) {
+
+		# strip out "last message repeated" lines
+		if ($line =~ /last message repeated/) {
+			next;
+		}
+
+		# strip out dates
+		$line =~ s/^.*: %//g;
+
+		# grep for icmp
+		if ($line =~ /icmp src/) {
+
+			# strip the dest and increment the %icmp hash count.
+			$line =~ s/ dst.*//g;
+			$icmp{$line}++;
+
+			next;
+		}
+
+		# pretty print high ports.
+		if ($line =~ m|/([0-9]+) by access| and $1 > 1024) {
+
+			$line =~ s|/$1|/\(high port\)|;
+		}
+		
+		# group the high ports contact attempts
+		if ($line =~ m|/([0-9]+) dst| and $1 > 1024) {
+
+                       $line =~ s|/$1|/\(high port\)|;
+		}
+
+		# group the high ports contact attempts for ports at the end of line.
+		if ($line =~ m|/([0-9]+)$| and $1 > 1024) {
+
+                       $line =~ s|/$1|/\(high port\)|;
+		}
+
+		# add each line to a hash and increment it's value: ie: 1, 2, 3
+		$sorted{$line}++;
+	}
+
+	################################################################
+	# sort and print out the summaries.
+
+	$file =~ s/\d$//;
+
+	print(SUMMARY "\n------------------------ SUMMARY for $file$domain ------------------------\n\n");
+
+	for my $line (sort { $sorted{$b} <=> $sorted{$a} } keys %sorted) {
+
+		# skip empty lines
+		next if $line =~ /^\s*$/;
+
+		printf(SUMMARY "%5.d %s", $sorted{$line}, $line);
+	}
+	
+	print(SUMMARY "\n------------------------ ICMP SUMMARY for $file$domain ------------------------\n\n");
+
+	for my $line (sort { $icmp{$b} <=> $icmp{$a} } keys %icmp) {
+
+		# skip empty lines
+		next if $line =~ /^\s*$/;
+
+		printf(SUMMARY "%5.d %s", $icmp{$line}, $line);
+	}
+}
+
+main();
+
+exit(0);

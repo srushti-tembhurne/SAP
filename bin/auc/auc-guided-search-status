@@ -1,0 +1,106 @@
+#!/usr/local/bin/perl
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+require "geturl";
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use JSON;
+use Pod::Usage;
+use Getopt::Long;
+use Data::Dumper;
+
+
+my $debug = 0;
+
+my($mon,$me,$siteurl,$url,@results,$decoded_json);
+ 
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    
+    GetOptions(
+        "help|h" => sub { pod2usage(1); },
+        "debug|d+" => \$debug,
+        "e" => \$sendEmail,
+        "p" => \$sendPage,
+    );
+
+    $mon = ariba::rc::InstalledProduct->new('mon');
+    $me = ariba::rc::InstalledProduct->new('community', $mon->service());
+    $siteurl = $me->default('SiteURLSecure');
+    chomp($siteurl);
+    my $start_time = `date +%s` - (60*60);
+    my $interval = 60*60;
+    $url = "$siteurl/internal/ga_search_suggestions_monitoring.php?start_ts=$start_time&duration_sec=$interval";
+	print "url : $url \n" if($debug);
+    eval { geturl("-e","-q","-timeout", '60', "-results",\@results,$url) };
+    if ($@) {
+	    @results = ("URL error");
+    } else {
+        my $json = join('',@results);
+	print "json : $json \n" if($debug);
+        eval { $decoded_json = JSON::decode_json($json); };
+        if ($@) {
+		    @results=("Invalid JSON");
+		    print "Invalid JSON from this url : $url \n" if($debug);
+        }
+    }
+
+	
+
+	print Dumper($decoded_json) if($debug);
+	print $decoded_json->{'succeeded'} if($debug);
+
+	unless(defined ( $decoded_json->{'timed_out'} ) ) {
+		print "JSON is not returning expected results \n" if($debug);
+	}
+	
+	
+
+
+    my %queries;
+    $queries{'timed_out'} = {
+                                    severity => 1,
+				                    warn => 'answer > 0 and previousAnswer > 0',
+				                    critOnWarnAfterMinutes => 719,
+                                    description => 'Guided Assistance Search Suggestions Status',
+                                    correctiveActions => [
+                                          Ops => 'Send email to AUC engineering alias - DL ARB AUC_Eng (External) - DL_5419DA6CFD84A00838000005@exchange.sap.corp',
+                                    ],
+				                    perl => sub {  return $decoded_json->{'timed_out'} }, 
+				                    inf_field   => "timed_out",
+
+                                  };
+
+
+
+    $queries{'succeeded'} = {
+                                    description => 'Guided Assistance Search Suggestions Status',
+				                    perl => sub {  return $decoded_json->{'succeeded'} }, 
+				                    inf_field   => "succeeded",
+
+                                  };
+
+
+
+    $queries{'total'} = {
+                                    description => 'Guided Assistance Search Suggestions Status',
+				                    perl => sub {  return $decoded_json->{'total'} }, 
+				                    inf_field   => "total",
+                                  };
+
+
+
+      my $email = $me->default('notify.email');
+      my $qm = ariba::monitor::QueryManager->newWithDetails('Zero Search Results Guided Assistance Search Suggestions Status', $me->name(), $me->service(), $me->customer(), \%queries);
+      $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+                                    
+}
+
+main(@ARGV);
+
+__END__

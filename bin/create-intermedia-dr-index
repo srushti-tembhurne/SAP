@@ -1,0 +1,130 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/create-intermedia-dr-index#5 $
+#
+# Create initial intermedia indices on DR
+#
+#
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DBConnection;
+use ariba::DBA::SampleSQLQueries;
+use ariba::Ops::OracleClient;
+
+my $debug = 0;
+
+sub main {
+	my $productname;
+	my $service;
+	my $customer;
+	my @schemaids = ();
+	my @results;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $queries = {};
+
+	while(my $arg = shift(@ARGV)) {
+		if($arg =~ m/^-product/o) { $productname = shift(@ARGV); next; }
+		if($arg =~ m/^-service/o) { $service = shift(@ARGV); next; }
+		if($arg =~ m/^-customer/o) { $customer = shift(@ARGV); next; }
+		if($arg =~ m/^-schemaid/o) { @schemaids = split(/,/, shift(@ARGV)); next; }
+		if($arg =~ m/^-h$/o) { usage(); }
+		if($arg =~ m/^-d$/o) { $debug++; next; }
+		usage("Unknown arg: $arg");
+	}
+
+	usage("Must specify product") unless $productname;
+	usage("Must specify service") unless $service;
+
+	my $mon = ariba::rc::InstalledProduct->new();
+	my $email = $mon->default('notify.email');
+	my $product = ariba::rc::InstalledProduct->new($productname, $service, undef, $customer);
+	my @connections = ariba::Ops::DBConnection->connectionsForProductOfDBType($product, ariba::Ops::DBConnection->typeDr());
+
+	for my $dbc (@connections) {
+		my $dbcSchema = $dbc->schemaId();
+		next unless grep ({ $dbcSchema == $_ } @schemaids);
+		my $success;
+		if(!$debug) {
+			@results = changeDatabaseToRW($mon, $dbc);
+			($success, @results) = runIntermediaScript($product, $dbc);
+			@results = changeDatabaseToRO($mon, $dbc);
+		}
+		print "Index created on ", $dbc->user(), " ", $dbc->host(), " ", $dbc->sid(), "\n";
+
+	}
+
+	exit(0);
+}
+
+sub usage {
+	my $errmsg = shift;
+
+	print "ERROR: $errmsg\n" if $errmsg;
+	print "Usage: $0 [-h|-d] -product <product> -service <service>\n";
+	print "       -h: this help message\n";
+	print "       -d: turn on debug\n";
+	print "       -product <product>: product name\n";
+	print "       -service <service>: service name\n";
+	print "\n";
+
+	exit(1);
+}
+
+sub changeDatabaseToRW {
+	my $mon = shift;
+	my $dbc = shift;
+	my @results;
+
+	@results = ariba::DBA::SampleSQLQueries::executeSQLQuery($mon, "setReadWrite", $dbc, 0, 30);
+
+	return @results;
+}
+
+sub runIntermediaScript {
+	my $product = shift;
+	my $dbc = shift;
+
+	my @result;
+
+	my $oc = ariba::Ops::OracleClient->newFromDBConnection($dbc);
+
+	$oc->connect();
+
+	print "Set attributes on " . $dbc->user() . "\n";
+	$oc->executeSql("CALL Ctx_Ddl.Drop_Preference('buffer_keeper');", \@result);
+	$oc->executeSql("CALL Ctx_Ddl.Create_Preference('buffer_keeper', 'BASIC_STORAGE');", \@result);
+	$oc->executeSql("CALL ctx_ddl.set_attribute('buffer_keeper','I_TABLE_CLAUSE','storage(buffer_pool keep)')", \@result);
+	$oc->executeSql("CALL ctx_ddl.set_attribute('buffer_keeper','K_TABLE_CLAUSE','storage(buffer_pool keep)')", \@result);
+	$oc->executeSql("CALL ctx_ddl.set_attribute('buffer_keeper','R_TABLE_CLAUSE','storage(buffer_pool keep) lob (data) store as (cache)')", \@result);
+	$oc->executeSql("CALL ctx_ddl.set_attribute('buffer_keeper','N_TABLE_CLAUSE','storage(buffer_pool keep)')", \@result);
+	$oc->executeSql("CALL ctx_ddl.set_attribute('buffer_keeper','I_INDEX_CLAUSE','storage(buffer_pool keep) compress 2')", \@result);
+	$oc->executeSql("CALL ctx_ddl.set_attribute('buffer_keeper','P_INDEX_CLAUSE','storage(buffer_pool keep)')", \@result);
+	print "Create index AttrsBlobTab_idx on " . $dbc->user() . "\n";
+	$oc->executeSql("CREATE INDEX AttrsBlobTab_idx ON AttrsBlobTab(BLB_BLOBFIELD) INDEXTYPE IS CTXSYS.CONTEXT PARAMETERS ('LEXER global_lexer LANGUAGE COLUMN CLB_LANG FILTER CTXSYS.INSO_FILTER FORMAT COLUMN CLB_TEXTFLAG CHARSET COLUMN CLB_CHARSET TRANSACTIONAL STORAGE buffer_keeper')", \@result);
+
+	print "Create index FileBlobTab_idx on " . $dbc->user() . "\n";
+	$oc->executeSql("CREATE INDEX FileBlobTab_idx ON FileBlobTab(BLB_BLOBFIELD) INDEXTYPE IS CTXSYS.CONTEXT PARAMETERS ('LEXER global_lexer LANGUAGE COLUMN CLB_LANG FILTER CTXSYS.INSO_FILTER FORMAT COLUMN CLB_TEXTFLAG CHARSET COLUMN CLB_CHARSET')", \@result);
+
+	print "Create index NotesBlobTab_idx on " . $dbc->user() . "\n";
+	$oc->executeSql("CREATE INDEX NotesBlobTab_idx ON NotesBlobTab(BLB_BLOBFIELD) INDEXTYPE IS CTXSYS.CONTEXT PARAMETERS ('LEXER global_lexer LANGUAGE COLUMN CLB_LANG FILTER CTXSYS.INSO_FILTER FORMAT COLUMN CLB_TEXTFLAG CHARSET COLUMN CLB_CHARSET')", \@result);
+
+	$oc->disconnect();
+
+	return(1, @result);
+}
+
+sub changeDatabaseToRO {
+	my $mon = shift;
+	my $dbc = shift;
+	my @results;
+
+	@results = ariba::DBA::SampleSQLQueries::executeSQLQuery($mon, "setReadOnly", $dbc, 0, 30);
+
+	return @results;
+}
+
+main();

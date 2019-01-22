@@ -1,0 +1,299 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/an/document-flux#21 $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+use ariba::rc::InstalledProduct;
+
+use ariba::Ops::ProductAPIExtensions;
+
+my %incomingDocFlux;
+my %outgoingDocFlux;
+
+sub main {
+	my $debug = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while(my $arg = shift(@ARGV) ){
+		if($arg =~ /^-d/o){ $debug = 1; }
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $an = ariba::rc::InstalledProduct->new("an", $me->service());
+
+	my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+	my $communitiesList = join(", ", @communityIds);
+
+	queryDocumentFlux($an, "incoming");
+	queryDocumentFlux($an, "outgoing");
+
+	my %queries = ();
+
+	#BlanketOrderStatusUpdateRequest
+	#CXMLResponse
+	#CatalogUploadRequest
+	#CollaborationRequest
+	#ConfirmationRequest
+	#InvoiceDetailRequest
+	#MasterAgreementRequest
+	#OrderRequest
+	#OrganizationDataRequest
+	#PaymentProposalRequest
+	#PaymentRemittanceRequest
+	#PaymentRemittanceStatusUpdateRequest
+	#ProfileRequest
+	#ProviderDoneMessage
+	#ProviderSetupRequest
+	#PunchOutSetupRequest
+	#Response
+	#ShipNoticeRequest
+	#StatusUpdateRequest
+	#SubscriptionContentRequest
+	#SubscriptionListRequest
+	my @docTypes = ( 
+			 'ConfirmationRequest',
+			 'InvoiceDetailRequest',
+			 'OrderRequest',
+			 'OrganizationDataRequest',
+			 'ShipNoticeRequest',
+			 'SupplierListRequest',
+			 'ProfileRequest',
+			 'PunchOutSetupRequest',
+			 'PaymentProposalRequest',
+			 'PaymentRemittanceRequest',
+			 'PaymentRemittanceStatusUpdateRequest',
+			);
+
+	for my $docType (@docTypes) {
+		$queries{"Number of incoming $docType"} =
+		{	
+		  runForCommunities => $communitiesList,
+		  aggregationMethod => "counts",
+		  recordMaxResults => 110000,
+		  recordDataType=> "gauge",
+		  recordDataUnits=> "perhour",
+		  graphRecorded=> 1,
+		  perl => "main::documentFluxFor(\"$docType\");",
+		},
+	}
+
+	#OrderRequest
+	#CollaborationRequest
+	#ConfirmationDocument
+	#CopyRequest
+	#InvoiceDetailRequest
+	#MasterAgreement
+	#OrderStatusDataRequest
+	#OrganizationChangeMessage
+	#ParkedInvoiceDocument
+	#Payment
+	#PaymentDisbursement
+	#PaymentProposalRequest
+	#
+	#PaymentRemittanceBatchRequest
+	#PaymentRemittanceRequest
+	#PaymentRemittanceRequestToEdi
+	#PaymentRemittanceStatusUpdateRequest
+	#PaymentRequestDocument
+	#ProviderDataRequest
+	#ProviderSetupRequest
+	#PurchaseOrder
+	#ReceiptRequest
+	#ShipNoticeDocument
+	#StatusUpdateRequest
+	#
+	#SubscriptionChangeMessage
+	#TimeCardRequest
+	my @outDocType = ( 
+			 'InvoiceDetailRequest',
+			 'OrderRequest',
+			 'ConfirmationDocument',
+			 'ShipNoticeDocument',
+			 'CopyRequest',
+			 'OrderStatusDataRequest',
+			 'Payment',
+			 'PaymentDisbursement',
+			 'PaymentProposalRequest',
+			 'PaymentRemittanceBatchRequest',
+			 'PaymentRemittanceRequest',
+			 'PaymentRemittanceRequestToEdi',
+			 'PaymentRemittanceStatusUpdateRequest',
+			 'PaymentRequestDocument',
+			 'PurchaseOrder',
+			 'ReceiptRequest',
+			 'StatusUpdateRequest',
+			 'TimeCardRequest',
+			);
+
+
+
+	for my $docType (@outDocType) {
+		$queries{"Number of outgoing $docType"} =
+		{	
+		  runForCommunities => $communitiesList,
+		  aggregationMethod => "counts",
+		  recordMaxResults => 110000,
+		  recordDataType=> "gauge",
+		  recordDataUnits=> "perhour",
+		  graphRecorded=> 1,
+		  perl => "main::outgoingDocumentFluxFor(\"$docType\");",
+		},
+	}
+
+
+	my $q = ariba::monitor::QueryManager->newWithDetails("document-flux", "an", $me->service(), $me->customer(), \%queries);
+
+	$q->setUiHint("ignore");
+	$q->run();
+	if ( $debug ) {
+		$q->displayToStdout();
+	} else {
+		$q->archiveResults();
+		$q->displayToLog();     
+	}
+
+}
+
+sub timeInOracleFormat {
+	my $time = shift();
+
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = 
+							    localtime($time);
+
+	$year += 1900;
+	$mon++;
+
+	$mon = "0". $mon if ($mon < 10);
+	$mday = "0". $mday if ($mday < 10);
+
+	return "$year-$mon-$mday $hour:$min";
+}
+
+sub queryDocumentFlux {
+	my ($an, $incomingOutgoing) = @_;
+
+	my $now = time();
+	my $interval = 5 * 60; # 5 mins
+
+	my $etime = $now;
+	my $stime = $now - $interval;
+	my $endTime = timeInOracleFormat($etime);
+	my $startTime = timeInOracleFormat($stime);
+	my @sqls;
+	my $sql;
+	my $docFluxRef;
+	my @bindVariables;
+
+	if ($incomingOutgoing eq "incoming") {
+		$sql = qq`
+		SELECT /*+ INDEX(cxml_log, IND_C053883D_8FA2584A) */
+			message_type,
+			count(*)
+		FROM
+			cxml_log
+		WHERE
+			direction = 'Inbound' and
+			created between
+				to_date(?, 'YYYY-MM-DD HH24:MI')
+				and to_date(?, 'YYYY-MM-DD HH24:MI')
+		GROUP BY
+			message_type
+		`;
+
+		push(@sqls, $sql);
+		push(@bindVariables, $startTime, $endTime);
+
+		$docFluxRef = \%incomingDocFlux;
+
+	} elsif ($incomingOutgoing eq "outgoing") {
+		my $stimeInMillis = $stime * 1000;
+		my $etimeInMillis = $etime * 1000;
+
+		$sql = qq`select 'OrderRequest', count(*) from po_doc_disp_queue 
+			where status_changed between 
+			? and ?
+			and status in (3, 4)`;
+		push(@sqls, $sql);
+
+		$sql = qq`select c.document_type, count(*) from doc_disp_queue d, cxml_document c
+			where
+			d.item = c.id and
+			d.status_changed between ? and ?
+			and d.status in (3, 4)
+			group by c.document_type`;
+
+		push(@sqls, $sql);
+		push(@bindVariables, $stimeInMillis, $etimeInMillis);
+
+		$docFluxRef = \%outgoingDocFlux;
+
+	}
+
+
+    my @communityConnections = grep { $_->community() && !$_->isDR() } ariba::Ops::DBConnection->connectionsFromProducts($an);
+
+    for my $dbc (@communityConnections) {
+
+		my $oracleClient = ariba::Ops::OracleClient->newFromDBConnection($dbc);
+		my $community = $dbc->community();
+
+		unless ($oracleClient->connect()) {
+			$docFluxRef->{$community}{'ReservedSQLError'} = $oracleClient->error();
+			next;
+		}
+
+		for $sql (@sqls) {
+			#print "sql = $sql\n";
+			my @allDocsFlux;
+
+			my $timeout = 60;
+			my $coderef = sub { @allDocsFlux = $oracleClient->executeSql($sql, \@bindVariables); };
+
+			if(! ariba::Ops::Utils::runWithTimeout($timeout,$coderef) ){
+				my $error = "0 timed out running sql \"$sql\" after $timeout sec";
+				$oracleClient->handleExecuteSqlTimeout();
+				$docFluxRef->{$community}{'ReservedSQLError'} = $error;
+			}
+
+			for my $flux (@allDocsFlux) {
+				#print "flux === $flux\n";
+				my ($type, $num) = split(/\s+/, $flux);
+				$docFluxRef->{$community}{$type} = $num;
+			}
+		}
+	}
+}
+
+sub documentFluxFor {
+	my $docType = shift;
+	my $self = $ariba::monitor::Query::_ourGlobalQuerySelf;
+	my $communityId = $self->communityId();
+
+	if (defined($incomingDocFlux{$communityId}{'ReservedSQLError'})) {
+	    return $incomingDocFlux{$communityId}{'ReservedSQLError'};
+	}
+
+	return ($incomingDocFlux{$communityId}{$docType} || 0);
+}
+
+sub outgoingDocumentFluxFor {
+	my $docType = shift;
+	my $self = $ariba::monitor::Query::_ourGlobalQuerySelf;
+	my $communityId = $self->communityId();
+
+	if (defined($outgoingDocFlux{$communityId}{'ReservedSQLError'})) {
+	    return $outgoingDocFlux{$communityId}{'ReservedSQLError'};
+	}
+
+	return ($outgoingDocFlux{$communityId}{$docType} || 0);
+}
+
+main();

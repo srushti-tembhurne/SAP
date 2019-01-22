@@ -1,0 +1,333 @@
+#!/usr/local/bin/perl -w
+# $Id:$
+
+use strict;
+use Data::Dumper;
+use XML::Simple;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+use lib "$FindBin::Bin/../lib/perl";
+use lib "$FindBin::Bin/../../lib/perl";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::misc;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::OracleClient;
+
+require "geturl";
+
+my $debug = 0;
+
+sub main {
+
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $cluster;
+
+    my $statusMap = {
+        404 => {
+            'warn' => 9000,
+            'crit' => 12000,
+        },
+        500 => {
+            'warn' => 900,
+            'crit' => 1200,
+        },
+        200 => {
+            'warn' => 30000,
+            'crit' => 40000,
+        },
+
+        ## Some of these APNS are in the direct action XML but not in the mon request, I'll just leave these here
+        ##    for when someone decides to monitor them.
+        #400 => {
+        #    'warn' => 99999,
+        #    'crit' => 99999,
+        #},
+
+        APNS_Exception => {
+            'warn' => 20000,
+            'crit' => 30000,
+        },
+        APNS_Sent => {
+            'warn' => 20000,
+            'crit' => 30000,
+        },
+        APNS_Connects_OK => {
+            'warn' => 20000,
+            'crit' => 30000,
+        },
+        APNS_Failed_State => {
+            'warn' => 20000,
+            'crit' => 30000,
+        },
+        APNS_Connection_ERR => {
+            'warn' => 20000,
+            'crit' => 30000,
+        },
+        APNS_Writes => {
+            'warn' => 20000,
+            'crit' => 30000,
+        },
+        APNS_ERR_Response => {
+            'warn' => 20000,
+            'crit' => 30000,
+        },
+        GCM_Exception => {
+            'warn' => 20000,
+            'crit' => 30000,
+        },
+        GCM_Sent => {
+            'warn' => 20000,
+            'crit' => 30000,
+        },
+        GCM_Connects_OK => {
+            'warn' => 20000,
+            'crit' => 30000,
+        },
+        GCM_Failed_State => {
+            'warn' => 20000,
+            'crit' => 30000,
+        },
+        GCM_Connection_ERR => {
+            'warn' => 20000,
+            'crit' => 30000,
+        },
+        GCM_Writes => {
+            'warn' => 20000,
+            'crit' => 30000,
+        },
+        GCM_ERR_Response => {
+            'warn' => 20000,
+            'crit' => 30000,
+        },
+
+    };
+
+    while ( my $arg = shift ( @ARGV ) ) {
+        if ( $arg =~ /^-e/o ) { $sendEmail = 1; }
+        if ( $arg =~ /^-p/o ) { $sendPage  = 1; }
+        if ( $arg =~ /^-c/o ) { $cluster   = shift ( @ARGV ); next }
+        if ( $arg =~ /^-d/o ) { $debug     = 1; }
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $me = ariba::rc::InstalledProduct->new( 'buyer', $mon->service() ); 
+    my $name = $me->name();
+    my $service = $me->service();
+    my $customer = $me->customer() || undef;
+    my $msg = 'A value of 99999 signifies trouble accessing the Direct Action, open a ticket with the team responsible for the Buyer Mobile API';
+    $cluster = $me->currentCluster() || 'primary' unless ( $cluster );
+
+    my $email = $me->default( 'notify.email' );
+    my $community = getCommunity($me); 
+
+    unless ($community =~ /^\d+$/){
+        print "This is not valid community $community for aribamobileapi\n", if $debug;
+    }
+
+    my @uiAndTaskInstances = grep { $_->instance() =~ /^UI-|^TaskCXML-/ } $me->appInstancesInCommunity($community);
+    print "Got '" . scalar @uiAndTaskInstances . " instances\n" if $debug;
+
+    # Loop over all products.
+    for my $inst ( @uiAndTaskInstances ) {
+        my %queries;
+        my $host = $inst->host();
+        my $port = $inst->httpPort();
+        my $nodeName = $inst->instanceName();
+
+        my $url    = "http://$host:$port/Buyer/v1/api/mgmt/monitorStats";
+        my $monUrl = ariba::monitor::Url->new( $url );
+        print "URL: '$url'\n" if $debug;
+        my $results = $monUrl->request();
+
+        my $xml = XMLin( $results );
+
+        foreach my $status ( keys %{ $statusMap } ) {
+            my $warn = $statusMap->{ $status }->{ 'warn' };
+            my $crit = $statusMap->{ $status }->{ 'crit' };
+
+#            my $val = grabVal( $xml, $status );
+#            print "$host:$port [$status] - warn( $warn ) crit( $crit ) val( $val )\n" if $debug;
+
+            ##We are monitroing HTTP response for UI node and APNS and GCM type of response for task node else 
+            ## we ignore that response  
+            next if ( ($nodeName =~ /^UI/  && $status !~ /^\d+/) || ($nodeName =~ /^Task/  && $status !~ /^APNS|^GCM/) );
+
+            $queries{ "Mobile API Status ($host:$status)" } = {
+                crit        => "answer >= $crit",
+                info        => "answer >= $warn",
+                uiHint      => $nodeName,
+                perl        => sub { return main::grabVal( $xml, $status ); },
+                ticketOwner => 'unassigned-sre',
+                ticketOnWarnOpenAfterMinutes    => 1,
+                severity    => 1,
+                description => 'Counts of Mobile API response statuses over 5 minute period',
+                correctiveActions => [
+                    Ops => 'Open a ticket with the team responsible for the Buyer Mobile API',
+                ],
+                note        => (grabVal( $xml, $status ) == 99999) ? $msg : '',  
+            };
+        }
+
+        if ($nodeName =~ /^TaskCXML-/){
+            my @certs = ('APNS', 'GCM');
+            foreach my $cert (@certs) {
+                $queries{ "Mobile API Write/Sent Diff ($host:$cert)" } = {
+                    crit        => 'answer >= 100',
+                    warn        => 'answer >= 50',
+                    uiHint      => $nodeName,
+                    perl        => sub { return main::diffSentWrites( $xml, $cert ); },
+                    ticketOwner => 'unassigned-sre',
+                    ticketOnWarnOpenAfterMinutes    => 1,
+                    severity    => 1,
+                    description => 'Ensures APNS_Writes and APNS_Sent are the same',
+                    correctiveActions => [
+                        Ops => 'Open a ticket with the team responsible for the Buyer Mobile API',
+                    ],
+                };
+            }
+        }
+
+        my $q = ariba::monitor::QueryManager->newWithDetails(
+            "mobile-api-response-counts", $name, $service, $customer, $cluster, \%queries
+        );
+
+        $q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub grabVal {
+    my $data = shift;
+    my $key  = shift;
+
+    my $ret = defined $data->{ 'monitorStatus' }->{ 'currentTotal' }->{ 'entry' }->{ $key }->{ 'content' } 
+                ? $data->{ 'monitorStatus' }->{ 'currentTotal' }->{ 'entry' }->{ $key }->{ 'content' }
+                : 99999;
+    return $ret;
+}
+
+sub diffSentWrites {
+    my $data = shift;
+    my $cert = shift;
+    
+    my $writes = $data->{ 'monitorStatus' }->{ 'currentTotal' }->{ 'entry' }->{ $cert."_Writes" }->{ 'content' };
+    my $sent   = $data->{ 'monitorStatus' }->{ 'currentTotal' }->{ 'entry' }->{ $cert."_Sent"   }->{ 'content' };
+
+    ## Return the positive integer difference
+    return abs $writes - $sent;
+}
+
+sub getCommunity {
+    my $me = shift;
+    my $oc = ariba::Ops::OracleClient->new($me->connectInfoForOracleClient());
+    my $versionClause = "";
+    if ( $me->releaseName() =~ m/R3/ ){
+        # Note the space here.
+        $versionClause = " and c.Version = (select b.RealmToCommunityVersion from BucketStateTab b where b.Bucket = 0)";
+    }
+    my $sql = "select c.CommunityId, r.Id, r.Name, r.State from CommunityTab c, RealmTab r where r.Id = c.RealmId$versionClause and r.Name = 'aribamobileapi' order by c.CommunityId, r.Label";
+    
+    if ($oc->connect()) {
+        my $timeout = 60;
+        my @results;
+        $oc->executeSqlWithTimeout($sql, $timeout, \@results);
+
+        print "Oracle Error: ", $oc->error() if ($debug && $oc->error());
+            
+        unless ($oc->error()) {
+            my ($community, @info) = split (/\s+/, $results[0]);
+            print "Community for aribamobileapi is #". $community . "\n", if ($debug); 
+            return $community;
+        }
+        return "Oracle Error: ", $oc->error() if ($oc->error);
+    }
+}
+
+
+main();
+
+__END__
+
+XML response example:
+<xml>
+    <monitorStatus>
+        <currentTotal>
+            <entry name="409" warn="-1" crit="-1">0</entry>
+            <entry name="total" warn="-1" crit="-1">0</entry>
+            <entry name="404" warn="100" crit="1000">0</entry>
+            <entry name="200" warn="-1" crit="-1">0</entry>
+            <entry name="201" warn="-1" crit="-1">0</entry>
+            <entry name="410" warn="-1" crit="-1">0</entry>
+            <entry name="400" warn="-1" crit="-1">0</entry>
+            <entry name="403" warn="-1" crit="-1">0</entry>
+            <entry name="500" warn="10" crit="100">0</entry>
+            <entry name="APNS_Failed_State" warn="-1" crit="-1">0</entry>
+            <entry name="APNS_Connection_ERR" warn="-1" crit="-1">0</entry>
+            <entry name="APNS_Exception" warn="-1" crit="-1">0</entry>
+            <entry name="APNS_Sent" warn="-1" crit="-1">0</entry>
+            <entry name="APNS_Connects_OK" warn="-1" crit="-1">0</entry>
+            <entry name="APNS_Writes" warn="-1" crit="-1">0</entry>
+            <entry name="APNS_ERR_Response" warn="-1" crit="-1">0</entry> 
+        </currentTotal>
+    </monitorStatus>
+</xml>
+
+Perl hash from the XML:
+$VAR1 = {
+          'monitorStatus' => {
+                             'currentTotal' => {
+                                               'entry' => {
+                                                          '403' => {
+                                                                   'crit' => '-1',
+                                                                   'warn' => '-1',
+                                                                   'content' => '0'
+                                                                 },
+                                                          '400' => {
+                                                                   'crit' => '-1',
+                                                                   'warn' => '-1',
+                                                                   'content' => '0'
+                                                                 },
+                                                          'total' => {
+                                                                     'crit' => '-1',
+                                                                     'warn' => '-1',
+                                                                     'content' => '0'
+                                                                   },
+                                                          '200' => {
+                                                                   'crit' => '-1',
+                                                                   'warn' => '-1',
+                                                                   'content' => '0'
+                                                                 },
+                                                          '201' => {
+                                                                   'crit' => '-1',
+                                                                   'warn' => '-1',
+                                                                   'content' => '0'
+                                                                 },
+                                                          '409' => {
+                                                                   'crit' => '-1',
+                                                                   'warn' => '-1',
+                                                                   'content' => '0'
+                                                                 },
+                                                          '500' => {
+                                                                   'crit' => '100',
+                                                                   'warn' => '10',
+                                                                   'content' => '0'
+                                                                 },
+                                                          '404' => {
+                                                                   'crit' => '1000',
+                                                                   'warn' => '100',
+                                                                   'content' => '0'
+                                                                 },
+                                                          '410' => {
+                                                                   'crit' => '-1',
+                                                                   'warn' => '-1',
+                                                                   'content' => '0'
+                                                                 }
+                                                        }
+                                             }
+                           }
+        };

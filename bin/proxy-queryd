@@ -1,0 +1,202 @@
+#!/usr/local/bin/perl -w
+#
+# a proxy for queryd.  used on backup-monservers
+#
+#
+# $Id: //ariba/services/monitor/bin/proxy-queryd#4 $
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use strict;
+use ariba::Ops::PageUtils;
+use ariba::monitor::misc;
+use IO::Socket::INET;
+use Fcntl;
+use Socket;
+use POSIX qw(WNOHANG);
+
+my $debug = 0;
+my $timeout = 60;
+
+sub logmsg {
+        my $date = scalar(localtime(time));
+        print STDERR "[",$date, "] ", @_;
+}
+
+sub processClientConnection {
+	my $tag = shift;
+	my $monclient = shift;
+	my $clientSocket = shift;
+
+	my $monclientfd = $monclient->fileno();
+	my $querydfd = $clientSocket->fileno();
+
+	logmsg "$tag: processClientConnection()\n" if $debug;
+	
+	while (1) {
+		my $rin = "";
+		my $rout;
+		vec($rin, $monclientfd, 1) = 1;
+		vec($rin, $querydfd, 1) = 1;
+
+		my ($nfound, $tl) = select($rout = $rin, undef, undef, $timeout);
+
+		if( $nfound == 0 ){	
+			#a timeout
+			logmsg "$tag: timeout in select()\n" if $debug;
+			print $monclient "error: timeout in select()\n";
+
+			closeAll($tag, $monclient, $clientSocket);
+			return undef;
+                }
+
+		if( $nfound < 0 ){
+			logmsg "$tag: error $! from select()\n" if $debug;
+			print $monclient "error: error $! in select()\n";
+
+			closeAll($tag, $monclient, $clientSocket);
+			return undef;
+		}
+
+		if( vec($rout, $monclientfd, 1) == 1 ){
+			my $buf = "";
+			if( sysread($monclient, $buf, 1024)){
+				syswrite($clientSocket, $buf, length($buf));
+				logmsg "$tag>> $buf\n" if $debug;
+			} else {
+				#monitoringClient has closed!
+				closeAll($tag, $monclient, $clientSocket);
+				return 2;
+			}
+		}
+
+		if( vec($rout, $querydfd, 1) == 1){
+			my $buf = "";
+			#read from server, write to monitorClient
+			if( sysread($clientSocket, $buf, 1024) ){
+				syswrite($monclient, $buf, length($buf));
+				logmsg "$tag<< $buf\n" if $debug;
+			} else {
+				#server has closed!
+				closeAll($tag, $monclient, $clientSocket);
+				return 1;
+			}
+		}
+	}
+}
+
+sub closeAll {
+	my $tag = shift;
+	my @fhs = @_;
+
+	logmsg "$tag: closing fhs\n" if $debug;
+
+	for my $fh ( @fhs ) {
+		close($fh);
+	}
+	return 1;
+}
+	
+sub clientSocket {
+	my $serverHost = shift;
+	my $port = shift;
+	my $monclientSocket = shift;
+
+	my $clientSocket = IO::Socket::INET->new(
+		PeerAddr => $serverHost,
+		PeerPort => $port,
+		Timeout => $timeout 
+	) || 
+	do {
+		my $errno = $! + 0;
+		print $monclientSocket "error: connect to $serverHost:$port [errno=$errno] $!\n";
+		return undef;
+	};
+	return $clientSocket;
+}
+
+sub serverSocket {
+	my $port = shift;
+
+	my $backlog = 1024; # TMID: 7820, 8265
+
+        my $serverSocket = IO::Socket::INET->new(
+		Listen    => $backlog,
+		LocalAddr => '0.0.0.0',
+		LocalPort => $port,
+		Proto     => 'tcp',
+		Reuse     => 1,
+		Timeout   => $timeout
+	);
+	return $serverSocket;
+}
+
+sub usage {
+	print "proxy-queryd [-h] [-d] [-l filename]\n";
+	print "   -h this help\n";
+	print "   -d debug\n";
+	print "   -l <filename> log debugging to this file\n";
+	print "\n";
+	exit(1);
+}
+
+sub main {
+	my $logfile;
+
+	while(my $arg=shift(@ARGV)){
+		if( $arg =~ /^-d/o ){ $debug = 1; next };
+		if( $arg =~ /^-l/o ){ $logfile = shift(@ARGV); next };
+		if( $arg =~ /^-h/o ){ usage(); };
+        }
+
+        if ( defined($logfile) ) {
+                open(STDERR, "> $logfile") || die "can't log to $logfile: $!";
+        } 
+
+	$SIG{'PIPE'} = "IGNORE";
+	$SIG{'CHLD'} = "IGNORE";
+
+	my $connectionCount = 0;
+
+	my $realServer = ariba::Ops::PageUtils::monitorServer();
+	my $querydPort = ariba::monitor::misc::querydPort();
+
+	my $serverSocket = serverSocket($querydPort);
+
+	while (1) {
+		my ($monclientSocket, $addr) = $serverSocket->accept();
+
+		# IO::Socket::INET is lame and times out accept();
+		next unless $monclientSocket;
+
+		my ($port, $iaddr) = unpack_sockaddr_in($addr);
+		my $fromaddr = inet_ntoa($iaddr);
+		$connectionCount++;
+
+		my $tag = "$connectionCount=$fromaddr:$port";
+		logmsg "$tag: connection from a monitoring client\n" if $debug;
+
+		## do a fork
+
+		my $pid;
+		if ( ( $pid = fork() ) == 0 && defined($pid) ) {
+			logmsg "$tag: connecting to queryd on $realServer\n";
+			my $clientSocket = clientSocket($realServer, $querydPort, $monclientSocket);
+
+			processClientConnection($tag, $monclientSocket, $clientSocket) if $clientSocket;
+			exit(1);
+		}
+
+		$monclientSocket->close();
+		waitpid(-1, WNOHANG); 
+
+		if ( defined($pid) ) {
+			logmsg "$tag: forked $pid\n" if $debug;
+		} else {
+			logmsg "$tag: main loop FAILED TO FORK $!\n" if $debug;
+		}
+	}
+}
+
+main();

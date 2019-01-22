@@ -1,0 +1,110 @@
+#!/usr/local/bin/perl -w
+#
+#NOTE:  1.  It seems some processes will not die after being sent a 'kill 9', which I don't really understand.  But then,
+#           followed by a 'kill 15', they go away.  Note that when strace'd, these processes were attached but showed no
+#           code, which I think means they were basically zombies.
+#
+#       2.  Need to add two features:
+#           a.  need a way to get process trees for multiple sets of trees, so can kill children before parents.
+#               The current method for trees uses PIDs, which we don't have, but could get, unordered.
+#           b.  should try to do a kill 15 first, followed by a kill 9 after a short wait (say 15-20 seconds?).
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use Getopt::Long qw(:config no_ignore_case_always no_getopt_compat require_order no_bundling);
+use File::Basename;
+use POSIX qw (SIGKILL SIGTERM);
+
+use dmail::LockLib;
+
+my $lockFile = '/tmp/clean-old-mon-procs';
+
+use ariba::Ops::ProcessTable;
+
+my $debug;
+my $help;
+
+sub usage
+{
+    my $msg = shift;
+    my $cmd = basename ($0);
+    print "$msg.\n\n" if $msg;
+    print "usage:\t$cmd [-d] [-h]\n\n",
+          "\t-d  print debug info rather than actually killing any processes.\n",
+          "\t-h  print this help\n";
+
+    exit 0;
+}
+
+GetOptions (
+                'debug|d' => \$debug,
+                'help|h'  => \$help,
+           );
+
+usage () if $help;
+
+my $linkName = readlink ("$ENV{HOME}/bin");
+die "ERROR:  Failed to determine the Mon 'bin' link name, aborting.\n"
+    unless $linkName;
+print "Link:  $linkName\n" if $debug;
+
+# We need the Cookies.* directory name only.
+my ($cookiesBuild) = ($linkName =~ m@/[^/]+/[^/]+/([^/]+)/bin@);
+die "ERROR:  Failed to determine Cookies build name/number, aborting.\n"
+    unless $cookiesBuild;
+print "Current MON build:  $cookiesBuild\n" if $debug;
+
+# And then the prefix to use for the general search, currently "Cookies".
+my $mon_name = (split('-', $cookiesBuild))[0];
+die "ERROR:  Failed to determine root Mon name, aborting.\n"
+    unless $mon_name;
+print "Current MON name prefix:  $mon_name\n" if $debug;
+
+# Don't request a lockfile unless it is actually going to be used.  Putting it here at least doesn't
+# create one and then exit, having done nothing, due to one of the errors above or a usage request.
+if (!dmail::LockLib::requestlock ($lockFile, 10))
+{
+    die "can't grab lock\n";
+}
+
+my $processTable = ariba::Ops::ProcessTable->new ();
+
+for my $sigNum (SIGTERM, SIGKILL)
+{
+    # Sleep on second time through the loop only.
+    sleep 30 if $sigNum == SIGKILL;
+
+    my @allCookiesProcesses = $processTable->processNamesMatching ($mon_name);
+
+    # Now we want to remove all *current* build number processes, we don't want to kill them.
+    my @procsToKill = grep !/$cookiesBuild/, @allCookiesProcesses;
+    # We can exit if the array is empty. ;>
+    unless (@procsToKill)
+    {
+        print "Exiting, nothing to do.\n" if $debug;
+        last;
+    }
+
+    # Print a couple of representative values:
+    print "Sample of processes to kill:\n\t$procsToKill[0]\n\t$procsToKill[$#procsToKill]\n" if $debug;
+
+    # Unfortunately, the killProcessesWithName () method of ariba::Ops::ProcessTable finds names using a regex, but
+    # this script can't do that (easily, at least), since we don't know anything except what we *don't* want.  So
+    # the above has built an array, with names, which will be passed one at a time to the kill method.  Not exactly
+    # efficient, but it'll get the job done.
+    for my $name (@procsToKill)
+    {
+        if ($debug)
+        {
+            print "\$processTable->killProcessesWithName ($name, $sigNum)\n";
+        }
+        else
+        {
+            $processTable->killProcessesWithName ($name, $sigNum);
+        }
+    }
+}
+
+dmail::LockLib::releaselock($lockFile);
+exit 0;

@@ -1,0 +1,118 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/cleanup-heap-dumps#11 $
+
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use ariba::rc::Utils;
+use ariba::rc::InstalledProduct;
+use File::Basename;
+use File::Copy;
+use File::Path;
+use dmail::LockLib;
+
+my $ERROR      = "error";
+my $PROCESSED  = "clean";
+my $RAW        = "raw";
+my $INCOMING   = "incoming";
+
+my $debug = 0;
+
+sub usage
+{
+    print "Usage: $0\n";
+    print "    Cleans heap dumps older than 30 days (2 days for RAW files)\n";
+    print "    -h          this message\n";
+    print "    -d[ebug]    debug\n";
+	print "    -p[roduct] \$product -- specify a product name.\n";
+    exit;
+}
+
+sub main {
+	my $prodname = undef;
+        
+    while ( my $arg = shift(@ARGV) ) {
+        if ( $arg =~ /^-h/ ) { usage(); }
+        if ( $arg =~ /^-d(ebug)?/i ) { ++$debug; next; }
+		if ( $arg =~ /^-p(roduct)?/i ) { $prodname = shift(@ARGV); next; }
+    }
+    
+    
+    my $qmName      = 'cleanup-heap-dumps';
+    
+    my $me       = ariba::rc::InstalledProduct->new();
+	my @products;
+	unless($prodname) {
+    	@products = ariba::rc::InstalledProduct->installedProductsList($me->service());
+	} else {
+		my $p = ariba::rc::InstalledProduct->new( $prodname, $me->service() );
+		push(@products, $p);
+	}
+
+    for my $product (@products) {
+    	my $lockFile = "/tmp/$qmName";
+		$lockFile .= "-" . $product->name();
+    
+		unless ( dmail::LockLib::requestlock($lockFile,1) ) {
+			print STDERR "can't grab lock $lockFile\n" if -T STDOUT;
+			next;
+		}
+
+        if (defined($product->default('Ops.HeapDumpRoot'))) {
+            cleanupDumps($product);
+        }
+        else {
+            print "Product: " . $product->name() . " has no dump root, skipping\n" if $debug;
+        }
+
+    	dmail::LockLib::releaselock($lockFile);
+    }
+    
+}
+
+
+sub cleanupDumps
+{
+    my $product = shift;
+
+    my $basedir = $product->default('Ops.HeapDumpRoot');
+
+    unless (-d $basedir) {
+	return;
+    }
+    
+    print "Cleaning up dumps for  " . $product->name() . " from $basedir\n" if $debug;
+
+
+    my @dirs = ($ERROR, $RAW, $PROCESSED, $INCOMING);
+
+
+    for my $dir (@dirs) {
+	my $filename;
+	my $mtime;
+	my $ageToRemove = 21*24*60*60;
+	$ageToRemove = 2*24*60*60 if($dir eq $RAW);
+	
+	my $currentdir = "$basedir/$dir";
+
+	if (opendir(DIR, $currentdir)) {
+	    while ($filename = readdir(DIR)) {
+		if ($filename eq '.' || $filename eq '..') {
+		    next;
+		}
+		$mtime = (stat("$currentdir/$filename"))[9];
+		if (time() - $mtime > $ageToRemove) {
+		    print "Purging $currentdir/$filename\n" if $debug;
+		    rmtree("$currentdir/$filename");
+		}
+	    }
+	}
+	closedir(DIR);
+    }
+}
+
+main();

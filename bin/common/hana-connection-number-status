@@ -1,0 +1,960 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/common/hana-connection-number-status#93 $
+
+use strict;
+use warnings;
+use Data::Dumper;
+use File::Basename;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::HanaClient;
+use ariba::Ops::Constants;
+use ariba::Ops::DBConnection;
+use ariba::Ops::Startup::Common;
+use ariba::rc::InstalledProduct;
+use dmail::LockLib;
+
+# the default watchdog timeout. Should typically be set to no greater than cron run interval - 1 minute.
+use constant WATCHDOG_TIMEOUT => 840;
+
+# num secs to wait trying to obtain a db connection
+use constant CONNECT_TIMEOUT  =>  10;
+
+# num of tries to obtain a db connection
+use constant NUM_TRIES        =>   2;
+
+my $expando  = "hana-status-for-main-db";
+my $debug    = FALSE;
+my $wto      = WATCHDOG_TIMEOUT;
+my $cto      = CONNECT_TIMEOUT;
+my $ntries   = NUM_TRIES;
+my $prog     = basename($0);
+my $LOCKFILE = "/tmp/$prog";
+
+$| = TRUE;
+
+my %kids; # for the parent to track child procs
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+
+Usage: $0 [-c N|-n N|-w N|-e|-p|-d|-h]
+
+    -c    connect timeout in secs.  (default: @{[CONNECT_TIMEOUT()]})
+    -n    num tries to connect.     (default: @{[NUM_TRIES()]})
+    -w    watchdog timeout in secs. (default: @{[WATCHDOG_TIMEOUT()]})
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode.
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n\n" if ($error);
+    exit();
+}
+
+sub durationLog {
+    my ($logfile, @txt) = @_;
+    my   $fh;
+    open $fh, ">>$logfile" or return; # non-fatal
+    for my $line (@txt) { print $fh "$line\n"; }
+    close $fh;
+}
+
+sub main {
+    my $sendEmail = FALSE;
+    my $sendPage  = FALSE;
+    while(my $arg = shift) {
+        if($arg eq '-h') { usage();            next; }
+        if($arg eq '-d') { $debug++;           next; }
+        if($arg eq '-e') { $sendEmail = TRUE;  next; }
+        if($arg eq '-p') { $sendPage  = TRUE;  next; }
+        if($arg eq '-c') { $cto       = shift; next; }
+        if($arg eq '-w') { $wto       = shift; next; }
+        if($arg eq '-n') { $ntries    = shift; next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    usage("'-w' must be positive integer") unless $wto    =~ /^\d+$/;
+    usage("'-t' must be positive integer") unless $cto    =~ /^\d+$/;
+    usage("'-c' must be positive integer") unless $ntries =~ /^\d+$/;
+
+    print "watchdog timeout: $wto secs ; connect timeout: $cto secs ; num tries: $ntries\n" if $debug;
+    die "can't grab lock\n" unless dmail::LockLib::requestlock($LOCKFILE, 5);
+    my $me = ariba::rc::InstalledProduct->new();
+
+    ## HOA-50384 adding logic to monitor starttime, endtime, & duration to execute the script 
+    my $logdir          = ariba::Ops::Startup::Common::logsDirForProduct($me);
+    my $durationLogFile = "$logdir/$prog-time-duration.log";
+    my $startTime       = time();
+    my $jobStarted      = localtime;
+    durationLog($durationLogFile, "Job Started $jobStarted");
+
+    my $dbuser   = $me->default("dbainfo.hana.system.username");
+    my $email    = $me->default('notify.email');
+    my $dbpass   = $me->default("dbainfo.hana.system.password");
+    my @products = ariba::rc::InstalledProduct->installedProductsList($me->service());
+    my $isProdMsServce = 0;
+    if (ariba::Ops::ServiceController::isProductionMsServicesOnly($me->service())){
+        $isProdMsServce = 1;
+    }
+    my $isProdService;
+    if (ariba::Ops::ServiceController::isProductionServicesOnly($me->service())){
+        $isProdService = 1;
+    }
+
+    foreach my $product (@products) {
+        my $pName = $product->name();
+        next if $pName eq 'mon' or $pName eq 'ebs';
+
+        my @all_dbcs    = ariba::Ops::DBConnection->connectionsFromProducts([$product]);
+        my @unique_dbcs = ariba::Ops::DBConnection->uniqueConnectionsByHostAndPort(@all_dbcs);
+
+        for my $dbc (@unique_dbcs) {
+            next if $dbc->isDR() || $dbc->dbServerType() ne ariba::Ops::DBConnection->hanaDBServerType();
+
+            my $kid = fork();
+            if($kid == 0) {
+                process_dbc($dbc, $product, $dbuser, $dbpass, $email, $sendEmail, $sendPage, $cto, $wto, $ntries, $debug, $isProdMsServce, $isProdService);
+                exit;
+            }
+            elsif(! $kid) {
+                print "[$$] main: fork() failed: $!"; # spew
+            }
+            else {
+                print "[$$] main: successfully forked pid $kid\n" if $debug;
+                $kids{$kid} = TRUE;
+            }
+        }
+    }
+
+    watchdog($wto, $debug);
+    my $jobEnded = localtime;
+    my $duration = sprintf("%.2f", (time() - $startTime));
+    durationLog($durationLogFile, "Job Ended $jobEnded",
+               "Total time taken is $duration seconds.",
+               "**" x 25);
+
+    dmail::LockLib::releaselock($LOCKFILE);
+}
+
+sub watchdog {
+    my ($wto, $debug) = @_;
+    eval {
+        local $SIG{ALRM} = sub { die "timeout" };
+        alarm $wto;
+        while((my $kid = wait()) > 0) {
+            print "[$$] main: harvested child pid $kid\n" if $debug;
+            delete $kids{$kid};
+        }
+        alarm 0;
+    };
+    if($@ && $@ =~ /timeout/) {
+        print "[$$] main: timed out waiting for child pids: ", (join ' ', keys %kids), "\n" if $debug;
+        for my $kid (keys %kids) { kill 'TERM', $kid; sleep 2; kill 'KILL', $kid; }
+    }
+}
+
+sub convert_stats_to_String {
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+    my $ret =  "OK" ;
+
+    my $result = $query->results();
+    print Dumper $result if $debug > 1;
+    if($result !~ /\d+/ || $result != 0) {
+        $ret = "Smart Merge Blocked";
+    }
+    return $ret;
+}
+
+sub parse_dbc {
+    my $dbc = shift;
+
+    # Some products (such as S4) are incorrectly defining the SID as hostname, so we'll coerce it to short name.
+    my $pName     =  $dbc->product()->name();
+    my $dbsid     =  uc($dbc->sid());
+    $dbsid        =~ s/^([^.]+).*/$1/;
+    my $dbname    =  $dbc->dbname() ? uc($dbc->dbname()) : $dbsid;
+    my $host      =  $dbc->host();
+    $host         =~ s/:\d+//; # strip port
+    my $type      =  $dbc->type();
+    my $port      =  $dbc->port();
+    my $hanaHosts =  $dbc->hanaHosts() || [];
+    $hanaHosts    =  [ sort @$hanaHosts ] if @$hanaHosts;
+    my $clusterHost  =  $dbc->{'clusterHost'} || $host;
+
+    return ($pName, $dbsid, $dbname, $host, $clusterHost, $type, $port, $hanaHosts);
+}
+
+sub process_dbc {
+    my ($dbc, $product, $dbuser, $dbpass, $email, $sendEmail, $sendPage, $cto, $wto, $ntries, $debug, $isProdMsServce, $isProdService) = @_;
+
+    # in the old serialized-processing version of this script, sysdb dbcs were pushed onto the
+    # @unique_dbcs stack as they were detected. but now we're in a child proc, so that won't
+    # work. instead, we'll have to note the sysdb conn and re-loop once to process it.
+    # (there can never be more than one sys dbc corresponding to a tenant dbc.)
+    #
+    # a side effect is that we can no longer easily track whether we've already visited a given
+    # sys dbc. so multiple children might wind up querying the same sys dbc. the upside is: the
+    # sys dbc will actually show in the product tab for *all* products that are MDC tenants,
+    # not just the 1st one encountered in the dbc list, as was the case in the old serialized-
+    # processing version of this script.
+    LOOP:
+
+    my $sys_dbc = undef;
+    my %sidQueries;
+
+    my ($backupFreq, $incrBackupFreq, $anyBackupFreq) = ariba::Ops::Constants->backupFreqHana($product->service());
+
+    my ($pName, $dbsid, $dbname, $host, $clusterHost, $type, $port, $hanaHosts) = parse_dbc($dbc);
+    my $hanaVolumeIndex = "Cluster($clusterHost:$port:$dbsid:$dbname)";
+
+    print "[$$] connecting to: product=$pName sid=$dbsid dbname=$dbname host=$host port=$port hanaHosts=(@$hanaHosts)\n" if $debug;
+
+    my $hanaClient = ariba::Ops::HanaClient->new($dbuser, $dbpass, $host, $port, $hanaHosts);
+    $hanaClient->setDebug($debug > 1); # only show the low-level hanaClient debug output for debug levels > 1
+                                       # (that is: if the user supplied multiple "-d" opts on the cmd line)
+
+    # on connect failure, break out and continue to the next dbc. queries for the failed dbc may
+    # go stale, but that's ok, because hana-isup is our 1st line of defense for connect failures.
+    unless($hanaClient->connect($cto, $ntries)) {
+        my $err = $hanaClient->error() || '';
+        print "[$$] connect failed for $pName $hanaVolumeIndex: $err\n" if $debug;
+        return;
+    }
+    my ($hanaVer, $hanaRev) = ($hanaClient->version(), $hanaClient->revision());
+
+    # if this is an MDC tenant, sysdb_host will be set. see notes at top of this loop.
+    if((my $sysdb_host = $hanaClient->sysdb_host())) {
+        print "[$$] adding sysdb host $sysdb_host to the stack\n" if $debug;
+        my $type = "MDC_master";
+        $sys_dbc = ariba::Ops::DBConnection->new($dbuser, $dbpass, $dbsid, $sysdb_host, $type, undef, $product, "dummy");
+        $sys_dbc->setDbType(ariba::Ops::DBConnection::hanaDBServerType());
+        $sys_dbc->setPort($hanaClient->sysdb_port());
+        # save the original clusterHost (bit hacky), to be used within $hanaVolumeIndex
+        # sysdb_host changes after HA failover and using it, could leave behind stale entries having old sysdb_host name
+        $sys_dbc->{'clusterHost'} = $host;
+        $sys_dbc->dbname("SYSTEMDB");
+    }
+
+    # must cycle thru all hosts to prevent stale standby queries.
+    my @allHana_host = ($hanaClient->master(), @{$hanaClient->slaves()}, @{$hanaClient->standbys()});
+    print "[$$] connected to: product=$pName sid=$dbsid dbname=$dbname host=$host port=$port hanaHosts=(@allHana_host)\n" if $debug;
+
+    my $type_name           = "$type db";
+    my $dbMonHint           = "Transaction Monitoring";
+    my $hanBackup           = "Hana Backup";
+    my $hlthMonHint         = "Health Monitoring";
+    my $lockingMonHint      = "Health Monitoring/Locking";
+    my $alertMonHint        = "Health Monitoring/Alerts";
+    my $restartAlertMonHint = "Health Monitoring/Alerts/Service Restarts";
+    my $cpuMonHint          = "Health Monitoring/CPU";
+    my $memMonHint          = "Health Monitoring/Memory/$hanaVolumeIndex";
+    my $oomMonHint          = "$memMonHint/OOM";
+    my $dmaMonHint          = "$memMonHint/DeltaMerge Allocator";
+    my $ddiskMonHint        = "Health Monitoring/Disks/Data";
+    my $ldiskMonHint        = "Health Monitoring/Disks/Log";
+    my $tdiskMonHint        = "Health Monitoring/Disks/Trace";
+    my $srvMonHint          = "Health Monitoring/Services";
+    my $alrtMonHint         = "Health Monitoring/Alerts";
+    my $drUIHint            = "DR Monitoring";
+    my $clusterUIHint       = "Cluster Monitoring";
+    my $configUIHint        = "Cluster Configuration";
+    my $hanaLicense         = "Hana License Check";
+    my $hanaUIHint          = "Hana Total Connection Utilisation(%)";
+
+    my $hanahostrolesql;
+    if( $hanaVer > 2 ) {
+        $hanahostrolesql = "select 'Host', 'Is Active', 'Status', 'Nameserver Configiured / Actual Role', 'Indexserver Configured / Actual Role', 'Host Actual Role', 'Storage Partition', 'Failover Status' from DUMMY UNION select host, host_active, host_status, concat(concat(nameserver_config_role,' / '), nameserver_actual_role), concat(concat(indexserver_config_role, ' / '),indexserver_actual_role), host_Actual_roles, to_char(storage_partition), failover_status from M_LANDSCAPE_HOST_CONFIGURATION";
+    }
+    else {
+        $hanahostrolesql = "select 'Host', 'Is Active', 'Status', 'Nameserver Configiured / Actual Role', 'Indexserver Configured / Actual Role', 'Storage Partition', 'Failover Status' from DUMMY UNION select host, host_active, host_status, concat(concat(nameserver_config_role,' / '), nameserver_actual_role), concat(concat(indexserver_config_role, ' / '),indexserver_actual_role), to_char(storage_partition), failover_status from M_LANDSCAPE_HOST_CONFIGURATION";
+    }
+        
+    %sidQueries = (
+        "$hanaVolumeIndex Configuration" => {
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => $configUIHint,
+            'sql'           => q`select name, value from m_system_overview where section = 'System'`,
+        },
+
+	"$hanaVolumeIndex Hana Total Connection Utilised(%)" => {
+            'rowCountLimit'	=> 4000,
+	    'severity'		=> 1,
+            'recordMaxResults' 	=> 110000,
+            'warn'		=> "answer > 75",
+            'crit'		=> "answer > 80",
+            'uiHint'		=> $hanaUIHint,
+            'sql'		=> q`select (conn.con_cnt/ini.max_connections)*100 from (select count(*) con_cnt from m_connections where connection_type not like '%History%' ) conn,(select value max_connections FROM M_INIFILE_CONTENTS WHERE key='maximum_connections' and FILE_NAME='indexserver.ini') ini;`,
+            'correctiveActions' => [
+                Ops => 'If unusual number of connections in the database,involve DBA to liaise with app team(in case these are app connection), or else DBA to health check the database.',
+            ],
+        },
+
+        "$hanaVolumeIndex Cluster Host Status" => {
+            'rowCountLimit' => 4000,
+            'crit'          => 'answer =~ /WARNING/ || answer =~ /ERROR/',
+            'uiHint'        => $clusterUIHint,
+            'sql' => $hanahostrolesql,
+        },
+
+        "$hanaVolumeIndex Current Alerts" => {
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'crit'          => 'answer =~ /ERROR/',
+            'warn'          => 'answer =~ /WARNING/',
+            'uiHint'        => $alertMonHint,
+            'sql' =>
+              q`select status || ' (' || value || ' )' from M_SYSTEM_OVERVIEW where section= 'Statistics' and name = 'Alerts'`,
+        },
+
+        "$hanaVolumeIndex Current Alerts Details" => {
+            'rowCountLimit' => 100,
+            'info'          => "answer",
+            'crit'          => 'answer != 0 && answer ne previousAnswer',
+            'warn'          => 'answer =~ /WARNING/',
+            'uiHint'        => $alertMonHint,
+            'sql'           => q`SELECT A.ALERT_TIMESTAMP,A.ALERT_DETAILS FROM _SYS_STATISTICS.STATISTICS_ALERTS A ,_SYS_STATISTICS.STATISTICS_CURRENT_ALERTS CA where A.ALERT_ID = CA.ALERT_ID AND A.INDEX = CA.INDEX AND A.SNAPSHOT_ID = CA.SNAPSHOT_ID and A.ALERT_RATING =5`,
+        },
+
+        "$hanaVolumeIndex Hana Service Restarts" => {
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'crit'          => 'answer =~ /restarted/si',
+            'severity'      => 2,
+            'uiHint'        => $restartAlertMonHint,
+             'sql' =>
+                   q`select host, case when (SECONDS_BETWEEN(max(START_TIME) OVER (PARTITION BY HOST) ,CURRENT_TIMESTAMP )/3600) < 3 then 'service restarted' else 'running fine' end as result from M_SERVICE_STATISTICS`,
+        }, 
+
+        "$hanaVolumeIndex Cpu overall status" => {
+            'rowCountLimit' => 4000,
+            'warn'          => 'answer =~ /WARNING/',
+            'uiHint'        => $cpuMonHint,
+            'sql' =>
+              q`select status || ' (' || value || ' )' from M_SYSTEM_OVERVIEW where section= 'CPU' and name = 'CPU'`,
+        },
+
+        "$hanaVolumeIndex Cpu status by Host" => {
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => $cpuMonHint,
+            'sql' =>
+              q`select 'Host', 'Core (Threads) * Clock', 'Percent CPU Usage' from DUMMY UNION select a.host, a.value, concat(b.cpu,'%') from  (select host, value from M_HOST_INFORMATION  where key = 'cpu_summary') a, (select host, MAX("TOTAL_CPU") as cpu from M_SERVICE_STATISTICS group by host) b where a.host = b.host`,
+        },
+
+        "$hanaVolumeIndex Data Disk overall status" => {
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'crit'          => 'answer =~ /ERROR/',
+            'warn'          => 'answer =~ /WARNING/',
+            'uiHint'        => $ddiskMonHint,
+            'sql' =>
+              q`select status || ' (' || value || ' )' from M_SYSTEM_OVERVIEW where section= 'Disk' and name = 'Data'`,
+        },
+
+        "$hanaVolumeIndex Data Disk status by Host" => {
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => $ddiskMonHint,
+            'sql' =>
+              q`select status || ' (' || value || ' )' from M_SYSTEM_OVERVIEW where section= 'Disk' and name = 'Data'`,
+            'sql' =>
+              q`select 'Host', 'Disk Id', 'Path', 'Used size in GB', 'Total size in GB', 'Percent Used' from DUMMY UNION(select host, to_char(disk_id), path , to_char(round(used_size/1024/1024/1024,2)), to_char(round(total_size/1024/1024/1024,2)), to_char(round((used_size * 100/total_size),2)) from M_DISKS where usage_type = 'DATA' order by host)`,
+        },
+
+        "$hanaVolumeIndex Log Disk overall status" => {
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'crit'          => 'answer =~ /ERROR/',
+            'warn'          => 'answer =~ /WARNING/',
+            'uiHint'        => $ldiskMonHint,
+            'sql' =>
+              q`select status || ' (' || value || ' )' from M_SYSTEM_OVERVIEW where section= 'Disk' and name = 'Log'`,
+        },
+
+        "$hanaVolumeIndex Log Disk status by Host" => {
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => $ldiskMonHint,
+            'sql' =>
+              q`select status || ' (' || value || ' )' from M_SYSTEM_OVERVIEW where section= 'Disk' and name = 'Data'`,
+            'sql' =>
+              q`select 'Host', 'Disk Id', 'Path', 'Used size in GB', 'Total size in GB', 'Percent Used' from DUMMY UNION(select host, to_char(disk_id), path , to_char(round(used_size/1024/1024/1024,2)), to_char(round(total_size/1024/1024/1024,2)), to_char(round((used_size * 100/total_size),2)) from M_DISKS where usage_type = 'LOG' order by host)`,
+        },
+
+        "$hanaVolumeIndex Trace Disk overall status" => {
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'crit'          => 'answer =~ /ERROR/',
+            'warn'          => 'answer =~ /WARNING/',
+            'uiHint'        => $tdiskMonHint,
+            'sql' =>
+              q`select status || ' (' || value || ' )' from M_SYSTEM_OVERVIEW where section= 'Disk' and name = 'Trace'`,
+        },
+
+        "$hanaVolumeIndex Trace Disk status by Host" => {
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => $tdiskMonHint,
+            'sql' =>
+              q`select status || ' (' || value || ' )' from M_SYSTEM_OVERVIEW where section= 'Disk' and name = 'Data'`,
+            'sql' =>
+              q`select 'Host', 'Disk Id', 'Path', 'Used size in GB', 'Total size in GB', 'Percent Used' from DUMMY UNION(select host, to_char(disk_id), path , to_char(round(used_size/1024/1024/1024,2)), to_char(round(total_size/1024/1024/1024,2)), to_char(round((used_size * 100/total_size),2)) from M_DISKS where usage_type = 'TRACE' order by host)`,
+        },
+
+        "$hanaVolumeIndex Overall Memory status" => {
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'crit'          => 'answer =~ /ERROR/',
+            'warn'          => 'answer =~ /WARNING/',
+            'uiHint'        => $memMonHint,
+            'sql' =>
+              q`select status || ' (' || value || ' )' from M_SYSTEM_OVERVIEW where section= 'Memory' and name = 'Memory'`,
+        },
+
+        "$hanaVolumeIndex Virtual Memory Utilization by Host" => {
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => $memMonHint,
+            sql =>
+              q`select 'Host', 'Used Virtual Memory in GB', 'Available Virtual Memory in GB', 'Percent Used' from DUMMY UNION (select host, to_char(round((USED_PHYSICAL_MEMORY + USED_SWAP_SPACE) /1024/1024/1024,2)), to_char(round((USED_PHYSICAL_MEMORY + FREE_PHYSICAL_MEMORY + USED_SWAP_SPACE + FREE_SWAP_SPACE) /1024/1024/1024, 2)), concat(round(((USED_PHYSICAL_MEMORY + USED_SWAP_SPACE)/(USED_PHYSICAL_MEMORY + FREE_PHYSICAL_MEMORY + USED_SWAP_SPACE + FREE_SWAP_SPACE)) * 100,2),'%') from PUBLIC.M_HOST_RESOURCE_UTILIZATION)`,
+        },
+
+        "$hanaVolumeIndex Services (All Started)" => {
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'crit'          => 'answer =~ /ERROR/',
+            'warn'          => 'answer =~ /WARNING/',
+            'uiHint'        => $srvMonHint,
+            'sql' =>
+              q`select status || ' (' || value || ' )' from M_SYSTEM_OVERVIEW where section= 'Services' and name = 'All Started'`,
+        },
+
+        "$hanaVolumeIndex Start Time of First Started Service" => {
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => $srvMonHint,
+            'sql' =>
+              q`select value from M_SYSTEM_OVERVIEW where section= 'Services' and name = 'Min Start Time'`,
+        },
+
+        "$hanaVolumeIndex Start Time of Latest Started Service" => {
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => $srvMonHint,
+            'sql' =>
+              q`select value from M_SYSTEM_OVERVIEW where section= 'Services' and name = 'Max Start Time'`,
+        },
+
+        "$hanaVolumeIndex Status by Host" => {
+            'rowCountLimit' => 4000,
+            'crit'          => 'answer =~ /NO/ || answer =~ /UNKNOWN/ || answer =~/STOPPING/',
+            'uiHint'        => $srvMonHint,
+            'sql' =>
+              q`select 'Host', 'Port','Service Name', 'Is Active', 'Detail', 'Start Time', 'CPU Percentage Used', 'Memory Used in MB', 'Effective Allocation Limit', 'Physical Memory on Host' from DUMMY UNION (select a.host, to_char(a.port), a.service_name, a.active_status, a.detail, to_char(b.start_time), to_char(b.process_cpu), to_char(round(b.total_memory_used_size/1024/1024,2)), to_char(round(b.effective_allocation_limit/1024/1024,2)), to_char(round(b.physical_memory/1024/1024,2)) from M_SERVICES a left outer join (select x.host, x.port, x.service_name, x.total_memory_used_size, x.effective_allocation_limit, y.start_time, y.process_cpu, y.physical_memory from M_SERVICE_MEMORY x, M_SERVICE_STATISTICS y where x.host = y.host and x.port = y.port and x.service_name = y.service_name)  b on a.host = b.host and a.port = b.port and a.service_name = b.service_name order by a.host, a.service_name)`,
+        },
+
+        "$hanaVolumeIndex Total number of connections" => {
+            'rowCountLimit' => 4000,
+            info            => "answer",
+            uiHint          => $dbMonHint,
+            sql =>
+              q`select 'Connection Status', 'Count' from DUMMY UNION (select connection_status, to_char(count(*)) from m_connections where connection_status != '' group by connection_status)`,
+        },
+
+        "$hanaVolumeIndex Total number of Active connections" => {
+            recordMaxResults => 110000,
+            recordDataType   => "gauge",
+            info             => "answer",
+            uiHint           => $dbMonHint,
+            sql              => q`select count(*) from m_connections where connection_status = 'RUNNING' `,
+        },
+
+        "$hanaVolumeIndex Percent of Active Sessions in Blocked State" => {
+            recordMaxResults => 60000,
+            recordDataType   => "guage",
+            format           => "%.1f%%\n",
+            uiHint           => $lockingMonHint,
+            sql =>
+              q`SELECT round((blocked/active)*100,2) percent_blocked from (select count(*) active from M_TRANSACTIONS WHERE TRANSACTION_STATUS = 'ACTIVE') , (select count(*) blocked from M_BLOCKED_TRANSACTIONS )`
+        },
+
+        "$hanaVolumeIndex Amount of redo logs generated in last hour" => {
+            recordMaxResults => 60000,
+            recordDataType   => "guage",
+            uiHint           => $dbMonHint,
+            sql =>
+              q`select 'Host', 'Redo Logsize in GB' from DUMMY UNION(select host, to_char(round(sum(backup_size)/1024/1024/1024,2)) from m_backup_catalog_files, m_backup_catalog where m_backup_catalog_files.entry_id = m_backup_catalog.entry_id and entry_type_name = 'log backup' and sys_start_time >= add_seconds(current_date, -3600) group by host)`
+        },
+
+        "$hanaVolumeIndex Transactions Blocked For More Than 5 mins" => {
+            'rowCountLimit' => 4000,
+            'info'          => "numrows > -1",
+            'warn'          => "numrows > 1",
+            uiHint          => $dbMonHint,
+            'sql' =>
+              q`SELECT B.HOST, B.PORT,B.BLOCKED_TIME AS BLOCKED_TIME,B.WAITING_SCHEMA_NAME AS WAITING_SCHEMA_NAME,B.WAITING_TABLE_NAME AS WAITING_TABLE_NAME,B.LOCK_TYPE AS LOCK_TYPE,B.LOCK_MODE AS LOCK_MODE,C.CLIENT_HOST AS LOCK_OWNER_HOST,C.USER_NAME AS LOCK_OWNER_USER_NAME,C.LAST_ACTION AS LOCK_OWNER_LAST_ACTION,P.STATEMENT_STRING AS BLOCKED_STATEMENT_STRING FROM SYS.M_BLOCKED_TRANSACTIONS B,SYS.M_TRANSACTIONS T,SYS.M_CONNECTIONS C,SYS.M_TRANSACTIONS TB,SYS.M_CONNECTIONS CB LEFT OUTER JOIN SYS.M_PREPARED_STATEMENTS P ON CB.CURRENT_STATEMENT_ID = P.STATEMENT_ID WHERE B.LOCK_OWNER_TRANSACTION_ID = T.TRANSACTION_ID AND T.CONNECTION_ID = C.CONNECTION_ID AND B.BLOCKED_TRANSACTION_ID = TB.TRANSACTION_ID AND TB.CONNECTION_ID = CB.CONNECTION_ID AND B.BLOCKED_TIME > add_seconds(current_date, -300)`,
+        },
+
+        "$hanaVolumeIndex Count of Transactions Blocked" => {
+            'recordMaxResults' => 50000,
+            'crit'          => "answer > 20",
+            'warn'          => "answer > 15",
+            uiHint          => $dbMonHint,
+            'sql' =>
+              q`SELECT count(*) FROM SYS.M_BLOCKED_TRANSACTIONS B JOIN SYS.M_TRANSACTIONS T ON (B.HOST, B.PORT, B.LOCK_OWNER_TRANSACTION_ID) = (T.HOST, T.PORT, T.TRANSACTION_ID) LEFT OUTER JOIN SYS.M_TRANSACTIONS TP ON (T.VOLUME_ID, T.PRIMARY_TRANSACTION_ID) = (TP.VOLUME_ID, TP.TRANSACTION_ID) AND TP.TRANSACTION_TYPE = 'USER TRANSACTION' JOIN SYS.M_CONNECTIONS C ON MAP(TP.CONNECTION_ID, NULL, T.CONNECTION_ID, TP.CONNECTION_ID) = C.CONNECTION_ID JOIN SYS.M_TRANSACTIONS TB ON (B.HOST, B.PORT, B.BLOCKED_TRANSACTION_ID) = (TB.HOST, TB.PORT, TB.TRANSACTION_ID) LEFT OUTER JOIN SYS.M_TRANSACTIONS TBP ON (TB.VOLUME_ID, TB.PRIMARY_TRANSACTION_ID) = (TBP.VOLUME_ID, TBP.TRANSACTION_ID) AND TBP.TRANSACTION_TYPE = 'USER TRANSACTION' JOIN SYS.M_CONNECTIONS CB ON MAP(TBP.CONNECTION_ID, NULL, TB.CONNECTION_ID, TBP.CONNECTION_ID) = CB.CONNECTION_ID LEFT OUTER JOIN SYS.M_ACTIVE_STATEMENTS P ON CB.CURRENT_STATEMENT_ID = P.STATEMENT_ID`,
+        },
+
+        "$hanaVolumeIndex Top Delta Merge Transactions" => {
+            'rowCountLimit' => 4000,
+            'info'          => "numrows > -1",
+            uiHint          => $dbMonHint,
+            'sql' =>
+              q`select 'Host','Schema Name','Table Name','Execution Time in MilliSeconds','Number Of Merged Delta Records' from DUMMY UNION(SELECT TOP 10 HOST, SCHEMA_NAME, TABLE_NAME, to_char(EXECUTION_TIME), to_char(MERGED_DELTA_RECORDS) from M_DELTA_MERGE_STATISTICS order by execution_time desc)`,
+        },
+
+        "$hanaVolumeIndex Smart Merge Lock Wait State" => {
+            'rowCountLimit'    => 4000,
+            'crit'             => "answer > 0",
+            'processAnswer'    => sub { return main::convert_stats_to_String(); },
+            'uiHint'           => $lockingMonHint,
+            'sql' =>
+              q`select count(*) from M_SERVICE_THREAD_CALLSTACKS where frame_level = 2 and frame_name like 'Synchronization::ReadWriteLock::timedWaitLockExclusive%' and thread_id in (select thread_id from M_SERVICE_THREADS where thread_type = 'SmartMerger')` ,
+        },
+
+        "$hanaVolumeIndex Threads in Wait State" => {
+            'recordMaxResults' => 110000,
+            'rowCountLimit'    => 4000,
+            'info'             => "answer > 100",
+            'uiHint'           => $lockingMonHint,
+            'sql'              => q`select  count(*) threads_in_wait from m_service_threads where thread_state like '%Wait%'`,
+        },
+
+        "$hanaVolumeIndex MVCC Version Count" => {
+            'recordMaxResults' => 110000,
+            'rowCountLimit'    => 4000,
+            'crit'             => "answer > 7000000", # crit if answer > 7 Million
+            'warn'             => "answer > 2000000", # warn if answer > 2 Million  
+            'uiHint'           => $lockingMonHint,
+            'sql'              => q`select max(value) num_of_versions from m_mvcc_tables where name = 'NUM_VERSIONS'`,
+        },
+
+        "$hanaVolumeIndex Active connections running for more than 1 minutes" => {
+            recordMaxResults => 110000,
+            recordDataType   => "gauge",
+            info             => "answer",
+            uiHint           => $dbMonHint,
+            sql              => q`select * from m_connections where user_name not like '_SYS%' and user_name != 'SYSTEM' and start_time >= add_seconds(current_timestamp, -60) and connection_status = 'RUNNING'`,
+            severity         => 0,
+            details          => {
+                "Connections started in last 5 minutes" => {
+                    noRowCount => 1,
+                    sql => q`select * from m_connections where user_name not like '_SYS%' and user_name != 'SYSTEM' and start_time >= add_seconds(current_timestamp,-300)`,
+                } 
+            }
+        },
+
+        "$hanaVolumeIndex Hana License will get expired in Days" => {
+            'info' => "answer",
+            crit   => "answer < 15",
+            uiHint => $hanaLicense,
+            'sql'  => q`select IFNULL(DAYS_BETWEEN(current_timestamp, expiration_date), 9999) from M_LICENSE`,
+        },
+
+        "$hanaVolumeIndex Last Full Backup Size" => {
+            'info' => "answer",
+            uiHint => $hanBackup,
+            'recordMaxResults' => 35000,
+            'sql' => q`select round(sum(backup_size/(1024*1024*1024))) "Size(GB)" from M_BACKUP_CATALOG_FILES where
+                       entry_id = ( select max(entry_id) from m_backup_catalog where entry_type_name = 'complete data backup' and state_name='successful')`,
+        },
+
+        "$hanaVolumeIndex Last successful full Backup Duration" => {
+            'info' => "answer",
+            uiHint => $hanBackup,
+            'recordMaxResults' => 35000,
+            'sql' => q`select round(SECONDS_BETWEEN( sys_start_time,sys_end_time )/60) ||' Minutes' from m_backup_catalog where
+                       entry_id = ( select max(entry_id) from m_backup_catalog where entry_type_name = 'complete data backup' and state_name='successful' )`,
+        },
+
+        "$hanaVolumeIndex Last Successful full Backup age" => {
+            'info' => "answer",
+            'crit' => "answer > $backupFreq",
+            uiHint => $hanBackup,
+            'recordMaxResults' => 35000,
+            'sql' => q`select DAYS_BETWEEN( add_seconds(sys_start_time, 60*60*6),current_timestamp ) from m_backup_catalog where entry_id = ( select max(entry_id) from m_backup_catalog where entry_type_name = 'complete data backup' and state_name='successful' )`,
+        },
+
+        "$hanaVolumeIndex Last Backups" => {
+            'info' => "answer",
+             uiHint => $hanBackup,
+            'sql' => q`select entry_type_name,backup_id,sys_start_time,sys_end_time,state_name from m_backup_catalog where entry_type_name like '%data backup' and state_name='successful' order by SYS_START_TIME desc limit 20`,
+         },
+
+        ### INCR Backup Lines
+        "$hanaVolumeIndex Last Incremental Backup Size" => {
+            'info' => "answer",
+            uiHint => $hanBackup,
+            'recordMaxResults' => 35000,
+            'sql' => q`select round(sum(backup_size/(1024*1024*1024)), 2) "Size(GB)" from M_BACKUP_CATALOG_FILES where
+                       entry_id = ( select max(entry_id) from m_backup_catalog where (entry_type_name like 'incr%backup' or entry_type_name like 'diff%backup') and state_name='successful')`,
+        },
+
+        "$hanaVolumeIndex Last successful incremental Backup Duration" => {
+            'info' => "answer",
+            uiHint => $hanBackup,
+            'recordMaxResults' => 35000,
+            'sql' => q`select round(SECONDS_BETWEEN( sys_start_time,sys_end_time )/60, 2) ||' Minutes' from m_backup_catalog where
+                       entry_id = ( select max(entry_id) from m_backup_catalog where (entry_type_name like 'incr%backup' or entry_type_name like 'diff%backup') and state_name='successful' )`,
+        },
+
+        "$hanaVolumeIndex Last Successful incremental Backup age" => {
+            'info' => "answer",
+            #enabling alert only for hana db versions > 1.85, because older versions dont support incremental backups
+            'crit' => "(answer > $incrBackupFreq) && ($hanaVer > 1 || $hanaRev > 85)",
+            uiHint => $hanBackup,
+            'recordMaxResults' => 35000,
+            'sql' => q`select DAYS_BETWEEN(sys_start_time,current_timestamp ) from m_backup_catalog where entry_id = ( select max(entry_id) from m_backup_catalog where (entry_type_name like 'incr%backup' or entry_type_name like 'diff%backup') and state_name='successful' )`,
+        },
+
+        "$hanaVolumeIndex Last Successful Backup age" => {
+            'info' => "answer",
+            'crit' => "answer > $anyBackupFreq",
+            uiHint => $hanBackup,
+            'recordMaxResults' => 35000,
+            'sql' => q`select DAYS_BETWEEN(add_seconds(sys_start_time, 60*60*6),current_timestamp ) from m_backup_catalog where entry_id = ( select max(entry_id) from m_backup_catalog where entry_type_name like '%data backup' and state_name='successful' )`,
+        },
+    );
+
+    # These are the queries for 'Work Load Growth'.
+    my $sql = q(select data_volume.host as HOST, DATA_SIZE_USED_IN_MB from ( select host, round(sum(USED_SIZE)/1024/1024,2) as DATA_SIZE_USED_IN_MB from M_VOLUME_FILES where FILE_TYPE='DATA' group by host) as data_volume order by data_volume.host asc);
+    my @results = $hanaClient->executeSql($sql);
+    foreach my $result (@results) {
+        my ($shost, $size) = split /\s/, $result;
+        $sidQueries {"$hanaVolumeIndex Data Volume Growth ($shost)"} = {
+            'rowCountLimit'    => 4000,
+            'info'             => "answer",
+            'uiHint'           => "$hlthMonHint/Work Load Growth",
+            'recordMaxResults' => 70080,
+            'perl'             => sub {return $size},
+        };
+    }
+
+    $sql = q(select log_volume.host as HOST, LOG_SIZE_USED_IN_MB from (select host, round(sum(ls.USED_SIZE)/1024/1024,2) as LOG_SIZE_USED_IN_MB from M_LOG_SEGMENTS ls group by host) as log_volume);
+    @results = $hanaClient->executeSql($sql);
+    foreach my $result (@results) {
+        my ($shost, $size) = split /\s/, $result;
+        $sidQueries {"$hanaVolumeIndex Log Volume Growth ($shost)"} = {
+            'rowCountLimit'    => 4000,
+            'info'             => "answer",
+            'uiHint'           => "$hlthMonHint/Work Load Growth",
+            'recordMaxResults' => 70080,
+            'perl'             => sub {return $size},
+        };
+    }
+
+    foreach my $shortHost (@allHana_host) {
+        # DBAs want to start alerting on physical mem utilization%.
+        # per PFS-4726: warn >= 85%, and crit >= 89%.
+        $sidQueries{"$hanaVolumeIndex Physical Memory Utilization ($shortHost)"} = {
+            'info'              => "answer",
+            'warn'              => 'answer =~ /([\d.]+)%$/ and $1 >= 85.0',
+            'crit'              => 'answer =~ /([\d.]+)%$/ and $1 >= 89.0',
+            'uiHint'            => $memMonHint,
+            'correctiveActions' => [ Ops => 'Inform On-Call DBA', ],
+            'sql'               =>
+              qq`select 'Host', 'Used Physical Memory in GB', 'Available Physical Memory in GB','Allocation Limit','Percent Used' from DUMMY UNION (select host, to_char(round(USED_PHYSICAL_MEMORY/1024/1024/1024,2)), to_char(round((USED_PHYSICAL_MEMORY + FREE_PHYSICAL_MEMORY) /1024/1024/1024, 2)),to_char(round(ALLOCATION_LIMIT/1024/1024/1024,2)), concat(round((USED_PHYSICAL_MEMORY/(USED_PHYSICAL_MEMORY + FREE_PHYSICAL_MEMORY)) * 100,2),'%') from PUBLIC.M_HOST_RESOURCE_UTILIZATION where host = '$shortHost')`,
+        };
+
+        $sidQueries{"$hanaVolumeIndex Total used memory (in GB) ($shortHost)"} = {
+            'recordMaxResults' => 110000,
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => "$memMonHint/Heap/Total Used Memory",
+            'description'   => 'This shows the total memory being used by HANA.',
+            'sql' =>
+              qq`SELECT round(INSTANCE_TOTAL_MEMORY_USED_SIZE/1024/1024/1024,2) as TOTAL_MEMORY_USED_IN_GB FROM M_HOST_RESOURCE_UTILIZATION where host = '$shortHost'`,
+        };
+
+        $sidQueries{"$hanaVolumeIndex Total used heap memory (in GB) ($shortHost)"} = {
+            'recordMaxResults' => 110000,
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => "$memMonHint/Heap/Total Used Heap",
+            'description'   => 'This shows the total heap memory being used by HANA.',
+            'sql' =>
+              qq`SELECT round(sum(HEAP_MEMORY_USED_SIZE/1024/1024/1024),2) as HEAP_MEMORY_USED_IN_GB FROM SYS.M_SERVICE_MEMORY where host = '$shortHost'`,
+        };
+
+        $sidQueries{"$hanaVolumeIndex Persistence component inside heap memory (in GB) ($shortHost)"} = {
+            'recordMaxResults' => 110000,
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => "$memMonHint/Heap/Persistence",
+            'description' =>
+              'This shows the persistence component part of the heap memory being used by HANA. ',
+            'sql' =>
+              qq`SELECT round(sum(EXCLUSIVE_SIZE_IN_USE) / 1024 / 1024 /1024, 2) FROM M_HEAP_MEMORY where CATEGORY like 'Pool/PersistenceManager%'and host = '$shortHost' group by host`,
+        };
+
+        $sidQueries{"$hanaVolumeIndex Column Store Intermediate Results and Shared datastructure component inside heap memory (in GB) ($shortHost)"} = {
+            'recordMaxResults' => 110000,
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => "$memMonHint/Heap/Column Store",
+            'description'   => 'This shows the above component part of the heap memory being used by HANA.',
+            'sql' =>
+              qq`SELECT round(sum(EXCLUSIVE_SIZE_IN_USE) / 1024 / 1024 /1024, 2) FROM M_HEAP_MEMORY where CATEGORY in ('Pool/malloc/libhdbcscommon.so', 'Pool/itab') and host = '$shortHost' group by host`,
+          };
+
+        $sidQueries{"$hanaVolumeIndex Memory Management Information component inside heap memory (in GB) ($shortHost)"} = {
+            'recordMaxResults' => 110000,
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => "$memMonHint/Heap/Memory Management Information",
+            'description'   => 'This shows the above component part of the heap memory being used by HANA.',
+            'sql' =>
+              qq`SELECT round(sum(EXCLUSIVE_SIZE_IN_USE) / 1024 / 1024 /1024, 2) FROM M_HEAP_MEMORY where CATEGORY like '%MemoryMapLevel2Blocks' and host = '$shortHost' group by host`,
+        };
+
+        $sidQueries{"$hanaVolumeIndex 'Database Kernel Statistics and Merge Statistics' component inside heap memory (in GB) ($shortHost)"} = {
+            'recordMaxResults' => 110000,
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => "$memMonHint/Heap/Database Kernel and Merge Statistics",
+            'description'   => 'This shows the above component part of the heap memory being used by HANA.',
+            'sql' =>
+              qq`SELECT round(sum(EXCLUSIVE_SIZE_IN_USE) / 1024 / 1024 /1024, 2) FROM M_HEAP_MEMORY where (CATEGORY='Pool/Statistics' OR CATEGORY='Pool/MergeMonitor') and host = '$shortHost' group by host`,
+          };
+
+        $sidQueries{"$hanaVolumeIndex Prepared Statement Cache component inside heap memory (in GB) ($shortHost)"} = {
+            'recordMaxResults' => 110000,
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => "$memMonHint/Heap/Prepared Statement Cache",
+            'description'   => 'This shows the above component part of the heap memory being used by HANA.',
+            'sql' =>
+              qq`SELECT round(sum(EXCLUSIVE_SIZE_IN_USE) / 1024 / 1024 /1024, 2) FROM M_HEAP_MEMORY where CATEGORY='Pool/RowEngine/SQLPlan' and host = '$shortHost' group by host`,
+        };
+
+        $sidQueries{"$hanaVolumeIndex 'Transaction Management' component inside heap memory (in GB) ($shortHost)"} = {
+            'recordMaxResults' => 110000,
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => "$memMonHint/Heap/Transaction Management",
+            'description'   => 'This shows the above component part of the heap memory being used by HANA.',
+            'sql' =>
+              qq`SELECT round(sum(EXCLUSIVE_SIZE_IN_USE) / 1024 / 1024 /1024, 2) FROM M_HEAP_MEMORY where CATEGORY='Pool/RowEngine/Transaction' and host = '$shortHost' group by host`,
+        };
+
+        $sidQueries{"$hanaVolumeIndex 'Auxiliary Row Store' component inside heap memory (in GB) ($shortHost)"} = {
+            'recordMaxResults' => 110000,
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => "$memMonHint/Heap/Auxiliary Row Store",
+            'description'   => 'This shows the above component part of the heap memory being used by HANA.',
+            'sql' =>
+              qq`SELECT round(sum(EXCLUSIVE_SIZE_IN_USE) / 1024 / 1024 /1024, 2) FROM M_HEAP_MEMORY where  (CATEGORY like 'Pool/RowEngine%' OR CATEGORY='Pool/malloc/libhdbrskernel.so') and CATEGORY!='Pool/RowEngine/SQLPlan' and CATEGORY!='Pool/RowEngine/Transaction' and host = '$shortHost' group by host`,
+        };
+
+        $sidQueries{"$hanaVolumeIndex 'Kernel Datastructures (Stack-Allocated)' component inside heap memory (in GB) ($shortHost)"} = {
+            'recordMaxResults' => 110000,
+            'rowCountLimit' => 4000,
+            'info'          => "answer",
+            'uiHint'        => "$memMonHint/Heap/Kernel Datastructures",
+            'description'   => 'This shows the above component part of the heap memory being used by HANA.',
+            'sql' =>
+              qq`SELECT round(sum(EXCLUSIVE_SIZE_IN_USE) / 1024 / 1024 /1024, 2) FROM M_HEAP_MEMORY where  CATEGORY='StackAllocator' and host = '$shortHost' group by host`,
+        };
+
+        # per HOA-95991, DBAs want to alert if Other Engine Components mem used > (15% of phys mem + 25 GB).
+        # per HOA-171028, update the fomular to mem used > 50% phys mem
+        $sidQueries{"$hanaVolumeIndex 'Other Engine Components (misc.)' component inside heap memory (in GB) ($shortHost)"} = {
+            'recordMaxResults' => 110000,
+            'rowCountLimit'   => 4000,
+            'info'            => "answer",
+            'warn'            => 'answer =~ /([\d.]+) of ([\d.]+)/ and $1 > 0.50 * $2',
+            'crit'            => '(previousAnswer =~ /([\d.]+) of ([\d.]+)/ and $1 > 0.50 * $2) &&
+                                  (answer         =~ /([\d.]+) of ([\d.]+)/ and $1 > 0.50 * $2)',
+            correctiveActions => [
+                Ops => 'Inform On-Call DBA',
+            ],
+            'uiHint'      => "$memMonHint/Heap/Misc",
+            'description' => 'This shows the above component part of the heap memory being used by HANA.',
+            'sql' => qq`
+                select concat(
+                    concat(
+                        (select round(sum(exclusive_size_in_use)/1024/1024/1024,2)
+                            from m_heap_memory
+                            where  category not in ('Pool/malloc/libhdbrskernel.so', 'StackAllocator',
+                                'Pool/RowEngine/SQLPlan', 'Pool/RowEngine/Transaction', 'Pool/MergeMonitor',
+                                'Pool/Statistics' , 'Pool/malloc/libhdbcscommon.so', 'Pool/itab',
+                                'Pool/malloc/libhdbbasement.so', 'Pool/malloc/libhdbcs.so')
+                              and category not like '%MemoryMapLevel2Blocks'
+                              and category not like 'Pool/RowEngine%'
+                              and category not like 'Pool/PersistenceManager%'
+                              and category not like 'Pool/AttributeEngine%'
+                              and host = '$shortHost'),
+                        ' of '),
+                    (select round(value/1024/1024/1024,2)
+                        from m_host_information
+                        where key = 'mem_phys' and host = '$shortHost')
+                ) from dummy`,
+        };
+    }
+
+    # Query to get the number of volumes defined for the hana cluster
+    # This is needed to plot the graph for each volume for the DR lag
+    my @vol_ids = ();
+    $sql = "select volume_id from M_SERVICE_REPLICATION order by volume_id";
+    @vol_ids = $hanaClient->executeSql($sql);
+
+    if(@vol_ids) {
+        $sidQueries{ "$hanaVolumeIndex Cluster Replication Status" } = {
+            'rowCountLimit' => 4000,
+            'crit' =>
+              '(answer =~ /UNKNOWN/ || answer =~ /ERROR/ || answer !~ /YES/) && (previousAnswer =~ /UNKNOWN/ || previousAnswer =~ /ERROR/ || previousAnswer !~ /YES/)',
+            'warn'                         => 'answer =~ /full replication/',
+            'ticketOnWarnOpenAfterMinutes' => 10,
+            'ticketOwner'                  => "unassigned-dba",
+            'uiHint'                       => $drUIHint,
+            'sql' =>
+              q`select 'Host','Volume Id', 'Service', 'Secondary Host', 'Secondary Is Active','Replication Status','Replication Details' from DUMMY UNION (select a.host,to_char(a.volume_id), b.service_name, a.secondary_host, a.secondary_active_status, a.replication_status,substr(a.REPLICATION_STATUS_DETAILS,1,45) from M_SERVICE_REPLICATION a, M_VOLUMES b where a.volume_id = b.volume_id order by a.volume_id)`,
+        };
+
+        $sidQueries{ "$hanaVolumeIndex Log Shipping Replication Status" } = {
+            'rowCountLimit' => 4000,
+            'crit' => '(answer =~ /UNKNOWN/ || answer =~ /ERROR/) && (previousAnswer =~ /UNKNOWN/ || previousAnswer =~ /ERROR/)',
+            'uiHint' => $drUIHint,
+            'sql' => q`select 'Host','Volume Id','Secondary Host', 'Replication Status', 'Last Log Position', 'Shipped Log Position', 'Difference In Log Position', 'Last Log Position Time', 'Shipped Log Position Time', 'Time Difference In Seconds' from DUMMY UNION (select host,to_char(volume_id), secondary_host, replication_status, to_char(last_log_position), to_char(shipped_log_position), to_char(last_log_position - shipped_log_position), to_char(last_log_position_time), to_char(shipped_log_position_time), to_char(seconds_between(shipped_log_position_time, last_log_position_time)) from M_SERVICE_REPLICATION order by volume_id)`,
+        };
+
+        $sidQueries{ "$hanaVolumeIndex Last Delta Replication Status" } = {
+            'rowCountLimit' => 4000,
+            'crit' => '(answer =~ /UNKNOWN/ || answer =~ /ERROR/) && (previousAnswer =~ /UNKNOWN/ || previousAnswer =~ /ERROR/)',
+            'uiHint' => $drUIHint,
+            'sql' => q`select 'Host', 'Volume Id', 'Secondary Host', 'Replication Status','Delta Replica In GB', 'Start Time', 'End Time', 'Shipping Duration In Seconds' from DUMMY UNION (select host,to_char(volume_id), secondary_host, replication_status, to_char(round(SHIPPED_LAST_DELTA_REPLICA_SIZE/1024/1024/1024,2)), to_char(shipped_last_delta_replica_start_time), to_char(shipped_last_delta_replica_end_time), to_char(seconds_between(shipped_last_delta_replica_start_time, shipped_last_delta_replica_end_time)) from M_SERVICE_REPLICATION order by volume_id)`,
+        };
+
+        my $selectQry;
+        if($hanaVer > 1 || $hanaRev > 85) {
+            # query for hana versions > 1.85
+            $selectQry = 'select round(seconds_between(replayed_log_position_time, current_timestamp)/60,2)';
+            print "[$$] Executing v$hanaVer.$hanaRev sql query: $selectQry\n" if ($debug);
+        }
+        else {
+            # query for hana versions <= 1.85
+            $selectQry = 'select round(seconds_between(shipped_last_delta_replica_end_time, current_timestamp)/60,2)';
+            print "[$$] Executing v$hanaVer.$hanaRev sql query: $selectQry\n" if ($debug);
+        }
+
+        foreach my $volId (@vol_ids) {
+            my $queryName = "$hanaVolumeIndex Maximum DR lag in minutes on volume ($volId)";
+            ##my $query = "select round(seconds_between(shipped_last_delta_replica_end_time, current_timestamp)/60,2) from M_SERVICE_REPLICATION where volume_id=$volId";
+            my $query = "$selectQry from M_SERVICE_REPLICATION where volume_id=$volId";
+            $sidQueries{ $queryName } = {
+                recordMaxResults => 110000,
+                recordDataType   => "gauge",
+                warn             => "answer > 120",
+                crit             => "answer > 240",
+                uiHint           => $drUIHint,
+                sql              => $query,
+            };
+        }
+    }
+
+    ## Add OOM Monitoring:
+
+    my $oom_sql =  "select *, 'RED', seconds_between(to_SECONDDATE(FILE_MTIME),NOW()) from M_TRACEFILES where file_name like '%oom.trc%'
+        and seconds_between(to_SECONDDATE(FILE_MTIME),NOW()) < 28800
+        UNION ALL
+        select *, 'YELLOW', seconds_between(to_SECONDDATE(FILE_MTIME),NOW()) from M_TRACEFILES where file_name like '%oom.trc%'
+        and seconds_between(to_SECONDDATE(FILE_MTIME),NOW()) between 28801 and 86400
+        UNION ALL
+        select top 1 *, 'GREEN', seconds_between(to_SECONDDATE(FILE_MTIME),NOW()) from M_TRACEFILES where file_name like '%oom.trc%'
+        and seconds_between(to_SECONDDATE(FILE_MTIME),NOW()) >= 86401
+        order by FILE_MTIME desc";
+
+    $sidQueries{ "$hanaVolumeIndex Out-Of-Memory Files" } = {
+        crit => 'answer =~ /red/i',
+        warn => 'answer =~ /yellow/i',
+        info => 'answer =~ /green/i',
+        sql => "$oom_sql",
+        uiHint => $oomMonHint,
+        correctiveActions => [
+                          Ops => "Please check the individual status, e.g. 'Status: crit hana1000 indexserver_hana1000.30003.rtedump.20150729-042430.035205.oom.trc'.In this case hana1000 is critical not the other box where the 'Status: ok' ",
+        ],
+    };
+
+    $sidQueries{ "$hanaVolumeIndex DeltaMerge-Allocator" } = {
+        crit => 'answer =~ /crit/i',
+        warn => 'answer =~ /warning/i',
+        info => 'answer =~ /normal/i',
+        sql => "SELECT top 10 HOST, PORT, CATEGORY, round(EXCLUSIVE_SIZE_IN_USE/(1024*1024*1024),2) size, case when round(EXCLUSIVE_SIZE_IN_USE/(1024*1024*1024),2) > 200 then 'crit' when round(EXCLUSIVE_SIZE_IN_USE/(1024*1024*1024),2) > 175 then 'warning' else 'normal' end as status FROM M_HEAP_MEMORY where CATEGORY like 'Pool/%/Delta%' order by EXCLUSIVE_SIZE_IN_USE desc",
+        uiHint => $memMonHint,
+        correctiveActions => [
+                           Ops => "Please check the status of individual host",
+        ],
+    };
+
+    if( $hanaVer >= 2 && ($port != $hanaClient->sysdb_port()) ) {
+        my $sql = q(select round((SUM(allocation_limit)/1024/1024/1024), 2) from M_SERVICE_MEMORY where service_name = 'indexserver');
+        my @results = $hanaClient->executeSql($sql);
+        my $allocation_limit = $results[0];
+
+        $sidQueries{ "$hanaVolumeIndex Index Server Allocated memory (in GB)" } = {
+            recordMaxResults => 110000,
+            info             => "answer",
+            perl             => sub {return $allocation_limit},
+            uiHint           => $memMonHint,
+            description      => 'This shows the above component part of the allocated memory assigned.',
+        };
+
+        $sidQueries{ "$hanaVolumeIndex Index Server Current used memory (in GB)" } = {
+            recordMaxResults => 110000,
+            info => "answer",
+            warn => "answer > 0.75 * $allocation_limit",
+            crit => "answer > 0.80 * $allocation_limit",
+            sql => "select round((SUM(TOTAL_MEMORY_USED_SIZE)/1024/1024/1024), 2) from M_SERVICE_MEMORY where service_name = 'indexserver'",
+            uiHint => $memMonHint,
+            description   => 'This shows the above component part of the current used memory being used by HANA.',
+        };
+
+        $sidQueries{ "$hanaVolumeIndex Index Server Peak used memory (in GB)" } = {
+            recordMaxResults => 110000,
+            info => "answer",
+            sql => "SELECT ROUND(SUM(MEM)/1024/1024/1024,2) as PEAK_USED_MEMORY_GB FROM (SELECT SUM(CODE_SIZE+SHARED_MEMORY_ALLOCATED_SIZE) AS MEM FROM SYS.M_SERVICE_MEMORY where service_name = 'indexserver' UNION SELECT SUM(INCLUSIVE_PEAK_ALLOCATION_SIZE) AS MEM FROM M_HEAP_MEMORY_RESET WHERE DEPTH = 0)",
+            description   => 'This shows the above component part of the peak memory being used by HANA.',
+            uiHint => $memMonHint,
+        };
+    }
+
+    if ( $isProdMsServce ){
+        ##its micro service, re-define pName
+        $pName = ariba::monitor::StatusPage::hanaMsProduct();
+    }
+
+    my $sidQM = ariba::monitor::QueryManager->newWithDetails("$expando-$hanaVolumeIndex", $pName, $product->service(), $product->customer(), \%sidQueries);
+    $sidQM->setUiManager($expando);
+    $sidQM->setSQLConnectInfoFromHanaClient($hanaClient);
+    $sidQM->processQueries($debug, $email, $sendEmail, $sendPage);
+
+    if($sys_dbc) {
+        print "[$$] processing MDC systemdb\n" if $debug;
+        $dbc = $sys_dbc;
+        goto LOOP;
+    }
+}
+
+main(@ARGV);

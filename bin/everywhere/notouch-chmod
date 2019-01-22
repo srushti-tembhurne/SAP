@@ -1,0 +1,49 @@
+#!/usr/local/bin/perl
+
+#
+# $Id: //ariba/services/monitor/bin/everywhere/notouch-chmod#3 $
+#
+
+use strict;
+use POSIX;
+
+#
+# S_ISVTX is normally a standard macro, but perl POSIX omits it.  So I add it
+# back here.  This is known to work on redhat, solaris, and hp-ux.
+#
+sub S_ISVTX { return 512; }
+sub S_PMASK {
+	return ( S_IRWXU|S_IRWXG|S_IRWXO|S_ISUID|S_ISGID|S_ISVTX );
+}
+
+main(@ARGV);
+
+sub usage {
+	print "Usage: notouch-chmod MODE file1 [ file2 ... fileN ]\n";
+	print "mode must be a 4 digit octal string.\n";
+}
+
+sub main {
+	my $new_mode = shift;
+	my @files = (@_);
+
+	if($new_mode !~ /[0-7]{4}/) {
+		usage();
+		exit(1);
+	}
+
+	#
+	# get each octal digit for setuid/sticky, user, group, and other and
+	# then build a decimal value out of it by bit shifting
+	#
+	my ($s, $u, $g, $o) = unpack("aaaa", $new_mode);
+	my $new_mode_dec = $o + ($g << 3) + ($u << 6) + ($s << 9);
+
+	foreach my $file (@files) {
+		my $mode = (lstat($file))[2];
+		$mode = $mode & S_PMASK;
+		if ( $new_mode_dec != $mode ) {
+			chmod ( $new_mode_dec, $file );
+		}
+	}
+}

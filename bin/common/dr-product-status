@@ -1,0 +1,111 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/dr-product-status#5 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::Constants;
+use ariba::rc::CipherStore;
+use ariba::rc::Utils;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Globals;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $debug     = 0;
+    my $force     = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-e/o) { $sendEmail = 1 };
+        if ($arg =~ /^-p/o) { $sendPage  = 1 };
+        if ($arg =~ /^-d/o) { $debug++ };
+        if ($arg =~ /^-f/o) { $force++ };
+    }
+
+    $main::quiet = 1 unless($debug);
+
+    my $me = ariba::rc::InstalledProduct->new();
+
+    my $email        = $me->default('notify.email');
+    my $cluster      = $me->currentCluster();  
+    my $otherCluster = $me->otherCluster();
+
+    # No need to run if there is only one cluster
+    exit() unless ( $otherCluster );
+
+    my $cipherStore = ariba::rc::CipherStore->new($me->service());
+    my $monUser     = ariba::rc::Globals::deploymentUser($me->name(), $me->service());
+    my $password    = $cipherStore->valueForName($monUser);
+
+    unless ( $password ) {
+        print "Failed to get password for $monUser\n" if ( $debug ); 
+        exit();
+    }
+
+    foreach my $prod (ariba::rc::InstalledProduct->installedProductsList()) {
+        next unless ( $prod->currentCluster() eq $cluster );
+
+        my @hosts = $prod->hostsForRoleInCluster('copyhost', $otherCluster);
+
+        # this is only needed if the product runs on multiple clusters
+        next unless(scalar(@hosts));
+
+        my $hostName = shift(@hosts);
+        my $installDir = $prod->installDir();
+        my @output;
+        my $result = "unknown";
+        my $retry = 2;
+
+        while ($retry-- > 0) {
+            unless(ariba::rc::Utils::executeRemoteCommand(
+                "ssh $monUser\@$hostName \"ls -l $installDir/../bin\"",
+                $password,
+                0,
+                undef,
+                undef,
+                \@output,
+            )) {
+                $result = "failed to execute command remotely.";
+            } else {
+                $result = "result was not parsed correctly";
+                foreach my $line (@output) {
+                    if($line =~ / -> /) {
+                        my ($jnk, $dir) = split(' -> ', $line);
+                        $dir =~ s|/bin$||;
+                        if($installDir eq $dir) {
+                            $dir =~ m|([^/]+$)|;
+                            my $subdir = $1;
+                            $result = "ok ($subdir installed in DR)";
+                        } else {
+                            $result = "DR install $dir does not match $installDir";
+                        }
+                        $retry = 0;
+                        last;
+                    }
+                }
+            }
+        }
+
+        my %queries;
+        $queries{'DR deployment state'} = {
+            perl => sub { return $result; },
+            info => "answer =~ /ok/",
+            warn => "answer !~ /ok/",
+            crit => "answer =~ /does not match/",
+        };
+
+        my $qm = ariba::monitor::QueryManager->newWithDetails(
+            'dr-deployment-status', $prod->name(), $prod->service(), $prod->customer(), $cluster, \%queries
+        );
+
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+main(@ARGV);
+
+__END__

@@ -1,0 +1,162 @@
+#!/usr/local/tools/perl-5.22.1/bin/perl
+
+use strict;
+use warnings;
+use Data::Dumper;
+use 5.010;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use ariba::monitor::TlsSecurityUtil;
+require "geturl";
+
+use Getopt::Long qw(GetOptions);
+use Pod::Usage qw(pod2usage);
+use Parallel::ForkManager;
+
+=head1 SYNOPSIS
+
+    tls-security -s "service name"  [-mp 2]
+
+    Options:
+        --help|h             Show this help.
+        --service|s          Required. For which service this tool need to be run.
+        --max_process|mp     Optional. Number of parallel processes to fork. Defaults to 5(if none provided)
+        --verbose            Show debug messages.
+
+=cut
+
+my $service;    ### Service name on which this tool will run upon
+my $verbose;
+my $help;
+my $max_process;
+my %protocolUsage;
+
+GetOptions(
+    'service|s=s'       => \$service,
+    'max_process|mp=i', => \$max_process,
+    'verbose'           => \$verbose,
+    'help|h'            => sub { pod2usage(1) },
+);
+
+### Basic validations to check if required params are provided
+pod2usage(1) unless ($service);
+
+my %fs_info = (
+    lq25     => "/var/tmp/tools",
+    test     => "/subzero/opsdumps/tools",
+    prod     => "/nfs/never/monprod",
+    prodeu   => "/nfs/never/monprodeu",
+    prodeums => "/nfs/never/monprodeums",
+    prodru   => "/nfs/never/monprodru",
+    prodms   => "/nfs/never/monprodms",
+);
+
+$max_process = 5 unless ($max_process);
+
+### Check if the command line argument(service) is valid
+ariba::monitor::TlsSecurityUtil::service($service);
+unless ( ariba::monitor::TlsSecurityUtil::is_service_valid() ) {
+    die "Service Name: $service is invalid \n";
+    exit(1);
+}
+
+### Check if we've mapping for root_dir
+unless ( $fs_info{$service} ) {
+    die "File system info not found \n";
+    exit(1);
+}
+
+### Generate the needed info to download source files etc
+my %download_info = ariba::monitor::TlsSecurityUtil::generate_download_info();
+exit(0)
+  unless ( scalar( keys %download_info ) )
+  ;    ### Graceful exit when there's none to process
+
+### Make source and target directories
+### Source files are temporarily saved & deleted at the end of the process      ### Source files : access.*.gz
+### Target files are retained for 5 days                                        ### Target files : access.*.csv
+my $root_dir = $fs_info{$service};    ### File System Root Dir
+my $is_success = ariba::monitor::TlsSecurityUtil::mk_dirs($root_dir);
+die "Directory creation failed in shared file system \n" unless ($is_success);
+
+### Fork multiple processes, so downloading source is faster.                   ### Max processes set to 5
+my $pm_download = Parallel::ForkManager->new($max_process);
+
+$pm_download->run_on_start(
+    sub {
+        my ( $pid, $file_name ) = @_;
+
+        say "Downloading $file_name -  pid:$pid" if ($verbose);
+    }
+);
+
+my $source_dir = ariba::monitor::TlsSecurityUtil::source_dir();
+
+foreach my $key ( keys %download_info ) {
+    my $arr          = $download_info{$key};
+    my $log_file_url = $arr->[0];
+    my $out_log_path = $source_dir . $arr->[1];
+    $pm_download->start( $arr->[0] ) and next;
+    eval {
+        geturl( "-e", "-q", "-timeout", "1500", $log_file_url, $out_log_path );
+    };
+
+    $pm_download->finish;
+}
+$pm_download->wait_all_children;
+
+### Get all the list of files(gz) to parse and save them as csv.
+### Also a summary report file is created
+my @all_files = ariba::monitor::TlsSecurityUtil::get_all_input_files();
+
+foreach my $source_file (@all_files) {
+    my $target_file = $download_info{$source_file}->[2];
+    my %hash =
+      ariba::monitor::TlsSecurityUtil::process_access_log( $source_file,
+        $target_file, $verbose );
+
+    %protocolUsage =
+      ariba::monitor::TlsSecurityUtil::merge_hash( \%protocolUsage, \%hash );
+}
+
+### Archive csv files
+my $csv_dir     = ariba::monitor::TlsSecurityUtil::csv_dir();
+my $target_dir  = ariba::monitor::TlsSecurityUtil::target_dir();
+my $gzfile_name = qq(tls-security-$service-details-)
+  . ariba::monitor::TlsSecurityUtil::source_date();
+my $is_archive_successful =
+  ariba::monitor::Utils::archive( $csv_dir, $target_dir, "*.csv",
+    $gzfile_name );
+
+### Cleanup source directory
+if ($is_archive_successful) {
+    my $cw_dir = ariba::monitor::TlsSecurityUtil::cw_dir();
+    print "\n\nCleaning up: \n\t $cw_dir\n" if ($verbose);
+    ariba::monitor::TlsSecurityUtil::rm_cw_dir();
+
+    ### Delete files 5 days older
+    my $now = time();              # get current time
+    my $age = 60 * 60 * 24 * 5;    # 5 days
+
+    opendir( DIR, $target_dir );
+    my @files = grep( /\.tgz$/, readdir(DIR) );
+    closedir(DIR);
+
+    foreach my $file (@files) {
+        my $file  = qq($target_dir/$file);
+        my @stats = stat($file);
+        if ( $now - $stats[9] > $age ) {
+            print "Deleting file : $file \n" if ($verbose);
+            unlink($file);
+        }
+    }
+}
+
+### Transfer temp.summary ini file contents to csv file
+ariba::monitor::TlsSecurityUtil::transform_summary_ini_to_csv(
+    \%protocolUsage );
+
+exit(0);
+

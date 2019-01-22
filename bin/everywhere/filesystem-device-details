@@ -1,0 +1,317 @@
+#!/usr/local/bin/perl 
+#
+# This script gives all details of a devices that make up a filesystem.
+#
+
+use strict;
+
+use FindBin;
+
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../lib/perl";
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+use lib "$FindBin::Bin/../../../tools/lib/perl";
+
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Machine;
+use ariba::Ops::FileSystemUtils;
+use ariba::Ops::NetworkDeviceManager;
+use ariba::Ops::DatacenterController;
+
+my $debug = 0;
+my $tofile = 0;
+my $sid="";
+my $onlyWWNandVV = 0;
+my $onlyDGandVV = 0;
+my $extendedInfo = 0;
+$| = 1;
+
+sub usage {
+    print "$0 [-dfvwgx] [-s <sid>] [<filesystem> ...]\n";
+    print "<filesystem> : limit results to only listed filesystem\n";
+    print " -s <sid>    : limit results to only filesystems for the specified SID\n";
+    print " -d          : debug\n";
+    print " -v          : list all imported 3par VVs on host\n";
+    print " -w          : print only the Veritas wwn and 3par VV\n";
+    print " -g          : print only the 3par diskgroup and 3par VV\n";
+    print " -x          : print all data in a structured format for machine parsing\n";
+    print " -f          : write the VV's discovered for <filesystem> to /var/tmp/<filesystem>-virtual-volumes.txt.\n";
+    print "               This file is intended to be used as input for bcv-backup.\n"; 
+    exit(0);
+}
+
+sub main {
+    my @filesystems = ();
+    my $listVVs = 0;
+
+    while(my $arg=shift(@ARGV)) {
+        if( $arg =~ /^-h/o ){ usage(); };
+        if( $arg =~ /^-d/o ){ $debug++; };
+        if( $arg =~ /^-f/o ){ $tofile = 1; next; };
+        if( $arg =~ /^-w/o ){ $onlyWWNandVV = 1; next; };
+        if( $arg =~ /^-g/o ){ $onlyDGandVV = 1; next; };
+        if( $arg =~ /^-x/o ){ $extendedInfo = 1; next; };
+        if( $arg =~ /^-v/o ){ $listVVs = 1; next; }
+        if( $arg =~ /^-s/o ){
+            $sid = shift(@ARGV);
+            #
+            # hana DBCs set the "SID" to the hostname... so we treat these
+            # different.  In the case of a hana DB, we're looking for all
+            # xfs filesystems on the box, since hana basically is host based.
+            #
+            if($sid =~ '^hana') {
+                @filesystems = ariba::Ops::FileSystemUtils::mountedFileSystemsOfType("xfs");
+                unless(scalar(@filesystems)) {
+                    print "ERROR: Did not find any xfs filesystems for $sid\n";
+                    exit(1);
+                }
+            } else {
+                push(@filesystems, ariba::Ops::FileSystemUtils::mountedFilesystemsForSID($sid));
+                unless(scalar(@filesystems)) {
+                    print "ERROR: Did not find any vxfs filesystems for $sid\n";
+                    exit(1);
+                }
+            }
+            next;
+        }
+        if( $arg !~ /^-/o ){push(@filesystems, $arg); next;};
+    }
+
+    print "debug level in $debug\n" if $debug;
+
+    if(!scalar(@filesystems)) {
+        @filesystems = ariba::Ops::FileSystemUtils::mountedFileSystemsOfType("vxfs");
+        push(@filesystems, ariba::Ops::FileSystemUtils::mountedFileSystemsOfType("xfs"));
+    }
+
+    usage() unless (@filesystems or $listVVs);
+
+    ariba::Ops::FileSystemUtils::setDebug($debug);  
+
+    if ($listVVs) {
+        listAllVxDetails();
+    } elsif ($extendedInfo) {
+        listExtendedInfo(\@filesystems);
+    } else {
+        listFSDetails(\@filesystems);
+    }
+    print "\n";#This seperates "Connection to closed" stripping from this program output.
+}
+
+sub listAllVxDetails {
+
+    my @deviceDetails = ariba::Ops::FileSystemUtils::devicesForSystem();
+    printDevicesDetails(\@deviceDetails);
+}
+
+sub listExtendedInfo {
+    my $filesystems = shift;
+
+    for my $filesystem (@$filesystems) {
+        my @deviceDetails = ariba::Ops::FileSystemUtils::devicesForMountPoint($filesystem);
+        printExtendedInfo(\@deviceDetails, $filesystem);
+    }
+}
+
+sub printExtendedInfo {
+    my $deviceDetails = shift;
+    my $filesystem = shift;
+
+    print "#$filesystem:\n";
+
+    my $host = ariba::Ops::NetworkUtils::hostname();
+    my $machine = ariba::Ops::Machine->new($host);
+    my $shouldProxy; $shouldProxy = 1 if(ariba::Ops::DatacenterController::isDevlabDatacenters($machine->datacenter()));
+    my $datacenter = $machine->datacenter();
+    
+    my $sharedDC = ariba::Ops::DatacenterController::switchDC($datacenter);
+    $datacenter = $sharedDC if ($sharedDC);
+
+    my @inservs = ariba::Ops::NetworkDeviceManager->newFromDatacenter($datacenter, 'inserv', $shouldProxy);
+    my @emcs = ariba::Ops::NetworkDeviceManager->newFromDatacenter($datacenter, 'enginuity');
+
+    push(@inservs, @emcs);
+
+    for my $d (@$deviceDetails) {
+        my @luns = ($d->lun());
+        my $nm = $d->inservForDevice(\@inservs);
+
+        if (!$nm) {
+            print "Warning: Can't find inserv device for ", $d->instance(), " (", $d->hostTargetWWN(), "). "; # No newline here for ariba::Ops::FileSystemUtilsRPC::vvsForMountPoints
+            next;
+        }
+
+        $nm->setDebug($debug);
+
+        my $retry = 0;
+        my @vv;
+        #
+        # the following call sometimes fails to talk to the 3par
+        # which causes a LOT of problems.  We'll retry a few times
+        # to try and work around this.
+        #
+        do {
+            sleep 3 if($retry);
+            @vv = $nm->virtualVolumesForLunsOnHost(\@luns, $host);
+            @vv = $nm->volumeTagsForDevices($d) unless(scalar(@vv));
+            $retry++;
+        } while($retry < 10 && !scalar(@vv));
+        
+        next unless (@vv);
+
+        print "VV: " . $vv[0]->name() . "\n";
+        print "VXName: " . $d->name() . "\n";
+        print "DiskName: " . $d->diskName() . "\n";
+        print "DiskGroup: " . $d->diskGroup() . "\n";
+        print "LUN: " . $d->lun() . "\n";
+        print "VvWwn: " . $d->osVvWwn() . "\n";
+        print "Inserv: " . $d->inserv->hostname() . "\n";
+
+        foreach my $path ($d->paths()) {
+            print "Path" . $path->controller() . ": " . $path->name() . "\n";
+        }
+        print "----\n";
+    }
+    #
+    # we need to cleanly close these -- ssh NetworkDevice happens to work, but
+    # if we leave these open with proxy (telnet) NetworkDevices, the exit
+    # status will be non-zero, and this will look like it errored out.
+    #
+    foreach my $nm (@inservs) {
+        $nm->disconnect();
+    }
+}
+
+sub listFSDetails {
+    my $filesystems = shift;
+
+    #
+    # Get details of all the devices that make up a filesystem
+    #
+    for my $filesystem (@$filesystems) {
+
+        my @deviceDetails = ariba::Ops::FileSystemUtils::devicesForMountPoint($filesystem);
+        printDevicesDetails(\@deviceDetails, $filesystem);
+    }
+}
+
+sub printDevicesDetails {
+    my $deviceDetails = shift;
+    my $filesystem = shift;
+
+    my $header=1;
+    my @vvs;
+
+    my $format="%-15s%-20s%-4s%-18s%-30s";
+
+    if ( $tofile ) {
+        my $sidpre = $sid;
+        $sidpre = "hana" if($sid && $sid =~ /hana/);
+        $sidpre = "-$sidpre" if($sidpre);
+        my $filename;
+        if($sid =~ 'hana') {
+            my $type = "data";
+            $type = "log" if($filesystem =~ /log/);
+            $filename = "/var/tmp/" . $type . $sidpre . "-virtual-volumes.txt";
+            
+        } else {
+            $filename = "/var/tmp" . $filesystem . $sidpre . "-virtual-volumes.txt";
+        }
+        print "Writing out vv list to $filename\n";
+        open(FILE, ">$filename") or die "Unable to open $filename for writing: $!";
+        print FILE "fs: $filesystem\n";
+    } elsif ( defined $filesystem ) {
+        print "#$filesystem:";
+        print "\n" unless $onlyWWNandVV || $onlyDGandVV;
+    }
+
+    my $host = ariba::Ops::NetworkUtils::hostname();
+    my $machine = ariba::Ops::Machine->new($host);
+    my $shouldProxy; $shouldProxy = 1 if(ariba::Ops::DatacenterController::isDevlabDatacenters($machine->datacenter()));
+    my $datacenter = $machine->datacenter();
+    
+    my $sharedDC = ariba::Ops::DatacenterController::switchDC($datacenter);
+    $datacenter = $sharedDC if ($sharedDC);
+    my @inservs = ariba::Ops::NetworkDeviceManager->newFromDatacenter($datacenter, 'inserv', $shouldProxy);
+    my @emcs = ariba::Ops::NetworkDeviceManager->newFromDatacenter($datacenter, 'enginuity');
+
+    push(@inservs, @emcs);
+
+    # set the debug levels
+
+    my $firstRecord = 1;
+    for my $d (@$deviceDetails) {
+        my @luns = ($d->lun());
+
+        my $nm = $d->inservForDevice(\@inservs);
+
+        # For BCV backups, we assume that there's only 1 inserv/filesystem
+        if ( $tofile && $firstRecord ) {
+            print FILE "inserv: ", $nm->hostname(), "\n";
+        }
+
+        if (!$nm) {
+            print "Warning: Can't find inserv device for ", $d->instance(), " (", $d->hostTargetWWN(), "). "; # No newline here for ariba::Ops::FileSystemUtilsRPC::vvsForMountPoints
+            next;
+        }
+
+        $nm->setDebug($debug);
+
+        my $retry = 0;
+        my @vv;
+        #
+        # the following call sometimes fails to talk to the 3par
+        # which causes a LOT of problems.  We'll retry a few times
+        # to try and work around this.
+        #
+        do {
+            sleep 3 if($retry);
+            @vv = $nm->virtualVolumesForLunsOnHost(\@luns, $host);
+            @vv = $nm->volumeTagsForDevices($d) unless(scalar(@vv));
+            $retry++;
+        } while($retry < 10 && !scalar(@vv));
+        
+        next unless (@vv);
+
+        unless ($tofile || $onlyWWNandVV || $onlyDGandVV) {
+            if ( $header ) {
+                printf "$format", "VV", "VX Name", "Lun", "WWN", "3par Device", ;
+                foreach my $path ($d->paths()) {
+                    printf "%-8s", "Path " . $path->controller();
+                }
+                print "\n";
+                $header = 0;
+            }
+        }
+
+        if ( $tofile ) {
+            print FILE "vv: ", $vv[0]->name(), "\n";
+        } elsif ( $onlyWWNandVV ) {
+            print " " if ! $firstRecord;
+            print $vv[0]->name(), ",", $d->osVvWwn(), ",", $d->inserv->hostname();
+        } elsif ( $onlyDGandVV ) {
+            print " " if ! $firstRecord;
+            print $vv[0]->name(), ",", $d->diskGroup(), ",", $d->inserv->hostname();
+        } else {
+            printf  "$format", $vv[0]->name(), $d->name(), $d->lun(), $d->osVvWwn(), $d->inserv->hostname();
+            foreach my $path ($d->paths()) {
+                printf "%-8s", $path->name();
+            }
+            print "\n";
+        }
+        $firstRecord = 0;
+    }
+    close FILE if $tofile;
+
+    #
+    # we need to cleanly close these -- ssh NetworkDevice happens to work, but
+    # if we leave these open with proxy (telnet) NetworkDevices, the exit
+    # status will be non-zero, and this will look like it errored out.
+    #
+    foreach my $nm (@inservs) {
+        $nm->disconnect();
+    }
+}
+
+main();

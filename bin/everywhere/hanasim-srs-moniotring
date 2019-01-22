@@ -1,0 +1,596 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/everywhere/hanasim-srs-moniotring#3 $
+
+use strict;
+use FindBin;
+use Data::Dumper;
+use POSIX;
+use Date::Parse;
+use Time::Piece;
+use Time::Seconds;
+
+use lib '/usr/local/ariba/lib';
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Machine;
+use ariba::Ops::HanaClient;
+
+my $debug = 0;
+my $queries;
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -s    Service
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode.
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $service;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-s$/o) { $service = shift;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+    usage( "Service is a required argument" ) unless $service;
+    $sendPage = 0;
+
+    my $me       = ariba::rc::InstalledProduct->new('hanasim', $service);
+    
+    #my $cluster  = $me->currentCluster();
+    my $cluster  = 'primary';
+
+    my @monhosts = $me->hostsForRoleInCluster( 'monitor', $cluster );
+    die "Error reading mon host for $service ...\n" unless ( scalar @monhosts );
+    my $monhost = $monhosts[0];
+
+    my $mon      = ariba::rc::InstalledProduct->new('mon', $service);
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my %queries;
+
+    my $serverProc   = $me->default( 'SRSReplication.SRSRepserverInfo.SRSRepServerID' ) || 'NONE';
+    my $srsAgentAndHost = $me->default( 'SRSReplication.SRSRepserverInfo.SRSAgentHostAndTragetHanaUser'  ) || 'NONE';
+    my $serverAgentPass = $me->default("SRSReplication.SRSRepserverInfo.password") || 'NONE';
+    my $severAgentUser = 'sa';
+    my $srsLicensePath = "/opt/sybase/SYSAM-2_0/licenses";
+   
+    print "Server Proc          : $serverProc\n" if $debug > 1;
+   
+    my ($hostInfo, $error) = getSRSHostInfo($srsAgentAndHost, $hostname);
+  
+
+    if ( defined (keys %{$hostInfo}) ){
+        print "DEBUG: Hostinfo \n", Dumper($hostInfo), "\n", if $debug > 1;
+        print "DEBUG: Error ", $error, "\n", if (defined ($error) && $debug ) ;
+
+        my $agentProc = $hostInfo->{$hostname}->{'agent'}; 
+        my $agentUname = $hostInfo->{$hostname}->{'user'}; 
+        checkSRSServerStatus($agentProc, $serverProc, $hostname);
+        checkRSTicketStatus($me, $agentProc, $severAgentUser, $serverAgentPass, $agentUname, $hostname );
+        monitorQDepthSize($severAgentUser, $serverAgentPass, $serverProc, $hostname ); 
+        monitorSRSLicenseExpiration($srsLicensePath, $hostname ); 
+    }
+ 
+    my $email = $mon->default('notify.email');
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('SRS Health Check', $me->name(), $me->service(), $me->customer(), $queries);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monhost);
+}
+
+sub checkStatus {
+    my $map = shift;
+    my $type = shift;
+    my $ret = 'OK';
+
+    print "Looking for process '$map->{'proc'}'\n" if $debug > 1;
+    print "Running: '$map->{'regex'}'\n" if $debug > 1;
+
+    ## Count the number of processes containing the keyword from the DD we stored in the map
+    ## Proc::ProcessTable would probably be better than shelling out here but we have issues
+    ##   with the version we have.  This is more stable at the moment.
+    my $result = `$map->{'regex'}`;
+
+    if($type eq 'Server') {
+         $ret = 'Error' unless ( $result == 2 );
+    } else {
+         $ret = 'Error' unless ( $result == 1 );
+    }
+
+    return $ret;
+}
+
+sub checkSRSServerStatus {
+
+    my $agentProc = shift;
+    my $serverProc = shift;
+    my $hostname = shift;
+
+    my %typeMap = (
+        'Rep Server' => {
+            'role' => 'srs-server',
+            'proc' => $serverProc,
+            'regex' => "ps -ef | grep $serverProc | grep -v grep | grep \/repserver | wc -l",
+        },
+        'Agent'  => {
+            'role' => 'srs-agent',
+            'proc' => $agentProc,
+            'regex' => "ps -ef | grep $agentProc | grep -v grep | grep java | wc -l",
+        },
+    );
+
+    TYPE:
+    foreach my $type ( keys %typeMap ){
+
+        $queries->{"SRS $type $typeMap{$type}{'proc'}-$hostname Status"} = {
+            crit    => "answer ne 'OK'",
+            perl    => sub { return main::checkStatus( $typeMap{$type} ); },
+            ticketOwner => 'unassigned-sre',
+            uiHint  => "$hostname/SRS Status",
+            severity    => 1,
+            ticketOnWarnOpenAfterMinutes => 1,
+            description => "Monitor the SRS $type",
+            recordDataType=> "gauge",
+            recordItem => "answer",
+            recordDataUnits => "$type processes",
+            recordMaxResults => 35040, ## 4 (runs/hour) * 24 (hours/day) * 365 (days/year) - runs every 15 minutes. save 12 months
+            correctiveActions => [
+                Ops => 'Make SRS Server and SRS Agent logs available to Engineering',
+                Engr => 'Fix the issue found by monitoring',
+            ],
+        };
+    }
+
+}
+
+sub getSRSHostInfo {
+    my $srsAgentAndHost = shift;
+    my $hostname = shift;
+    my $error = 'Error';
+    my $host = ''; 
+
+    my @srsInfo = split/\s/,$srsAgentAndHost;    
+
+    my $AgentHost = {};
+    foreach my $info (@srsInfo){
+        $info =~ /(.*),(.*),(.*)/;  
+        $AgentHost->{$2}->{'agent'} = $1;
+        $AgentHost->{$2}->{'host'}  = $2;
+        $AgentHost->{$2}->{'user'}  = $3;
+
+    }
+
+    foreach my $host (keys %{$AgentHost}){
+       print "Checkin Host $host\n";
+       if ($host eq $hostname){
+           print "$host is the current host\n", if $debug;
+           my $info;
+           $info->{$host} = $AgentHost->{$host};
+           print "Returning host information for $hostname ", Dumper($info), "\n", if ($debug > 1); 
+           return $info;
+      }
+    }
+
+    return ($host, $error)
+}
+
+sub checkRSTicketStatus{
+    my $me = shift;
+    my $agentName = shift;
+    my $serverAgentUser = shift; 
+    my $serverAgentpass = shift;
+    my $targetUname = shift;
+    my $hostname = shift;
+ 
+    my $sql_out_file = writeFileSendTicket($agentName, $hostname, $serverAgentUser, $serverAgentpass ); 
+
+    $queries->{"Sending Ticket Status [$agentName:$hostname]"} = {
+        recordMaxResults => 8760,
+        crit    => "answer !~ /Successfully Sent/",
+        perl    => sub { return ticket_status( $sql_out_file ); },
+        uiHint  =>  "$hostname/RS Ticket Monitoring",
+        ticketOnWarnOpenAfterMinutes    => 1,
+        ticketOwner => 'unassigned-dba',
+        severity    => 1,
+        description => 'Checking whether the ticket Successfully sent or not to target host',
+        correctiveActions => [
+             Ops => 'Inform the SRS/Luna team',
+              Engr => 'Fix the issue found by monitoring',
+           ],
+    };    
+
+
+
+    ## Checking whethere tickit received or not in RS_TICKET_HISTORY table in Traget Host for replocation
+    my $cluster  = $me->currentCluster();
+    my $targetUserPass = $me->default("SRSReplication.SRSAgentTargetHana.password");
+    my @hanaHosts = $me->hostsForRoleInCluster( 'hanadatabasehosts', $cluster );
+    my $port = '30015';
+
+
+
+    my $sql = "Select rdb_t, pdb_t, exec_t, h1 from rs_ticket_history where cnt=(select max(cnt) from rs_ticket_history )";
+
+    my $hanaClient;
+    my $hanaDB = 1;
+
+    CONNECT:  ##Connect other host; 
+    foreach my $hanaHost (@hanaHosts){
+        $hanaClient = ariba::Ops::HanaClient->new( $targetUname, $targetUserPass, $hanaHost, $port, undef, undef );
+        $hanaClient->connect( 20, 4 );
+        next CONNECT if ($hanaClient->error());
+        $hanaDB = $hanaHost;
+        print "Sucessfully connected with host $hanaHost for $targetUname\n", if $debug;
+        my $results = $hanaClient->executeSql( $sql );
+    
+        my $type = 'latency';
+    
+        $queries->{"Last Ticket Received [$agentName:$hanaHost]"} = {
+            'recordMaxResults' => 8760,
+            'crit' => "answer > 30 || (answer =~ /Error/ && previousanswer =~ /Error/)",
+            'warn' => "answer > 20",
+            'info' => "answer < 20",
+            'format' => '%s min ago',
+            'uiHint'  =>  "$hostname/RS Ticket Monitoring",
+            'timeout' => 60,
+            'perl' => sub { return main::checkResult($results, $type) },
+        };
+    
+        ##Checking Ingress and Egress Time
+    
+        my %latency = ('Ingress' => 'Time Taken: From Source to Repserver (Ingress)',
+                       'Egress'  => 'Time Taken: From Repserver to Target (Egress)');
+    
+        foreach my $type (keys %latency) {
+    
+            $queries->{"$latency{$type} for [$agentName:$hanaHost]"} = {
+                'recordMaxResults' => 8760,
+                'crit' => "answer > 30 || (answer =~ /Error/ && previousanswer =~ /Error/)",
+                'warn'    => 'answer > 20',
+                'info'    => 'answer < 20',
+                'uiHint'  =>  "$hostname/RS Ticket Monitoring",
+                'format' => '%s min',
+                'perl'    => sub { return main::checkResult($results, $type) },
+                'ticketOnWarnOpenAfterMinutes'    => 1,
+                'ticketOwner' => 'unassigned-dba',
+                'severity'    => 1,
+                'correctiveActions' => [
+                    'Ops' => 'Inform the SRS/Luna team',
+                    'Engr' => 'Fix the issue found by monitoring',
+                 ],
+            };
+    
+        }
+
+        last;
+    }
+
+
+}
+
+
+sub ticket_status {
+   my $filename = shift;
+
+   my $data = getFileContent($filename);
+
+   my $ret = 'Successfully Sent, ';
+   $ret = 'Error', unless ( grep /successful/, @{$data} );
+
+   my $date;
+   if ($ret !~ /'Error'/){
+       my ( $index )= grep { $data->[$_] =~ /Current RA Date/ } 0..scalar @{$data};
+       $date = $data->[$index+2];
+       print "The value of the index is ", $index, " and date is ", $date, "\n", if $debug > 1;
+   }
+
+   return "$ret $date";
+}
+
+sub writeFileSendTicket{
+    my $agentName = shift;
+    my $hostname  = shift;
+    my $serverAgentUser = shift;
+    my $serverAgentpass = shift;
+
+    $agentName =~ /(.*)_(.*)/;
+    my $ticketName = $1;
+ 
+    my $sql_file = "/tmp/send_$agentName\_ticket.sql";
+    my $sql_out_file = "/tmp/$agentName\_sql_out.txt";
+
+
+    if ($debug) {
+        print "Input File (isql Command ) ", $sql_file, "\n";
+        print "Output File (isql output ) ", $sql_out_file, "\n";
+    }
+
+    my $sql_cmd = <<EOT;
+rs_ticket $ticketName
+go
+ra_date
+go
+EOT
+
+    writeFile($sql_file, $sql_out_file, $sql_cmd) ;
+
+    my $sup_cmd = "sudo -u sybase -i isql -H $hostname -U $serverAgentUser -P $serverAgentpass -S $agentName -J utf8 -i $sql_file -o $sql_out_file";
+    print "Running '$sup_cmd'\n", if $debug > 1;
+    `$sup_cmd`;
+
+    die "'$sql_out_file' not found, something went wrong running isql\n" unless ( -e $sql_out_file );
+    return $sql_out_file;
+
+}
+
+sub checkResult {
+    my $result = shift;
+    my $type = shift;
+    return "Error", unless (defined $result );
+    #return 1 unless (defined $result );
+
+    print "DEBUG Query Result: ", $result , "\n\n", if ($debug);
+    my @timeString = split ('\t', $result) ;
+
+    # Don't know it's not working as pdb_t and exec_t, so first capturing rdb_t using perl substring function;
+    my $r_time = substr ($result,0, 25);
+    my $rdb_t  = str2time("$r_time GMT");
+
+    my $pdb_t  = str2time("$timeString[1] GMT");
+    my $exec_t = str2time("$timeString[2] GMT");
+
+    if($debug) {
+        print "RDB_T", " " x(35 - length('RDB_T')),  "PDB_T",        " " x(20 - length('PDB_T')) ,        "EXEC_T\n";
+        print $r_time, " " x(35 - length($r_time)),  $timeString[1], " " x(20 - length($timeString[1])), $timeString[2],"\n";
+        print $rdb_t,  " " x(35 - length($rdb_t) ),  $pdb_t,         " " x(20 - length($pdb_t))        , $exec_t, "\n";
+    }
+
+    if ($type !~ /latency/) {
+        #This means RS_Ticket is reach target host before Repserver send, It's wrong
+        #This is happening becuase only RDB_T is returning timestamp along with the date string but PDB_T and EXEC_T is returning timestamp with timeonly
+        ## e.g.
+        ## RDB_T                              PDB_T               EXEC_T
+        ## 2015-05-18 10:02:21.25200          10:02:16.142        10:02:20.566
+        return "Error", if ( ($rdb_t - $exec_t) < 0 );
+    }
+
+    my $currenTime = localtime ;
+    my $ctime = str2time("$currenTime GMT");
+
+    my $timediff;
+    $timediff = sprintf ("%d" , ($exec_t - $pdb_t) ), if ($type =~ /Ingress/);
+    $timediff = sprintf ("%d" ,($rdb_t - $exec_t) ), if ($type =~ /Egress/);
+    $timediff = sprintf ("%d", ($ctime - $rdb_t) ), if ($type =~ /latency/);
+
+    print "Timediff for $type ", $timediff, "\n", if ($debug);
+    $timediff = sprintf ("%.2f", ($timediff/60));
+
+    ## if $timediff is greater than 30 min we will send actual date string of rdb_t (rdb_t = last ticket reach to target hana)
+    $timediff = ($timediff > 30 ) ? $r_time : $timediff;
+
+    return $timediff;
+
+}
+
+sub getFileContent {
+    my $filename = shift;
+
+    open my $IN, '<', $filename || die "Problem encountered opening '$filename' for read: $!\n";
+    my @data = <$IN>;
+    close $IN || die "Problem encountered closing '$filename' after read: $!\n";
+    return \@data;
+}
+
+sub monitorQDepthSize{
+
+    my $serverUser = shift;
+    my $serverPass = shift;
+    my $server = shift;
+    my $hostname = shift;
+    ## SRS Q- Depth
+
+    my $qDepthSqlFile = '/tmp/qDepth.sql';
+    my $qDepthSqlOutFile = '/tmp/qDepthSqlOut.txt';
+
+     my $qDepthSql = <<EOT;
+admin disk_space
+go
+EOT
+
+    writeFile($qDepthSqlFile, $qDepthSqlOutFile, $qDepthSql) ;
+
+
+    my $qDepthCmd = "sudo -u sybase -i isql -H $hostname -U $serverUser -P $serverPass -S  $server -J utf8 -i $qDepthSqlFile -o $qDepthSqlOutFile";
+    print "Running '$qDepthCmd'\n", if $debug > 1;
+    `$qDepthCmd`;
+
+    die "'$qDepthSqlOutFile' not found, something went wrong running isql\n" unless ( -e $qDepthSqlOutFile );
+
+    my @content = checkQDepth( $qDepthSqlOutFile );
+
+    my $totalSpace = 0;
+    my $totalUsedSpace = 0;
+    foreach my $partition (@content) {
+        my @checkPartition = split /\s+/, $partition;
+        my $partID = $checkPartition[1];
+        my $usedSegment = pop @checkPartition;
+           $totalUsedSpace += $usedSegment;
+        my $totalSegment = pop @checkPartition;
+           $totalSpace += $totalSegment;
+
+        $queries->{"SRS - Queue Depth for [$hostname] Partition ID $partID"} = {
+            recordMaxResults => 8760,
+            uiHint  =>  "$hostname/SRS_Q_Depth_Monitoring",
+            perl    => sub { return "$usedSegment MB [Partition Size: $totalSegment MB] "; },
+            ticketOnWarnOpenAfterMinutes    => 1,
+            ticketOwner => 'unassigned-dba',
+            severity    => 1,
+            description => 'SRS Q-depth monitoring will provide the information for total and occupied # of segment on partition. 1 segment = 1 MB. ',
+            correctiveActions => [
+                Ops => 'Inform the SRS/Luna team',
+                Engr => 'Fix the issue found by monitoring',
+            ],
+        };
+
+    }
+
+    print "Total Allocated Space $totalSpace and total used space, $totalUsedSpace\n",if $debug ;
+
+    $queries->{"All Partition: Total SRS-Queue Depth in use for $hostname"} = {
+        recordMaxResults => 8760,
+        crit    => "answer > ($totalSpace * 0.7)",
+        warn    => "answer > ($totalSpace * 0.6)",
+        uiHint  =>  "$hostname/SRS_Q_Depth_Monitoring",
+        format  =>  '%s MB in Use',
+        perl    => sub { return $totalUsedSpace; },
+        ticketOnWarnOpenAfterMinutes    => 1,
+        ticketOwner => 'unassigned-dba',
+        severity    => 1,
+        description => 'SRS Q-depth monitoring will provide the information for total and occupied # of segment on partition. 1 segment = 1 MB. ',
+        correctiveActions => [
+            Ops => 'Inform the SRS/Luna team',
+            Engr => 'Fix the issue found by monitoring',
+        ],
+    };
+
+    $queries->{"Total SRS-Queue Depth for $hostname"} = {
+        recordMaxResults => 8760,
+        uiHint  =>  "$hostname/SRS_Q_Depth_Monitoring",
+        format  =>  '%s MB in Use',
+        perl    => sub { return $totalSpace; },
+        ticketOnWarnOpenAfterMinutes    => 1,
+        ticketOwner => 'unassigned-dba',
+        severity    => 1,
+        description => 'SRS Q-depth monitoring will provide the information for total and occupied # of segment on partition. 1 segment = 1 MB. ',
+        correctiveActions => [
+            Ops => 'Inform the SRS/Luna team',
+            Engr => 'Fix the issue found by monitoring',
+        ],
+    };
+
+}
+
+
+sub writeFile {
+
+    my $inFile = shift;
+    my $outFile = shift;
+    my $content = shift;
+
+    open my $OUT, '>', $inFile || die "Problem encountered opening '$inFile' for write: $!\n";
+    print $OUT $content || die "Problem encountered writing to '$inFile': $!\n";
+    close $OUT || die "Problem encountered closing '$inFile' after write: $!\n";
+
+}
+
+
+sub monitorSRSLicenseExpiration {
+   my $licenseDir = shift;
+   my $hostname = shift;
+
+   opendir (LD, $licenseDir) or die "Could not Open $licenseDir\n";
+
+    my $licenses = {};
+    while (my $file = readdir(LD)){
+        next unless (($file =~ /^SRS/i) && ($file =~ /(.*)\.lic$/) );
+        chomp($file);
+        my @fileInfo = split (/_/, $1);
+        my $date = pop @fileInfo;
+        $date = substr($date, 0, 8);
+        my $licenseName = "$fileInfo[0] $fileInfo[1]";
+        $licenses->{$licenseName} = $date;
+    }
+
+    foreach my $lic( keys %{$licenses}) {
+
+        $queries->{"$lic [$hostname]"} = {
+            'crit' => "answer <  30 || (answer =~ /Unable to Read/)",
+            'warn' => "answer <  60",
+            'info' => "answer",
+            'perl'   => sub { return main::processLicenseDate($licenses->{$lic}) },
+            'format' => "Expire in %d days",
+            'uiHint'  => "$hostname/SRS Licenses",
+            'cketOnWarnOpenAfterMinutes'    => 1,
+            'ticketOwner' => 'unassigned-dba',
+            'severity'    => 1,
+            'correctiveActions' => [
+                'Ops' => 'Inform the SRS/Luna team',
+                'Engr' => 'Fix the issue found by monitoring',
+            ],
+        };
+    }
+
+}
+
+sub processLicenseDate {
+
+    my $licDate  = shift;
+    my $ret =  "Unable to Read Expiration date";
+
+    print $ret unless ($licDate =~ /\d{8}/);
+    return $ret unless ($licDate =~ /\d{8}/);
+
+    $licDate =~ /^([0-9]{4})([0-9]{2})([0-9]{2})/;
+
+    $licDate = Time::Piece->strptime("$3.$2.$1", "%d.%m.%Y");
+    print "LIC DATE ", $licDate, "\n", if $debug;
+
+    ## ONE_YEAR and ONE_MONTH is a Constant of Time::Seconds
+    ## License will expire after 10 month of the license date
+
+    $licDate += ONE_YEAR - ONE_MONTH - ONE_MONTH;
+    print "SRS License Expiration date is ", $licDate, "\n", if $debug ;
+
+    my $expDate = str2time("$licDate GMT");
+    my $ctime = time();
+
+    my $daysRemaining = sprintf( "%d", ( ($expDate - $ctime) / (3600 * 24) ) );
+
+    return $daysRemaining;
+
+}
+
+sub checkQDepth {
+
+   my $filename = shift;
+   my $data = getFileContent($filename);
+
+   my @content;
+   foreach my $part (@{$data}){
+      $part =~ s/^\s+//g;
+      print "Pushing $part\n", if $debug;
+      next if ($part !~ /^partition|^new_partition/);
+      push @content, $part;
+   }
+
+  return @content;
+
+}
+
+main(@ARGV);
+
+__END__

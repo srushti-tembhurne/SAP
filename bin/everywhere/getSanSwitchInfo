@@ -1,0 +1,162 @@
+#!/usr/local/bin/perl -w
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib qw(/usr/local/ariba/lib);
+
+use strict;
+use warnings;
+use Data::Dumper;
+use ariba::rc::Utils;
+use ariba::Ops::NetworkUtils;
+
+my $debug = 0;
+
+sub main {
+    
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-d/o) { $debug++; };
+    }
+  
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my $domain = ariba::Ops::NetworkUtils::domainForHost($hostname);
+    
+    my $san_data = "/var/mon/docroot/san-data";
+    unless(-d $san_data) {
+       system("mkdir -p $san_data");
+    }
+    
+    my %switchMap = ('snv' => "b6500-1, b6500-2", 
+                     'us1' => "ds6510b-1, ds6510b-2",
+                     'eu1' => "ds6510b-1, ds6510b-2",
+                     'eu2' => "ds6510b-1, ds6510b-2",  	
+    		   );
+    
+    my ( $shortname, $dc ) = $hostname =~ /([^\.]+)?\.([^\.]+)?/;
+    my @sanSwitches = split /,\s*/, $switchMap{$dc}; 
+    my $pw = "welcome1a";
+    my $user = 'admin';
+    
+    foreach my $server (@sanSwitches) {
+        my $switch = "$server.$domain";       
+        captureSwitchData($switch, $user, $pw, $san_data);
+    }
+}
+
+sub captureSwitchData {
+    my ($server, $user, $pw, $san_data) = @_; 
+    my $s_cmd = "ssh -l $user $server switchshow";
+    my $a_cmd = "ssh -l $user $server 'alishow *'";
+    my @sData;
+    my @aData;
+    $server =~ s/\./_/g; 
+    my $record_data = "$san_data/$server.txt";
+    unlink($record_data), if (-e $record_data);
+    print "filename is $record_data\n", if $debug; 
+
+    unless ($debug) {
+        close(STDERR);
+        close(STDOUT);
+        open(STDERR, '>>', "/var/log/omni-logs-transfer.txt");
+        open(STDOUT, '>>', "/var/log/omni-logs-transfer.txt");
+    }
+
+    my $sr = ariba::rc::Utils::executeRemoteCommand($s_cmd, $pw, 0, undef, undef, \@sData);
+    my $ar = ariba::rc::Utils::executeRemoteCommand($a_cmd, $pw, 0, undef, undef, \@aData );
+
+    my $wwpn  = formatAliases(@aData);
+    my $wwpn_switch = formatSwitch($wwpn, $record_data, @sData);
+
+    open FH, ">>", $record_data or die "Unbale to open file $record_data\n";
+
+    foreach (keys %$wwpn) {
+        unless ($wwpn_switch->{$_}) {
+            print FH "\t\t\t\tConfigured but not connected       $_   $wwpn->{$_}\n";
+        }
+    }
+
+    close(FH);
+}
+
+
+
+sub mapAliases {
+    my @ali = @_;
+    my %wwpn = (); 
+    foreach (@ali) {
+        chomp($_);
+        my @d = split /\s+/, $_;
+        $wwpn{$d[1]} = $d[0];
+    }
+    return (\%wwpn);
+}
+
+
+sub formatAliases {
+    my @aliases = @_;
+    my @formatted_ali = ();
+    for ( my $i = 0 ; $i < scalar @aliases ; $i++ ) {
+        chomp ($aliases[$i]);
+        $aliases[$i] =~ s/alias://g;
+        $aliases[$i] =~ s/^\s+|\s$//g;
+        if(defined $aliases[$i+1] and $aliases[$i+1] !~ /alias/) {
+            chomp ($aliases[$i+1]);
+            $aliases[$i+1] =~ s/^\s+|\s$//g;
+            my $ali =  "$aliases[$i] $aliases[$i+1]\n";
+            push(@formatted_ali, $ali);
+            $i++;
+            next;
+        }
+        push(@formatted_ali, "$aliases[$i]\n"), if ($aliases[$i] =~ /\d/);
+    }
+    my $wwpn = mapAliases(@formatted_ali);
+    return ($wwpn);
+}
+
+sub formatSwitch {
+    my $wwpn = shift;
+    my $writeData = shift;
+    my @switchdata = @_;
+    my $record  = 0;
+    my $cnt = 1;
+    my @switchInfo = ();
+    my %wwpn_switch = (); 
+    open WD, ">>", "$writeData" or die "Unbale to open file $writeData\n";
+
+    for ( my $i = 0 ; $i < scalar @switchdata; $i++ ) {
+        chomp ($switchdata[$i]);
+        if ( ($switchdata[$i] =~ /Index/ && $switchdata[$i] =~ /Port/) || ($switchdata[$i] =~ /====/) ) {
+             $record = 1;
+             next;
+        }          
+        
+        next unless $record; 
+        
+        my @d = split /\s+/, $switchdata[$i];
+        $cnt = sprintf ("%03d", $cnt);
+        if (defined $d[9]) {
+            $wwpn_switch{$d[9]} = 1;
+         
+            if ($wwpn->{$d[9]}) {
+                print WD "$cnt] $switchdata[$i]  $wwpn->{$d[9]}\n";
+                my $swIn =   "$cnt] $switchdata[$i]  $wwpn->{$d[9]}\n";
+                push (@switchInfo, $swIn); 
+            }
+            else {
+                print WD "$cnt] $switchdata[$i]  Alias Not Available\n";
+            }
+        }
+        else {
+           print WD "$cnt] $switchdata[$i]", " " x 10 , "WWPN Not Available\n";
+           my $swIn = "$cnt] $switchdata[$i] \t\t\t\t WWPN Not Available\n";
+           push (@switchInfo, $swIn);
+        }
+        $cnt++;
+
+    }   
+    close(WD);
+    return (\%wwpn_switch);
+}
+
+
+main();

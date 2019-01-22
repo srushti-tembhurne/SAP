@@ -1,0 +1,133 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/dba/dg-log-cleanup#3 $
+#
+# A script to cleanup oracle dataguard logs
+# 
+# 
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::Passwords;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+use ariba::Ops::ProductAPIExtensions;
+
+my $debug = 0;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	my ($instance, $user, $pass, $array, @productNames);
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-prod/o) { $array = \@productNames; next; };
+		if ($arg =~ /^-e/o) { $sendEmail = 1; next; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; next; };
+		if ($arg =~ /^-d/o) { $debug = 1; next; };
+		if ($arg !~ /^-/o ) { push(@$array, $arg); next; };
+	}
+
+	my $me	          = ariba::rc::InstalledProduct->new();
+	my $hostname      = ariba::Ops::NetworkUtils::hostname();
+	my $cluster       = $me->currentCluster();
+	my $email         = $me->default('notify.dba');
+
+	my @products      = ();
+
+	if (@productNames) {
+
+		for my $productName (@productNames) {
+			push(@products, ariba::rc::InstalledProduct->installedProductsList($me->service(), $productName));
+		}
+
+	} else {
+		push(@products, ariba::rc::InstalledProduct->installedProductsList($me->service(), 'sourcing'));
+	}
+
+	exit (0) unless(@products);
+
+	if (-t STDOUT) {
+		ariba::rc::Passwords::initialize($me->service());
+	}
+
+	my @dbconnections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+
+	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbconnections)) {
+		my $type        = $dbc->type();
+		my $virtualHost = $dbc->host();
+		my $instance    = uc($dbc->sid());
+
+		my $product     = $dbc->product();
+		my $productName = $product->name();
+
+		my $activeHost  = $product->activeHostForVirtualHostInCluster($virtualHost, $cluster);
+
+		if (!$activeHost || $activeHost ne $hostname) {
+			next;
+		}
+		# We do not replicate data warehouse instance ignore it
+		# for now
+		if ($dbc->community() || $type ne ariba::Ops::DBConnection->typeDr()) {
+			next;
+		}	
+		
+		$user = "system";
+		$pass = $me->default("dbainfo.$user.password");
+
+		cleanupLogs($user, $pass, $instance, $hostname);
+	}
+}
+
+sub cleanupLogs {
+	my $user = shift;
+	my $pass = shift;
+	my $sid = shift;
+	my $hostname = shift;
+
+	my $sql1 = "execute DBMS_LOGSTDBY.PURGE_SESSION";
+	my $sql2 = "SELECT * FROM DBA_LOGMNR_PURGED_LOG";
+
+	my $oracleClient = ariba::Ops::OracleClient->new($user,$pass,$sid,$hostname);
+	$oracleClient->connect() || die $oracleClient->error();
+
+	my $timeout = 60;
+	my $coderef = sub { $oracleClient->executeSql($sql1); };
+
+	#
+	# first purge all sessions
+	#
+	if(! ariba::Ops::Utils::runWithTimeout($timeout,$coderef) ){
+		my $error = "0 timed out running sql \"$sql1\" after $timeout sec";
+		$oracleClient->handleExecuteSqlTimeout();
+	}
+
+	my @logFiles;
+	$timeout = 60;
+	$coderef = sub { @logFiles = $oracleClient->executeSql($sql2); };
+
+	#
+	# Now get a list of logfiles that can be removed and remove them
+	#
+	if(! ariba::Ops::Utils::runWithTimeout($timeout,$coderef) ){
+		my $error = "0 timed out running sql \"$sql2\" after $timeout sec";
+		$oracleClient->handleExecuteSqlTimeout();
+	}
+
+	for my $logFile (@logFiles) {
+		if ($debug) {
+			print "DEBUG: Would have removed file [$logFile]\n";
+		} else {
+			if (-t STDOUT) {
+				print "Removing [$logFile]\n";
+			}
+			unlink($logFile) || warn "Unable to remove file $logFile, $!";
+		}
+	}
+}
+
+main();

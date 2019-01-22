@@ -1,0 +1,110 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/on-call/count-oncall#5 $
+# See if a schedule is fair
+# count-oncall 2000 1 2 1999 10  to sum 1/2000, 2/2000 and 10/1999
+
+use strict;
+
+use FindBin;
+use File::Basename;
+
+use lib "$FindBin::Bin/../../lib";
+use ariba::Oncall::Schedule;
+use ariba::Ops::Constants;
+
+
+sub main {
+	my @monthsAndYears;
+	my $usePersonalSchedule = 0;
+	my $debug = 0;
+	my $oncallScheduleDir = ariba::Ops::Constants::oncallscheduledir();
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-h/) { usage();}
+		if ($arg =~ /^-d/) { $debug = 1; next;}
+		if ($arg =~ /^-s/) { $oncallScheduleDir = shift(@ARGV) ; next;}
+		if ($arg =~ /^\d+$/) { push(@monthsAndYears, $arg); next;}
+	}
+
+	print "Looking for schedules in $oncallScheduleDir\n" if $debug;
+
+	my %shifts;
+	my %backup;
+	my %primary;
+	my $year;
+	my $days;
+
+
+	for my $month (@monthsAndYears) {
+		if ($month > 1000) {
+			$year = $month;
+			next;
+		}
+		my $schedule = ariba::Oncall::Schedule->new($month, $year, $oncallScheduleDir);
+
+		unless ( $schedule ) {	
+			print "ERROR: Can't find schedule for $month, $year in $oncallScheduleDir\n";
+		} else {
+
+			for (my $day = 1; $day <= $schedule->days(); $day++) {
+				my $primaryCount = 1;
+				my $p = $schedule->primaryForDay($day) || 'unassigned';
+				my $e = $schedule->europePrimaryForDay($day);
+				my $b = $schedule->backupForDay($day) || 'unassigned';
+
+				if($e) {
+					$primaryCount = .5;
+					$shifts{$e} += .5;
+					$primary{$e} += .5;
+				}
+
+				$shifts{$p}+=$primaryCount;
+				$shifts{$b}++;
+
+				$primary{$p}+=$primaryCount;
+				$backup{$b}++;
+
+				$days++;
+			}
+		}
+	}
+
+	for my $person (reverse sort {$shifts{$a} <=> $shifts{$b}} keys %shifts) {
+
+		$backup{$person} ||= 0;
+		printf("%-12s %3.1f %4.1f%%", $person, $shifts{$person}, percent($shifts{$person}/($days * 2)) );
+
+		if (!defined($primary{$person})){ $primary{$person} = 0; }
+		if (!defined($backup{$person})){ $backup{$person} = 0; }
+
+		printf("  (primary %3.1f %4.1f%%", $primary{$person}, percent($primary{$person}/$days) );
+		printf(", backup %3.1f %4.1f%%\)\n", $backup{$person}, percent($backup{$person}/$days) );
+	}
+}
+
+sub percent {
+	my $num = shift;
+	sprintf($num * 100);
+}
+
+sub usage {
+	print "usage: count-oncall [-h] [-s dir] year month [months|year...]\n";
+	print "\n";
+	print "See if on-call schedule is fair\n";
+	print "\n";
+	print "  -h this help\n";
+	print "  -d debug\n";
+	print "  -s <dir>  Get schedules from dir instead of " . ariba::Ops::Constants::oncallscheduledir() ."\n";
+	print "\n";
+	print "Example uses:\n";
+	print "    count-oncall 2002 6\n";
+	print "    count-oncall 2002 1 2 3 4 5 6\n";
+	print "    count-oncall 1999 10 11 12 2001 1 2\n";
+	print "\n";
+	exit(1);
+}
+
+main();
+
+__END__

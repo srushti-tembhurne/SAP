@@ -1,0 +1,233 @@
+#!/usr/local/bin/perl -w
+
+# Verify blob migration. This script computes hash for each data in a new BLOB column 
+# on the primary database, and makes sure it matches the hash for corresponding data
+# in the old LONG RAW column on the primary, and the hash for corresponding data
+# in the new BLOB column on the DR database.
+# tbilsborrow
+
+# $Id: //ariba/services/monitor/bin/an/blob-migrate-verification#3 $
+
+use strict;
+use FindBin;
+
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+use ariba::Ops::DatabaseManager::BerkeleyDB;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::Passwords;
+use Digest::MD4;
+
+# original table name => new table name to check in source and target
+my %blobTableMap = (
+    'CATALOG_BLOB'       => 'CATALOG_BLOB_CONTENT',
+    'CXML_DOCUMENT_BLOB' => 'CXML_DOCUMENT_CONTENT',
+    'CXML_BLOB'          => 'CXML_LOG_CONTENT'
+);
+# column name is always CONTENT
+my $column = 'CONTENT';
+
+$| = 1;
+
+# only checking the first 5MB of each column's data
+my $maxLen = 5 * 1024 * 1024;
+
+my $debug = 0;
+
+sub main {
+
+	my $maxCount = -1;
+
+	while (my $arg = shift(@ARGV)) {
+        if($arg =~ /^-d/o) {$debug = 1; next;}
+        if($arg =~ /^-full/o) {$maxCount = 0; next;}
+        if($arg =~ /^-first/o) {$maxCount = shift(@ARGV); next;}
+	}
+
+	if ($maxCount < 0) {
+		print "Usage: $0 [-full] [-first x]\n";
+		print "\t-full compares every blob.\n";
+		print "\t-first compares first x blobs.\n";
+		exit;
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	ariba::rc::Passwords::initialize($me->service());
+	my $cluster = $me->currentCluster();
+
+    compare($me, $cluster, $maxCount);
+}
+
+sub compare {
+	my ($me,$cluster,$maxCount) = @_;
+
+	# store the checked rows
+	ariba::Ops::DatabaseManager::BerkeleyDB->setDir('/var/tmp');
+	ariba::Ops::DatabaseManager::BerkeleyDB->unsetDuplicate();
+
+	my $bdbHandle = ariba::Ops::DatabaseManager::BerkeleyDB->handle('blob-migrate-compare');
+
+    my $product  = ariba::rc::InstalledProduct->new('an', $me->service());
+    my @communityIds = $product->communityIdsForProduct();
+
+    for my $community (@communityIds) {
+
+        my @dbconnections = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndInCommunity($product, ariba::Ops::DBConnection->typeMain(), $community);
+
+        for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbconnections)) {
+            my $srcDBC = $dbc;
+            my $trgDBC = $dbc->drDBPeer();
+
+            my $srcOracleClient = ariba::Ops::OracleClient->newFromDBConnection($srcDBC);
+            $srcOracleClient->connect();
+            my $srcDBH = $srcOracleClient->handle();
+
+            my $trgOracleClient = ariba::Ops::OracleClient->newFromDBConnection($trgDBC);
+            $trgOracleClient->connect();
+            my $trgDBH = $trgOracleClient->handle();
+
+            my $hasDrDb = defined $trgDBH;
+
+            $srcDBH->{LongReadLen} = $maxLen;
+
+            while (my ($oldTable, $newTable) = each %blobTableMap) {
+
+                print "Checking community $community new table $newTable against old table $oldTable\n";
+
+                my $selStmt = "SELECT /*+ index(t " . $newTable . "_PK) */ ID, " . $column . " FROM " . $newTable . " t";
+                if ($maxCount > 0) {
+                    $selStmt = $selStmt . " where rownum <= " . $maxCount;
+                }
+
+                my $srcStmt = "SELECT $column FROM $oldTable WHERE ID = ?";
+                my $trgStmt = "SELECT $column FROM $newTable WHERE ID = ?";
+
+                my $selSTH = $srcDBH->prepare($selStmt);
+                my $srcSTH = $srcDBH->prepare($srcStmt);
+                my $trgSTH;
+                if ($hasDrDb) { $trgSTH = $trgDBH->prepare($trgStmt); }
+
+                print "$selStmt\n" if $debug;
+                print "$srcStmt\n" if $debug;
+                print "$trgStmt\n" if $debug;
+
+                $selSTH->execute();
+
+                my $counter = 0;
+
+                while (my $newRow = $selSTH->fetchrow_hashref()) {
+
+                    my $newID = $newRow->{'ID'};
+
+                    # skip if we've seen it, and it's good.
+                    $bdbHandle->db_get("AN:$newTable:$newID", my $alreadyCheckedFlag);
+                    next if defined $alreadyCheckedFlag;
+
+                    $counter++;
+
+                    # get hash for new row on primary
+                    my $newBlob = $newRow->{$column};
+
+                    unless (defined $newBlob) {
+                        print "\tcould not retrieve column\n";
+                        print "\tCommunity: $community Table: $newTable row: $newID column: $column DB: source!\n";
+                        print "\tskipping! this is an error!\n";
+                        next;
+                    }
+                    my $newHash = Digest::MD4->hexhash( $newBlob );
+                    my $newLen = length $newBlob;
+                    print "New Length: $newLen\n" if $debug;
+                    unless (defined $newHash) {
+                        print "\tCould not create a hexhash!\n";
+                        print "\tCommunity: $community Table: $newTable row: $newID column: $column DB: source!\n";
+                        print "\tskipping! this is an error!\n";
+                        next;
+                    }
+
+                    # get hash for old row on primary
+                    $srcSTH->execute($newID);
+                    my $srcRow = $srcSTH->fetchrow_hashref();
+                    my $srcBlob = substr($srcRow->{$column}, 0, $maxLen);
+                    my $srcLen = length $srcBlob;
+                    print "Old Length: $srcLen\n" if $debug;
+                    unless (defined $srcBlob) {
+                        print "\tcould not retrieve column\n";
+                        print "\tCommunity: $community Table: $oldTable row: $newID column: $column DB: source!\n";
+                        print "\tskipping! this is an error!\n";
+                        next;
+                    }
+                    my $srcHash = Digest::MD4->hexhash( $srcBlob );
+                    unless (defined $srcHash) {
+                        print "\tCould not create a hexhash!\n";
+                        print "\tCommunity: $community Table: $oldTable row: $newID column: $column DB: source!\n";
+                        print "\tskipping! this is an error!\n";
+                        next;
+                    }
+
+                    # get hash for new row on dr
+                    my $trgHash;
+                    if ($hasDrDb) {
+                        $trgSTH->execute($newID);
+                        my $trgRow = $trgSTH->fetchrow_hashref();
+                        my $trgBlob = substr($trgRow->{$column}, 0, $maxLen);
+                        my $trgLen = length $trgBlob;
+                        print "Target Length: $trgLen\n" if $debug;
+                        unless (defined $trgBlob) {
+                            print "\tcould not retrieve column\n";
+                            print "\tCommunity: $community Table: $newTable row: $newID column: $column DB: target!\n";
+                            print "\tskipping! this is an error!\n";
+                            next;
+                        }
+                        my $trgHash = Digest::MD4->hexhash( $trgBlob );
+                        unless (defined $trgHash) {
+                            print "\tCould not create a hexhash!\n";
+                            print "\tCommunity: $community Table: $newTable row: $newID column: $column DB: target!\n";
+                            print "\tskipping! this is an error!\n";
+                            next;
+                        }
+                    }
+
+                    if ($newHash ne $srcHash) {
+                        print "Blob mismatch between BLOB and LONG RAW! Community [$community] Table: [$newTable] ID: [$newID]\n";
+                        print "New MD4: [$newHash]\n";
+                        print "Old MD4: [$srcHash]\n";
+
+                    } elsif ($trgHash && ($newHash ne $trgHash)) {
+                        print "Blob mismatch between primary and dr! Community [$community] Table: [$newTable] ID: [$newID]\n";
+                        print "Source MD4: [$newHash]\n";
+                        print "Target MD4: [$trgHash]\n";
+
+                    } else {
+
+                        # so we can restart
+                        $bdbHandle->db_put("AN:$newTable:$newID", 1);
+                    }
+
+                    if ($counter != 0 and ($counter % 100000) == 0) {
+                        print "\tchecked $counter rows.\n";
+                    }
+                }
+
+                print "\tchecked $counter total rows.\n";
+
+                $selSTH->finish();
+                $srcSTH->finish();
+                if ($trgSTH) { $trgSTH->finish(); }
+                $bdbHandle->db_sync();
+            }
+
+            $srcOracleClient->disconnect();
+            if ($hasDrDb) { $trgOracleClient->disconnect(); }
+        }
+    }
+
+	print "done with blob compare.\n";
+}
+
+main();
+
+__END__

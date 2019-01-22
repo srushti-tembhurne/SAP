@@ -1,0 +1,156 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/hadoop/cleanup-hbase-snapshots#1 $
+
+#
+# Monitor for the jobcache directory, as during catalog migration,
+# this directory may fill up and reach the max number of files and
+# will prevent additional jobcache files to be written
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use POSIX qw(strftime);
+use Time::Local;
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::Ops::Constants;
+use ariba::Ops::Startup::Hadoop;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+
+my $debug = 0;
+my $count = 0;
+my $oldestFile = time();
+my $maxResults = 8760; # one year running once an hour
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();          next; }
+        if ($arg =~ /^-d$/o) { $debug++;         next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;   next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;    next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $service = $me->service();
+    exit unless (ariba::rc::InstalledProduct->isInstalled('hadoop', $service));
+
+    my $hadoop = ariba::rc::InstalledProduct->new('hadoop', $service);
+    my $cluster = $hadoop->currentCluster();
+    my @tasktrackerHosts;
+
+    push(@tasktrackerHosts, $hadoop->hostsForRoleInCluster('hadoop-task', $hadoop->currentCluster()));
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+
+    return unless (grep { /^$hostname$/ } @tasktrackerHosts);
+
+    #
+    # jobcache dir:
+    # /*mapred-local-dir*/ttprivate/taskTracker/svc$service/jobcache/
+    #
+    #my @mapredDirs = split(",", $hadoop->default('Hadoop.MapRed.LocalDir'));
+    my @mapredDirs = ("/tmp/hadoop/data/hadoop/mapred","/var/hadoop/data/hadoop/mapred");
+ 
+    foreach my $dir (@mapredDirs) {
+        $dir .= "/ttprivate/taskTracker/svc$service/jobcache";
+        processDirs($dir);
+    }
+
+    my %queries = ();
+
+    $queries{"Total jobcache files on $hostname"} = {
+        crit => 'answer > 20000',
+        severity => 2,
+        perl => sub { return $count },
+        recordMaxResults => $maxResults,
+        recordDataType => 'gauge',
+        recordItem => 'answer',
+        description => "Total number of jobcache files on a task host.
+                        There is a 32k max limit",
+        correctiveActions => [
+            Ops => "File a ticket with DBAs",
+            DBA => "Investigate why jobcache files are not getting cleaned up. Do cleanup
+                   as needed",
+        ],
+    };
+
+    ## Calculate file date age in days
+    my $now = time();
+    my $timeDiff = ($now - $oldestFile) / (60 * 60 * 24); 
+
+    $queries{"Oldest jobcache file on $hostname"} = {
+        format => "%d days",
+        crit => 'answer > 14',
+        perl => sub { return $timeDiff },
+        description => "Age of oldest jobcache file. Jobcache files are automatically
+                        cleaned up. If monitoring alerts on old jobache jobs, this needs
+                        to be investigated",
+        correctiveActions => [
+            Ops => "File a ticket with DBAs",
+            DBA => "Investigate why jobcache files are not getting cleaned up. Do cleanup
+                    as needed",
+        ]
+    };
+
+    my $email = $me->default('notify.email');
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('jobcache', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queries);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+#
+# Count all files in the given directory
+#
+sub processDirs { 
+    my $path = shift;
+
+    if (-d "$path") { 
+        opendir (SUBDIR, $path) or die "Cannot open the subfolder for reading\n";
+
+        my @files = sort grep {!/^\.{1,2}$/} readdir(SUBDIR); 
+
+        foreach my $file (@files) {
+            processDirs("$path/$file")
+        }
+        closedir (SUBDIR); 
+    } else { 
+        my $time = (stat("$path"))[9];
+        $oldestFile = $time if ($oldestFile > $time);
+        $count++;
+    }
+}
+
+sub debug {
+    my $msg = shift; 
+
+    print "(debug) $msg\n" if ($debug);
+}
+
+main(@ARGV);
+
+__END__

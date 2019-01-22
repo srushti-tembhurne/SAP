@@ -1,0 +1,213 @@
+#!/usr/local/bin/perl -w
+
+# This script monitor stmp failures
+#
+# $Id
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::PageUtils;
+use Date::Calc;
+
+use strict;
+
+
+my @months = qw( Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec );
+my $monthsToNumberIterator = 1;
+my %monthToNumber = map {$_ => $monthsToNumberIterator++} @months;
+
+
+my $SCANPERIOD   = 24 * 60 * 60; # 24 hours
+
+
+my $debug = 0;
+sub extractLogsForFilename {
+	my $filename =  shift;
+	
+	my $currentYear = (localtime(time))[5] + 1900;
+	my $now = time();
+
+
+	my %logEntriesByEventId;
+	open my $FILEIN, $filename  or die "Error : unable to open $filename; $!\n";
+ 
+		while (my $line = <$FILEIN>) {
+
+			# Feb  3 00:00:06 util11 sendmail[6340]: m13806ev006340: from=<monlab@svclabsmtp.ariba.com>, size=623, class=0, nrcpts=1, msgid=<200802030800.m13806CF003713@mon11.opslab.ariba.com>, proto=ESMTP, daemon=MTA, relay=mon11.opslab.ariba.com [172.22.1.203]
+			my ($month, $day, $time, $user, $pid, $eventId, $content) = split(/\s+/, $line, 7);
+
+			# We need a unix time format for the event
+			my $unixTimeForTime =  _logDateToUTC ($currentYear, $month, $day, $time);
+
+			# Sendmail log format doesn't provide any information about the year of an event
+			# Since we rotate logs once a week, we supppose an event cannot be older than a year
+			# We still need to handle some corner cases. An event might be younger than a year but still happening last year
+			# Ex: $now is January the 2nd 2008 and the event happened on December 30th 2007
+			# _logDateToUTC ($currentYear, $month, $day, $time) would return December 30th 2008
+			$unixTimeForTime =  _logDateToUTC ($currentYear - 1, $month, $day, $time) if ($unixTimeForTime > $now);
+
+			if ($eventId && ( ($now - $SCANPERIOD)  < $unixTimeForTime) ) {
+				@{$logEntriesByEventId{$eventId}} = () unless (exists $logEntriesByEventId{$eventId});
+				push(@{$logEntriesByEventId{$eventId}}, $content);
+			}
+
+		}
+
+	close($FILEIN); 
+	return \%logEntriesByEventId;
+}
+
+sub analyzeLogsForData {
+
+	my $logEntriesByEventIdRef = shift;
+	my %logEntriesByEventId = %$logEntriesByEventIdRef;
+
+	my %numberOfRejectedEmailsByDomainAndDsn;
+
+	for my $eventId (keys(%logEntriesByEventId)) {
+		my $error = 0;
+		my $dsn = 0;
+		my $domain = "unknown domain"; 
+
+		for my $content (@{$logEntriesByEventId{$eventId}}) {
+			if ($content =~ m/\Wdsn=(5\.\d+\.\d+)/) {
+				$error = 1;
+				$dsn = $1;
+			}
+			
+			# to must be a word (must have a non-alphabetic character before).
+			# It might also be at the beginning of the line
+			if ($content =~ m/^(.*\W)?to=([^,>]+)/) {
+				$domain = $2; 
+				$domain =~ s/^[^\@]+\@//;
+	
+			}
+		}
+
+		if ($error) {
+			${$numberOfRejectedEmailsByDomainAndDsn{$dsn}}{$domain}++ ;
+		}
+	}
+	return \%numberOfRejectedEmailsByDomainAndDsn;
+}
+
+
+sub computeErrorMsgForNumberOfRejectedEmailsByDomainAndDsn {
+	my $numberOfRejectedEmailsByDomainAndDsnRef = shift;
+	my $dsn = shift;
+
+	my @msgs ;
+	for my $domain (keys(%{$$numberOfRejectedEmailsByDomainAndDsnRef{$dsn}})) {	 
+		push(@msgs, "Number of emails rejected by $domain : " . ${$$numberOfRejectedEmailsByDomainAndDsnRef{$dsn}}{$domain});
+	}
+
+	return join("\n", @msgs);
+}
+
+sub analyzeLogsForLogFile {
+	my $logFile = shift;
+
+
+	my $logEntriesByEventIdRef = extractLogsForFilename ($logFile);
+	
+	my $numberOfRejectedEmailsByDomainAndDsnRef = analyzeLogsForData($logEntriesByEventIdRef);
+
+
+	my @result;
+	for my $dsn (keys(%$numberOfRejectedEmailsByDomainAndDsnRef)) {
+
+		push @result, "E-mails rejected with error code $dsn";
+
+		if (scalar(keys(%{$$numberOfRejectedEmailsByDomainAndDsnRef{$dsn}}))) {
+			my $msg = computeErrorMsgForNumberOfRejectedEmailsByDomainAndDsn( $numberOfRejectedEmailsByDomainAndDsnRef, $dsn );
+			push @result, "$msg";
+		}
+
+		push @result, "\n";
+	}
+
+	return @result;
+}
+
+sub main {
+
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $logFile;
+	my @unrecognizedArgs;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; next; };
+		if($arg =~ /^-e/o){ $sendEmail = 1; next;};
+		if($arg =~ /^-p/o){ $sendPage = 1; next;};
+		if($arg =~ /^-logfile/oi){ $logFile = shift(@ARGV); next;};
+
+		push (@unrecognizedArgs, $arg);
+	}
+
+	usage("Please, provide a log file") unless ($logFile);
+
+	usage ("Unrecognized argument(s) : " . join("\n", @unrecognizedArgs)) if (scalar (@unrecognizedArgs) );
+
+	my $me = ariba::rc::InstalledProduct->new('mon');
+    my $host       =  ariba::Ops::NetworkUtils::hostname();
+	my $email = $me->default('notify.email');
+
+	my %query;
+	$query{"$host E-mails rejected"} = {
+
+		'info'   => "1",
+		'perl'   => sub{ return join("\n", analyzeLogsForLogFile($logFile)); },
+	};
+
+    my $machine    = ariba::Ops::Machine->new($host);
+    my $datacenter = $machine->datacenter();
+	my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+    my $monserver  = ariba::Ops::PageUtils::monitorServerForDatacenterByProduct( $me );
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails("smtp-failures", $pn, $me->service(), $me->customer(), \%query);
+
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monserver);
+
+	
+
+}
+
+sub usage {
+
+	print "Error: $_[0]\n" if $_[0];
+	print "usage: $0 \n";
+	print "          [-d] debug\n";
+	print "          -logfile <sendmail log file>\n";
+	exit(1);
+
+}
+
+
+sub _logDateToUTC {
+	my $year = shift();
+	my $monthName = shift();
+	my $day = shift();
+	my $timeString = shift();
+
+
+	my ($hour, $min, $sec) = split(/:/, $timeString);
+
+	# If the log was truncated, bail so Mktime doesn't blow up.
+	if (!$year || !defined($monthToNumber{$monthName}) || !$day || !$hour || !$min || !$sec) {
+		return 0;
+	}
+
+	my $utime = Date::Calc::Mktime($year, $monthToNumber{$monthName}, $day, $hour, $min, $sec);
+
+	return $utime;
+}
+
+
+
+main();

@@ -1,0 +1,60 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/mon/cdb-fix-reorder#2 $
+#
+# Utility to fix out-of-order entries that mess up powergraph.
+# Reads in the records, sorts them, deletes the cdb, writes out sorted values
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use ariba::monitor::CircularDB;
+
+sub usage {
+	my $msg = shift;
+	print "Error: $msg\n" if $msg;
+	print "Usage: $0 <cdbfile1> [<cdbfile2> ...]\n";
+	print "  -h[elp]       this help\n";
+	exit(1);
+}
+
+sub main {
+
+	my @cdbPaths = ();
+
+	my $verbose = 1;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-h/) { usage(); }
+		if ($arg =~ /^-/) { usage("Unknown arg $arg\n"); next; }
+		push(@cdbPaths, $arg);
+	}
+
+	for my $path (@cdbPaths) {
+		my $cdb = ariba::monitor::CircularDB->new($path);
+
+		next unless -f $path;
+
+		my $name = $cdb->name();
+		print "Working on $name\n" if $verbose;
+
+		my (@records);
+		$cdb->readRecords(undef, undef, undef, \@records);
+
+		print "pre: last rec = " . $records[$#records][0] . "\n";
+		my @newRecords = sort { $a->[0] <=> $b->[0] } @records;
+		print "post: last rec = " . $newRecords[$#newRecords][0] . "\n";
+
+		$cdb->_closeDB();
+		unlink($cdb->fileName());
+		$cdb->{_header}->{_numRecords} = 0;
+		$cdb->{_header}->{_startRecord} = 0;
+
+		$cdb->writeRecords(@newRecords);
+
+	}			
+}
+
+main();

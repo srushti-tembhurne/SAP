@@ -1,0 +1,117 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/an/check-wip-snapshot#1 $
+#
+# Find all AN hosts providing the supplieruiapps role, and check for the 'wip-snapshot' directory under $prefixPath.
+
+use strict;
+use warnings;
+
+use Data::Dumper;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use ariba::rc::CipherStore;
+use dmail::LockLib;
+
+$main::quiet = 1; # prevent "spew" for error conditions in executeRemoteCommand ()
+
+sub main
+{
+    my $debug = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $test = 0;
+
+    my $resource = 'wip-snapshot-search';
+
+    while (my $arg=shift (@ARGV))
+    {
+        if ($arg =~ /^-d$/){ $debug     = 1; }
+        if ($arg =~ /^-e$/){ $sendEmail = 1; };
+        if ($arg =~ /^-p$/){ $sendPage  = 1; };
+        if ($arg =~ /^-t$/){ $test      = 1; };
+    }
+
+    # Set up a lockfile to prevent possible multiple sets of this from running.  Currently, being run once an hour makes this
+    # unlikely, but in case the frequency should need to be increased, this may become useful.
+    die "could not get lockfile.\n" unless dmail::LockLib::requestlock($resource, 10);
+
+    # One hour, in seconds:
+    my $hour = 60 * 60;
+    # Current time, constant value throughout script execution.
+    my $now = time ();
+
+    my $me = ariba::rc::InstalledProduct->new ();
+    my $cluster = $me->currentCluster ();
+    my $service = $me->service ();
+    my $prefixPath = "/var/tmp/fs/an";
+    my $wipDirName = 'wip-snapshot';
+
+    my $an = ariba::rc::InstalledProduct->new ("an", $service);
+    my $productName = $an->name ();
+    my $role = 'supplieruiapps';
+    my @hosts = $an->hostsForRoleInCluster ($role, $cluster);
+    my %queries = ();
+
+    my $user = $me->deploymentUser ();
+    my $cipherStore = ariba::rc::CipherStore->new ($service);
+    my $password = $cipherStore->valueForName ($user);
+
+    # Search for the directory "wip-snapshot", under $prefixPath, using the 'find' command.  If any are found, check them with
+    # the 'stat' command for mod/change times and report any that are more than 1 hour old.
+    for my $host (@hosts)
+    {
+        # Using the 'find' command and the '-exec ... +' option to run 'stat' on files found, will return what we need to
+        # determine file status.
+        my $cmd =qq{ssh -l $user $host find $prefixPath -name $wipDirName -exec stat --format \\\"%n:  %Y %Z\\\" \\\'{}\\\' +};
+        my @results;
+
+        # Using the 'find', as above, means 'stat' will only be run for existing items, which means @results could be empty.  The
+        # "empty" case is the "all is good", info status, case.  On the other hand, there may be one or more directories found,
+        # which must be handled as a single query, since the total number may be variable.
+        my $return = executeRemoteCommand ($cmd, $password, 0, undef, undef, \@results);
+        my ($dir, $modTime, $changeTime, $time, $status, $multiRow);
+        if (@results)
+        {
+            @results > 1 ? ($multiRow = 1) : ($multiRow = 0);
+
+            for my $result (@results)
+            {
+                ($dir, $modTime, $changeTime) = ($result =~ /^(\S+)\s+(\d+)\s+(\d+)/);
+                $time = ($modTime > $changeTime ? $changeTime : $modTime);
+                (($now - $time) >= $hour) && ($status .= "Not OK (found:  $dir)\n");
+            }
+            # If nothing in status, set it to OK.
+            $status = 'OK' unless $status;
+
+            $queries {"$wipDirName $host"}  =  {
+                                                   perl     => sub {return $status},
+                                                   crit     => 'answer =~ /^Not OK/',
+                                                   multiRow => $multiRow,
+                                               };
+        }
+        else # There were no wip-snapshop directories found.
+        {
+            $queries {"$wipDirName $host"}  =  {
+                                                   perl   => sub {return 'OK'},
+                                                   info   => "answer eq 'OK'",
+                                               };
+        }
+    }
+
+    # Create the query manager and post the results.
+    my $email = $me->default ('notify.email');
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails ('wip-snapshot-check', $productName, $service, undef, \%queries);
+    $qm->processQueries ($debug, $email, $sendEmail, $sendPage);
+
+    dmail::LockLib::releaselock($resource);
+}
+
+main ();
+
+__END__

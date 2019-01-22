@@ -1,0 +1,93 @@
+#!/usr/local/bin/perl -w
+
+# $Id$
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Machine;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::NetworkUtils;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $debug = 0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; };
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	# don't run unless we have a fiber interface.
+	unless (-e '/dev/td0' or -e '/dev/td1' or -e '/dev/td2') {
+		exit(0);
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $cluster  = $me->currentCluster();
+	my %queries  = ();
+
+	my $emcStats = getSymstatData();
+
+	for my $stat (sort keys %$emcStats) {
+
+		$queries{"$hostname $stat/sec"} = {
+			info => "answer > -1",
+			recordMaxResults => 110000,
+			recordDataType => 'gauge',
+			perl => $emcStats->{$stat},
+		};
+	}
+
+	my $email = $me->default('notify.email');
+
+	my $machine = ariba::Ops::Machine->new($hostname);
+	my $datacenter = $machine->datacenter();
+	
+	my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+	my $q = ariba::monitor::QueryManager->newWithDetails("emc-stats", $pn, $me->service(), $me->customer(), \%queries);
+	$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+sub getSymstatData {
+	# bash-2.05$ /usr/symcli/bin/symstat -i 5 -c 2|grep -v "Not Visible"
+
+	#         DEVICE                   IO/sec        KB/sec     % Hits %Seq Num WP
+	# 13:43:42                        READ  WRITE   READ  WRITE  RD WRT READ Tracks
+	#	019  (c8t0d0)             0      0      0      0 N/A N/A  N/A      1
+	# 	01A  (c8t0d1)             0      0      0      0 N/A N/A  N/A      1
+	# 	01B  (c8t0d2)             0      0      0      0 N/A N/A  N/A      2
+
+	my %stats = ();
+
+	open(SYM, "/usr/symcli/bin/symstat -i 5 -c 2|") || die "Can't open symstat: $!";
+	while(<SYM>) {
+		chomp;
+		next unless /\(c\d+t\d+d\d+\)/;
+		# remove the timestamp that is on the 001 label
+		s/\d+:\d+:\d+//;
+		s/^\s*//g;
+		s/\s*$//g;
+		my ($id,$disk,$ioRead,$ioWrite,$kbRead,$kbWrite,undef) = split /\s+/;
+
+		$stats{'ioRead'}  += $ioRead;
+		$stats{'ioWrite'} += $ioWrite;
+		$stats{'kbRead'}  += $kbRead;
+		$stats{'kbWrite'} += $kbWrite;
+	}
+	close(SYM);
+
+	return \%stats;
+}
+
+main();
+
+__END__

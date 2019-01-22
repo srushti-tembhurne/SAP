@@ -1,0 +1,149 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+use Data::Dumper;
+use File::Basename;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use JSON;
+use File::Slurp;
+
+use ariba::rc::Utils;
+use ariba::Ops::Constants;
+use ariba::Ops::Logger;
+use ariba::Ops::HanaClient;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductConfig::Constants qw(HANA_SELF_DISC_CONFIG);
+use ariba::Ops::ProductConfig::Utils qw(mklogdir read_hana_self_disc_config);
+use ariba::Ops::SplunkLogger;
+
+use Getopt::Long qw(GetOptions);
+use Pod::Usage qw(pod2usage);
+
+use dmail::LockLib;
+
+=head1 SYNOPSIS
+
+    hana-mini-health-checks [--debug | --dryrun]
+
+    Options:
+        --help|h            Show this help.
+        --debug|d           enable debug logging.
+        --dryrun|n          Doesn't actually execute the mini checks query. just shows the hosts/tenants that it would run on. 
+
+        e.g: 
+            hana-mini-health-checks --debug 
+            hana-mini-health-checks --dryrun
+
+=cut
+
+my $debug;
+my $help;
+my $dryrun;
+
+my $prog = basename($0);
+
+GetOptions(
+           'debug|d'    => \$debug,
+           'dryrun|n'    => \$dryrun,
+           'help|h'     => sub {pod2usage(1)},
+          );
+
+### When this script is included in unit test, caller = main.
+### Do not execute the script when included
+return 1 if (caller);
+
+my $me = ariba::rc::InstalledProduct->new();
+my $service = $me->service();
+
+# Set up logger
+my $toolsLogDir = ariba::Ops::Constants->toolsLogDir();
+mklogdir($toolsLogDir, $service) unless ( -d $toolsLogDir );
+
+my $log_filename = $toolsLogDir . '/hana_mini_checks_run.log';
+my $logger       = ariba::Ops::Logger->logger();
+
+$logger->setLogFile($log_filename);
+
+# append to logger file and dont print to screen
+my $LOGGER;
+open $LOGGER, '>>', $log_filename;
+$logger->setFh($LOGGER);
+#$logger->setQuiet(1);
+
+main();
+
+sub main
+{
+
+    my $lockfile = "/tmp/$prog-lock";
+    unless(dmail::LockLib::requestlock( $lockfile, 5)) {
+         warn "can't grab lock\n";
+         exit(-1);
+    }
+
+    my $config = eval { read_hana_self_disc_config() };
+    if ($@) { 
+        $logger->error("Error reading config file: $@");
+        exit;
+    }
+
+    my $version = $config->{version};
+    
+    my $etc = $me->installDir() . '/etc';
+    my $sql_path = "$etc/hana-mini-checks-v$version.sql";
+
+    my $sql = eval { read_file($sql_path) };
+    if ( $@ ) { 
+        $logger->error("Error fetching mini checks sql ($sql_path): $!");
+        exit;
+    }
+    
+    my $dbuser = $me->default( "dbainfo.hana.system.username" );
+    my $dbpass = $me->default( "dbainfo.hana.system.password" );
+
+    my $splunk_logger;
+
+    foreach my $conn ( @{ $config->{master}->{connections} } ) { 
+        my ($dbhost, $dbport, $sid, $dbname) = ( $conn->{host}, $conn->{port}, $conn->{sid}, $conn->{dbname} );
+
+        my $hanaClient = ariba::Ops::HanaClient->new($dbuser, $dbpass, $dbhost, $dbport );
+        if ( !$hanaClient->connect(10, 3) ) { 
+            $logger->warn("Unable to connect on $dbhost:$dbport: " . $hanaClient->error());
+            next;
+        }
+
+        if ( $dryrun ) { 
+            $logger->info("Would run mini health checks on $dbhost:$dbport. Dry run, skipping..");
+            next;
+        }
+
+        $splunk_logger ||= ariba::Ops::SplunkLogger->new('hana_mini_checks');
+
+        $logger->info("Running mini checks query (version: $version) on $dbhost:$dbport");
+
+        my @data;
+        $hanaClient->executeSqlWithTimeout($sql, 3600, \@data); 
+        if ( $hanaClient->error() ) { 
+            $logger->error("Error running mini checks query: " . $hanaClient->error());
+            $hanaClient->disconnect;
+            next;
+        }
+
+        foreach my $row ( @data ) { 
+            my ($chid, $desc, $host, $value, $expected_value, $crit, $details) = split("\t", $row);
+            $splunk_logger->log_msg({ dbhost => $dbhost, dbport => $dbport, sid => $sid, dbname => $dbname, chid => $chid, description => $desc, host => $host, value => $value, expected_valued => $expected_value, critical => $crit, details => $details });
+        }
+
+        $hanaClient->disconnect;
+    }
+
+    $logger->info("Finished writing output to splunk log file: " . $splunk_logger->{log_file}) if $splunk_logger;
+
+    dmail::LockLib::releaselock($lockfile);
+    exit(0);
+}
+

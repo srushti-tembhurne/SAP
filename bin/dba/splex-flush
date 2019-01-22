@@ -1,0 +1,328 @@
+#!/usr/local/bin/perl -w
+#
+# A script to help flushing of shareplex queues
+#
+# $Id: //ariba/services/monitor/bin/dba/splex-flush#10 $
+#
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+
+my %filesToTransfer=();
+my $debug = 0;
+my $test = 0;
+$main::quiet = 1;
+
+sub usage 
+{
+	print "Error: $_[0]\n" if $_[0];
+	print "usage: $0 \n";
+	print "          [-h] this help\n";
+	print "          [-d] turn on debug\n";
+	print "          [-x] run in test mode, no writes\n";
+	print "          -cluster <primary|secondary> which cluster is currently live\n";
+	print "          -products <an[/buildname]|ibx|...> <an|ibx[/buildname]|...>\n";
+	print "\n";
+	exit(1);
+
+}
+
+sub getPassword
+{
+	my $prompt = shift();
+
+	my $oldState = $|;
+	$| = 1;
+	print "$prompt";
+	$| = $oldState;
+
+	if (-t STDIN) {
+		CORE::system("stty -echo");
+	}
+
+	my $key = <STDIN>;
+	chop($key);
+
+	if (-t STDIN) {
+		CORE::system("stty echo");
+		print "\n";
+	}
+
+	return $key;
+}
+
+sub main 
+{
+	my @products;
+	my $cluster;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-h/) { usage();}
+		if ($arg =~ /^-d/) { $debug++; next;}
+		if ($arg =~ /^-x/) { $test = 1; next;}
+		if ($arg =~ /^-cluster/i) { $cluster = shift(@ARGV); next;}
+		if ($arg =~ /^-pro/) { push(@products, shift(@ARGV)); next; }
+		if ($arg !~ /^-/) {
+			if ( scalar(@products) ){
+				push(@products, $arg);
+				next;
+			}
+		}
+	}
+
+
+	unless ($cluster) {
+		usage("need to specify -cluster <primary|secondary>");
+	}
+
+	unless (@products) {
+		usage("need to specify -products <an|ibx|..>...");
+	}
+
+
+	if ($debug) {
+		print "d(1)\n";
+		print "d(1) cluster = $cluster\n";
+		for my $p (@products) {
+			print "d(1) product = $p\n";
+		}
+		print "d(1)\n";
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+
+	# get the master password
+	my $oracleUnixPassword = getPassword("Enter Oracle UNIX Password (not validated):");
+
+	my %servers;
+	my $source = "src";
+	my $target = "trg";
+
+	for my $productIdentifier (@products) {
+
+		my ($productName, $buildName) = split(/\//, $productIdentifier);
+		#allocate the product
+		my $product = ariba::rc::InstalledProduct->new($productName, 
+							       $me->service(), $buildName);
+
+		$product->setClusterName($cluster);
+
+		my @dbconnections = ariba::Ops::DBConnection->connectionsForProductOfDBType($product, ariba::Ops::DBConnection->typeMain());
+
+		my $varDir = $product->default('shareplex.vardir');
+		my $port = $product->default('shareplex.spcopport');
+
+		for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbconnections)) {
+
+			my $productDbSid;
+
+			my $mainDBServer;
+			my $drDBServer;
+			my $reportingDbServer;
+			my $reportingSid;
+			my $peer;
+
+			$productDbSid = $dbc->sid();
+			$mainDBServer = $dbc->host();
+
+			$peer = $dbc->reportingDBPeer();
+			if ($peer) {
+				$reportingDbServer = $peer->host();
+				$reportingSid = $peer->sid();
+			}
+
+			$peer = $dbc->drDBPeer();
+			if ($peer) {
+				$drDBServer = $peer->host();
+			}
+
+			if ($debug) {
+				print "d(1)\n";
+				print "d(1) productName = $productName\n";
+				print "d(1) cluster = $cluster\n";
+				print "d(1) productDbSid = $productDbSid\n";
+				print "d(1) reportingSid = $reportingSid\n" if ($reportingSid);
+				print "d(1) main db server = $mainDBServer\n";
+				print "d(1) dr db server = $drDBServer\n";
+				print "d(1) reporting server = $reportingDbServer\n" if ($reportingDbServer);
+				print "d(1) vardir = $varDir\n";
+				print "d(1) port = $port\n";
+				print "d(1)\n";
+			}
+
+
+			#
+			# halt all shareplex activity.
+			# stop post on dest and export on src
+			#
+			print "\n\n";
+			print ">> press <enter> to flush queue for $productDbSid\n";
+			my $ans = <STDIN>;
+
+			$servers{$mainDBServer} = "$mainDBServer:$varDir:$port:$source";
+			$servers{$drDBServer} = "$drDBServer:$varDir:$port:$target";
+			$servers{$reportingDbServer} = "$reportingDbServer:$varDir:$port:trg" if ($reportingDbServer);
+
+			shareplexControl($mainDBServer, $oracleUnixPassword,
+					 $varDir, $port,
+					 "flush o.$productDbSid");
+
+		} 
+	}
+
+	if (keys(%servers)) {
+		while(1) {
+			for my $dbServer (keys(%servers)) {
+				my $info = $servers{$dbServer};
+				my ($host, $varDir, $port, $srcOrTarget, $qsize) = split(':', $info);
+
+				my @output;
+				print "\n\n$host ($srcOrTarget)\n";
+				if ($srcOrTarget eq $target) {
+					@output = shareplexControl($host, 
+							 $oracleUnixPassword,
+							 $varDir, $port,
+							 "status");
+
+#status on ibxdb-oracle.opslab-dr.ariba.com:2101
+#status line =
+#status line = Brief Status for ibxdb-oracle.opslab-dr.ariba.com
+#status line =
+#status line = Process          State                             PID     Running   Since
+#status line = ---------------  ------------------------------  --------  --------------------
+#status line = Cop              Running                            11364  15-Feb-02 14:08:16
+#status line = Capture          Running                            11365  15-Feb-02 14:08:16
+#status line = Read             Running                            11367  15-Feb-02 14:08:16
+#status line = Import           Running                            11451  15-Feb-02 14:09:49
+#status line = Post             Running                            11366  15-Feb-02 14:08:16
+#status line = Export           Stopped by user
+#status line = Export           Stopped by user
+#status line = Cmd & Ctrl       Running                             9975  19-Feb-02 17:11:58
+#status line =
+#status line = System is used as a source machine
+#status line =
+#status line = System summary information:
+#status line =       Queue problems
+#status line =       Warning conditions
+#status line =       An internal error has occurred
+#status line =       A configuration file was activated/deactivated
+#status line =       An error has occurred
+#status line =
+#status line =
+#status line = Destination Hosts Summary:
+#status line =    bermuda.opslab.ariba.com -
+#status line =       Warning conditions
+#status line =       An error has occurred
+#status line =
+#status line =
+#status line = There is 1 active configuration file
+#
+					for my $line (@output) {
+						$line =~ s/^\s*//;
+						$line =~ s/\s*$//;
+						if ($line =~ /^Post/o) {
+							my ($process, $state) = split(/\s+/, $line);
+							print "  $line\n";
+							last;
+						}
+						
+					}
+				}
+
+				@output = shareplexControl($host, 
+						 $oracleUnixPassword,
+						 $varDir, $port,
+						 "qstatus");
+#line = Queues Statistics for ibxdb-oracle.opslab-dr.ariba.com
+#line =   Name:  o.IBXLAB (Capture queue)
+#line =     Number of messages:          0 (Age         0 min; Size         3 mb)
+#line =     Backlog (messages):          0 (Age         0 min)
+#line =
+#line =   Name:  ibxdb-oracle (o.IBXLAB-o.IBXLAB) (Post queue)
+#line =     Number of messages:          0 (Age         0 min; Size       113 mb)
+#line =     Backlog (messages):          0 (Age         0 min)
+#line =
+#line =   Name:  ibxdb-oracle (Export queue)
+#line =     Number of messages:         16 (Age     21985 min; Size        17 mb)
+#line =     Backlog (messages):         16 (Age     21985 min)
+
+				my $checkSize = 0;
+				my $queueLine = "";
+				for my $line (@output) {
+					$line =~ s/^\s*//;
+					$line =~ s/\s*$//;
+					if ($srcOrTarget eq $source &&
+					    ($line =~ /^.*\(Capture queue\)/o ||
+						 $line =~ /^.*\(Export queue\)/o) ) {
+						$queueLine = $line;
+						$checkSize = 1;
+						next;
+					} elsif ($srcOrTarget eq $target &&
+					    ($line =~ /^.*\(Post queue\)/o ||
+						$line =~ /^.*\(Import queue\)/o) ) {
+						$queueLine = $line;
+						$checkSize = 1;
+						next;
+					}
+					if ($checkSize &&
+					    $line =~ /^\s*Number of messages/o) {
+						my ($msg, $length) = split(/\s+/, $line);
+						print "  $queueLine\n";
+						print "  $line\n";
+						$checkSize = 0;
+					}
+				}
+			}
+			print "\n\n";
+			print "<enter> to continue, ^C to abort\n";
+			my $ans = <STDIN>;
+		}
+	}
+}
+
+sub shareplexControl
+{
+	my $host = shift;
+	my $oracleUnixPassword = shift;
+	my $varDir = shift;
+	my $port = shift;
+	my $subCommand = shift;
+
+	my $spCmd = "export SP_SYS_HOST_NAME=$host; ".
+		    "export SP_SYS_VARDIR=$varDir; ".
+		    "export SP_COP_UPORT=$port; ".
+		    "export SP_COP_TPORT=$port; ".
+		    "/opt/splex/bin/sp_ctrl";
+
+	my $cmd = "ssh oracle\@$host \"$spCmd $subCommand on $host:$port\"";
+
+	#print "$subCommand on $host:$port\n";
+
+	print "d(3) will run $cmd\n" if ($debug >= 3);
+
+	my @output;
+	unless ($test) {
+		unless(ariba::rc::Utils::executeRemoteCommand(
+						$cmd,
+						$oracleUnixPassword,
+						0,
+						undef,
+						undef,
+						\@output,
+							)) {
+			#looks like sp_ctrl returns 'fail' status
+			#if subcommand was already performed previously
+			#print "ERROR: cmd $cmd failed!\n";
+		}
+	}
+
+	return (@output);
+}
+
+main();

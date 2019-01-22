@@ -1,0 +1,988 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/common/oracle-status#122 $
+#
+
+use strict;
+use File::Slurp;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::DBA::SampleSQLQueries;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+use ariba::Ops::ServiceController;
+use ariba::Ops::DatacenterController;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use ariba::rc::Globals;
+use ariba::util::Misc;
+use dmail::LockLib;
+use Parallel::ForkManager;
+
+use Math::BigInt;
+use Log::Log4perl qw (get_logger :levels);    # Import the method and level definitions ($INFO, $DEBUG, etc).
+
+my $LOCKFILE = '/tmp/oracle-status';
+
+# Query objects, key on dbsid-dbhost-dbtype
+my %queryCache = ();
+
+# query hashes (for creating Query objects), key on dbsid-dbhost-dbtype
+my %queryHashCache = ();
+
+# OracleClient objects, key on dbsid-dbhost-dbuser
+my %oracleClientCache = ();
+
+sub usage
+{
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h|-daily] -product <product>
+
+        -e                   Enables sending of email for monitor query.
+        -p                   Enables sending of pages for monitor query.
+        -d                   Turns on debug mode. 
+        -h                   Shows this help.
+        -daily               Run once per day queries only
+        -product <product>   Run for specified product name
+
+USAGE
+
+    print "(error) $error\n" if $error;
+
+    exit();
+}
+
+my $debug               = 0;
+my $quiet               = 0;
+my $sendEmail           = 0;
+my $sendPage            = 0;
+my $runDailyQueriesOnly = 0;
+
+my $me      = ariba::rc::InstalledProduct->new();
+my $service = $me->service();
+
+sub main
+{
+
+    my $productName;
+
+    while ( my $arg = shift(@ARGV) )
+    {
+        print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+        if ( $arg =~ m/^-h$/o ) { usage(); next; }
+        # Modifying to allow use of debug levels.  Most existing debug related stuff left as is and so will work
+        # regardless of the level value.  Level 2 will be used to actually run the extend-tablespace script, but
+        # using that script's debug mode.  This is to allow testing that code path as well as whether the called
+        # script will run correctly.
+        if ( $arg =~ m/^-d$/o )       { $debug              += 1;            next; }
+        if ( $arg =~ m/^-e$/o )       { $sendEmail           = 1;            next; }
+        if ( $arg =~ m/^-p$/o )       { $sendPage            = 1;            next; }
+        if ( $arg =~ m/^-daily$/ )    { $runDailyQueriesOnly = 1;            next; }
+        if ( $arg =~ m/^-product$/o ) { $productName         = shift(@ARGV); next; }
+        usage("Unknown arg: $arg");
+    }
+
+    usage("Must specify product") unless $productName;
+
+    $LOCKFILE .= '-daily' if ($runDailyQueriesOnly);
+
+    $| = 1;
+
+    # Set up for logging:
+    my $logConfigFile = $me->installDir . '/etc/ora-stat-log.conf';
+    my $configString = read_file($logConfigFile) or die "ERROR:  config file read error:  $!\n";
+
+    # This is unfortunate, but I don't know any other way to handle it, for now.  We assume the lhs of the
+    # dot could change but the right side will always be 'log'.  But we need to deal with leading path
+    # elements as well:  /var/log/oracle-status.log Since this is "static", can check for it explicitly.
+    $configString =~ s@(=\s+)/var/tmp/oracle-status/oracle-status.log@$1/var/tmp/oracle-status/oracle-status-${productName}.log@;
+
+    # Be sure we have a place to store the logfiles we create, that won't go away and is writeable.
+    -d '/var/tmp/oracle-status' or mkdir '/var/tmp/oracle-status';
+
+    Log::Log4perl::init( \$configString );
+    my $logger = get_logger();
+
+    $logger->debug("Determining products list.") if $logger->is_debug();
+    my @products = ariba::rc::InstalledProduct->installedProductsList( $service, $productName );
+
+    foreach my $product (@products)
+    {
+        next if ( $product->name() eq "ebs" );    # EBS uses AN database, avoid duplicate monitoring
+
+        my $isSSProduct = !$product->isASPProduct();
+
+        my $productLock = "$LOCKFILE-" . $product->name();
+        unless (dmail::LockLib::requestlock($productLock, 5))
+        {
+            warn "can't grab lock\n";
+            next;
+        }
+        $logger->debug( "Product " . $product->name() . " lock file set successfully, determining connections." ) if $logger->is_debug();
+
+        my @connections = ariba::Ops::DBConnection->connectionsFromProducts($product);
+        my @dbc = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections);
+
+        my $pfm = Parallel::ForkManager->new(20);
+        for my $dbc (@dbc) {
+            $pfm->start() and next;
+            my $args = { dbc => $dbc, connections => \@connections, logger => $logger, isSSProduct => $isSSProduct };
+            my $sid_lock = _run_query($args);
+            dmail::LockLib::releaselock($sid_lock) if ( $sid_lock );
+            $pfm->finish;
+        }
+        $pfm->wait_all_children;
+        dmail::LockLib::releaselock($productLock);
+    }
+}
+
+sub _processAnswer
+{
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+    # The returned value in this case is a string which will contain the single row result from the SELECT, delimited by spaces, as:
+    #    HIGHEST_OPEN_CUR       MAX_OPEN_CUR
+    # We will simply split it into two variables, using the same names.
+    my ($highest_open_cur, $max_open_cur) = split (/\s+/, ($query->results)[0]);
+    print "Open cursors:  $highest_open_cur; Max Open cursors:  $max_open_cur\n" if $debug;
+    # The return value is a percentage, calculated from the two values.  Verify $max_open_cur is not zero/undef, and is a number.
+    return ($highest_open_cur / $max_open_cur) * 100 if $max_open_cur and $max_open_cur =~ /^\d+$/;
+    return;
+}
+
+sub _run_query
+{
+    my ($args) = shift;
+
+    my $dbc         = $args->{dbc};
+    my @connections = @{ $args->{connections} };
+    my $logger      = $args->{logger};
+    my $isSSProduct = $args->{isSSProduct};
+
+    my $cluster = $me->currentCluster();
+    my $email   = $me->default('notify.email');
+
+    my $dbuser = "system";
+    my $dbpass = $me->default("dbainfo.$dbuser.password");
+
+    my $product     = $dbc->product();
+    my $productName = $product->name();
+
+    my $host  = $dbc->host();
+    my $dbsid = $dbc->sid();
+    my $type  = $dbc->type();
+
+    my $logger_prefix = qq($host/$dbsid/$type);
+
+    # skip if not oracle
+    if ($dbc->dbServerType() ne ariba::Ops::DBConnection->oracleDBServerType())
+    {
+        $logger->debug( "$logger_prefix : DB ServerType:" . $dbc->dbServerType() . " ne to OracleDBServerType:"
+            . ariba::Ops::DBConnection->oracleDBServerType() ) if $logger->is_debug();
+        return;
+    }
+
+    # skip dev database not maintained by ops
+    return if $dbsid =~ /^(h|l|s|n)o/io;
+    return if $dbsid =~ /^jdbctest$/i;     # well-known sid used for jdbc testing
+
+    $logger->debug("$logger_prefix: Preparing to find all schemas (host $host; sid $dbsid; type $type.") if $logger->is_debug();
+
+    # all schemas on this sid that will be used by this product
+    my @schemas = map { "'" . uc( $_->user() ) . "'" } grep { $_->sid() eq $dbsid } @connections;
+    if ( $logger->is_debug() )
+    {
+        foreach my $schema (@schemas)
+        {
+            $logger->debug("$logger_prefix: Found schema:  $schema");
+        }
+    }
+
+    # fetch the oracleClient from a cached querymanager to avoid
+    # opening duplicate connections
+    my $oracleClient;
+
+    # This will be the same for products like AES across all customers
+    my $queryCacheKey = join( '-', $dbsid, $host, $type );
+
+    my $ocCacheKey = join( "", $dbuser, $dbsid, $host );
+    if ( $oracleClientCache{$ocCacheKey} )
+    {
+        $oracleClient = $oracleClientCache{$ocCacheKey};
+        if ($oracleClient->error())
+        {
+            warn $oracleClient->error() if $debug;
+            $logger->debug("$logger_prefix : Oracle client error") if $logger->is_debug();
+            return;
+        }
+    }
+    else
+    {
+        $oracleClient = ariba::Ops::OracleClient->new( $dbuser, $dbpass, $dbsid, $host );
+
+        # on connect timeout, just keep going; this will cause
+        # queries to fail with a connect error, which is what
+        # we want.
+        $oracleClientCache{$ocCacheKey} = $oracleClient;
+        $oracleClient->connect( 20, 4 );
+    }
+
+    my ( $expando, $tab, $dbname );
+
+    $tab = $productName;
+    if ($dbc->isDR())
+    {
+
+        #
+        # there is no 'system' login for databases in
+        # physical replication mode
+        if ($dbc->isPhysicalReplication())
+        {
+            $logger->debug("$logger_prefix : dbc is physical replication") if $logger->is_debug();
+            return;
+        }
+
+        # if we are running on secondary cluster
+        # don't monitor the primary DB
+        if ($product->currentCluster() eq "secondary")
+        {
+            $logger->debug("$logger_prefix : Secondary cluster ") if $logger->is_debug();
+            return;
+        }
+
+        $expando = "oracle-status-for-dr-db";
+    }
+    elsif ($dbc->isReplicated()) {
+    	$expando = "oracle-status-for-replicated-db";
+    }
+    else
+    {
+        $expando = "oracle-status-for-main-db";
+    }
+
+    $dbname = "$type-db";
+    $dbname =~ s/-/ /g;
+
+    #
+    # XXX HACK for TMID 12396, 17272
+    #
+
+    my $warnThresholdForCacheHit = 80;
+    my $critThresholdForCacheHit = 60;
+
+    if ($productName eq 'anl' || $productName eq 'aes')
+    {
+        $warnThresholdForCacheHit = 60;
+        $critThresholdForCacheHit = 50;
+    }
+
+    # Just want to keep track of this number, it is not
+    # something we want to page or warn on
+    if ($dbsid eq 'edipro1' || $productName eq 'perf')
+    {
+        $warnThresholdForCacheHit = 0;
+        $critThresholdForCacheHit = 0;
+    }
+
+    unless ( $queryHashCache{$queryCacheKey} )
+    {
+
+        my $openCursorsSql = q{
+        select max(a.value) as highest_open_cur, p.value as max_open_cur
+        from v$sesstat a, v$statname b, v$parameter p
+        where a.statistic# = b.statistic#
+            and b.name = 'opened cursors current'
+            and p.name= 'open_cursors'
+        group by p.value;
+        };
+
+        #
+        # generate sid-wide queries
+        #
+        $logger->debug("$logger_prefix: Preparing sid-wide queries.") if $logger->is_debug();
+        my %sidQueries = (
+
+            "$dbsid remaining sessions on $dbname" => {
+                recordMaxResults => 30000,
+                recordDataType   => "gauge",
+                info             => "answer",
+                warn             => "answer < 200",
+                crit             => "answer < 100",
+
+                sql => q{
+                select /*+ no_merge(p) */ p_value-sesscount
+                from (select count(username) sesscount from v$session),
+                (select to_number(value) p_value from v$parameter where name = 'sessions') p
+                },
+
+                details => {
+                    "current sessions per app" => {
+                        noRowCount => 1,
+                        sql => q{
+                        select count(*), machine, program from 
+                        v$session group by machine, program order
+                        by count(*) desc;
+                        },
+                    }
+                }
+            },
+
+            "$dbsid:  Percentage of used open cursors for $dbname" => {
+                info          => "answer && answer < 90 ",
+                warn          => "answer && answer >= 90",
+                crit          => "answer && answer >= 95",
+                format        => "%.2f%%\n",
+                sql           => $openCursorsSql,
+                processAnswer => \&_processAnswer,
+            },
+
+            "$dbsid dataguard open cursors on $dbname " => {
+                info             => 1,
+                recordMaxResults => 30000,
+                recordDataType   => "gauge",
+                sql              => q{
+                SELECT 
+                SUM(a.value)
+                FROM 
+                v$sesstat a, v$session s 
+                WHERE 
+                s.program like '%LSP%'
+                    and s.sid=a.sid and a.STATISTIC#=3;
+                },
+            },
+
+            #
+            # XXX HACK for TMID 12396, 16698
+            #
+            "$dbsid Cache hit ratio (should be above 60% and near 90%) on $dbname" => {
+                recordMaxResults => 60000,
+                recordDataType   => "gauge",
+                info             => $expando =~ /replicated/ ? 1 : "answer",
+                warn             => $expando =~ /replicated/ ? 0 : "answer < $warnThresholdForCacheHit",
+                crit             => $expando =~ /replicated/ ? 0 : "answer < $critThresholdForCacheHit",
+                sql              => q{
+                select round((1 - (a.reads / (b.bgets + c.cgets)))*100,2)
+                from
+                (select value reads from v$sysstat
+                where name = 'physical reads') a,
+                (select value bgets from v$sysstat
+                where name = 'db block gets') b,
+                (select value cgets from v$sysstat where name =
+                'consistent gets') c
+                },
+            },
+
+            "$dbsid size on $dbname" => {
+                recordMaxResults => 30000,
+                recordDataType   => "gauge",
+                info             => 1,
+                format           => "%.d MB\n",
+                sql              => q{select sum(bytes)/1024/1024 from sys.dba_data_files}
+            },
+
+            "$dbsid log file sync wait on $dbname" => {
+                recordMaxResults => 30000,
+                recordDataType   => "count",
+                info             => 1,
+                warn             => 'answer > 100',
+                crit             => 'answer > 300',
+                format           => "%.d ms\n",
+                sql              => q{select round(AVERAGE_WAIT_FG,0) AVERAGE_WAIT_FG from v$system_event where event = 'log file sync'}
+            },
+
+            "$dbsid db files used on $dbname" => {
+                info             => 1,
+                warn             => $expando =~ /replicated/ ? 0 : "answer > 80",
+                crit             => $expando =~ /replicated/ ? 0 : "answer > 90",
+                format           => "%.2f%%\n",
+                recordMaxResults => 60000,
+                timeout          => 180,
+                sql              => q{
+                select (a.dbf_num/b.value)*100 
+                from ( select count(*) dbf_num from v$datafile) a, 
+                v$parameter b 
+                where b.name = 'db_files';}
+            },
+            "$dbsid number of child cursors on $dbname" => {
+                recordMaxResults => 30000,
+                recordDataType   => "gauge",
+                sql              => q{
+                select max(version_count) from v$sqlarea},
+            },
+
+            "$dbsid statistic retention time on $dbname" => {
+                recordMaxResults => 30000,
+                recordDataType   => "gauge",
+                info             => 1,
+                warn             => $expando =~ /replicated/ ? 0 : "answer != 0",
+                sql              => q{
+                select dbms_stats.get_stats_history_retention from dual},
+            },
+
+            "$dbsid dynamic parameters with boolean or specific values $dbname" => {
+                info => 1,
+                warn => "answer != 0 && answer ne previousAnswer",
+                sql  => q{
+                select count(*) from v$parameter where ismodified like 'SYSTEM%'},
+                ticketOnWarnOpenAfterMinutes => 1,
+                ticketOwner                  => "unassigned-dba",
+                details                      => {
+                    "dynamic parameters" => {
+                        sql => q{select name, value from v$parameter where ismodified like 'SYSTEM%'},
+                    }
+                }
+            },
+        );
+        my $q_Name = "$productName/"."$dbsid"."_room_allocated_for_objects_on_"."$type"."_db";
+        my $que = ariba::monitor::Query->new($q_Name);
+        my $l_time = $que->checkTime;
+        my $time = time;
+        my $diff = int(($time-$l_time)/60);
+        if ($diff > 1440){
+             %sidQueries = (
+                "$dbsid room allocated for objects on $type db" => {
+                 info   => 1,
+                 format => "%.d MB\n",
+                 sql    => q{select /*+ no_merge(d) */ sum(bytes)/1024/1024 from sys.dba_segments d}
+                 },
+             );
+        }
+
+        ## Community/AUC only:
+        if ( $productName =~ /^community$/i )
+        {
+            $logger->debug("$logger_prefix: Community/AUC only") if $logger->is_debug();
+            $sidQueries{"Checking for the DRCP Status on $dbname"} = {
+                crit => 'answer eq "INACTIVE"',
+                sql  => q{select STATUS from dba_cpool_info},
+            },
+
+            $sidQueries{"Checking for the Total number of client requests that had to wait due to non-availability of free pooled servers on $dbname"} = {
+                warn => 'numrows > 0',
+                sql  => q{select num_requests, num_waits from v$cpool_stats where num_waits > 0},
+            },
+
+            $sidQueries{"Checking for the maximum pool that have ever reached maximum numbers on $dbname"} = {
+                warn    => "answer == varmaxsize",
+                maxsize => q{select maxsize from dba_cpool_info},
+                sql     => q{select historic_max from v$cpool_stats},
+            }
+
+        }
+
+        # Flashback queries need to be Prod-only
+        # tmid: 162265
+        if (ariba::Ops::ServiceController::isProductionServicesOnly($service))
+        {
+            $logger->debug("$logger_prefix: Flashback queries - prod only.") if $logger->is_debug();
+            $sidQueries{"$dbsid flashback status on $dbname"} = {
+                info => 1,
+                crit => 'answer eq "NO"',
+                sql  => q{select flashback_on from v$database},
+            };
+            $sidQueries{"$dbsid hours of flashback on $dbname"} = {
+                info             => 1,
+                recordMaxResults => 30000,
+                recordDataType   => "gauge",
+                warn             => $expando =~ /replicated/ ? 0 : "answer < 12",
+                sql              => q{select trunc((sysdate-oldest_flashback_time)*24) "Hours of Flashback" from v$flashback_database_log},
+            };
+            #HOA-88629 - moving force logging to prod only section
+            $sidQueries{"$dbsid force_logging setting enabled $dbname"} = {
+                info => 'answer',
+                crit => 'answer eq "NO"',
+                sql  => q{select force_logging from v$database},
+            };
+
+        }
+
+        if ($expando =~ m/dr/i)
+        {
+            $logger->debug("$logger_prefix: $dbsid LOG_AUTO_DELETE status") if $logger->is_debug();
+            $sidQueries{"$dbsid LOG_AUTO_DELETE status"} = {
+                warn                         => 'answer eq "FALSE"',
+                ticketOnWarnOpenAfterMinutes => 10,
+                ticketOwner                  => "unassigned-dba",
+                openTicketInServices         => "all",
+                sql                          => q{select value
+                from dba_logstdby_parameters
+                where name='LOG_AUTO_DELETE';},
+                processAnswer => sub {
+                    my $self = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+                    # Prevent tickets from created for db down / errors in opslab
+                    $self->deleteTicketOnWarnOpenAfterMinutes() if ( $self->error() && !( ariba::Ops::ServiceController::isProductionServicesOnly($service) ) );
+                    return join( "\n", $self->results() );
+                },
+            };
+        }
+
+        if ($runDailyQueriesOnly)
+        {
+            $logger->debug("$logger_prefix: Run daily queries only.") if $logger->is_debug();
+            %sidQueries = (
+
+                "$dbsid undo tablespace used on $dbname" => {
+                    recordMaxResults             => 10000,
+                    format                       => "%.2f %%\n",
+                    info                         => 1,
+                    warn                         => "answer > 90",
+                    ticketOnWarnOpenAfterMinutes => 30,
+                    ticketOwner                  => "unassigned-dba",
+                    sql                          => q{
+                    select (sum(bytes)*100)/sum(maxbytes)  
+                    from dba_data_files 
+                    where tablespace_name='UNDO1';
+                    },
+                },
+
+                "$dbsid db temp files used on $dbname" => {
+                    recordMaxResults             => 10000,
+                    format                       => "%.2f %%\n",
+                    info                         => 1,
+                    warn                         => "answer > 90",
+                    ticketOnWarnOpenAfterMinutes => 30,
+                    ticketOwner                  => "unassigned-dba",
+                    sql                          => q{
+                    select (sum(bytes)*100)/sum(maxbytes)
+                    from dba_temp_files;
+                    },
+                },
+            );
+        }
+        my $colsep = ariba::Ops::OracleClient->colsep();
+
+        # this is for 10g only
+        # These tablepsaces are used by all tables across the sid
+        # run these only once per sid
+        my @sysTablespacenames;
+        unless ($runDailyQueriesOnly)
+        {
+            unless (
+                $oracleClient->executeSqlWithTimeout(
+                    q{select tablespace_name, min_extlen 
+                    from dba_tablespaces 
+                    where tablespace_name in ('SYSTEM', 'SYSAUX') 
+                        and extent_management != 'DICTIONARY'
+                    }, undef, \@sysTablespacenames
+                )
+            )
+            {
+                warn("timeout while running SQL for uniform table space names in $queryCacheKey");
+                $logger->debug("$logger_prefix: Timeout while running SQL for uniform table space names") if $logger->is_debug();
+                return;
+            }
+
+            # The items in @sysTablespacenames are objects, from which we should probably extract something useful.
+            if ( $logger->is_debug() )
+            {
+                $logger->debug("$logger_prefix: Selected sys table space names:") if $logger->is_debug();
+                foreach my $tsn (@sysTablespacenames)
+                {
+                    $logger->debug("$logger_prefix: Tablespace name:  $tsn");
+                }
+            }
+        }
+
+        for my $row (@sysTablespacenames)
+        {
+
+            my ( $sysTablespacename, $minExtLen ) = split( /$colsep/, $row );
+
+            $sidQueries{"$dbsid tablespace $sysTablespacename auto-extend size in MB on $dbname"} = {
+                info             => "answer",
+                warn             => "answer < 1000",
+                crit             => "answer < 600",
+                recordMaxResults => 60000,
+                recordDataType   => "gauge",
+                format           => "%d\n",
+                sql              => q{
+                select round(((select sum(floor(decode(MAXBYTES,0,BYTES,MAXBYTES)-BYTES))
+                from dba_data_files c, dba_tablespaces d
+                where c.tablespace_name='} . $sysTablespacename . q{'
+                    and c.tablespace_name=d.tablespace_name))/1024/1024)
+                from dual},
+            };
+            $logger->debug("$logger_prefix: Created queries for sys table space ") if $logger->is_debug();
+        }
+        $queryHashCache{$queryCacheKey} = \%sidQueries;
+
+        #
+        # generate all schema-specific (tablespace) queries
+        #
+
+        my @uniformTablespacenames;
+        unless ($runDailyQueriesOnly)
+        {
+            unless (
+                $oracleClient->executeSqlWithTimeout(
+                    "select tablespace_name, min_extlen from dba_tablespaces where
+                    tablespace_name not in ('RBS','AUDIT_STORAGE','CSIDATA1', 'STBTEMP01', 'TEMP','UNDO1', 'SYSTEM', 'SYSAUX') and
+                    ALLOCATION_TYPE in ('UNIFORM','SYSTEM')", undef, \@uniformTablespacenames
+                )
+            )
+            {
+                warn("timeout while running SQL for uniform table space names in $queryCacheKey");
+                $logger->debug("$logger_prefix : Timeout while running SQL for uniform tablespace in runDailyQueriesOnly") if $logger->is_debug();
+                return;
+            }
+            if ( $logger->is_debug() )
+            {
+                $logger->debug("$logger_prefix: Selected uniform tablespace names:") if $logger->is_debug();
+                foreach my $tsn (@uniformTablespacenames)
+                {
+                    $logger->debug("$logger_prefix: Tablespace name:  $tsn");
+                }
+            }
+        }
+
+        my $freeChunkWarnLevel;
+        my $freeChunkCritLevel;
+
+        for my $row (@uniformTablespacenames)
+        {
+
+            my ( $uniformTablespacename, $minExtLen, $user ) = split( /$colsep/, $row );
+            $minExtLen /= ( 1024 * 1024 );
+
+            # TMID: 26887
+            # ssspro2 and anlpro1 sids tend to grow very fast so the
+            # thresholds need to be raised
+            # TMID: 29237
+            # raise threadsholds for anpro1
+            #
+            # TMID: 49364
+            # ssspro2 thresholds raised to give DBAs more time to
+            # respond
+            #
+            # TMID: 87247
+            # Raised alpro1 threshold for the same reason
+            #
+            # HOA: 142850
+            # Raised all the threshold values
+            #
+            if ( $uniformTablespacename !~ /TOOLS|ANLTESTDATA|ANSDATA/i )
+            {
+                if ( $dbsid =~ /anlpro1|anpro1|anpro2|ancr1|ssspro1|ssspro3|ssspro5|s2pro1|byrpro0|byrpro1|byrpro2|perfpro1|edipro1/i )
+                {
+                    $freeChunkWarnLevel = 25000 / $minExtLen;
+                    $freeChunkCritLevel = 20000 / $minExtLen;
+                }
+                elsif ( $dbsid =~ /alpro1|ssspro2|ssspro4|ssspro6|s2pro2|sdbpro1/i )
+                {
+                    $freeChunkWarnLevel = 25000 / $minExtLen;
+                    $freeChunkCritLevel = 20000 / $minExtLen;
+                }
+                else
+                {
+                    $freeChunkWarnLevel = 25000 / $minExtLen;
+                    $freeChunkCritLevel = 20000 / $minExtLen;
+                }
+            }
+            else
+            {
+                $freeChunkWarnLevel = 25000 / $minExtLen;
+                $freeChunkCritLevel = 20000 / $minExtLen;
+            }
+
+            my $path = "http://ops.ariba.com/documentation/prodops/common/extend_tablespacetool.txt";
+            my $queries;
+            if ( $uniformTablespacename eq "TOOLS" || $isSSProduct )
+            {
+                # 10g shared tablespace, run this only once per sid
+                $queries = $queryHashCache{$queryCacheKey};
+            }
+            else
+            {
+                $queries = {};
+                $queryHashCache{"$queryCacheKey-$uniformTablespacename"} = $queries;
+            }
+
+            my $asql = <<bsql;
+                            select (free+grow)/1024/1024 space_mb from
+                            (select nvl(sum(maxbytes-bytes),0) grow
+                            from dba_data_files where maxbytes > bytes
+                            and tablespace_name = '$uniformTablespacename') a,
+                            (select nvl(sum(bytes),0) free from dba_free_space
+                            where tablespace_name = '$uniformTablespacename') b
+bsql
+
+            $queries->{ "$dbsid uniform tablespace $uniformTablespacename free chunk(" . $minExtLen . "M) number(inclspace avail via autoextend) on $dbname" } = {
+                info                         => "answer",
+                warn                         => "answer < $freeChunkWarnLevel",
+                crit                         => "answer < $freeChunkCritLevel",
+                recordMaxResults             => 60000,
+                recordDataType               => "gauge",
+                note                         => "For increasing tablespace refer $path",
+                ticketOnWarnOpenAfterMinutes => 30,
+                ticketSubmitter              => 'dept_an_ops_prod@ariba.com',
+                ticketOwner                  => "unassigned-sre",
+                format                       => "%d\n",
+                sql                          => $asql,
+            };
+
+            if ($productName eq "s4" && $type =~ /star/i)
+            {
+                $queries->{ "$dbsid uniform tablespace $uniformTablespacename required chunk(" . $minExtLen . "M) on $dbname" } = {
+                    recordMaxResults => 60000,
+                    recordDataType   => "gauge",
+                    sql              => q{
+                    select max(bytes/1024/1024)
+                    from dba_segments where SEGMENT_NAME in
+                    ('DIM_SUPPLIER','FACT_INVOICE_LINE_ITEM','FACT_PO_LINE_ITEM')
+                        and TABLESPACE_NAME='} . $uniformTablespacename . q{'},
+                    processAnswer => sub { return main::isInitialized() }
+                };
+            }
+        }
+    }    # unless ($queryHashCache{$queryCacheKey})
+
+    my $sidLock = "$LOCKFILE-$queryCacheKey";
+    unless (dmail::LockLib::requestlock( $sidLock, 5 ))
+    {
+        warn "can't grab lock\n";
+        $logger->debug("$logger_prefix : Can't grab lock");
+        return;
+    }
+    $logger->debug("$logger_prefix: Lock file for sid $queryCacheKey.") if $logger->is_debug();
+
+    unless ($isSSProduct || $runDailyQueriesOnly)
+    {
+        #
+        # run per-schema queries
+        #
+        my @tablespacesForSchemas = ();
+        unless (
+            $oracleClient->executeSqlWithTimeout(
+                q{
+                SELECT UNIQUE(tablespace_name)
+                FROM dba_ts_quotas
+                WHERE username IN (} . join( ",", @schemas ) . q{)
+                }, 2 * 60, \@tablespacesForSchemas
+            )
+        )
+        {
+            return ( $sidLock );
+        }
+
+        my %schemaQueries;
+
+        # copy to %schemaQueries those queries that were created for
+        # sid-host-type-tablespace
+        #
+        for my $ts (@tablespacesForSchemas)
+        {
+            my $tsKey = "$queryCacheKey-$ts";
+            map { $schemaQueries{$_} = $queryHashCache{$tsKey}->{$_} }    # copy to %schemaQueries from %queryHashCache
+            keys %{ $queryHashCache{$tsKey} }                           # for all queries that apply to this tablespace
+            if exists $queryHashCache{$tsKey};                          # but only if there are any
+        }
+
+        my $schemaQM = ariba::monitor::QueryManager->newWithDetails( $expando, $tab, $product->service(), $product->customer(), \%schemaQueries, );
+
+        $schemaQM->setSQLConnectInfoFromOracleClient($oracleClient);
+
+        # Change @extend to be a hash, containing two arrays of tablespaces, segregated by status.  This allows processing 'crit' issues first.
+        my %extend = (crit => [], warn => []); # setting to be empty arrays, which evaluate to zero in Boolean context.
+        foreach my $query ( $schemaQM->queries() )
+        {
+            next unless ( $query->queryName() =~ m/uniform tablespace/ and ( $query->status() eq "warn" or $query->status() eq "crit" ) );
+            $query->queryName() =~ m/(.*?) uniform tablespace (.*?) free chunk/;
+            my $sid        = $1;
+            my $tablespace = $2;
+            # Only have 'crit' or 'warn' status here, nothing else.
+            if ($query->status() eq "warn")
+            {
+                push( @{$extend{warn}}, $tablespace );
+            }
+            else
+            {
+                push( @{$extend{crit}}, $tablespace );
+            }
+            $logger->debug("$logger_prefix : Adding tablespace $tablespace for sid $sid ($host schema queries).") if $logger->is_debug();
+        }
+
+        my $stopFile = $me->installDir . '/tmp/extend-tablespace-stopfile';
+        if (! -f $stopFile &&
+            (@{$extend{crit}} || @{$extend{warn}}) &&
+            grep /$service/, (ariba::rc::Globals::allServicesForDatacenters (ariba::Ops::DatacenterController::devlabDatacenters (),
+                                                                             ariba::Ops::DatacenterController::salesDatacenters (),
+                                                                             ariba::Ops::DatacenterController::prodDatacenters ()
+                                                                            )
+                             )
+           )
+        {
+            my $binDir = $me->installDir () . "/bin";
+            my $cmd = "$binDir/dba/extend-tablespace $productName $dbsid";
+            $cmd .= " -customer " . $product->customer () if (!$isSSProduct);
+            $cmd .= " @{$extend{crit}} @{$extend{warn}}";
+            if ($debug && $debug < 2) # If debug is set, level 2 will now run $cmd
+            {
+                print qq(Would run "$cmd"\n);
+            }
+            else
+            {
+                # Modify $cmd to include -d option to force debug mode in extend-tablespace script.  Based on the options processing
+                # in the script, the -d option can simply be appended to the string.
+                $cmd .= ' -d' if $debug and $debug > 1;
+                if (my $ret = r($cmd))
+                {
+                    $logger->logwarn ("$logger_prefix: Failed to run $cmd: $ret ($host schema queries)");
+                }
+                else
+                {
+                    # Changing to produce logging data at warn level, all the time.
+                    $logger->logwarn ("$logger_prefix: extend-tablespace successful for $productName $dbsid ($host schema queries)."
+                                     . "extended tablespaces:  crit:  '@{$extend{crit}}' warn:  '@{$extend{warn}}'");
+                }
+            }
+            $schemaQM->recomputeStatus;
+        }
+
+        $schemaQM->processQueriesUsingServer ( $debug, $email, $sendEmail, $sendPage );
+    }
+    #
+    # run sid-wide queries
+    #
+    my $sidQM = ariba::monitor::QueryManager->newWithDetails ($expando, $tab, $product->service(), $product->customer(), $queryHashCache{$queryCacheKey},);
+    $sidQM->setSQLConnectInfoFromOracleClient ($oracleClient);
+
+    my %extend = (crit => [], warn => []);
+    foreach my $query ($sidQM->queries())
+    {
+        next unless ($query->queryName() =~ m/uniform tablespace/ and ($query->status() eq "warn" or $query->status() eq "crit"));
+        $query->queryName () =~ m/(.*?) uniform tablespace (.*?) free chunk/;
+        my $sid        = $1;
+        my $tablespace = $2;
+        # Only have 'crit' or 'warn' status here, nothing else.
+        if ($query->status() eq "warn")
+        {
+            push( @{$extend{warn}}, $tablespace );
+        }
+        else
+        {
+            push( @{$extend{crit}}, $tablespace );
+        }
+        $logger->debug ("$logger_prefix: Adding tablespace $tablespace for sid $sid ($host sid-wide queries).") if $logger->is_debug();
+    }
+
+    my $stopFile = $me->installDir . '/tmp/extend-tablespace-stopfile';
+    if (! -f $stopFile &&
+        (@{$extend{crit}} || @{$extend{warn}}) &&
+        grep /$service/, (ariba::rc::Globals::allServicesForDatacenters (ariba::Ops::DatacenterController::devlabDatacenters (),
+                                                                         ariba::Ops::DatacenterController::salesDatacenters (),
+                                                                         ariba::Ops::DatacenterController::prodDatacenters () 
+                                                                        )
+                         )
+       )
+    {
+        my $binDir = $me->installDir () . "/bin";
+        my $cmd = "$binDir/dba/extend-tablespace $productName $dbsid";
+        $cmd .= " -customer " . $product->customer() if (!$isSSProduct);
+        $cmd .= " @{$extend{crit}} @{$extend{warn}}";
+
+        if ($debug && $debug < 2) # Debug level 2 will now run $cmd
+        {
+            print qq(Would run "$cmd"\n);
+        }
+        else
+        {
+            # Modify $cmd to include -d option to force debug mode in extend-tablespace script.  Based on the options processing
+            # in the script, the -d option can simply be appended to the string.
+            $cmd .= ' -d' if $debug and $debug > 1;
+            if (my $ret = r($cmd))
+            {
+                $logger->logwarn ("$logger_prefix (PID $$): Failed to run $cmd: $ret ($host sid-wide queries)");
+            }
+            else
+            {
+                # Changing to produce logging data at warn level, all the time.
+                $logger->logwarn ("$logger_prefix (PID $$): extend-tablespace successful for $productName $dbsid ($host sid-wide queries)."
+                                 . "extended tablespaces:  crit:  '@{$extend{crit}}' warn:  '@{$extend{warn}}'");
+            }
+        }
+        $sidQM->recomputeStatus;
+    }
+
+    # check if we've already run the sid-wide queries
+    unless ( $queryCache{$queryCacheKey} )
+    {
+        $sidQM->processQueriesUsingServer( $debug, $email, $sendEmail, $sendPage );
+
+        $queryCache{$queryCacheKey} = [ $sidQM->queries() ];
+    }
+    else
+    {
+        # pull out all queries from the cached QM
+        my %queriesHash = map { $_->queryName() => $_ } @{ $queryCache{$queryCacheKey} };
+
+        # for each query in the sid-wide QM, match any queries
+        # that have already been run and stuff the previous values
+        for my $query ( $sidQM->queries() )
+        {
+            my $cachedQuery = $queriesHash{ $query->queryName() };
+            unless ($cachedQuery)
+            {
+                print ">>>NOT FOUND ", $query->queryName() . " for $queryCacheKey\n";
+                return ( $sidLock );
+            }
+
+            # Stuff the data from the previous query here.
+            for my $attribute ( $cachedQuery->attributes() )
+            {
+                $query->setAttribute( $attribute, $cachedQuery->attribute($attribute) );
+            }
+
+            $query->deleteTicketOnWarnOpenAfterMinutes();
+            $query->setParentQueryManager($sidQM);
+            $query->setCustomer( $sidQM->customer() );
+        }
+
+        # Don't notify here - notification has already been sent for
+        # these sid-wide queries
+        if ($debug)
+        {
+            $sidQM->displayToStdout();
+        }
+        else
+        {
+            my $monserver = ariba::Ops::PageUtils::monitorServer();
+            unless ( defined $monserver )
+            {
+                warn "oracle-status: ariba::Ops::PageUtils::monitorServer() couldn't find a monitor server.\n";
+            }
+            else
+            {
+                $sidQM->checkStatus();
+                if ( ( my $ret = $sidQM->appendToServer($monserver) ) != 0 )
+                {
+                    warn "oracle-status: appending to server failed with ret $ret";
+                }
+                else
+                {
+                    $sidQM->archiveResultsOnServer();
+                }
+            }
+        }
+    }
+    dmail::LockLib::releaselock($sidLock);
+}
+
+sub isInitialized
+{
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+    unless ( $query->results() )
+    {
+        return "schema has not been initialized";
+    }
+
+    return $query->results();
+}
+
+main();

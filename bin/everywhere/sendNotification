@@ -1,0 +1,130 @@
+#!/usr/local/bin/perl -w
+
+# Stub program to allocate an ariba::Ops::NotificationRequest and send it
+#
+# Called by programs that would like to but can't link directly to our perl
+# libraries.   If the caller is perl, use ariba::Ops::NotificationRequest
+# directly
+#
+#
+# $Id: //ariba/services/monitor/bin/everywhere/sendNotification#3 $
+#
+
+use lib qw(/usr/local/ariba/lib);
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../lib/perl";
+
+use ariba::Ops::NotificationRequest;
+use ariba::Ops::PageUtils;
+use ariba::rc::InstalledProduct;
+
+use strict;
+
+sub main {
+    my $debug = 0;
+
+    my $message;
+    my $severity;
+    my $subject;
+    my $sender = $0;
+
+    my $product;
+    my $service;
+
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-h/) { usage();}
+        if ($arg =~ /^-d/) { $debug = 1; next;}
+
+        if ($arg =~ /^-sender/ ) { $sender = shift(@ARGV); next; }
+
+        if ($arg =~ /^-subject/) { $subject = shift(@ARGV); next; }
+
+        if ($arg =~ /^-product/) { $product = shift(@ARGV); next; }
+        if ($arg =~ /^-service/) { $service = shift(@ARGV); next; }
+
+        if ($arg =~ /^-crit/) { $severity = "crit"; next; }
+        if ($arg =~ /^-warn/) { $severity = "warn"; next; }
+        if ($arg =~ /^-info/) { $severity = "info"; next; }
+    }
+
+    usage("need service") unless $service;
+    usage("need product") unless $product;
+    usage("need severity") unless $severity;
+    usage("need subject") unless $subject;
+
+    my $body = join("", <STDIN>);
+
+    my $me = ariba::rc::InstalledProduct->new($product, $service);
+    my $customer = $me->customer();
+    my $cluster = $me->currentCluster();
+
+    # some products have "notify" in dd.xml, some have notify.email
+
+    my $notify = $me->default("notify") || $me->default("notify.email");
+
+    my $server = ariba::Ops::PageUtils::pageServer($me);
+
+    my $notificationRequest = ariba::Ops::NotificationRequest->newMessage(
+        $severity, 
+        $sender, 
+        $product, 
+        $service, 
+        $customer,
+        $cluster,
+        $subject, 
+        $body,
+        $notify
+    );
+
+    $notificationRequest->setDebug($debug);
+    my $return = $notificationRequest->send($server);
+
+    if ( $return ) {
+        exit 0;
+    } else {
+        print STDERR "-----------------------------------------\n";
+        print STDERR scalar(localtime(time)),"\n";
+        print STDERR "notificationRequest->send($server) failed,\n";
+        print STDERR "returned $return\n";
+        print STDERR "notificationRequest was: \n";
+        $notificationRequest->print(*STDERR);
+        print STDERR "-----------------------------------------\n";
+        
+        exit $return;
+    }
+}
+
+sub usage {
+    my $error = shift;
+
+    print "error: $error\n" if $error;
+    print "usage: sendNotification -product <product> -service <service> <-info|-warn|-crit> -subject <subject> [-sender sender]\n";
+    print "\n";
+    print "  This program is for use by programs that want to allocate\n";
+    print "  ariba::Ops::NotificationRequests but can not link to that library\n";
+    print "  directly.  (for example, when the caller is a java program)\n";
+    print "  ariba::Ops::NotificationRequest is the top level class for\n";
+    print "  programatically sending notifications to AN Operations\n";
+    print "\n";
+    print "  The body of the notificationRequest is read from stdin.\n";
+    print "\n";
+    print "   -product  product API product name (like an, ibx, edi...)\n";
+    print "   -service  product API service name (like prod, dev, qa, beta...)\n";
+    print "   -sender   set the name of the sending program\n";
+    print "   -subject  set the subject for notifications\n";
+    print "\n";
+    print "   -info   notification is just informational\n";
+    print "   -warn   notification is important\n";
+    print "   -crit   notification is critial\n";
+    print "\n";
+    print "   -help   this help\n";
+    print "\n";
+    print "  sendNotification will return a non-zero exit code and\n";
+    print "  error messages on stderr if it fails.\n";
+    print "\n";
+    exit(1);
+}
+
+main();

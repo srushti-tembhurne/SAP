@@ -1,0 +1,56 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+
+sub main {
+	my $sar = '/usr/sbin/sar';
+
+	exit(1) unless -x $sar;
+	exit(1) unless defined $ARGV[0] and $ARGV[0] =~ /^(runqsz|pgscan)$/;
+
+	if ($ARGV[0] eq 'pgscan') {
+		currentForPageScan($sar);
+	} else {
+		currentForRunQueue($sar);
+	}
+
+	exit(0);
+}
+
+sub currentForPageScan {
+	my $sar = shift;
+
+	open(SAR, "$sar -g |") or die "Can't open [$sar -g]: $!";
+	my @output = <SAR>;
+	close(SAR);
+
+	pop @output;
+	pop @output;
+
+	my $pgscan = (split /\s+/, pop @output)[4] || '0.00';
+
+	$pgscan = '0.00' unless $pgscan =~ /\d+/;
+
+	print "$pgscan\n";
+}
+
+sub currentForRunQueue {
+	my $sar = shift;
+
+	open(SAR, "$sar -q |") or die "Can't open [$sar -q]: $!";
+	my @output = <SAR>;
+	close(SAR);
+
+	pop @output;
+	pop @output;
+
+	my $runqsz = (split /\s+/, pop @output)[1] || '0.0';
+
+	$runqsz = '0.00' unless $runqsz =~ /\d+/;
+
+	print "$runqsz\n";
+}
+
+main();
+
+__END__

@@ -1,0 +1,110 @@
+#!/usr/local/tools/bin/perl
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use Getopt::Long;
+use JSON;
+use Data::Dumper;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+
+main();
+
+sub main
+{
+    my ($debug, $sendEmail, $sendPage, $productName);
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    GetOptions  (
+                    'debug|d'         => \$debug,
+                    'sendemail|e'     => \$sendEmail,
+                    'sendpage|p'      => \$sendPage,
+                    'product|prod=s'  => \$productName,
+                );
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+    my $email = $me->default('ops.notify.email') || $me->default('notify');
+
+	my $product = ariba::rc::InstalledProduct->new($productName, $service);
+    my $monserver = ($product->hostsForRoleInCluster('monitor', $product->currentCluster()))[0];
+
+	exit unless $monserver eq $hostname;
+
+	my $dirurl = $product->default("VendedUrls.AdminFrontDoorTopURL");
+
+	exit(0) unless $dirurl;
+
+    my $json_data  = getDataFromURL($dirurl);
+	my $data = JSON->new->utf8(1)->decode($json_data) or die "Fail to decode json data: $!";
+    my %queries = ();
+
+	my $topLevelStatus = $data->{status} || 'Info';
+	my $errorMessage = $data->{errorMessage} || 'None';
+
+	$queries{"Status"} = {
+		note => "Error message: $errorMessage",
+		perl => "return '$topLevelStatus'"
+	};
+
+    foreach my $realm (@{$data->{replicationStatus}}){
+
+        my $RealmID = $realm->{realmId};
+
+        foreach my $child (@{$realm->{childRealms}}){
+
+            my $childRealmID = $child->{childRealmId};
+            my $uiHint = "$RealmID/$childRealmID";
+
+            # $intstant_id will have the format like R12CR32
+			(my $instance_id = $uiHint) =~ s/[^RC\d]//g;
+
+            foreach my $stat (@{$child->{subsStat}}){
+
+                my $childName = $stat->{name};
+				$childName =~ s/[^[:ascii:]]//g;
+                my $errorCount = $stat->{errorCount};
+                my $fatalCount = $stat->{fatalCount};
+				my $minsRunning = $stat->{minsRunning};
+				my $note = $minsRunning == 0 ? "Not running" : "Running for $minsRunning minute(s)";
+
+				if ($errorCount > 0 || $fatalCount > 0){
+					$note .= " - consecutive error count: $errorCount - fatal error count: $fatalCount";
+				}
+                
+                #Added $instance_id to make %queries key unique
+                $queries{"$childName ($instance_id) Status"} = {
+                    info => "$errorCount <= 5 || $fatalCount <= 2",
+                    warn => "$errorCount > 5 || $fatalCount > 2",
+                    crit => "$errorCount >= 10 || $fatalCount >= 5 || $minsRunning >= 240",
+                    perl => "return '$stat->{status} - $note'",
+                    uiHint =>  "$uiHint",
+                };
+            }
+        }
+    }
+    exit unless (keys %queries);
+    my $q = ariba::monitor::QueryManager->newWithDetails(
+    	"Parent-Child-Replication-Thread-Status-from-QM",
+        $productName,
+        $product->service(),
+        undef,
+        \%queries,
+    );
+
+    $q->setUiManager("Parent-Child-Replication-Thread-Status");
+    $q->processQueries($debug, $email, $sendEmail, $sendPage); # debug, $email , $sendEmail, $sendPage
+}
+
+sub getDataFromURL {
+    my $url = shift;
+	$url .= '/Buyer/Main/ad/ReplicationStats/ariba.htmlui.coreui.MonitorActions?awh=r&awssk=8vQFkAiQ&threshold=240';
+
+	my $mds = ariba::monitor::Url->new ($url);
+	my $data = $mds->request(30) or die "Failed to get a response: $!\n";
+	return $data;
+}

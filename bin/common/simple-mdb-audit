@@ -1,0 +1,401 @@
+#!/usr/local/tools/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Long    qw(:config bundling no_ignore_case_always no_getopt_compat require_order);
+use File::Basename;
+use Data::Dumper;
+use File::Slurp;
+use JSON;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Machine;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::StatusPage;
+use JIRA::Client::Automated;
+use ariba::Ops::ProductAPIExtensions;
+
+# This is most easily done as a file global, to remove the need to provide the variables via function
+# arguments.  Because we can, and the code was developed with this embedded in the createQuery()
+# method, and arguments would have had to be passed as part of an already too long list.
+#
+# NOTE:  this code is duplicated in mon*'s $HOME/statup-hooks/monserver and should be extracted as a
+# utility method, in ariba::Ops::Utils.
+
+my $mon = ariba::rc::InstalledProduct->new ('mon');
+my $cfgFile = $mon->installDir . '/etc/query/simple-mdb-audit.conf';
+# And set up the environment, read configs, etc. needed to support ticket creation.
+$ENV{PERL_LWP_SSL_CA_FILE} = 0;
+# We slurp the config file in.
+my $jsonCfg = eval {
+                       my $file = $ENV{SIMPLE_MDB_AUDIT_CONFIG_FILE} || $cfgFile;
+                       my $content = read_file ($file) or die "ERROR:  failed to read $file:  $!\n";
+                       if ($content)
+                       {
+                           # The input is a string, the result should be a reference to a hash.
+                           $content = decode_json $content;
+                           return $content if ref ($content) eq 'HASH';
+                           die "ERROR:  JSON decode_json did not return a hash element, aborting!\n";
+                       }
+                       die "ERROR:  no config data found!  File is $file (aborting)\n";
+                   };
+die "ERROR:  file open failed:  $@\n" if $@;
+my @nonProdServices = @{$jsonCfg->{devServices}}; # This is a list of non-production services for which no ticket
+                                                  # should be created.
+my $jiraCfg = $jsonCfg->{jira}->{prod}; # change dev to prod for production JIRA system.
+
+sub main
+{
+    my $program = basename ($0);
+    my $usage = "usage:  $program [-e|--email] [-p|--page] [-c|--check] [-h|--help] [-d|--debug] file[s]|directory\n"
+              . "\tVery simple machinedb file validation for required fields only.\n"
+              . "\tIt will only process files in the local filesystem hierarchy.\n"
+              . "\tIt only prints hard errors related to the required fields.\n"
+              . "\n\tOptions:\n"
+              . "\t\t-h|--help  prints this help message\n"
+              . "\t\t-c|--check validate the values rather than just the fields\n"
+              . "\t\t-d|--debug print results, otherwise create queries for monitoring\n"
+              . "\t\t-e|--email send monitoring email\n"
+              . "\t\t-p|--page  page on call\n"
+              . "\t\t-s|--service  the service being validated, defaults to production\n"
+              . "\n\tSupply a list of files to validate, or a directory containing files.  These are mutually exclusive.\n"
+              . "\tWith no args, it will determine the datacenter and build a directory path at run time.";
+
+    my ($check, $help);
+    my $debug     = 0;
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $service;
+
+    GetOptions (
+                    'c|check'     => \$check,
+                    'h|help'      => \$help,
+                    'd|debug'     => \$debug,
+                    'e|email'     => \$sendEmail,
+                    'p|page'      => \$sendPage,
+                    's|service=s' => \$service,
+               );
+
+    # Check options, do help if requested:
+    die "$usage\n" if $help;
+
+    # Then, get the list of required fields from Machine module.  This is a two step process, get all
+    # fields, and select from them the ones marked as required.
+    my @requiredFields = grep {ariba::Ops::Machine->isRequired ($_)} ariba::Ops::Machine->listFields ();
+    my $fieldPattern = join '|', @requiredFields;
+    $fieldPattern = qr/^($fieldPattern):/;
+
+    # We also need the datacenter name, both for creating a directory when no args are present, and for
+    # knowing the name of the monitoring tab where the MachineDB expando needs to go.  We also need to
+    # loop over the datacenters (primary/secondary) for a particular service, so both are monitored.
+    my $me = ariba::rc::InstalledProduct->new();
+    for my $dc (ariba::Ops::ProductAPIExtensions::datacentersForProducts ($me))
+    {
+        # Now, determine the list of files to process.  This may be a simple list from the command line, or
+        # a single arg that is a directory containing files to process.  Also allowing nothing, which requires
+        # additional processing to determine the datacenter and create a directory path.
+        my %filesProcessed;
+        if (@ARGV && ((@ARGV == 1 && -f $ARGV[0]) || @ARGV > 1)) # One arg, and it's a file, or more than one arg.
+        {
+            # Loop over each file:
+            for my $file (@ARGV)
+            {
+                my %foundFields = checkFiles ($file, $fieldPattern, $check, @requiredFields);
+                $file = basename $file;
+                $filesProcessed{$file} = {%foundFields};
+            }
+            if ($debug)
+            {
+                checkAndPrint ($check, \@requiredFields, \%filesProcessed);
+            }
+            else
+            {
+                createQuery($check, $sendEmail, $sendPage, $service, $dc, \@requiredFields, \%filesProcessed);
+            }
+        }
+        elsif ((@ARGV && -d $ARGV[0]) || # Single arg must be a directory,
+               ! @ARGV)                  # or no args at all.  This is handled by determining the datacenter, creating
+                                         # the directory and then processing as for a directory.
+        {
+            my $directory;
+            if (@ARGV)
+            {
+                $directory = $ARGV[0];
+            }
+            else
+            {
+                $directory = "/usr/local/ariba/machinedb/$dc.ariba.com";
+            }
+
+            for my $file (glob "$directory/*")
+            {
+                my %foundFields = checkFiles ($file, $fieldPattern, $check, @requiredFields);
+                $file = basename $file;
+                $filesProcessed{$file} = {%foundFields};
+            }
+            if ($debug)
+            {
+                checkAndPrint ($check, \@requiredFields, \%filesProcessed);
+            }
+            else
+            {
+                createQuery($check, $sendEmail, $sendPage, $service, $dc, \@requiredFields, \%filesProcessed);
+            }
+        }
+        else
+        {
+            die "ERROR:  invalid argument(s) supplied:  @ARGV\n";
+        }
+
+        # Output is the filename, newline, and indented list of problems, one per line.
+    }
+}
+
+sub checkFiles
+{
+    my $file = shift;
+    my $fieldPattern = shift;
+    my $check = shift;
+    my @requiredFields = @_;
+    my %foundFields;
+    open my $FILE, $file or die "ERROR:  cannot open $file ($!)\n";
+    while (<$FILE>)
+    {
+        chomp;
+        if (/$fieldPattern/o) # if the input line matches any required field name, split the line
+                              # and save it to a hash using the field name as the key.
+        {
+            # Users could accidentally have a space before the colon, though less likely than errors after it
+            # or spelling errors in the field name.  This way the name will end up with a trailing space, if
+            # there is one, it won't match the required name, and we'll see the error by seeing a missing field
+            # error.  Additionally, the pattern has to be \s+, so it doesn't match the "space between characters",
+            # which means a separate test for when the colon is followed by the data and not white space.  Can
+            # handle that by substituting a space after the first colon, so it will match.
+            s/:/: /; # Not global, must leave mac addresses intact.
+            my ($field, $value) = split /:\s+/;
+            # Be sure there isn't any trailing white space.
+            $value =~ s/^(\S+)\s*$/$1/;
+            $foundFields{$field} = $value;
+        }
+    }
+    close $FILE;
+    return %foundFields;
+}
+
+# This will create the query, but will also accumulate the data and create a JIRA ticket.  For a ticket, we only need the failed cases,
+# and create the ticket only if we have at least one failure (duh!).
+sub createQuery
+{
+    my $check          = shift;
+    my $sendEmail      = shift;
+    my $sendPage       = shift;
+    my $service        = shift;
+    my $datacenter     = shift;
+    my @requiredFields = @{shift @_};
+    my %filesProcessed = %{shift @_};
+
+    $service = $mon->service unless $service;
+    my $email = $mon->default('notify.email');
+    my %queries;
+    my $description; # Collect the full details, so sysadmins don't have to go somewhere else for info.
+
+    # So now, build a set of queries, one per item in %filesProcessed.
+    for my $host (sort (keys %filesProcessed))
+    {
+        my $results = processHost ($check, $host, \@requiredFields, \%filesProcessed);
+        # The results were originally intended for printing:  first line is the host, followed by indented
+        # lines for each field with a problem, if any.  It will return the host line only if all is good.
+        my ($hostLine, $fieldLines) = ($results =~ /^([^\n]+)\n(.*)/s);
+        my $rows;
+        if ($fieldLines)
+        {
+            # Get a count of the number of lines in the return
+            $rows = scalar (my @lines = ($fieldLines =~ /(\n)/g));
+            # Collect all hosts and problems here, for the JIRA ticket.
+            $description .= $results;
+        }
+        else
+        {
+            # set a value for good returns.
+            $fieldLines = 'OK';
+            $rows = 0;
+        }
+
+        $queries{"$host machinedb field check"} = {
+                                                      crit     => "answer !~ /OK/",
+                                                      info     => "answer =~ /OK/",
+                                                      perl     => sub {return $fieldLines;},
+                                                      uiHint   => "Machine DB File Validation/$datacenter",
+                                                      multiRow => $rows,
+                                                  };
+    }
+    # Create a ticket if there is a description and this is a production service.  No description and we don't even
+    # bother to check anything else.  And our service test is a negation of 'we are non-production'.
+    if ($description && ! grep (/^$service$/, @nonProdServices))
+    {
+        # Use the password and user name from our config file to access JIRA and create a JIRA object.
+        my $jira = JIRA::Client::Automated->new ($jiraCfg->{jiraURL}, $jiraCfg->{jirauser}, $jiraCfg->{jirapwd});
+        # Be sure the new object does not try to use SSL verification.
+        $jira->ua()->{ssl_opts} = {SSL_verify_mode => 'SSL_VERIFY_NONE'};
+        my $issueHash = {
+                            labels            => [$jsonCfg->{labels}],
+                            customfield_10108 => {value => $jsonCfg->{severity}},
+                            customfield_10625 => {value => $jsonCfg->{team}},
+                        };
+        # This method returns a hash element, from which we need to extract the correct id value.
+        my $jira_id = $jira->create_issue ($jsonCfg->{project}, $jsonCfg->{issuetype}, $jsonCfg->{summary} . $datacenter,
+                                           "{noformat}${description}{noformat}");
+        my $jira_key = $jira_id->{key};                            
+        # We have a newly created ticket, add any watchers listed in the configuration file.  The
+        # value in the configuration under the 'watchers' key is an array of arrays, we want only
+        # the first element of each contained array.  Each must apparently be processed separately.
+        foreach my $watcher (@{$jsonCfg->{watchers}})
+        {
+          my @watchers;
+          push @watchers, $jira->add_watcher ($jira_key, $watcher->[0]);
+        }
+        # Now update with the other info.  This will cause the watchers to receive an update email, since it is after
+        # adding the watchers.
+        $jira->update_issue ($jira_key, $issueHash);
+    }
+    my $expando = 'State of Machine DB';
+    my $qm = ariba::monitor::QueryManager->newWithDetails ("$expando-$datacenter",
+                                                           ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter),
+                                                           $service, undef, undef, \%queries);
+    # And reset the query manager expando name so it appends to it rather than overwritting it.
+    $qm->setUiManager ($expando);
+    # debug is handled via alternate processing, never gets here, hence the first arg is ...
+    $qm->processQueries (undef, $email, $sendEmail, $sendPage);
+}
+
+sub checkAndPrint
+{
+    my $check = shift;
+    my $requiredFields = shift;
+    my $filesProcessed = shift;
+
+    my $resultString;
+    for my $host (sort (keys %$filesProcessed))
+    {
+        $resultString .= processHost ($check, $host, $requiredFields, $filesProcessed);
+    }
+
+    # The returned value above includes a terminating newline, no need to add one.
+    if ($check > 1)
+    {
+        return $resultString;
+    }
+    else
+    {
+        print $resultString;
+    }
+}
+
+sub processHost
+{
+    my $check = shift;
+    my $host = shift;
+    my @requiredFields = @{shift @_};
+    my %filesProcessed = %{shift @_};
+
+    my $resultString = sprintf "$host fields:\n";
+    for my $field (@requiredFields)
+    {
+        # If the key/value pair is found in the hash, ...
+        if (exists $filesProcessed{$host}->{$field})
+        {
+            # Check for a value, if no value, report.
+            if (! $filesProcessed{$host}->{$field})
+            {
+                $resultString .= sprintf "\t\t%-26s  %s\n", "$field:", 'missing required value.';
+            }
+            elsif ($check) # There's a value, ...
+            {
+                # If check is set, validate the value against allowed values for the field, if they exist.  Append 'invalid'
+                # if it is not found.
+                if ($check)
+                {
+                    my @validValues = ariba::Ops::Machine->listValidValuesForField ($field);
+                    # Only do this is we have something in the array.
+                    if (@validValues)
+                    {
+                        # Modification so validateField is subclassed in ariba::Ops::Machine, so it will check the multiple
+                        # values for things like providesServices, one at a time, means it will return a list in that case.
+                        my @results = ariba::Ops::Machine->validateField ($field, $filesProcessed{$host}->{$field});
+                        if (@results && @results > 1) # Can only be if it is a "multiple" field.
+                        {
+                            my @valueList = split /[,\s]+/, $filesProcessed{$host}->{$field};
+                            # Each element needs to be examined and associated with the proper value for output.
+                            my $tmpString = '';
+                            my $count = 0;
+                            for (my $c=0; $c < @results; $c++)
+                            {
+                                if (! $results[$c]) # The value is not good.
+                                {
+                                    $tmpString ? ($tmpString .= ", '$valueList[$c]'") : ($tmpString = "'$valueList[$c]'");
+                                    $count++;
+                                }
+                            }
+                            $filesProcessed{$host}->{$field} = $tmpString . ($count == 1 ? ' is' : ' are') . ' invalid' if $tmpString;
+                        }
+                        elsif (@results) # If there's a 'true' return here, it is a single element array.
+                        {
+                            # But we could have an array which may have a TRUE or FALSE value.
+                            if (! $results[0])
+                            {
+                                $filesProcessed{$host}->{$field} .= ' is invalid';
+                            }
+                        }
+                        else # The return is false, so the value is not valid.
+                        {
+                            $filesProcessed{$host}->{$field} .= ' is invalid';
+                        }
+                    }
+                }
+                # Only print items with values marked as invalid.
+                $resultString .= sprintf "\t\t%-26s  %s\n", "$field:", $filesProcessed{$host}->{$field} if $filesProcessed{$host}->{$field} =~ /invalid/;
+            }
+        }
+        else
+        {
+            $resultString .= sprintf "\t\t%-26s  %s\n", "$field:",  'missing required field.';
+        }
+    }
+    return $resultString;
+}
+
+main();
+
+__END__
+
+0  HASH(0x2ba7781c3c60)
+   'project' => HASH(0x507c840)
+      'key' => 'HOA'
+   'issuetype' => HASH(0x2ba7781c8250)
+      'name' => 'OpsAutomated'
+   'summary' => 'Consolidated machinedb report for datacenter lab1'
+   'description' => "spoolwood.lab1.ariba.com fields:\cJ\cI\cIprovidesServices:           'iq' is invalid\cJ"
+   'labels' => ARRAY(0x51d39b0)
+      0  'Security'
+   'customfield_10108' => HASH(0x2ba7781c4540)
+      'value' => 'S1'
+   'customfield_10625' => HASH(0x52031e0)
+      'value' => 'SysAdmin'
+
+
+
+        my $issueHash = {
+                            project           => {key  => $jsonCfg->{project}},
+                            issuetype         => {name => $jsonCfg->{issuetype}},
+                            summary           => $jsonCfg->{summary} . $datacenter,
+                            description       => $description,
+                            labels            => [$jsonCfg->{labels}],
+                            customfield_10108 => {value => $jsonCfg->{severity}},
+                            customfield_10625 => {value => $jsonCfg->{team}},
+                        };
+        # This method returns a hash element, from which we need to extract the correct id value.
+        my $jira_id = $jira->create ($issueHash);

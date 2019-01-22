@@ -1,0 +1,217 @@
+#!/usr/local/bin/perl -w
+
+# $Id: do-stats,v 1.2 1999/12/04 08:16:41 dsully Exp dsully $
+# Generate analog and webalizer stats
+
+use strict;
+use Benchmark;
+use Compress::Zlib;
+use File::Copy;
+use File::Find;
+use File::Path;
+use POSIX qw(strftime);
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use vars qw(%servers);
+
+use ariba::WebStats::Conf;
+use ariba::WebStats::IP2Host;
+
+my $debug = 1;
+my $gzip  = 1;
+
+my ($time)	= time;
+my $yesterday	= ($time - ( 24 * 60 * 60 ));
+
+my $day		= strftime '%d', localtime($yesterday);
+my $yday	= strftime '%Y%m%d', localtime($yesterday);
+my $path_date	= strftime '%Y/%m', localtime($time);
+
+my $stats_dir	= '/home/web/htdocs/stats';
+my $live_dir	= "$stats_dir/live";
+my $raw_dir	= "$stats_dir/raw";
+my $c_dir	= "$stats_dir/cumulative";
+
+my $analog_prog	= '/usr/local/bin/analog';
+my $analog_conf = "$stats_dir/analog.conf.$$";
+my $analog_opts	= "+g$analog_conf -n +B +rr50 +t +o +i +Sr-100";
+my $analog	= "$analog_prog $analog_opts";
+
+my $webalizer	= '/usr/bin/webalizer -Q -p';
+
+my $analog_data = "MONTHLY ON\nDAILY ON\nFULLDAILY ON\nSTATUS ON\nREQUEST ON\nFAILURE ON";
+my $cumulative  = 'Ariba Network Cumulative Stats';
+
+# End conf section.
+###############################################
+
+sub main {
+
+	my $b1 = Benchmark->new();
+	
+	while(my($server,$conf) = each %servers) {
+
+		my $log_name = join '/', $conf->{'log'},
+			($conf->{'ssl'} ? 'raven_access_log' : 'access_log');
+		$log_name .= "-$yday";
+
+		#############################################
+		# Create year/month dirs if they don't exist.
+		for my $dir ($live_dir,$raw_dir) {
+			if (!-d "$dir/$path_date/$server") {
+				mkpath([ "$dir/$path_date/$server" ], 0, 0755) or do {
+					warn $!;
+					next;
+				};
+			}
+		}
+
+		my $new_log = "$raw_dir/$path_date/$server/${day}_access_log";
+		my $new_tmp = "$raw_dir/$path_date/$server/${day}_access_log.tmp";
+		print "Server: $server: $conf->{'host'} : $log_name\n\n";
+
+		if ($conf->{'rcp'}) {
+
+			system(qq!rcp "$conf->{'host'}:$log_name" $new_tmp!) == 0 or do {
+					warn "\nsystem (rcp) failed: [$conf->{'host'}]\n";
+					next;
+			};
+
+		} else {
+
+			if (-z $log_name) {
+				print "Log size is zero, skipping.\n" if $debug;
+				next;
+			}
+
+			copy($log_name, $new_log) or do {
+				warn "Can't copy $log_name to $new_log : $!";
+				next;
+			};
+
+			print "Copied $log_name to $new_log\n" if $debug;
+		}
+
+		# Run log programs..
+		#my $w1 = "$webalizer -n $conf->{'host'} -o $live_dir/$path_date/$server $new_log";
+		#system("$webalizer -n $conf->{'host'} -o $live_dir/$path_date/$server $new_log") == 0
+		#	or die "system $w1 failed: $! - $?\n";
+
+		# webalizer hack.
+		#move "$live_dir/$path_date/$server/index.html",
+		#	"$live_dir/$path_date/$server/webalizer.html"; # or die $!;
+
+		open LOG_IN,  "<$new_tmp" or warn $!;
+		open LOG_OUT, ">$new_log" or warn $!;
+
+		print "Resolving IP -> Host\n";
+		ip2host(*LOG_IN, *LOG_OUT, '/home/web/htdocs/stats/dns.cache');
+
+		close LOG_IN;
+		close LOG_OUT;
+		unlink $new_tmp or warn $!;
+
+		open  AC, ">$analog_conf" or die $!;
+		print AC "HOSTEXCLUDE *.ariba.com\n";
+		print AC "HOSTEXCLUDE 10.10.*\n";
+		print AC "HOSTEXCLUDE 206.251.25.*\n";
+		print AC "PAGEINCLUDE *.asp\n";
+		print AC "PAGEINCLUDE *.dll\n";
+		print AC "BARSTYLE h\n";
+		close AC;
+
+		system("$analog $raw_dir/$path_date/$server/* > $live_dir/$path_date/$server/analog.html") == 0
+			or warn "system $analog failed: $! - $?\n";
+		unlink $analog_conf;
+
+		####################
+		# Crunch the logfile
+		if ($gzip) {
+			print "Gzipping : $new_log.gz\n";
+			my $gz = gzopen("$new_log.gz", 'wb') or 
+				warn "Can't open $new_log.gz : $gzerrno : $!";
+
+			open IN, $new_log or warn $!;
+			while(<IN>) {
+				$gz->gzwrite($_) or warn "error writing: $gzerrno\n";
+			}
+			close IN;
+
+			$gz->gzclose();
+			unlink $new_log or warn $!;
+		}
+	}
+
+	##########################
+	# Run the cumulative logs..
+	my (@combined_logs, @new_logs) = ();
+
+	find sub {
+		my $file = $File::Find::name;
+		return unless -f $file;
+		return unless -s _;
+		push @combined_logs, $file if $file =~ /combined/;
+		push @new_logs, $file if $file =~ /$path_date/;
+	}, $raw_dir;
+
+	print "Combining this month's logs...\n";
+	system("/home/web/htdocs/stats/multisort @new_logs > /tmp/biglog") == 0 or warn "$!";
+
+	print "\n";
+	cumulative_analog(\@combined_logs);
+	#cumulative_webalizer(\@combined_logs);
+
+	cleanup_biglog();
+
+	# finish up..
+	my $b2 = Benchmark->new();
+	print timestr(timediff($b2,$b1)),"\n";
+
+}
+
+sub cumulative_analog {
+	my $combined_logs = shift;
+
+	print "Running analog cumulative..\n";
+
+	open  AC, ">$analog_conf" or die $!;
+	print AC "HOSTNAME \"$cumulative\"\n";
+	print AC "HOSTEXCLUDE *.ariba.com\n";
+	print AC "HOSTEXCLUDE 10.10.*\n";
+	print AC "HOSTEXCLUDE 206.251.25.*\n";
+	print AC "PAGEINCLUDE *.asp\n";
+	print AC "PAGEINCLUDE *.dll\n";
+	print AC "BARSTYLE h\n";
+	close AC;
+
+	system("$analog +g$analog_conf @$combined_logs /tmp/biglog > $c_dir/analog.html") == 0
+		or die "system $analog failed: $! - $?\n";
+}
+
+sub cumulative_webalizer {
+	my $logs = shift;
+
+	print "Running webalizer cumulative..\n";
+	opendir D, $c_dir or warn $!;
+	while(readdir D) {
+		unlink $_ if /usage/;
+	}
+	closedir D;
+
+	system("$webalizer -n '$cumulative' -o $c_dir /tmp/biglog"); # == 0
+		#or die "system webalizer cumulative failed: $! - $?\n";
+
+	move "$stats_dir/cumulative/index.html",
+		"$stats_dir/cumulative/webalizer.html"; # or die $!;
+}
+
+sub cleanup_biglog {
+	unlink '/tmp/biglog';
+	unlink $analog_conf or warn $!;
+}
+
+main ();
+
+__END__

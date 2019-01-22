@@ -1,0 +1,264 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/everywhere/process-watcher#4 $
+#
+# Walk the process table for a process
+# periodically, and make memory size information available to client.
+# Most of this code is coming from instance-watcher, but it is
+# modified to log cpu/memory for a process and not an instance of a product
+# This doesn't use the product API and is run from /usr/local/ariba/bin
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+
+use ariba::rc::Utils;
+use ariba::monitor::QueryManager;
+use ariba::Ops::ProcessTable;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Machine;
+use ariba::monitor::StatusPage;
+use ariba::Ops::CFEngine::MonitoringGlueUtils;
+use ariba::Ops::Utils;
+
+use Linux::Smaps;
+
+my $debug = 0;
+
+my $hostname = ariba::Ops::NetworkUtils::hostname();
+
+sub usage {
+    print "Error : $_[0]\n" if ($_[0]);
+    print "Usage: $0 process piddirectory\n";
+    print "          [-kr] log file is kr style\n";
+    print "          [-d] Debug\n";
+    print "          [-e] Send email\n";
+    print "          [-p] Send page\n";
+
+    exit(1);
+}
+
+
+sub _appPidFromRowInPidFile {
+    my $row = shift;
+    my $pidFile = shift; 
+    my $pid; 
+
+    if (open(my $fh, "< $pidFile")) {
+        my @pids = <$fh>; 
+        close($fh);
+
+        chomp($pid = $pids[$row - 1]) if (scalar(@pids) >= $row);
+    }
+
+    return $pid;
+}
+
+sub appPidFromKrPidFile {
+    my $krPidFile = shift; 
+
+    return _appPidFromRowInPidFile(2, $krPidFile);
+}
+
+sub appPidFromPidFile {
+    my $krPidFile = shift; 
+
+    return _appPidFromRowInPidFile(1, $krPidFile);
+}
+
+
+sub main {
+    my $sendEmail   = 1;
+    my $sendPage    = 0;
+    my $krDir = 0;
+    my $processName = undef;
+    my $pidDir;
+    my @unrecognizedArgs;
+    my @pidList;
+
+    while (my $arg = shift(@ARGV)) {
+        if( $arg =~ /^-e$/o ){ $sendEmail = 1; next; };
+        if( $arg =~ /^-p$/o ){ $sendPage = 1; next;};
+        if( $arg =~ /^-kr$/o ){ $krDir = 1; next;};
+        if( $arg =~ /^-d$/o ){ $debug = 1; next;};
+        if( $arg !~ /^-/o  ){ 
+            if ($processName) {
+                if ($pidDir) {
+                    push(@unrecognizedArgs, $arg);
+                } else {
+                    $pidDir = $arg;
+                }
+            } else {
+               $processName = $arg;
+            }
+            next;
+        }
+
+        push(@unrecognizedArgs, $arg);
+    }
+
+    usage("Unrecognized Argument(s) : " . join(', ', @unrecognizedArgs) ) if (scalar(@unrecognizedArgs));
+    usage ("Need to specify process name") unless ($processName);
+    usage ("Need to specify pid directory") unless ($pidDir);
+
+    my $machine  = ariba::Ops::Machine->new($hostname);
+    my $dataCenter = $machine->datacenter();
+
+    my $server   = ariba::Ops::CFEngine::MonitoringGlueUtils::monitorServer($hostname);
+    my $product  = ariba::monitor::StatusPage::fakeProductNameForDatacenter($dataCenter);
+    my $service  = $machine->service();
+    my $customer = undef;
+
+    my %queries  = ();
+    my %computingQueries  = ();
+
+
+    # Get the pid filenames, exclude non-running files.
+    # exit if /tmp/$processName doesn't exist, that means the apps aren't running
+
+    unless ( -e $pidDir && -d $pidDir ) {
+        print "The specified KR doesn't exist or is not a directory\n" if ($debug);
+        exit;
+    }
+
+    # grab the pid files
+    opendir(TMP, $pidDir) || die "instance-watcher could not open dir [$pidDir]: $!";
+    my @filelist = grep { /\.pid$/ } readdir(TMP);
+    closedir(TMP);
+
+    unless (@filelist) {
+        print "There are no pid files in $pidDir\n" if ($debug);
+        exit;
+    }
+
+
+    my ($file) = grep { /$processName/ } @filelist;
+
+    unless ($file) {
+        print "There is no pidfile for the $processName in $pidDir\n" if ($debug);
+        exit;
+    }
+
+     my $pid = $krDir ? appPidFromKrPidFile("$pidDir/$file") : appPidFromPidFile("$pidDir/$file");
+
+    # Walk the process table.
+    my $processTable = ariba::Ops::ProcessTable->new();
+
+     unless ($pid && $processTable->processWithPIDExists($pid)) {
+        print "Coudn't find pid or process is not in process table\n" if ($debug);
+        exit;
+    }
+
+     # fill in
+     my $procData = $processTable->dataForProcessID($pid);
+
+
+     my $uiHint = $hostname;
+
+     if (defined $procData->{'privateMemSize'}) {
+        
+        $queries{"$hostname: $processName RSS mem size in KBytes"} = {
+            'recordMaxResults' => 20000,
+            'recordDataType' => 'gauge',
+            'recordOnError' => 1,
+            'uiHint' => $uiHint,
+            'info' => 'answer > -1',
+            'perl' => "return $procData->{'privateMemSize'}",
+        };
+
+        if( -r "/proc/$pid/smaps") {
+
+            my $smap = Linux::Smaps->new($pid);
+            my $privateMemory = $smap->private_clean + $smap->private_dirty;
+            my $sharedMemory = $smap->shared_clean + $smap->shared_dirty;
+
+            $queries{"$hostname: $processName private mem size in KBytes"} = {
+                'recordMaxResults' => 20000,
+                'recordDataType' => 'gauge',
+                'recordOnError' => 1,
+                'uiHint' => $uiHint,
+                'info' => 'answer > -1',
+                'perl' => "return $privateMemory",
+            };
+
+            $queries{"$hostname: $processName shared mem size in KBytes"} = {
+                'recordMaxResults' => 20000,
+                'recordDataType' => 'gauge',
+                'recordOnError' => 1,
+                'uiHint' => $uiHint,
+                'info' => 'answer > -1',
+                'perl' => "return $sharedMemory",
+            };
+        }
+    }
+
+    if ($procData->{'time'}) {
+
+        my $samples   = 4;
+        my $warn      = 25;
+        my $crit      = 40;
+        my $queryName = "$hostname: $processName CPU time used";
+
+
+        # Flume uses a lot of cpu as it tails thousands of files
+        if ($processName =~ /^flume-/) {
+            $warn = 40;
+            $crit = 70;
+        }
+
+        $queries{$queryName} = {
+            'recordMaxResults' => 20000,
+            'recordDataType' => 'counter',
+            'perl' => "return $procData->{'time'} / getCpuCount() / 10000.0",
+            'uiHint' => "ignore",
+            'info' => 'answer > -1',
+            'recordDataUnits' => "per sec",
+            'recordOnError' => 1,
+        };
+
+        my $cdbName = ariba::monitor::Query->generateInstanceName($queryName, $product, $customer,undef);
+
+
+        $computingQueries{"$hostname: $processName percent CPU usage "} = {
+            'uiHint' => $uiHint,
+            'info' => 'answer > -1',
+            'crit' => "answer >= $crit",
+            'warn' => "answer >= $warn",
+            'extractRecorded'=> "average($cdbName, +3)",
+            'format' => "%.2f%%",
+        };
+
+    }
+
+    unless (keys(%queries)) {
+        print "There are no queries\n" if ($debug);
+        exit;
+    }
+
+    my $email = 'an_auto_sysadmin@ariba.com';
+    my $q = ariba::monitor::QueryManager->newWithDetails(
+                        "$processName Process Status", $product, $service, $customer, \%queries);
+
+
+    $q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $server);
+
+    my $computingQM = ariba::monitor::QueryManager->newWithDetails(
+                        "$processName Process Status", $product, $service, $customer, \%computingQueries);
+
+    $computingQM->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $server);
+                                  
+}
+
+sub getCpuCount() {
+    my $me = ariba::Ops::Machine->new($hostname);
+    return $me->cpuCount() || 1;
+}
+
+
+
+main();
+
+__END__

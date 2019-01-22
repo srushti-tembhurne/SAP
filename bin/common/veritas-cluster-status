@@ -1,0 +1,371 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/common/serviceguard-packages#21 $
+#
+# A script to monitor veritas cluster status
+#
+# 
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use ariba::rc::CipherStore;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::DBConnection;
+use ariba::Ops::Machine;
+use ariba::Ops::Utils;
+
+my $haStatusCommand = "/opt/VRTSvcs/bin/hastatus";
+#
+##
+## System should be all 'RUNNING'
+##
+#
+#$ /opt/VRTSvcs/bin/hastatus -summary
+#
+#-- SYSTEM STATE
+#-- System               State                Frozen              
+#
+#A  db10                 RUNNING              0                    
+#A  db11                 RUNNING              0                    
+#A  db12                 RUNNING              0                    
+#A  db13                 RUNNING              0                    
+#
+#
+##
+## Group should be all Probed == 'Y' and AutiDisabled == 'N'
+## also State should be 'ONLINE' for primary db in the cluster.
+##
+#-- GROUP STATE
+#-- Group           System               Probed     AutoDisabled    State 
+#
+#B  BYRPRO1         db10                 Y          N               OFFLINE
+#B  BYRPRO1         db13                 Y          N               ONLINE
+#B  SSSPRO1         db10                 Y          N               OFFLINE
+#B  SSSPRO1         db11                 Y          N               ONLINE
+#B  SSSPRO2         db10                 Y          N               OFFLINE
+#B  SSSPRO2         db12                 Y          N               ONLINE
+#
+##
+## There should be nothing listed for section 'C' or 'D'
+##
+#-- RESOURCES FAILED
+#-- Group           Type                 Resource             System
+#
+#C  SSSLAB1         Application          Ssh_tunnel_ssslab1_to_source duck
+#
+#-- RESOURCES NOT PROBED
+#-- Group           Type                 Resource             System
+#
+#D  SSSPRO2         Volume               Vol_ssspro2_ora11a   db12
+#D  SSSPRO2         Volume               Vol_ssspro2_ora11b   db12
+#
+sub main{
+
+	my $debug=0;
+	my $sendEmail=0;
+	my $sendPage=0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug=1; }
+		if($arg =~ /^-e/o){ $sendEmail=1; };
+		if($arg =~ /^-p/o){ $sendPage=1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $service = $me->service();
+
+	my $email = $me->default('notify.email');
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+
+	#
+	# if this machine is not part of a cluster, no point in checking veritas
+	# status
+    my $machine = ariba::Ops::Machine->new($hostname);
+	if (!grep /cluster/, $machine->providesServices()) {
+		exit(0);
+	}
+    my $dataCenter = $machine->monitoringDatacenter() || $machine->datacenter();
+
+	my $tab = ariba::monitor::StatusPage::commonProduct();
+	#
+	# veritas command can only be run as root. This runs out of
+	# root crontab
+	#
+
+	my @products  = ariba::rc::InstalledProduct->installedProductsList($me->service());
+	my @connections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+	push(@connections, ariba::Ops::DBConnection->connectionsToMySQLFromProducts(@products));
+	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections)) {
+
+		my $product = $dbc->product();
+		my $sid = $dbc->sid();
+		my $virtualHost = $dbc->host();
+		my @realHosts = $dbc->realHosts();
+
+		# strip off the port part of the mysql sid
+		if ($dbc->dbServerType() eq ariba::Ops::DBConnection->mysqlDBServerType()) {
+			$sid =~ s/\d+://;
+		}
+
+		next unless(@realHosts);
+
+		#
+		# Skip over db connections that are not setup as a cluster
+		#
+		my %uniqueHosts= map { $_ => 1 } @realHosts;
+		next unless (keys(%uniqueHosts) == 2);
+
+		#
+		# convert FQDN hosts to shortnames
+		#
+		my @shortHosts;
+		my $thisHostIsOneOfTheRealHosts = 0;
+		for my $host (@realHosts) {
+			my $shortHost = $host;
+			if ($host eq $hostname) {
+				$thisHostIsOneOfTheRealHosts = 1;
+			}
+			$shortHost =~ s|(\w+)\..*|$1|;
+
+			push(@shortHosts, $shortHost);
+		}
+
+		next unless ($thisHostIsOneOfTheRealHosts);
+
+		if ($debug) {
+			print $product->name(), " sid = $sid, host = $virtualHost (", join(",", @shortHosts). ")\n";
+		}
+
+		my %queries;
+		my $productName = $product->name();
+        my $vcsSystemState = vcsSystemState(@shortHosts); 
+        my $vcsGroupState = vcsGroupState($sid, @shortHosts); 
+        my $vcsBadResources = vcsBadResources($sid, @shortHosts);
+        my $vcsSystemState_error = ($vcsSystemState =~ /ERROR/i) ? 1 : 0;
+        my $vcsGroupState_error = ($vcsGroupState =~ /ERROR/i) ? 1 : 0;
+
+        #code the following in 2 lines to avoid warnings due to globbering of @_ pre perl 5.12
+        my @tmp_arr = split(/\n/,$vcsBadResources);
+        my $inf_numrow_vcsBadResources = scalar (@tmp_arr);
+
+		$queries{"System state for $sid on $hostname"} = {
+			'noRowCount' => 1,
+			'uiHint' => $productName,
+			'info' => 1,
+			'warn' => "answer =~ /^Warn/i",
+			'crit' => "answer =~ /^Error/i",
+            'severity'    => 1,
+			'perl' => sub { return $vcsSystemState; },
+             correctiveActions => [
+                Ops => 'Critical.Please assign the ticket to On-Call SA', 
+            ],
+		};
+
+		$queries{"Group state for $sid on $hostname"} = {
+			'noRowCount' => 1,
+			'uiHint' => $productName,
+			'info' => 1,
+			'warn' => "answer =~ /^Warn/i",
+			'crit' => "answer =~ /^Error/i",
+            'severity'    => 1,
+			'perl' => sub { return $vcsGroupState; },
+             correctiveActions => [
+                Ops => 'Critical.Please assign the ticket to On-Call SA', 
+            ],
+		};
+
+		$queries{"Resources that failed or were not probed for $sid on $hostname"} = {
+			'noRowCount' => 1,
+			'uiHint' => $productName,
+			'info' => "numrows <= 0",
+			'crit' => "numrows > 0",
+            'severity'    => 1,
+			'perl' => sub { return $vcsBadResources },
+             correctiveActions => [
+                Ops => 'Critical.Please assign the ticket to On-Call SA', 
+            ],
+		};
+
+        my %influx_data;
+        $influx_data{measurement} = 'veritas_cluster_status';
+        $influx_data{tags} = {  product => $productName,
+                service => $service,
+                datacenter => $dataCenter,
+                sid => $sid,
+                hostname => $hostname };
+        $influx_data{data} = {
+                vcsSystemState_error => $vcsSystemState_error,
+                vcsGroupState_error => $vcsGroupState_error,
+                numrow_vcsBadResources => $inf_numrow_vcsBadResources, };
+
+        eval {
+            my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+            print "$statsd_line\n" if $debug;
+            ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line );
+        };        
+
+		my $qm = ariba::monitor::QueryManager->newWithDetails("veritas-cluster-status", $tab, $product->service(), undef, \%queries);
+
+		#
+		# both primary and backup host will run these queries
+		#
+		$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+sub vcsSystemState {
+	my @shortHosts = @_;
+
+	my %hosts = map { $_ => 1 } @shortHosts;
+
+	my @results;
+
+	open(HASTATUS, "$haStatusCommand -summary |") || return ("ERROR: Could not run command $haStatusCommand, $!");
+	#-- SYSTEM STATE
+	#-- System               State                Frozen              
+	#
+	#A  db10                 RUNNING              0                    
+	#A  db11                 RUNNING              0                    
+	#A  db12                 RUNNING              0                    
+	#A  db13                 RUNNING              0                    
+	#
+	#
+	while (my $line  = <HASTATUS>) {
+		if ($line =~ /^A/) {
+			my ($a, $sys, $state, $frozen) = split(/\s+/, $line);
+			#
+			# If we care about this host, get its state.
+			##
+			## System should be all 'RUNNING'
+			##
+			#
+			if ($hosts{$sys}) {
+				if ($state eq "RUNNING") {
+					push(@results, "$sys: $state");
+				} else {
+					unshift(@results, "ERROR: $sys: $state");
+				}
+			}
+		}
+	}
+	close(HASTATUS);
+
+	return (join("\n", @results));
+}
+
+sub vcsGroupState {
+	my $sid = shift;
+	my @shortHosts = @_;
+
+	$sid = lc($sid);
+	my %hosts = map { $_ => 1 } @shortHosts;
+
+	my @results;
+
+	open(HASTATUS, "$haStatusCommand -summary |") || return ("ERROR: Could not run command $haStatusCommand, $!");
+	#-- GROUP STATE
+	#-- Group           System               Probed     AutoDisabled    State 
+	#
+	#B  BYRPRO1         db10                 Y          N               OFFLINE
+	#B  BYRPRO1         db13                 Y          N               ONLINE
+	#B  SSSPRO1         db10                 Y          N               OFFLINE
+	#B  SSSPRO1         db11                 Y          N               ONLINE
+	#B  SSSPRO2         db10                 Y          N               OFFLINE
+	#B  SSSPRO2         db12                 Y          N               ONLINE
+	#
+	while (my $line  = <HASTATUS>) {
+		if ($line =~ /^B/) {
+			my ($b, $group, $sys, $probed, $autoDisabled, $state) = split(/\s+/, $line);
+			#
+			# If we care about this host, get its state.
+			#
+			##
+			## Group should be all Probed == 'Y' and AutoDisabled == 'N'
+			## also State should be 'ONLINE' for primary db in the cluster.
+			##
+			if (lc($group) eq $sid && $hosts{$sys}) {
+				my $errMsg = "";
+				if ($probed ne "Y") {
+					$errMsg = "$sid, $sys Probed: $probed";
+				}
+				if($autoDisabled ne "N") {
+					if ($errMsg) {
+						$errMsg .= ", AutoDisabled: $autoDisabled ";
+					} else {
+						$errMsg = "$sid, $sys AutoDisabled: $autoDisabled";
+					}
+				}
+				if($state ne "ONLINE" && $sys eq $shortHosts[0]) {
+					if ($errMsg) {
+						$errMsg .= ", State: $state";
+					} else {
+						$errMsg = "$sid, $sys State: $state";
+					}
+				}
+				if ($errMsg) {
+					unshift(@results, "ERROR: $errMsg");
+				} else {
+					push(@results, "$sid, $sys ok");
+				}
+			}
+		}
+        elsif ($line =~/^C/){
+            my ($c, $group) = split(/\s+/, $line);
+            $group = lc $group;
+            if($group eq $sid){
+                @results  = ("ERROR: $group Frozen");
+            }
+        }
+	}
+	close(HASTATUS);
+
+	return (join("\n", @results));
+}
+
+sub vcsBadResources {
+	my $sid = shift;
+	my @shortHosts = @_;
+
+	$sid = lc($sid);
+	my %hosts = map { $_ => 1 } @shortHosts;
+
+	my @results;
+
+	open(HASTATUS, "$haStatusCommand -summary |") || return ("ERROR: Could not run command $haStatusCommand, $!");
+	#-- RESOURCES FAILED
+	#-- Group           Type                 Resource             System
+	#
+	#C  SSSLAB1         Application          Ssh_tunnel_ssslab1_to_source duck
+	#
+	#-- RESOURCES NOT PROBED
+	#-- Group           Type                 Resource             System
+	#
+	#D  SSSPRO2         Volume               Vol_ssspro2_ora11a   db12
+	#D  SSSPRO2         Volume               Vol_ssspro2_ora11b   db12
+	#
+	while (my $line  = <HASTATUS>) {
+		if ($line =~ /^(C|D)/) {
+			my ($section, $group, $type, $resources, $sys) = split(/\s+/, $line);
+			#
+			# If we care about this host, get its state.
+			#
+			# anything here is an error
+			#
+			if (lc($group) eq $sid && $hosts{$sys}) {
+				unshift(@results, "ERROR: $line");
+			}
+		}
+	}
+	close(HASTATUS);
+
+	return (join("\n", @results));
+}
+
+
+main();

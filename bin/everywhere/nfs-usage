@@ -1,0 +1,272 @@
+#!/usr/local/bin/perl -w
+#
+# This script estimates the number of megabits written over nfs v3 on a redhat nfs client.
+# It is meant to be called via SNMP's extend functionality.
+#
+#	# app22.opslab
+#	$ cat /usr/local/share/snmp/snmpd.conf
+#	...
+#	extend nfsV3MbWritten /usr/local/ariba/bin/nfs-usage write
+#
+#	root@app22 ~ $ /usr/local/ariba/bin/nfs-usage -d write
+#	----- NFS Stats -----
+#	remove     =>        207
+#	getattr    =>     156921
+#	readdir+   =>       2146
+#	setattr    =>        334
+#	readdir    =>          0
+#	rename     =>        309
+#	rmdir      =>         52
+#	symlink    =>          0
+#	read       =>          9
+#	write      =>     127204
+#	create     =>        615
+#	link       =>          0
+#	access     =>      30681
+#	readlink   =>          0
+#	null       =>          0
+#	commit     =>          0
+#	lookup     =>       4222
+#	mknod      =>          0
+#	fsstat     =>        586
+#	fsinfo     =>          1
+#	mkdir      =>         82
+#	pathconf   =>          0
+#	---------------------
+#	NFS V3 Writes        : 127204
+#	NFS Mount Block size : 32768
+#	NFS V3 Bytes Written : 4168220672
+#	NFS V3 Mb Written    : 33345.765376
+#	33345.765376
+#	
+#	# mon11.opslab
+#	$ snmpwalk -v 1 -c public app22.opslab nsExtendConfigTable
+#	NET-SNMP-EXTEND-MIB::nsExtendCommand."nfsV3MbWritten" = STRING: /usr/local/ariba/bin/nfs-usage
+#	NET-SNMP-EXTEND-MIB::nsExtendArgs."nfsV3MbWritten" = STRING: write
+#	NET-SNMP-EXTEND-MIB::nsExtendInput."nfsV3MbWritten" = STRING:
+#	NET-SNMP-EXTEND-MIB::nsExtendCacheTime."nfsV3MbWritten" = INTEGER: 5
+#	NET-SNMP-EXTEND-MIB::nsExtendExecType."nfsV3MbWritten" = INTEGER: exec(1)
+#	NET-SNMP-EXTEND-MIB::nsExtendRunType."nfsV3MbWritten" = INTEGER: run-on-read(1)
+#	NET-SNMP-EXTEND-MIB::nsExtendStorage."nfsV3MbWritten" = INTEGER: permanent(4)
+#	NET-SNMP-EXTEND-MIB::nsExtendStatus."nfsV3MbWritten" = INTEGER: active(1)
+#
+#	$ snmpwalk -v 1 -c public app22.opslab nsExtendOutput1Table
+#	NET-SNMP-EXTEND-MIB::nsExtendOutput1Line."nfsV3MbWritten" = STRING: 33347.33824
+#	NET-SNMP-EXTEND-MIB::nsExtendOutputFull."nfsV3MbWritten" = STRING: 33347.33824
+#	NET-SNMP-EXTEND-MIB::nsExtendOutNumLines."nfsV3MbWritten" = INTEGER: 1
+#	NET-SNMP-EXTEND-MIB::nsExtendResult."nfsV3MbWritten" = INTEGER: 0
+#
+#	$ snmpwalk -v 1 -c public app22.opslab nsExtendOutput2Table
+#	NET-SNMP-EXTEND-MIB::nsExtendOutLine."nfsV3MbWritten".1 = STRING: 33348.386816
+#
+#	$ snmpwalk -v 1 -c public -On app22.opslab nsExtendOutput2Table
+#	.1.3.6.1.4.1.8072.1.3.2.4.1.2.14.110.102.115.86.51.77.98.87.114.105.116.116.101.110.1 = STRING: 33348.64896
+#
+#	# This is the query we are most interested in. This OID is in MON's etc/system.cfg file:
+#	# [os=linux,redhat]
+#	#    {oids}
+#	#	# NFS V3 Bytes Written
+#	#	.1.3.6.1.4.1.8072.1.3.2.4.1.2.14.110.102.115.86.51.77.98.87.114.105.116.116.101.110.1, NFS V3 Mb Written
+#	#
+#	$ snmpget -v 1 -c public app22.opslab .1.3.6.1.4.1.8072.1.3.2.4.1.2.14.110.102.115.86.51.77.98.87.114.105.116.116.101.110.1
+#	NET-SNMP-EXTEND-MIB::nsExtendOutLine."nfsV3MbWritten".1 = STRING: 33348.911104
+#
+##
+
+use strict;
+
+my $debug = 0;
+
+sub usage {
+	print "usage: $0 [-d|-h] <write|read|getattr etc>\n\n",
+	      "Return requested NFS client statistics.\n",
+	      "To see all supported stats, run with -d write\n",
+	      "Options:\n\n",
+	      "-d	Increasing levels of debug information\n",
+	      "-h	Display usage\n\n";
+
+	exit 1;
+}
+
+sub main {
+	my $stat;      # holds which stat we are interested in
+	my $statValue; # value of stat
+
+	usage() unless @ARGV;
+
+	while (my $arg = shift @ARGV) {
+		if ($arg =~ /-d/) { $debug++; next; }
+		if ($arg !~ /^-/) {
+			if (!$stat) {
+				$stat = $arg;
+				next;
+			}
+		}
+		usage();
+	}
+	
+	usage() unless ( $stat );
+
+	my $nfsStats = nfsStatistics();
+
+	#
+	# if $nfsStats is empty we're probably running on a host with no nfs mounts
+	#
+	if (scalar keys %$nfsStats) {
+		unless ( exists( $nfsStats->{$stat} ) ) {
+			die "[$stat] is not a supported statistic";
+		}
+
+		$statValue = $nfsStats->{$stat};
+		    
+		if ($debug) {
+            printf "%-21s%s\n", "NFS $stat", ": $statValue";
+		}
+	}
+	else {
+		print "No NFS mounts found\n" if $debug;
+
+		$statValue = 0;
+	}
+
+	print "$statValue\n";
+
+	exit 0;
+}
+
+sub nfsStatistics {
+
+	my %nfsStats = ();
+	my $nfs = '/proc/net/rpc/nfs';
+
+	if ( -f $nfs ) {
+		open(NFS, $nfs) or die "Unable to open [$nfs] for reading: $!";
+	
+		while (my $line = <NFS>) {
+			chomp $line;
+	
+			print "\t\tNFS: [$line]\n" if ($debug > 2);
+	
+			# This shows how the results from the nfsstat command map to /proc/net/rpc/nfs.
+			# The first column after 'proc3' just says how many nfs statistic columns are in the
+			# line (e.g. 22 in the example below). This can be ignored.
+			#
+			# root@app23 ~ $ nfsstat -c -n
+			# Client nfs v3:
+			# null       getattr    setattr    lookup     access     readlink
+			# 0       0% 1541   49% 35      1% 84      2% 1236   39% 0       0%
+			# read       write      create     mkdir      symlink    mknod
+			# 1       0% 57      1% 29      0% 0       0% 0       0% 0       0%
+			# remove     rmdir      rename     link       readdir    readdirplus
+			# 26      0% 0       0% 3       0% 0       0% 0       0% 9       0%
+			# fsstat     fsinfo     pathconf   commit
+			# 89      2% 1       0% 0       0% 0       0%
+			#
+			# root@app23 ~ $ cat /proc/net/rpc/nfs
+			# net 0 0 0 0
+			# rpc 3111 0 0
+			# proc2 18 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+			# proc3 22 0 1541 35 84 1236 0 1 57 29 0 0 0 26 0 3 0 0 9 89 1 0 0
+			# proc4 32 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+	
+			if ($line =~ /^proc3/) {
+				my @cols = split(/ /, $line);
+	
+				$nfsStats{'null'}     = $cols[2];
+				$nfsStats{'getattr'}  = $cols[3];
+				$nfsStats{'setattr'}  = $cols[4];
+				$nfsStats{'lookup'}   = $cols[5];
+				$nfsStats{'access'}   = $cols[6];
+				$nfsStats{'readlink'} = $cols[7];
+				$nfsStats{'read'}     = $cols[8];
+				$nfsStats{'write'}    = $cols[9];
+				$nfsStats{'create'}   = $cols[10];
+				$nfsStats{'mkdir'}    = $cols[11];
+				$nfsStats{'symlink'}  = $cols[12];
+				$nfsStats{'mknod'}    = $cols[13];
+				$nfsStats{'remove'}   = $cols[14];
+				$nfsStats{'rmdir'}    = $cols[15];
+				$nfsStats{'rename'}   = $cols[16];
+				$nfsStats{'link'}     = $cols[17];
+				$nfsStats{'readdir'}  = $cols[18];
+				$nfsStats{'readdir+'} = $cols[19];
+				$nfsStats{'fsstat'}   = $cols[20];
+				$nfsStats{'fsinfo'}   = $cols[21];
+				$nfsStats{'pathconf'} = $cols[22];
+				$nfsStats{'commit'}   = $cols[23];
+	
+				last;
+			}
+		}
+	
+		close(NFS);
+		
+		if ($debug) {
+			print "----- NFS Stats -----\n";
+			while (my ($k,$v) = each %nfsStats) {
+				printf("%-10s => %10d\n", $k, $v);
+			}
+			print "---------------------\n";
+		}
+		
+		my $blockSize = largestNetworkDiskBlockSize();
+		
+		if ( my $read = $nfsStats{ 'read' } ) {
+		    my $result = $read * $blockSize;
+		    $nfsStats{ 'readMB' } = ( $result / 1000000 ) * 8;
+		    
+		    if ( $debug ) {
+		        print "NFS V3 Reads         : $read\n",
+		              "NFS Mount Block Size : $blockSize\n",
+		              "NFS V3 Bytes Read    : $result\n",
+		              "NFS V3 Mb Read       : $nfsStats{ 'readMB' }\n";
+		    } 
+		}
+		
+		if ( my $write = $nfsStats{ 'write' } ) {
+		    my $result = $write * $blockSize;
+		    $nfsStats{ 'writeMB' } = ( $result / 1000000 ) * 8;
+
+		    if ( $debug ) {
+		        print "NFS V3 Writes        : $write\n",
+		              "NFS Mount Block Size : $blockSize\n",
+		              "NFS V3 Bytes Written : $result\n",
+		              "NFS V3 Mb Written    : $nfsStats{ 'writeMB' }\n";
+		    }
+		}
+	}
+
+	return \%nfsStats;
+}
+
+sub largestNetworkDiskBlockSize {
+	my $largestBlockSize = 0;
+	my $mounts = '/proc/mounts';
+
+	open(MOUNTS, $mounts) or die "Unable to open $mounts for reading: $!";
+	while (my $line = <MOUNTS>) {
+		chomp $line;
+
+		print "\t\tMOUNTS: [$line]\n" if ($debug > 2);
+
+		# $ cat /proc/mounts
+		# silva.opslab.ariba.com:/vol/vol1/export /fs nfs rw,v3,rsize=32768,wsize=32768,hard,intr,tcp,lock,addr=silva.opslab.ariba.com 0 0
+		#
+		if ($line =~ /^\S+ (\S+) nfs .*wsize=(\d+).*$/) {
+			my $mountPoint = $1;
+			my $blockSize = $2;
+
+			print "\tblock size for [$mountPoint] is [$blockSize]\n" if ($debug > 1);
+
+			if ($blockSize > $largestBlockSize) {
+				print "\tupdating largest block size from [$largestBlockSize] to [$blockSize]\n" if ($debug > 1);
+				$largestBlockSize = $blockSize;
+			}
+		}
+	}
+	close(MOUNTS);
+
+	return $largestBlockSize;
+}
+
+main();

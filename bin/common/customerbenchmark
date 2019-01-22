@@ -1,0 +1,181 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/common/customer-benchmarking#2 $
+
+
+use Carp;
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::ArchivedProduct;
+use ariba::Ops::DateTime;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::ReportingConstants;
+use ariba::monitor::QueryManager;
+use ariba::util::Simplefind;
+use File::Basename;
+use ariba::rc::Utils;
+use DateTime;
+use ariba::monitor::Url;
+
+
+my $DESTINATION_DIRECTORY = '/var/mon/docroot/customer-benchmarks/';
+
+
+sub usage {
+	my $error = shift;
+
+	if ($error) {
+		print "Error: $error\n";
+	}
+
+	print "$0 [-h|-d] -product <Product Name> [-customer <Customer Name>] -service <Service Name> -startDate <Start date> [-startTime <Start time>] -endDate <End date> [-endTime <End time>] \n";
+	print "    -h : this help messsage\n";
+	print "    -d : debug mode\n";
+	print "    -product  <Product  name> : Name of the product\n";
+	print "    -customer <Customer name> : Comma-separated list of customers (will do all installed by default)\n";
+	print "    -service  <Service  name> : Name of the service\n";
+	print "    -startDate  <Start date provided as YYYY/MM/DD (default is the first day of this month)> \n";
+	print "    -startTime  <Start time provided as hh:mm (default is 00:00)>\n";
+	print "    -endDate  <End date provided as YYYY/MM/DD (default is the first day of next month)> \n";
+	print "    -endTime  <End time provided as hh:mm (default is 23:59)> \n";
+
+ 
+	exit(1);
+}
+
+
+sub createSymlinkForProduct {
+	my $product = shift;
+
+	return unless (defined $product);
+
+	my $dataPullDir = $product->default('DataPullFileDirectory');
+
+
+	ariba::rc::Utils::mkdirRecursively($DESTINATION_DIRECTORY) unless (-d $DESTINATION_DIRECTORY);
+	
+	my $link = $DESTINATION_DIRECTORY;
+	$link .= $product->customer();
+
+	if (-l $link) {
+		unlink ($link);
+	}
+
+	unless (symlink($dataPullDir, $link)) {
+		print "Error while trying to create a symlink [$link] to [$dataPullDir]\n";
+		print "Exiting.\n";
+		exit(-1);
+	}
+	
+}
+
+sub main {
+
+	my $debug = 0;
+	my $productName;
+	my $serviceName;
+	my $customerName;
+	my $customerList;
+
+	my $startDate = undef;
+	my $startTime = undef;
+	
+	my $endDate = undef;
+	my $endTime = undef;
+	
+	my $noDecrypt = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ m/^-h/o) { usage(); }
+		if ($arg =~ m/^-d$/o) { $debug = 1; }
+		if ($arg =~ m/^-product/o) { $productName = shift(@ARGV); }
+		if ($arg =~ m/^-service/o) { $serviceName = shift(@ARGV); }
+		if ($arg =~ m/^-customer/o) { $customerList = shift(@ARGV); }
+		if ($arg =~ m/^-startdate/io) { $startDate = shift(@ARGV); }
+		if ($arg =~ m/^-startTime/io) { $startTime = shift(@ARGV); }
+		if ($arg =~ m/^-enddate/io) { $endDate = shift(@ARGV); }
+		if ($arg =~ m/^-endTime/io) { $endTime = shift(@ARGV); }
+		if ($arg =~ m/^-nodecrypt/io) { $noDecrypt = 1; }
+	}
+	
+	usage("missing product name") unless (defined $productName);
+	usage("missing service name") unless (defined $serviceName);
+
+	usage("Only AES is currently supported.") if (lc($productName) ne 'aes');
+
+	ariba::rc::Passwords::initialize($serviceName);
+
+	$startTime = "00:00" if ($startDate && !$startTime);
+	$endTime = "23:59" if ($endDate && !$endTime);
+
+	my @customers;
+	if ($customerList) {
+		@customers = split(/,/, $customerList);
+	} else {
+		@customers = map { $_->customer() } ariba::rc::InstalledProduct->installedProductsList($serviceName, $productName);
+	}
+	for my $customerName (@customers) {
+
+		unless(ariba::rc::InstalledProduct->isInstalled($productName, $serviceName, undef, $customerName)) {
+			print "ERROR: $customerName not installed\n";
+			next;
+		}
+		my $product  = ariba::rc::InstalledProduct->new($productName, $serviceName, undef, $customerName);
+
+		createSymlinkForProduct($product);
+
+		my $frontDoor = $product->default("sourcing_incominghttpserverurl");
+
+		my $asmSharedSecret = $product->default("ASMSharedSecret");
+
+		unless ($noDecrypt) {
+
+			$asmSharedSecret = "{DES}$asmSharedSecret";
+			print "frontdoor [$frontDoor] ;\n asm [$asmSharedSecret]\n" if ($debug);
+
+			$asmSharedSecret = ariba::rc::Passwords::decryptUsingKnownPassword($asmSharedSecret);
+		}
+
+
+		my $url = 	$frontDoor . '/Sourcing/IntegrationDataServlet';
+		print "url : $url\n" if ($debug);
+
+		my $monUrl = ariba::monitor::Url->new($url);
+		$monUrl->setFollowRedirects("yes");
+		$monUrl->setContentType('application/x-www-form-urlencoded');
+		$monUrl->setUseOutOfBandErrors(1);
+
+		my $body = "sender_credential_domain=SpendManagement&";
+		$monUrl->setPostBody($body);
+		$monUrl->appendToAttribute('postBody', "sender_credential_identity=Sourcing&");
+		$monUrl->appendToAttribute('postBody', "sender_credential_shared_secret=$asmSharedSecret&");
+		$monUrl->appendToAttribute('postBody', "IncrementalStartDate=$startDate+$startTime&") if ($startDate && $startTime);
+		$monUrl->appendToAttribute('postBody', "IncrementalEndDate=$endDate+$endTime&") if ($endDate && $endTime);
+		$monUrl->appendToAttribute('postBody', "CustomerBenchmark=$customerName&");
+		$monUrl->appendToAttribute('postBody', "FILENAME=AnalysisData.csv");
+
+		print "Body : [", $monUrl->postBody() ,"]\n" if ($debug);
+
+
+
+		my $result =  $monUrl->request();
+
+		if ($monUrl->error()) {
+			print "ERROR : " . $monUrl->error() . "\n";
+		}
+
+		if ($result) {
+			print $result;
+
+		} else {
+			print "ERROR: Url didn't return anything\n";
+		}
+	}
+
+}
+
+main();

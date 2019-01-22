@@ -1,0 +1,117 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+
+# This script runs from ~/bin/common, so up two levels to find 'lib'.  Also, for Perl 5.8 environments, this *MUST* be before use'ing
+# any Perl module found in ../../lib.  This is not an issue for Perl 5.22 (where I first tested ;()).
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use Getopt::Long qw(:config no_bundling no_ignore_case_always no_getopt_compat require_order);
+use File::Basename;
+use Net::DNS;
+use dmail::LockLib;
+use Data::Dumper;
+use Time::HiRes;
+
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::StatusPage;
+
+my $programName = $0;
+my $qmName = basename ($programName);
+
+my $me = ariba::rc::InstalledProduct->new ();
+my $email = $me->default ('notify.email');
+my $cluster = $me->currentCluster ();
+
+my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts ($me);
+my $datacenter = ariba::Ops::ProductAPIExtensions::mainDatacenterForProductAndCluster ($me, $cluster);
+
+my $lockFile = "/tmp/$qmName";
+die "can't grab lock\n" unless dmail::LockLib::requestlock ($lockFile, 10);
+
+my $res    = Net::DNS::Resolver->new ();
+
+my ($debug, $sendEmail, $sendPage,) = (0, 0, 0);
+
+GetOptions  (
+                'debug|d'      => \$debug,
+                'sendemail|e'  => \$sendEmail,
+                'sendpage|p'   => \$sendPage,
+            );
+
+# In my testing, setting these did not affect the runtime of the test script, which took 1m 15s, 4 or 5 times in a row.
+# Setting them anyway, just in case they might help under some circumstances.
+$res->tcp_timeout (10);
+$res->udp_timeout (10);
+
+# Find all inservice hosts providing DNS lookup, based on machinedb, for all datacenters in the list.  Yes, even though
+# the field name is singular, it will process a comma separated list correctly.
+my %match = (
+                datacenter       => join (',', @dataCenters),
+                status           => 'inservice',
+                providesServices => 'dns',
+            );
+
+my $maxResults = 12 * 24 * 30 * 3; # Based on running once every 5 minutes (12 times per hour), for 3 months (assuming 30 days).
+my %queries = ();
+my @dnsServerMachines = sort {$a->hostname () cmp $b->hostname ()} ariba::Ops::Machine->machinesWithProperties (%match);
+for my $hostMachine (@dnsServerMachines)
+{
+    my (@ipAddress, $errString, $status, @startTime, @endTime);
+    my $hostname = $hostMachine->hostname ();
+    $res->nameservers ($hostname);
+    @startTime = Time::HiRes::gettimeofday ();
+    my $reply = $res->search ($hostname, "A");
+    @endTime = Time::HiRes::gettimeofday ();
+
+    if ($reply)
+    {
+        # I don't expect there ever should be more than one answer, since there is only one server/host, but just in
+        # case, since I don't grasp the full feature set of DNS or Net::DNS, will go with this as is.
+        foreach my $rr ($reply->answer ())
+        {
+            push (@ipAddress, $rr->address ()) if $rr->can ("address");
+        }
+        $status = "ok:  ipaddress:  @ipAddress";
+    }
+    else
+    {
+        $status = "not ok:  " . $res->errorstring;
+    }
+
+    # Set up the query hash now:
+    $queries {"DNS server $hostname status"}  = {
+                                                    noRowCount => 1,
+                                                    info       => "answer =~ /^ok/",
+                                                    crit       => "answer =~ /^not ok/",
+                                                    perl       => sub {return $status},
+                                                    inf_field  => "DNS Server $hostname status",
+                                                    uiHint     => $hostname,
+                                                };
+    $queries {"DNS server $hostname delay time"}  = {
+                                                        noRowCount       => 1,
+                                                        # The values used here are milliseconds.
+                                                        info             => "answer < 200",
+                                                        crit             => "answer >= 200",
+                                                        perl             => sub {return int ((Time::HiRes::tv_interval (\@startTime, \@endTime) * 1000))},
+                                                        inf_field        => "DNS Server $hostname delay time",
+                                                        uiHint           => $hostname,
+                                                        recordItem       => 'answer',
+                                                        recordDataType   => 'gauge',
+                                                        recordMaxResults => $maxResults,
+                                                        format           => "%d ms\n",
+                                                    };
+}
+
+print Dumper (\%queries) if $debug;
+
+my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+my $qm = ariba::monitor::QueryManager->newWithDetails ($qmName, $pn, $me->service (), undef, \%queries);
+
+$qm->processQueries ($debug, $email, $sendEmail, $sendPage);
+
+dmail::LockLib::releaselock($lockFile);

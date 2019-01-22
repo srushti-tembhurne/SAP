@@ -1,0 +1,880 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/cycle-wof-apps#68 $
+#
+# This app will cycle wof apps either through cron job or from the command line on the monitoring server
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../bin";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NotificationRequest;
+use ariba::Ops::ServiceController;
+use POSIX;
+use File::Touch;
+
+require "geturl";
+
+my $haveTTY = (-t STDIN || -t STDOUT) ? 1 : 0;
+my $debug = $haveTTY;
+my $timeout = 20;
+my $COMMUNITY = "community";
+my $HOST = "host";
+
+# spread instances such that app instances of the same type are not
+# sequentially cycled.  This will help prevent all app types on a
+# community being off line at the same time and potentially causing
+# a community down time.
+sub spread {
+    my @instances = @_;
+
+    my @sortedInstances = sort { $a->instanceName() cmp $b->instanceName() } @instances;
+    my @result = ();
+
+    for (my $order = 0;$order < 2;$order++) {
+
+        for (my $i = 0;$i < scalar(@sortedInstances);$i++) {
+
+            if (($i % 2) == $order) {
+
+                push(@result, $sortedInstances[$i]);
+            }
+        }
+    }
+
+    return @result;
+}
+
+#
+# in some cases we only want to *request* a subset of certain types of
+# instances to recycle themselves by bleeding off the current load. Sort
+# based on "flavor" of instances and their uptime
+#
+sub byCommunityAndNameAndUpTime {
+    my $aInstance = $a->instanceName();
+    my $bInstance = $b->instanceName();
+
+    my $aCommunity = $a->community() || 0;
+    my $bCommunity = $b->community() || 0;
+
+    my $aApp = $a->appName();
+    my $bApp = $b->appName();
+
+    if ($aCommunity == $bCommunity && $aApp eq $bApp) {
+        my $aUpTime = upTimeForInstance($a);
+        my $bUpTime = upTimeForInstance($b);
+
+        return($bUpTime <=> $aUpTime);
+    } elsif ($aCommunity == $bCommunity) {
+        return ($aInstance cmp $bInstance);
+    } else {
+        return ($aCommunity <=> $bCommunity);
+    }
+}
+
+sub checkIfAlive {
+    my $instance = shift;
+    my $fullyUp = shift;
+    my $waitTime = shift;
+
+    my $statsUrl = $instance->monitorStatsURL();
+    # Check to be sure we have something here before trying to use it.  Return of a negative number is
+    # currently OK, since the only use of the return value is to check if it is equal to zero.  But
+    # we need something that would be considered invalid otherwise.
+    return -1 unless $statsUrl;
+
+    my @output;
+
+    eval '&geturl("-e","-q","-timeout",$timeout,"-results",\@output,$statsUrl);';
+    my $outputStr = join("",@output);
+
+    #print "Result : $outputStr for url $statsUrl\n";
+    my $rc = 0;
+    if ($fullyUp) {
+        # If the returned url contains "UpTime" then the node is fully on line.
+        # Then verify the node has been recently restsarted by checking uptime.
+        if ($outputStr =~ /UpTime/i) {
+            my $upTime = parseUpTime(\@output);
+            if ($upTime < (2 * $waitTime)) {
+                $rc = 1;
+            } else {
+                print("Node has not cycled: uptime: $upTime.\n") if $debug;
+            }
+        } else {
+            print("Restarting url not fully up yet.\n") if $debug;
+        }
+    } else {
+        # just verify we can establish a connection to the port
+        if ($outputStr =~ /Connection refused/i) {
+            print("Can not connect to restarting url.\n") if $debug;
+        } else {
+            $rc = 1;
+        }
+    }
+    return ($rc);
+}
+
+sub instancesForRecycling {
+    my $percentageOfInstancesToRecyle = shift;
+    my @instances = @_;
+
+    print "\n" if $debug;
+    my @sortedInstances = sort byCommunityAndNameAndUpTime @instances;
+    print "\n" if $debug;
+    my @result = ();
+
+    my %appsInCommunityByUptime;
+    $percentageOfInstancesToRecyle /= 100;
+
+    #
+    # Get a list of app instances of a certain type, sorted by uptime
+    # (sort happened above!)
+    #
+    for (my $i = 0;$i < scalar(@sortedInstances);$i++) {
+        my $instance = $sortedInstances[$i];
+        my $app = $instance->appName();
+        my $community = $instance->community() || 0;
+
+        push(@{$appsInCommunityByUptime{"$community-$app"}}, $instance);
+    }
+
+    #
+    # put only a certain %age of the total number as recycle
+    # candidate
+    #
+    for my $key (keys(%appsInCommunityByUptime)) {
+        my @instances = @{$appsInCommunityByUptime{$key}};
+        my $totalNum = scalar(@instances);
+
+        #
+        # cheat to round off to the next digit, we dont want the
+        # number to be 0 for ex when TotalNum = 3 and percent is 0.3
+        #
+        my $recycle = int($totalNum * $percentageOfInstancesToRecyle + 0.5);
+        my @recycle;
+        my @dontRecycle;
+        for (my $i = 0; $i < $totalNum; $i++)  {
+            if ($i < $recycle) {
+                push(@recycle, $instances[$i]);
+            } else {
+                push(@dontRecycle, $instances[$i]);
+            }
+        }
+
+        #
+        # make sure at least 1 instances are up that will not be
+        # recycled, or at least 2 instances are up if cycling
+        # everything
+        #
+        my $instancesToNotRestartCount = scalar(@dontRecycle);
+        my $canCycle = 0;
+        my $instancesUpCount = 0;
+
+        if ($instancesToNotRestartCount) { # i.e. $percentageOfInstancesToRecyle is not 100
+            for my $instance (@dontRecycle) {
+                if ($instance->upTime()) {
+                    ++$instancesUpCount;
+                }
+            }
+        } else {
+            for my $instance (@recycle) {
+                ++$instancesUpCount if ($instance->upTime());
+            }
+        }
+
+        # Make sure we have at least half the instances up per
+        # community.
+        # It's ok if node cycling is skipped for a day, as it will
+        # resume the next day with the oldest instances
+        my $totalNeededUp = ceil($totalNum/2);
+        $canCycle = 1 if ($instancesUpCount >= $totalNeededUp);
+
+        unless ($canCycle) {
+            if ($debug > 0) {
+                print "Warning: Skipping recycle for instances in community-appType ($key), need $totalNeededUp out of $totalNum node(s) to be up but have $instancesUpCount.\n";
+            }
+            push(@dontRecycle, @recycle);
+            @recycle = ();
+        }
+
+        if ($debug > 1) {
+            print "Will recycle $recycle of $totalNum for $key\n";
+            print "Recycle Bucket: ", join(", ", map { $_->instanceName() } @recycle), "\n";
+            print "Do Not Recycle Bucket: ", join(", ", map { $_->instanceName() } @dontRecycle), "\n";
+            print "\n";
+        }
+        push(@result, @recycle);
+    }
+
+    return @result;
+}
+
+# Returns a list of all even or odd nodes based on which side has the highest average up time
+sub oddEvenInstancesForRecycling {
+    my @instances = @_;
+
+    my $oddCount = 0;
+    my $oddUpTime = 0;
+    my $evenCount = 0;
+    my $evenUpTime = 0;
+    my %oddEvenNodes;
+    my %downAppsOnHost;
+
+    foreach my $instance (@instances) {
+        my $upTime = upTimeForInstance($instance);
+        unless ($upTime) {
+            $downAppsOnHost{$instance->host()}{$instance->appName()} = 1;
+            next;
+        }
+        if ($instance->recycleGroup()) {
+            $oddCount++;
+            $oddUpTime += $upTime;
+        } else {
+            $evenCount++;
+            $evenUpTime += $upTime;
+        }
+        $oddEvenNodes{$instance->recycleGroup()} = [] unless defined($oddEvenNodes{$instance->recycleGroup()});
+        push(@{ $oddEvenNodes{$instance->recycleGroup()} }, $instance);
+    }
+
+    my $oddAvgUpTime = $oddCount ? $oddUpTime / $oddCount : 0;
+    my $evenAvgUpTime = $evenCount ? $evenUpTime / $evenCount : 0;
+
+    my $recycleGroup = 0;
+    $recycleGroup = 1 if ($oddAvgUpTime > $evenAvgUpTime);
+
+    # Prevent recycling nodes if there are already nodes down on the same host for the same node type.
+    # Supposedly, ShardWriter and SearchCore are distributed two per host, and only one of them can be ddown.
+    my @nodesToRecycle = grep { !$downAppsOnHost{$_->host()}{$_->appName()} }
+        @{ $oddEvenNodes{$recycleGroup} };
+
+    return @nodesToRecycle;
+}
+
+sub archesInstancesForRecycling {
+    my @instances = @_;
+
+    my @gracefulNodes;  # Nodes that will be recycled based on the older 35%
+    my @oddEvenNodes;   # Nodes that will be recycled based on odd / even recycle group.
+
+    foreach my $instance (@instances) {
+        if ($instance->appName() =~ /^(?:ShardWriter|SearchCore)$/o) {
+            push(@oddEvenNodes, $instance);
+        } else {
+            push(@gracefulNodes, $instance);
+        }
+    }
+
+    printNodeInstances('gracefulNodes', @gracefulNodes) if $debug;
+    printNodeInstances('oddEvenNodes', @oddEvenNodes) if $debug;
+
+    my @nodesToRecycle = instancesForRecycling(35, @gracefulNodes);
+    push(@nodesToRecycle, oddEvenInstancesForRecycling(@oddEvenNodes));
+
+    printNodeInstances('nodesToRecycle', @nodesToRecycle) if $debug;
+
+    return @nodesToRecycle;
+}
+
+sub printNodeInstances {
+    my $name = shift;
+    my @nodes = @_;
+
+    print "$name\n";
+    print "-" x 80, "\n";
+    foreach my $i (@nodes) {
+        print $i->instanceName(), " ";
+    }
+    print "\n\n";
+}
+
+sub stopAndPrevent {
+    my $productName = shift;
+    my $serviceName = shift;
+    my $customer = shift;
+    my $stopAndPreventForHours = shift;
+
+    my $preventCycleFile = "/tmp/no-cycle-$productName-$serviceName";
+    $preventCycleFile .=  '-' . $customer if ($customer);
+
+    if (defined($stopAndPreventForHours)) {
+
+        my $futureTime = time() + $stopAndPreventForHours * 60 * 60;
+        my $touch = File::Touch->new(mtime => $futureTime);
+        my $success = $touch->touch($preventCycleFile);
+
+        if ($success) {
+            # The word 'successfully' is being checked by docroot/cgi-bin/event-handler
+            # in sub handleControlDeploymentEvent
+            print "Successfully set $preventCycleFile to expire in $stopAndPreventForHours hour(s).\n";
+        } else {
+            print "Failed to set modified time for $preventCycleFile: $!\n";
+        }
+
+        return 1;
+    }
+
+    if (-e $preventCycleFile) {
+        my $daysSinceModified = -M $preventCycleFile; # Negative # of days if in future
+        my $hoursLeft = ($daysSinceModified >= 0) ? 0 : sprintf("%.2f", $daysSinceModified * -1 * 24);
+        if ($hoursLeft == 0) {
+            unlink($preventCycleFile);
+        } else {
+            print "$preventCycleFile lock file exists.  App instance cycling disabled for $hoursLeft more hour(s).\n" if $debug;
+            print "use -force to override.";
+            return 1;
+        }
+
+    }
+
+    return 0;
+}
+
+# Only one group type can be used.  If $groupType is defined then the group type has already
+# been set and the second call to this sub is an attempt to set a second group type.
+sub setGroupType {
+    my $groupType = shift;
+    my $constant = shift;
+
+    if (defined($groupType)) {
+        print "-host and -community are mutualy exclusive.  Please choose only one.\n";
+        usage();
+    }
+    return($constant);
+}
+
+# HACK ALERT
+#
+# Nightly instance cycling impacts some customers.  This subroutine stript instances for problem
+# communities from the instance list.  This prevents instances of those communities from being cycled.
+#
+sub dontCycle {
+    my $instances = shift;
+    my $serviceName = shift;
+    my $productName = shift;
+
+    my @strippedInstances = @$instances;
+    # This hack only applies to procution classic stack services
+    return ( @strippedInstances ) unless ariba::Ops::ServiceController::productionCsServicesOnly( $serviceName );
+
+    # I set this up as a hash to loop over.  If we ever need to expand this to skip other
+    # communities then this has should be extracted into a json file and read in here.
+    # This will make future community management easier.
+    my %skips = (
+        'prodeu' => {
+            'buyer' => [ 2 ],
+            's4' => [5,6],
+        },
+    );
+
+    foreach my $service ( keys %skips ) {
+        if ( $service eq $serviceName ) {
+            while ( my ( $product, $communities ) = each %{ $skips{ $service } } ) {
+                next unless ( $productName eq $product );
+
+                # We have a product/service match.  We're going to rebuild @strippedInstances
+                # Stripping out any matches so reinit it here.
+                @strippedInstances = ();
+                foreach my $instance ( @$instances ) {
+                    my $instanceCommunity = $instance->community() || 0;
+                    my $match;
+                    foreach my $hashCommunity ( @$communities ) {
+                        if ( $hashCommunity eq $instanceCommunity ) {
+                            print "Skipping $productName ".$instance->instanceName()." (".$instance->appName().") on community $instanceCommunity\n";
+                            $match = 1;
+                            last;
+                        }
+                    }
+                    push ( @strippedInstances, $instance ) unless $match;
+                }
+            }
+        }
+    }
+
+    return @strippedInstances;
+}
+
+sub main {
+    my $productName;
+    my $serviceName;
+    my $customer;
+    my $appToKill;
+    my $appToKillRegex;
+    my %appKillUrls;
+    my $foundInstance;
+    my $patternInstances;
+    my $waitTime = 30;
+    my $maxWaitTime = 10 * 60;
+    my $graceful;
+    my $stopAndPreventForHours;
+    my $fullyUp = 0;
+    my $force = 0;
+    my $groupIdentifier;
+    my $groupType;
+    my $logFile;
+
+    while (my $arg = shift(@ARGV)) {
+        if  ($arg eq '-graceful') {
+            $graceful = shift @ARGV;
+        } elsif  ($arg =~ /^-d/) {
+            $debug++;
+        } elsif  ($arg eq '-timeout') {
+            $timeout = shift @ARGV;
+        } elsif  ($arg eq '-waitTime') {
+            $waitTime = shift @ARGV;
+        } elsif  ($arg eq '-maxWaitTime') {
+            $maxWaitTime = shift @ARGV;
+        } elsif  ($arg eq '-customer') {
+            $customer = shift @ARGV;
+        } elsif  ($arg =~ /^-stopAndPrevent/i) {
+            $stopAndPreventForHours = shift @ARGV;
+        } elsif  ($arg =~ /^-fullyUp/i) {
+            $fullyUp = 1;
+            $maxWaitTime = 30 * 60;
+        } elsif  ($arg =~ /^-force/i) {
+            $force = 1;
+        } elsif  ($arg =~ /^-community/i) {
+            $groupIdentifier = shift @ARGV;
+            $groupType = setGroupType($groupType, $COMMUNITY);
+            # waitTime is set to 15 min to prevent community downtimes which would happen if all UI nodes are cycled at 30s intervals.
+            # this is a work around until 'bucket cycling' is implemented.
+            $waitTime = 900;
+        } elsif  ($arg =~ /^-host/i) {
+            $groupIdentifier = shift @ARGV;
+            $groupType = setGroupType($groupType, $HOST);
+        } elsif  ($arg =~ /^-log/i) {
+            $logFile = shift @ARGV;
+            $debug = 1;
+        } elsif (!$productName) {
+            $productName = $arg;
+        } elsif (!$serviceName) {
+            $serviceName = $arg;
+        } elsif (!$appToKill) {
+            $appToKill   = $arg;
+        }
+    }
+
+    if ( $logFile ) {
+        unless ( open(STDOUT, ">>$logFile") ) { # Let it continue to do the recycling regardless
+            print "Failed to redirect STDOUT to / open $logFile for writing: $!\n";
+            $debug = 0 unless ( -t STDOUT );
+        }
+        STDOUT->autoflush(1);
+    }
+    print "Start time " . strftime('%F %T',localtime) . "\n";
+    usage() unless ( defined($productName) && defined($serviceName) );
+
+    if (defined($graceful) && (!($graceful =~ /^\d+$/) || $graceful > 100 || $graceful < 1)) {
+        print "-graceful percent must be between 1 and 100.\n";
+        usage();
+    }
+
+    if (defined($appToKill)) {
+        if (defined($groupType)) {
+            print "Going to cycle app instances matching $appToKill in $productName $serviceName on $groupType $groupIdentifier\n" if $debug;
+        } else {
+            print "Going to cycle app instances matching $appToKill in $productName $serviceName\n" if $debug;
+        }
+        $patternInstances = 1;
+
+        # $appsToKill can be a coma separated list.  Construct a regex of this list so that we can compare
+        # each pattern against every app instance name
+        my @patterns = split(',', $appToKill);
+        $appToKillRegex = "(?:" . join('|', @patterns) . ")";
+
+    } elsif (defined($groupType)) {
+        print "Going to cycle all app instances in $productName $serviceName on $groupType $groupIdentifier\n" if $debug;
+    } else {
+        print "Going to cycle all non-dispatcher app instances in $productName $serviceName\n" if $debug;
+    }
+
+    if ($graceful) {
+        print "Graceful shutdown requested for $graceful% of instances\n" if $debug;
+    }
+
+    my @installedProducts = ariba::rc::InstalledProduct->installedProductsList($serviceName, $productName, $customer);
+
+    #
+    # Nothing to do if the product is not installed
+    #
+    unless ( scalar(@installedProducts) ) {
+        if (!defined($customer)) {
+            $customer = "";
+        }
+        print "no products found for $serviceName $productName $customer\n" if $debug;
+        exit(0);
+    }
+
+    #
+    # safety net: if we're running from the terminal, get
+    # confirmation for anything that will touch multiple products
+    if (@installedProducts && scalar(@installedProducts) > 1 && $haveTTY) {
+        print "*** Warning ***\n";
+        print "This will touch multiple products: ", join( ", ", map( { $_->name() . ($_->customer() ? "/".$_->customer() : "") } @installedProducts) ), "\n";
+        print "Are you sure? [y/N]: ";
+        my $answer = <STDIN>;
+        if ($answer !~ /^y/i) {
+            print "Aborted.\n";
+            exit(1);
+        }
+    }
+
+    for my $product (@installedProducts) {
+        if (!$force) {
+            next if (stopAndPrevent($product->name(), $product->service(), $product->customer(), $stopAndPreventForHours));
+        }
+
+        ## Since this isn't idiomatic Perl, @a = $a makes a single element array with the value of $a
+        ## my $a = 'hello';
+        ## my @a = $a;
+        ## print Dumper \@a;
+        ## $VAR1 = [
+        ##           'hello'
+        ##         ];
+        my @clusters =  ($product->name() =~ /^arches/)  ? $product->allClusters() :  $product->currentCluster() ;
+
+        foreach my $cluster (@clusters){
+            my @instancesToRecycle;
+
+            #
+            # When a pattern match is specified only cycle app instances with the pattern in their names
+            #
+            # For graceful recycle, we only request a subset of app instances every night
+            # based on how long they have been up, making sure recycle only a
+            # certain percentage of total number of instance of a particular
+            # flavor each night.
+            #
+            # For full recycle without graceful specified, make sure the app instances
+            # are cycled in an order such that no two app instances of the same type
+            # are cycled one right after the other
+            #
+
+            # OpenOffice instances don't get cycled
+            my @allInstances = grep { !$_->isOpenOfficeApp() && !$_->isSeleniumApp() } $product->appInstancesInCluster($cluster);
+            @allInstances = dontCycle( \@allInstances, $serviceName, $productName );
+
+            if ($graceful) {
+                if ($product->name() =~ /^arches/) {
+                    @instancesToRecycle = archesInstancesForRecycling(@allInstances);
+                } else {
+                    @instancesToRecycle = instancesForRecycling($graceful, @allInstances);
+                }
+            } else {
+                @instancesToRecycle = spread(@allInstances);
+            }
+
+            my @errors = ();
+
+            for my $instanceObj (@instancesToRecycle) {
+                STDOUT->autoflush(1);
+                if ( $logFile ) {
+                   close(STDOUT); # Close STDOUT only if o/p is redirected to logfile. #HOA-129556
+                   $|=1;
+                   unless ( open(STDOUT, ">>$logFile") ) { # Let it continue to do the recycling regardless
+                       print "Failed to redirect STDOUT to / open $logFile for writing: $!\n";
+                       $debug = 0 unless ( -t STDOUT );
+                   }
+                STDOUT->autoflush(1);
+                }
+                if (!$force) {
+                    last if (stopAndPrevent($product->name(), $product->service(), $product->customer()));
+                }
+
+                my @output   = ();
+                my $instanceName = $instanceObj->instanceName();
+                my $exitString = "Successfully\\s*initiated\\s*node\\s*shutdown|exiting\\s*normally\\.|app\\s*was\\s*killed|Shutting\\s*down";
+                my $instanceSearch = $instanceName;
+
+                # For tomcat app instances instance name is computed differently
+                if ($instanceObj->isTomcatApp()) {
+                    $instanceSearch .= $instanceObj->workerName();
+                }
+
+                # For Layout V5, add the logical name to the name used to search
+                if ($instanceObj->logicalName()) {
+                    $instanceSearch .= $instanceObj->logicalName();
+                }
+
+                next unless $instanceObj->needsNightlyRecycle() || defined($appToKill) || defined($groupType);
+
+                if ($debug > 1) {
+                    my $productId = $product->name() . ($product->customer()?"/" . $product->customer():"");
+                    my $community = $instanceObj->community() || 0;
+                    print "Attempting shutdown of $productId $instanceName (".$instanceObj->appName().") on community $community\n";
+                }
+
+                # When cycling app instances based on patterns and community we must check for these in order of:
+                # 1) community and pattern match.  Must be done before #2 else the commuity flag is ignored
+                #    and all app instances matching the pattern, regardless of community, would cycle.
+                # 2) pattern match only.
+
+                if ($groupType) {
+                    my $identifier;
+                    if ($groupType eq $COMMUNITY) {
+                        $identifier = $instanceObj->community();
+                        if (!$identifier) {
+                            $identifier = "default";
+                        }
+                    } elsif ($groupType eq $HOST) {
+                        $identifier = $instanceObj->host();
+                    }
+                    next unless $identifier eq lc($groupIdentifier);
+
+                    if (defined($appToKill)) {
+                        next unless $instanceSearch =~ /$appToKillRegex/o;
+                    }
+                    $foundInstance = 1;
+                }
+
+                if ($patternInstances) {
+                    next unless $instanceSearch =~ /$appToKillRegex/o;
+                    $foundInstance = 1;
+                }
+                my $output;
+                if ($graceful) {
+                    $output = gracefulShutdownInstance($instanceObj);
+                } else {
+                    $output = killInstance($instanceObj);
+                }
+                print "url output = $output\n" if ($debug > 1);
+
+                # If we try to kill an instance that is not running,
+                # we must not wait for it to be relaunched
+                my $somethingToWaitFor = 1;
+
+                if ($output =~ /Connection refused/i ) {
+                    $somethingToWaitFor = 0;
+                }
+                my $logicalName = $instanceObj->logicalName();
+                $logicalName = $instanceObj->workerName() unless ($logicalName);
+                my $datestring = timestamp();
+                if ($output =~ /Connection refused/i || $output !~ /$exitString/i) {
+                    push(@errors, "$datestring,$instanceName,$logicalName,ERROR - didn't kill: $output");
+
+                } else {
+                    print "$datestring,$instanceName,$logicalName was killed\n" if $debug;
+                }
+
+                # How long we have been waiting
+                my $waiting = 0;
+
+                # We will wait until the instance has been relaunched
+                if ($somethingToWaitFor && $waitTime > 0) {
+                    print "sleeping for ${waitTime}s while the instance is restarting.\n" if $debug;
+                    sleep($waitTime);
+                    $waiting += $waitTime;
+                    my $isAlive = checkIfAlive($instanceObj, $fullyUp, $waitTime);
+                    while ( ($isAlive == 0) and ($waiting < $maxWaitTime) ) {
+                        print "Waiting ${waitTime}s for the relaunch of the instance...\n" if ($debug);
+                        sleep($waitTime);
+                        $waiting += $waitTime;
+                        $isAlive = checkIfAlive($instanceObj, $fullyUp, $waitTime);
+                    }
+
+                    if ( ($isAlive == 0) && ($waiting >= $maxWaitTime) ) {
+                        print "I have been waiting for too long... Not waiting anymore for this instance.\n";
+                    }
+                }
+            }
+
+            if ( !$foundInstance && $debug && $patternInstances) {
+                print "Didn't find matches for $appToKill in list of possible app instances.  Check app instance name.\n";
+            }
+
+            #
+            # If there were errors, notify
+            #
+            if (@errors) {
+                my $message = join("\n", @errors);
+                notifyFailures($product, $message);
+            }
+        }
+    }
+    print "End time " . strftime('%F %T',localtime) . "\n";
+}
+
+sub timestamp {
+     my $datestring = strftime('%a %b %e %H:%M:%S %Y', localtime);
+}
+
+sub killInstance {
+    my $instanceObj = shift;
+
+    my $url = $instanceObj->killURL();
+    # Check to be sure we have something here before trying to use it.  Return of a negative number is
+    # currently OK, since the only use of the return value is to check if it is equal to zero.  But
+    # we need something that would be considered invalid otherwise.
+    return -1 unless $url;
+
+    my @output;
+    my $datestring = timestamp();
+    my $logicalName = $instanceObj->logicalName();
+    $logicalName = $instanceObj->workerName() unless ($logicalName);
+    my $nodeName = $instanceObj->instanceName();
+    print "$datestring,$nodeName,$logicalName, kill via $url\n" if $debug;
+    my @postdata = (" "); # springboot requires post of empty string
+    if ($instanceObj->isSpringbootApp()) {
+      eval '&geturl("-e","-q","-postmemory",\@postdata, "-timeout",$timeout,"-results",\@output,$url);';
+    } else {
+      eval '&geturl("-e","-q","-timeout",$timeout,"-results",\@output,$url);';
+    }
+    return(join("",@output));
+}
+
+sub gracefulShutdownInstance {
+    my $instanceObj = shift;
+
+    my $url = $instanceObj->shutdownURL();
+    # Check to be sure we have something here before trying to use it.  Return of a negative number is
+    # currently OK, since the only use of the return value is to check if it is equal to zero.  But
+    # we need something that would be considered invalid otherwise.
+    return -1 unless $url;
+
+    my @output;
+    my @postdata = (" "); # springboot requires post of empty string
+
+    print "graceful shutdown via $url\n" if $debug;
+    if ($instanceObj->isSpringbootApp()) {
+      eval '&geturl("-e","-q","-postmemory",\@postdata, "-timeout",$timeout,"-results",\@output,$url);';
+    } else {
+      eval '&geturl("-e","-q","-timeout",$timeout,"-results",\@output,$url);';
+    }
+
+    return(join("",@output));
+}
+
+sub parseUpTime {
+    my $output = shift;
+
+    my $upTime = 0;
+    for my $line (@$output) {
+        if ($line =~ m|<UpTime>(\d+)</UpTime>|i) {
+            $upTime = $1;
+            last;
+        }
+    }
+    return ($upTime);
+}
+
+sub upTimeForInstance {
+    my $instanceObj = shift;
+
+    my $url = $instanceObj->monitorStatsURL();
+    return 0 unless defined($url);
+
+    my @output;
+
+    print "getting uptime via $url\n" if $debug > 1;
+
+    eval '&geturl("-e","-q","-timeout",$timeout,"-results",\@output,$url);';
+
+    my $upTime = parseUpTime(\@output);
+
+    # check this later to see if the node is up
+    $instanceObj->setUpTime($upTime);
+
+    print "Uptime for ", $instanceObj->instanceName(), ": $upTime\n" if ($debug > 1);
+
+    return $upTime;
+}
+
+sub notifyFailures {
+    my $product = shift;
+    my $message = shift;
+
+    my $status = "warn";
+    my $subject = "$status: Failed to cycle app instances";
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $notifyEmailAddress = $me->default('notify.email');
+
+    if ($debug) {
+        print "$status: $subject\n";
+        print "$message\n";
+        #print "notify: $notifyEmailAddress\n";
+    } else {
+
+        my $notificationRequest = ariba::Ops::NotificationRequest->newMessage(
+            $status,
+            $0,
+            $product->name(),
+            $product->service(),
+            $product->customer(),
+            $product->currentCluster(),
+            $subject,
+            $message,
+            $notifyEmailAddress
+        );
+
+        return $notificationRequest->send();
+    }
+}
+
+sub usage {
+    print "usage: cycle-wof-apps [-graceful <percent>] [-timeout <seconds>] [-waitTime <seconds>] [-maxWaitTime <seconds>] [-fullyUp] [-force] [-community <community>|-host <host>] productName serviceName [-customer <customer>] [pattern[,pattern...]] [-stopAndPrevent <hours>] [-log <logFilePath>]\n";
+    print "\n";
+    print "    Cleanly cycles all AW app instances described by something like \"an prod\"\n";
+    print "    If multiple app instances are cycled they cycle at 30s intervals by default.\n";
+    print "    The default behavior is to use kill (exit now) directAction.\n";
+    print "    If you need session bleeding instead use -graceful.\n";
+    print "\n";
+    print "    productName is an installed productName (eg an or s4 or buyer).\n";
+    print "    serviceName is the service on which productName is installed (eg. prod or mig or dev).\n";
+    print "\n";
+    print "    pattern is a comma separated list of substrings to search against every app instance name.\n";
+    print "    All app instances matching any of the patterns will be cycled.\n";
+    print "    eg. UI16920000,UI16920006: will cycle only these two app instances.\n";
+    print "        becasue all app instance numbers are unique this is functionally the same: 16920000,16920006.\n";
+    print "    eg. ^Task: will cycle all task app instances (but not GlobalTask app instances).\n";
+    print "\n";
+    print "    If -graceful <percent> is specified, only <percent> of\n";
+    print "        each flavor of app instance will be recycled.\n";
+    print "        <percent> should be between 1 and 100. 30 seems like a reasonable number.\n";
+    print "        Recycle happens by bleeding off current load, as opposed to immediately.\n";
+    print "\n";
+    print "    If -timeout <seconds> is specified, it will wait up to\n";
+    print "        <seconds> for a response from a server. This timeout is set\n";
+    print "        to 20s by default.\n";
+    print "\n";
+    print "    If -waitTime <seconds> is specified, it will check every <seconds> for a response from\n";
+    print "        the app instance to verify if the app instance is restarting (or fullyUp).  WaitTime is set\n";
+    print "        to 30s by default.  Setting waitTime to 0 will not check for app instance restart\n";
+    print "        and cycle the app instances asap (this overrides -fullyUp).\n";
+    print "\n";
+    print "    If -maxWaitTime <seconds> is specified, it will wait up to\n";
+    print "        <seconds> for an app inststance is restarting. Then it will go on and cycle the next app instance.\n";
+    print "        maxWaitTime is set to 10min by default.\n";
+    print "\n";
+    print "    If -fullyUp is specified, it will wait until the app instance is fully up before\n";
+    print "       proceeding to the next node.  The default behavior is to wait only until\n";
+    print "       the app instance has been bound to its port and thus we assume the node will start.\n";
+    print "\n";
+    print "    If -force is specified, it will cycle the app instance(s) regardless of whether the lock\n";
+    print "        file preventing app instace cycling exists.\n";
+    print "\n";
+    print "    If -community <community> is specified, only the app instances on that community will be cycled.\n";
+    print "       Use 'default' for the default community.  You can also specify a pattern\n";
+    print "       to only cycle a type of app instances within the community (eg. UI app instances).\n";
+    print "       It is recommended to also use -fullyUp else the nodes will cycle at 30 second\n";
+    print "       intervals and risk a down time for the community.  Alternatively you could specify a watiTime\n";
+    print "       of 900 so the app instances will cycle at 15 minute intervals.\n";
+    print "\n";
+    print "    If -host <host> is specified, all app instances on the host will be cycled.\n";
+    print "       You can also specify a pattern to only cycle a type of app instances on the host (eg. UI app instances).\n";
+    print "       <host> must be the full domain.  eg. app100.snv.ariba.com or eagle.ariba.com.\n";
+    print "\n";
+    print "    If -stopAndPrevent <hours> is specified, it will stop any\n";
+    print "        cycling of the product/service in progress and prevent\n";
+    print "        future cycling from starting for the specified hours.\n";
+    print "\n";
+    print "    If -log <logFilePath> is specified, it will log STDOUT to the specified log file.\n";
+    print "        This will implicitly turn on debug (-d).\n";
+    print "\n";
+
+    exit(1);
+}
+
+main(@ARGV);

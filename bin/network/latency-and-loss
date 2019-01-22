@@ -1,0 +1,233 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/common/network-latency-and-loss#9 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Utils;
+use Net::Ping;
+
+my $debug = 0;
+
+#
+# These are not in dns...!
+#
+my %sites = (
+    'UK office PIX outside' => '213.31.228.162',
+    'Singapore office PIX outside' => '61.14.138.118',
+    'Bangalore office PIX outside' => '216.109.102.14',
+    'Pittsburgh office PIX outside' => '205.247.136.228',
+    'Sunnyvale office PIX outside' => '205.180.14.238',
+    'Link between snv and corporate' => '10.12.76.1',
+    'Link between snv n3 and snv n0' => '216.109.110.1', # interal HSRP of snv n0 routers
+    'Link between snv n3 and snv internap' => '66.151.157.57', # Internap IP of snv peering link
+    'Link between snv n3 and snv cogent' => '38.104.138.1', # Cogent IP of snv peering link
+    'Link between snv n3 and bou internap link' => '216.52.125.186',  # Ariba IP of Internap peering link
+    'Link between snv n3 and bou cogent link' => '38.103.67.17',  # Ariba IP of Cogent peering link
+    'Link between snv n3 and EU1 n0' => '194.39.128.1', # interal HSRP of eu1 n0 routers
+    'Link between snv n3 and EU1 n3' => '10.178.252.1',  # hsrp.n3 for eu1
+    'Link between snv n3 and EU2 n0' => '194.39.129.1', # interal HSRP of eu2 n0 routers
+    'Link between snv n3 and EU2 n3' => '10.178.236.1',  # hsrp.n3 for eu2
+    'Link between snv n3 and us1 internap link' => '64.94.31.186',  # Ariba IP of Internap peering link
+    'Link between snv n3 and us1 century link' => '205.218.18.174',  # Ariba IP of Centurylink peering link
+    'Link between snv n3 and us1 n3' => '10.162.220.1',  # hsrp.n3
+);
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while (my $arg = shift @ARGV) {
+        if ($arg =~ /^-e/o) { $sendEmail = 1; };
+        if ($arg =~ /^-p/o) { $sendPage  = 1; };
+        if ($arg =~ /^-d/o) { $debug     = 1; };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+
+    # some shared influxdb data
+    # NOTE: 'dc' and 'host' tags get added by generateStatsDLine(), so I don't include them
+    my %influx_data_shared = (
+        measurement => 'network_latency_and_loss',
+        tags        => {
+            product    => $me->name, 
+            service    => $me->service, 
+        },
+    );
+
+    my $email = $me->default('notify.email');
+
+    my $p = Net::Ping->new('icmp');
+    $p->hires(1);
+
+    my %queries;
+
+    my %latencyInMS;
+    my %packetLossPercent;
+
+    for my $site ( sort keys %sites ) {
+        my $ip = $sites{$site};
+        my $query = {
+            noRowCount => 1,
+            format => '%.2f ms',
+            info => "answer >= 0",
+            recordMaxResults => 36000,
+            recordDataType => 'gauge',
+            recordDataUnits => 'ms',
+            recordItem => 'answer',
+
+            perl => sub { 
+                my ($latency, $packetLossPercent ) = ping($p, $ip, 10);
+                if ( $latency == 0 ) {
+                    #$ariba::monitor::Query::_ourGlobalQuerySelf->setHasError(1);
+                    #   
+                    # Query->display should be checking if hasError()
+                    # to use the format, but instead it uses Query->error(),    
+                    # which we can't set even with _ourGlobalQuerySelf
+                    #$latency = "oo";
+                }
+
+                $latencyInMS{$site} = $latency;
+                $packetLossPercent{$site} = $packetLossPercent;
+
+                # emit output for influxdb
+                eval {
+                    my %influx_data = %influx_data_shared;
+                    $influx_data{tags}{site} = $site;
+                    $influx_data{tags}{ip}   = $ip;
+                    $influx_data{data}       = {
+                        roundtriptimetosite => $latency, 
+                        packetloss          => $packetLossPercent, 
+                    };
+
+                    my $statsd_line = ariba::Ops::Utils::generateStatsDLine( \%influx_data );
+                    ariba::Ops::Utils::sendToStatsD( $statsd_line )  if ( $statsd_line );
+                };
+
+                return undef;
+            },
+
+            processAnswer => sub { $latencyInMS{$site} },
+            inf_fields => "roundtriptimetosite",
+            inf_tags => qq|site="$site",ip="$ip"|,
+        };
+        if($site !~ m/PIX/) {
+            $query->{'warn'} = "answer > 350";
+            $query->{'crit'} = "answer > 500";
+        }
+
+        $queries{"round trip time to $site [$ip]"} = $query;
+    }
+
+    my $pn = ariba::monitor::StatusPage::commonProduct();
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails(
+        'network-latency-and-loss', $pn, $me->service(), $me->customer(), \%queries
+    );
+
+    # this is QueryManager->processQueriesUsingServer()
+    # except for runInParallel
+
+    my $monserver = ariba::Ops::PageUtils::monitorServer();
+
+    $qm->run();
+    #$qm->runInParallel(5);
+    if ( $debug ) {
+        $qm->displayToStdout();
+    } else {
+        $qm->checkStatus();
+
+        if ((my $ret = $qm->appendToServer($monserver)) == 0) {
+            $qm->archiveResultsOnServer();
+            $qm->notifyForStatusesOnServer($email, $sendEmail, $sendPage);
+        }
+    }
+
+    %queries = ();
+
+    for my $site ( sort keys %sites ) {
+        my $ip = $sites{$site};
+        my $query = {
+            noRowCount => 1,
+            format => '%.0f%%',
+            # should check average from cdb
+            info => "answer >= 0",
+            recordMaxResults => 36000,
+            recordDataType => 'gauge',
+            recordDataUnits => 'percent',
+            recordItem => 'answer',
+            perl => sub { $packetLossPercent{$site} },
+            inf_field  => "packetloss",
+            inf_tags   => qq|site="$site",ip="$ip"|,
+        };
+        $query->{"warn"} = "answer > 0" if $site !~ m/PIX/;
+
+        $queries{"packet loss to $site [$ip]"} = $query;
+    }
+
+    $qm = ariba::monitor::QueryManager->newWithDetails(
+        'network-latency-and-loss', $pn, $me->service(), $me->customer(), \%queries
+    );
+
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+sub ping {
+    my $p = shift;
+    my $host = shift;
+    my $packetCount = shift || 3;
+
+    my $packetsLost = 0;
+    my $totalRTT = 0;
+    my $averageRTT = 0;
+
+    my $latencyInMS;
+    my $packetLossPercent;
+    my $numRedirects = 0;
+
+    for (my $x = 0; $x < $packetCount; $x++ ) {
+        my ($ret, $rtt, $ip) = $p->ping($host, 0.8);
+        #print "$x, $ret, $rtt, $ip\n";
+
+        # XXX This relies on Ops hacked version of Net::Ping
+        # to handle ICMP_REDIRECT. It returns -1 when it
+        # encounters REDIRECT.
+        #
+        # If we got a ICMP_REDIRECT response, ignore this packet.
+        if ($ret && $ret == -1) {
+            $numRedirects++;
+            # prevent infinite loops by only allowing 3
+            # redirects
+            #print "got a redirect $numRedirects\n";
+            if ($numRedirects <= 3) {
+                $x--;
+                next;
+            }
+        }
+
+        if ( $ret && $ret != -1) {
+            $totalRTT += $rtt;
+        } else {
+            $packetsLost++;
+        }
+    }
+
+    my $packetsReceived = $packetCount - $packetsLost;
+
+    if ( $totalRTT ) {
+        $averageRTT = $totalRTT / $packetsReceived;
+    }
+
+    $latencyInMS = 1000 * $averageRTT;
+    $packetLossPercent = 100 - ($packetsReceived/$packetCount * 100);
+
+    return ($latencyInMS, $packetLossPercent);
+}
+
+main();

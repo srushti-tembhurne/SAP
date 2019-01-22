@@ -1,0 +1,183 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/common/glance-data
+#
+# This program will run glance in advisor mode and collect its ouput.
+# The output will be recorded in cdb and transmitted to mon server
+# for graphing
+#
+# 
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Machine;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::Utils;
+
+my $debug = 0;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $role;
+
+	while(my $arg=shift(@ARGV)){
+		if( $arg =~ /^-e/o ){ $sendEmail = 1; };
+		if( $arg =~ /^-p/o ){ $sendPage = 1; };
+		if( $arg =~ /^-d/o ){ $debug = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $cluster = $me->currentCluster();
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $machine = ariba::Ops::Machine->new($hostname);
+
+	#
+	# collect details to run glance command, this will run forever
+	# and print data to studout. Collect it and transmit to mon
+	# for recording into cdb.
+	#
+	my $installDir = $me->installDir();
+	my $glanceSyntaxFile = "$installDir/etc/glance/$hostname";
+	my $sampleInterval = 30; # half a minute for now
+	my $numRecords = 600000; # save about 6 months of data
+
+	#
+	# where should this be displayed
+	#
+	my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($machine->datacenter());
+	my $expando = "glance-data";
+
+	#
+	# Read the header information from syntax file
+	#
+	if (! -f $glanceSyntaxFile) {
+		print "Warn: glance syntax file $glanceSyntaxFile, does not exist, exiting...\n";
+		exit(0);
+	}
+
+	# First few lines in syntax file should be comments that have
+	# details of data in each column (csv header)
+	#
+	#Begin Header
+	#Time
+	#FC 0/12 read KB Rate,FC 0/12 write KB Rate
+	#FC 0/1 read KB Rate,FC 0/1 write KB Rate
+	#ora07data01 read KB Rate, ora07data01 write KB Rate
+	#....
+	#ora08log02 FC 0/12 read KB Rate, ora08log02 FC 0/12 write KB Rate
+	#ora08log02 FC 0/1 read KB Rate, ora08log02 FC 0/1 write KB Rate
+	#End Header
+	#
+	open(SYNTAX, "$glanceSyntaxFile") || do {
+		print "Error: Could not open syntax file $glanceSyntaxFile for reading, $!\n";
+		exit(1);
+	};
+	my $headerFields = 0;
+	my @dataFields;
+	while(my $header = <SYNTAX>) {
+		if ($header =~ /^\s*#\s*Sample Interval\s*:\s*(\d+)/i) {
+			$sampleInterval = $1;
+		}
+		if ($header =~ /Begin Header/i) {
+			$headerFields = 1;
+			next;
+		}
+		if ($header =~ /End Header/i) {
+			$headerFields = 0;
+			last;
+		}
+		if ($headerFields) {
+			chomp($header);
+			$header =~ s|\r$||;
+			$header =~ s|^\s*#\s*||;
+			push(@dataFields, split(/\s*,\s*/, $header));
+		}
+	}
+	close(SYNTAX);
+
+	my $glanceCommand = "/opt/perf/bin/glance -j $sampleInterval -adviser_only -syntax $glanceSyntaxFile";
+
+	if ($debug) {
+		print "Headers\n", join("\n", @dataFields), "\n";
+		print "Will Run command $glanceCommand\n";
+	}
+	#
+	# Now run glance and collect output continuously
+	#
+	open(GLANCE, "$glanceCommand|") || do {
+		print "Error: Could not run glance command $glanceCommand, $!\n";
+		exit(1);
+	};
+	ariba::rc::Utils::unbuffer(\*GLANCE);
+
+	#
+	# wait for glance to print something to studout
+	#
+	while (my $output = <GLANCE>) {
+		# skip lines that do not seem to be comma seperated values
+		next unless ($output =~ m|,|);
+
+		print "data: $output" unless ($debug);
+
+		chomp($output);
+		$output =~ s|\r$||;
+
+		my @dataValues = split(/\s*,\s*/, $output);
+
+		#
+		# If we didnt get enough data, skip it
+		#
+		if (@dataValues != @dataFields) {
+			print "Expecting ", scalar(@dataFields), " in output\n";
+			print "Got ", scalar(@dataValues), " in output\n";
+
+			print "Bad record $output, skipped\n";
+
+			print join("\n", @dataValues), "\n";
+			next;
+		}
+
+		#
+		# first field is always time, skip it, and record the
+		# rest in cdb
+		#
+		my %queries;
+		for (my $i = 1; $i < @dataFields; $i++) {
+			my $dataField = $dataFields[$i];
+			my $dataValue = $dataValues[$i];
+
+			if ($debug) {
+				print "$dataField = $dataValue\n";
+				next;
+			}
+
+			$queries{$dataField} = {
+				info => 1,
+				uiHint => $hostname,
+				# made to match iostat monitoring on RH
+				recordDataUnits => 'Mb/second',
+				recordMaxResults => $numRecords,
+				perl => sub {return $dataValue;},
+			};
+		}
+
+		my $email = $me->default('notify.email');
+
+		#
+		# run the queries and send results to server
+		#
+		my $q = ariba::monitor::QueryManager->newWithDetails($expando, $tab, $me->service(), $me->customer(), \%queries);
+		$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+main();
+
+__END__

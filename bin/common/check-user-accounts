@@ -1,0 +1,1876 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+
+use JSON;
+use DBI;
+use File::Basename;
+use FindBin;
+use URI::Escape;
+use lib "/usr/local/tools";
+use lib "$FindBin::Bin/../../../tools/lib/perl";
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin";
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Logger;
+use ariba::Ops::Machine;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+use ariba::Ops::Constants;
+use ariba::Oncall::Person;
+use ariba::Ops::AQLConnection;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::ServiceController;
+use ariba::Ops::Utils;
+use ariba::Ops::Jira;
+use Data::Dumper;
+
+use POSIX qw{ strftime };
+
+require "geturl";
+
+# The following two modules are found under /usr/local/ariba/lib, not found in any of the libs used above.
+# By putting the 'use lib' here, we guarantee the above modules are found via the specific libs given
+# above and not from this one.
+use lib '/usr/local/ariba/lib';
+use ariba::monitor::Url;
+use ariba::Ops::AQLClient;
+
+my $useMock = 0;
+my $createMock = 0;
+my $debug = 0;
+my %sapIdMap;
+my $logRoot;
+
+# Substituting @localTime for all the calls to localtime method, to get consistent and repeatable
+# date/time values.
+my @localTime = localtime;
+
+# define cost center codes of interest
+my $cost_center_codes = {
+                            ops            => [
+                                                '0800202909'
+                                              ],
+                            hana_migration => [
+                                                '0101988222',
+                                                '0163988222',
+                                                '0163999001',
+                                                '0163999003',
+                                                '0176999001',
+                                                '0176999002',
+                                                '0800999001',
+                                                '0800999002',
+                                                '0800999003',
+                                                '0808999001',
+                                                '0808999002'
+                                              ]
+                        };
+my $watcher_id = [ 'i851037', 'i860387' ];#keqin and billie inumber is hardcoded,this needs to be periodically verified
+
+my $cost_center_movement_map = {
+                                    0 => { 
+                                        name    => 'nochange', 
+                                        action  => 'none' 
+                                    },
+                                    1 => { 
+                                        name    => 'hana-to-cloudops', 
+                                        action  => 'warn' 
+                                    },
+                                    2 => { 
+                                        name   => 'any-to-hana', 
+                                        action => 'warn' 
+                                    },
+                                    3 => { 
+                                        name   => 'hana-to-any', 
+                                        action => 'warn' 
+                                    },
+                                    4 => { 
+                                        name => 'any-to-any', 
+                                        action => 'warn' 
+                                    }
+                               };
+
+
+my $cost_center_email_queue  = {};
+my $cost_center_base_file    = 'cost_center.txt';
+my $cost_center_db_dir       = '/home/monprod/user_lists'; 
+my $cost_center_file         = $cost_center_db_dir . '/' . $cost_center_base_file ;
+my $cost_center_archive_file = $cost_center_db_dir . '/archive/' . $cost_center_base_file;
+
+# Set up logger
+my $log_filename = ariba::Ops::Constants->toolsLogDir() . '/check-user-accounts.log';
+my $logger       = ariba::Ops::Logger->logger();
+
+$logger->setLogFile($log_filename);
+
+# append to logger file and dont print to screen
+my $LOGGER;
+open $LOGGER, '>>', $log_filename;
+$logger->setFh($LOGGER);
+$logger->setQuiet(1);
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    # Results holders
+    my ( $ANResults, $safeguardResults, $rsaResults, $app173Results, $violetResults,
+        $inspectorProxyResults, $peopleDBResults, $s4Results, $buyerResults,
+        $cyberSourceResults, $s2Results );
+
+    # Connection Status hash
+    my %conn_status = (
+        jira => {
+            title => "Connection Status: Jira",
+            status_str => "",
+        },
+        sapad => {
+            title => "Connection Status: SapAD",
+            status_str => "",
+        },
+    );
+
+    # hash for cost center info for each user
+    my %cost_center = ();
+
+    # Queries object
+    my %q;
+
+    # allAccounts - hash of all inactive accounts for all account types
+    my $allAccounts = {};
+
+    while(my $arg = shift) {
+        if($arg =~ /^-d$/i) { $debug++; }
+        if($arg =~ /^-m$/i) { $useMock++; }
+        if($arg =~ /^-c$/i) { $createMock++; }
+        if($arg =~ /^-e$/i) { $sendEmail=1; }
+        if($arg =~ /^-p$/i) { $sendPage=1; }
+    }
+
+    my $me = ariba::rc::InstalledProduct->new('mon');
+
+    my $service = $me->service();
+    my $date = strftime("%Y-%m-%d", @localTime);
+    $logRoot = "/tmp/$service/mon";
+    my $logFile = "$logRoot/active-accounts-$date.csv";
+
+    if ( ! -d $logRoot ){
+        ariba::rc::Utils::mkdirRecursively($logRoot);
+    }
+
+    # read in cost center information
+    read_cost_center_file(\%cost_center, $cost_center_file);
+
+    $logger->info("Started check-user-accounts debug: $debug");
+
+    $logger->info("Initializing \"peopleDBAccounts\"") if $debug;
+    my $people = peopleDBAccounts();
+
+    # groups must be lowercase here (the actual check will be case insensitive)
+    my %groups = map {$_, 1} qw (arch dba network prodops sysadmin sre deployment gts);
+    my $peopleInOpsGroups = peopleDBAccounts(\%groups);
+
+    $logger->info("Processing Jira tickets") if $debug;
+
+    # NOTE:  these two calls, to get JIRA tickets, take 8 minutes or more, each.  And the second is a subset of the first, so it
+    #        would speed things up a bit to cache the results of the first, and in the second, extract data from the cache, that
+    #        matches the search criteria.  This is left as a future enhancement.  Full runtime approximately 55 minutes.
+    $logger->debug("Initializing \"all Jira tickets\"") if $debug;
+    my $allTickets  = getJiraTickets('all', \%conn_status);
+
+    $logger->info("Initializing \"old Jira tickets\"") if $debug;
+    my $oldTickets = getJiraTickets('old', \%conn_status);
+
+    my @oldTicketIds;
+
+    my %processedTickets;
+
+    if ( defined($allTickets) ) {
+        foreach my $tick ( @{ $allTickets->{ 'issues' } } ){
+            $processedTickets{ $tick->{'fields'}->{'summary'} } = $tick->{'fields'}->{'description'};
+        }
+    }
+
+    if ( defined($oldTickets) ) {
+        foreach my $tick ( @{ $oldTickets->{ 'issues' } } ){
+            push @oldTicketIds, '<a href="https://product-jira.ariba.com/browse/' . $tick->{'key'} . '">' . $tick->{'key'} . '</a>';
+        }
+    }
+
+    my $oldTix = join( ', ', @oldTicketIds ) || 'NONE';
+
+    $q{'Old JIRA Tickets Needing Attention'} = {
+        perl => sub { return $oldTix; },
+        info => "defined(answer) && answer eq 'NONE'",
+        crit => "!defined(answer) || answer ne 'NONE'",
+    };
+
+    $logger->info("Processed Jira tickets") if $debug;
+
+    my $cipherStore = ariba::rc::CipherStore->new($me->service());
+    my $monProduct = ariba::rc::InstalledProduct->new("mon", $me->service());
+
+    $logger->info("Getting s4 sm accounts") if $debug;
+    my $s4ServiceManager = serviceManagerAccounts('s4', $me);
+    $s4Results = compareAgainstCorpAccounts(\%conn_status, \%cost_center, $s4ServiceManager, "s4 sm accounts");
+    updateAllAccounts($s4Results, $allAccounts, 's4-service-manager');
+    $s4Results = pruneActiveCCmoverFromInactiveAccounts($s4Results, \%cost_center);
+    $q{'S4 Service Manager accounts unmatched in corp directory'} = {
+        perl => sub { return $s4Results; },
+        info => "defined(answer) && answer eq 'NONE'",
+        warn => "!defined(answer) || answer ne 'NONE'",
+    };
+
+    $logger->info("Getting s4 superuser sm accounts") if $debug;
+    my $s4SuperUsers = serviceManagerAccounts('s4', $me, undef, undef, 1);
+    my $s4Results2 = compareAgainstCorpAccounts(\%conn_status, \%cost_center, $s4SuperUsers, "s4 superuser sm accounts");
+    updateAllAccounts($s4Results2, $allAccounts, 's4-service-manager-superuser-group');
+    $s4Results2 = pruneActiveCCmoverFromInactiveAccounts($s4Results2, \%cost_center);
+    $q{'S4 Service Manager SuperUser accounts unmatched in ops-only people db'} = {
+        perl => sub { return $s4Results2; },
+        info => "defined(answer) && answer eq 'NONE'",
+        warn => "!defined(answer) || answer ne 'NONE'",
+    };
+
+    $logger->info("Getting buyer sm accounts") if $debug;
+    my $buyerServiceManager = serviceManagerAccounts('buyer', $me);
+    $buyerResults = compareAgainstCorpAccounts(\%conn_status, \%cost_center, $buyerServiceManager, "buyer sm accounts");
+    updateAllAccounts($buyerResults, $allAccounts, 'buyer-service-manager');
+    $buyerResults = pruneActiveCCmoverFromInactiveAccounts($buyerResults, \%cost_center);
+    $q{'Buyer Service Manager accounts unmatched in corp directory'} = {
+        perl => sub { return $buyerResults; },
+        info => "defined(answer) && answer eq 'NONE'",
+        warn => "!defined(answer) || answer ne 'NONE'",
+    };
+
+    $logger->info("Getting Buyer Service Manager SuperUser accounts") if $debug;
+    my $buyerSuperUsers = serviceManagerAccounts('buyer', $me, undef, undef, 1);
+    my $buyerResults2 = compareAccounts($peopleInOpsGroups, $buyerSuperUsers, "people in ops groups vs. buyer superuser sm accounts");
+    updateAllAccounts($buyerResults2, $allAccounts, 'buyer-service-manager-superuser-group');
+    $buyerResults2 = pruneActiveCCmoverFromInactiveAccounts($buyerResults2, \%cost_center);
+    $q{'Buyer Service Manager SuperUser accounts unmatched in ops-only people db'} = {
+        perl => sub { return $buyerResults2; },
+        info => "defined(answer) && answer eq 'NONE'",
+        warn => "!defined(answer) || answer ne 'NONE'",
+    };
+
+    my ($cyberSource, $safeguard, $rsa);
+    my ($num_app173_users, $num_violet_users);
+    my ($inspector);
+    my ($anadmin);
+
+    if(ariba::Ops::ServiceController::isProductionServicesOnly($service)) {
+        $logger->info("Getting an admin accounts") if $debug;
+        $anadmin = anAdminAccounts($me);
+        $ANResults = compareAgainstCorpAccounts(\%conn_status, \%cost_center, $anadmin, "an admin accounts");
+        updateAllAccounts($ANResults, $allAccounts, 'an-admin');
+        $ANResults = pruneActiveCCmoverFromInactiveAccounts($ANResults, \%cost_center);
+        $q{'AN Admin accounts unmatched in corp directory'} = {
+            perl => sub { return $ANResults; },
+            info => "defined(answer) && answer eq 'NONE'",
+            warn => "!defined(answer) || answer ne 'NONE'",
+        };
+
+        $logger->info("Getting cybersource accounts") if $debug;
+        $cyberSource = cyberSourceAccounts($cipherStore, $monProduct);
+        $cyberSourceResults = compareAgainstCorpAccounts(\%conn_status, \%cost_center, $cyberSource, "cybersource accounts");
+        updateAllAccounts($cyberSourceResults, $allAccounts, 'Cybersource');
+        $cyberSourceResults = pruneActiveCCmoverFromInactiveAccounts($cyberSourceResults, \%cost_center);
+        $q{'Cybersource accounts unmatched in corp directory'} = {
+            perl => sub { return $cyberSourceResults; },
+            info => "defined(answer) && answer eq 'NONE'",
+            warn => "!defined(answer) || answer ne 'NONE'",
+        };
+
+        $logger->info("Getting safeguard accounts") if $debug;
+        $safeguard = safeguardAccounts();
+        $safeguardResults = compareAgainstCorpAccounts(\%conn_status, \%cost_center, $safeguard, "safeguard accounts");
+        updateAllAccounts($safeguardResults, $allAccounts, 'safeguard');
+        $safeguardResults = pruneActiveCCmoverFromInactiveAccounts($safeguardResults, \%cost_center);
+        $q{'Safeguard accounts unmatched in corp directory'} = {
+            perl => sub { return $safeguardResults; },
+            info => "defined(answer) && answer eq 'NONE'",
+            warn => "!defined(answer) || answer ne 'NONE'",
+        };
+
+        $logger->info("Getting rsa safeguard accounts") if $debug;
+        $rsa = rsaAccounts();
+        $rsaResults = compareAgainstCorpAccounts(\%conn_status, \%cost_center, $rsa, "rsa safeguard accounts");
+        updateAllAccounts($rsaResults, $allAccounts, 'rsa-safeguard');
+        $rsaResults = pruneActiveCCmoverFromInactiveAccounts($rsaResults, \%cost_center);
+        $q{'RSA Safeguard accounts unmatched in corp directory'} = {
+            perl => sub { return $rsaResults; },
+            info => "defined(answer) && answer eq 'NONE'",
+            warn => "!defined(answer) || answer ne 'NONE'",
+        };
+
+        $logger->info("Getting rsa bastion app173 accounts") if $debug;
+        $app173Results = bastionRsaAccounts('app173', \$num_app173_users);
+        updateAllAccounts($app173Results, $allAccounts, 'rsa-bastion-app173');
+        $app173Results = pruneActiveCCmoverFromInactiveAccounts($app173Results, \%cost_center);
+        $q{'RSA bastion app173 accounts unmatched in corp directory'} = {
+            perl => sub { return $app173Results; },
+            info => "defined(answer) && answer eq 'NONE'",
+            warn => "!defined(answer) || answer ne 'NONE'",
+        };
+
+        $logger->info("Getting rsa bastion violet accounts") if $debug;
+        $violetResults = bastionRsaAccounts('violet', \$num_violet_users);
+        updateAllAccounts($violetResults, $allAccounts, 'rsa-bastion-violet');
+        $violetResults = pruneActiveCCmoverFromInactiveAccounts($violetResults, \%cost_center);
+        $q{'RSA bastion violet accounts unmatched in corp directory'} = {
+            perl => sub { return $violetResults; },
+            info => "defined(answer) && answer eq 'NONE'",
+            warn => "!defined(answer) || answer ne 'NONE'",
+        };
+
+        my @datacenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+        my %match = (
+            'providesServices' => 'auth',
+            'datacenter' => join(",", @datacenters),
+            'status' => 'inservice',
+        );
+
+        $logger->info("Getting inspector proxy accounts") if $debug;
+        $inspector = inspectorProxyAccounts();
+        $inspectorProxyResults = compareAgainstCorpAccounts(\%conn_status, \%cost_center, $inspector, "inspector proxy accounts");
+        updateAllAccounts($inspectorProxyResults, $allAccounts, 'inspector-proxy');
+        $inspectorProxyResults = pruneActiveCCmoverFromInactiveAccounts($inspectorProxyResults, \%cost_center);
+        $q{'Inspector Proxy accounts unmatched in corp directory'} = {
+            perl => sub { return $inspectorProxyResults; },
+            info => "defined(answer) && answer eq 'NONE'",
+            warn => "!defined(answer) || answer ne 'NONE'",
+        };
+
+        $logger->info("Getting people db accounts") if $debug;
+        $peopleDBResults = compareAgainstCorpAccounts(\%conn_status, \%cost_center, $people, "people db accounts");
+        updateAllAccounts($peopleDBResults, $allAccounts, 'people-db');
+        $peopleDBResults = pruneActiveCCmoverFromInactiveAccounts($peopleDBResults, \%cost_center);
+        $q{'People DB accounts unmatched in corp directory'} = {
+            perl => sub { return $peopleDBResults; },
+            info => "defined(answer) && answer eq 'NONE'",
+            warn => "!defined(answer) || answer ne 'NONE'",
+        };
+
+        $logger->info("Getting cost center movers") if $debug;
+        my $cc_mover_results = get_cost_center_movers(\%cost_center);
+        $q{'Cost center movers'} = {
+            perl => sub { return $cc_mover_results; },
+            info => "defined(answer) && answer eq 'NONE'",
+            warn => "!defined(answer) || answer ne 'NONE'",
+        };
+    }
+
+    #
+    # Save results of current active users in a logfile
+    #
+    if ( open(LOG, ">", $logFile) ) {
+        saveActiveAccounts('s4', $service, $s4ServiceManager);
+        saveActiveAccounts('buyer', $service, $buyerServiceManager);
+        saveActiveAccounts('an', $service, $anadmin);
+        close(LOG);
+    }
+    else {
+        $logger->error("Unable to open $logFile for write: $!");
+    }
+
+    # Open up Jira tickets
+    openTickets($allAccounts, $service, $allTickets, \%conn_status, \%cost_center);
+
+    # Send cost center change warning emails
+    send_emails({ mail_per_user => $cost_center_email_queue });
+
+    my $qResults = 'NONE';
+    my @noResults;
+
+    push(@noResults, 's4ServiceManager') unless(keys %$s4ServiceManager);
+    push(@noResults, 's4ServiceManagerSuperUser') unless(keys %$s4SuperUsers);
+    push(@noResults, 'buyerServiceManager') unless(keys %$buyerServiceManager);
+    push(@noResults, 'buyerServiceManagerSuperUser') unless(keys %$buyerSuperUsers);
+
+    if(ariba::Ops::ServiceController::isProductionServicesOnly($service)) {
+        push(@noResults, 'anadmin') unless(keys %$anadmin);
+        push(@noResults, 'safeguard') unless(keys %$safeguard);
+        push(@noResults, 'rsa-safeguard') unless(keys %$rsa);
+        push(@noResults, 'rsa-bastion-app173') unless($num_app173_users);
+        push(@noResults, 'rsa-bastion-violet') unless($num_violet_users);
+        push(@noResults, 'people') unless(keys %$people);
+        push(@noResults, 'inspector') unless(keys %$inspector);
+        push(@noResults, 'cyberSource') unless(keys %$cyberSource);
+    }
+
+    $qResults = join(',', @noResults) if(scalar(@noResults));
+
+    $q{'Types of queries returning no results'} = {
+        perl => sub { return $qResults; },
+        info => "answer eq 'NONE'",
+        warn => "answer ne 'NONE'",
+    };
+
+    #
+    # pull the info from mon12.bou to display on prod mon page
+    #
+    if(ariba::Ops::ServiceController::isProductionServicesOnly($service)) {
+        scrapeBeta(\%q, 'mon/Buyer_Service_Manager_SuperUser_accounts_unmatched_in_ops-only_people_db');
+        scrapeBeta(\%q, 'mon/Buyer_Service_Manager_accounts_unmatched_in_corp_directory');
+        scrapeBeta(\%q, 'mon/S4_Service_Manager_SuperUser_accounts_unmatched_in_ops-only_people_db');
+        scrapeBeta(\%q, 'mon/S4_Service_Manager_accounts_unmatched_in_corp_directory');
+        scrapeBeta(\%q, 'mon/Tickets_opened_for_account_deletion');
+        scrapeBeta(\%q, 'mon/Types_of_queries_returning_no_results');
+    }
+
+    # Update Connection Status information in queries
+    update_conn_status( \%q, \%conn_status );
+
+    # write out cost center information
+    write_cost_center_file(\%cost_center, $cost_center_file);
+
+    # Create monitoring tab and display the queries
+    my $tab = "mon";
+    my $email = $me->default('notify.email');
+    my $qm = ariba::monitor::QueryManager->newWithDetails("account-status", $tab, $me->service(), $me->customer(), \%q);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+    $logger->info("Processed Queries") if $debug;
+
+    if($debug) {
+        my $msg = '';
+        $msg .= sprintf("Scanned %d AN Admin accounts\n", scalar keys %$anadmin);
+        $msg .= sprintf("Scanned %d S4 Admin accounts\n", scalar keys %$s4ServiceManager);
+        $msg .= sprintf("Scanned %d S4 Admin SuperUser accounts\n", scalar keys %$s4SuperUsers);
+        $msg .= sprintf("Scanned %d Buyer Admin accounts\n", scalar keys %$buyerServiceManager);
+        $msg .= sprintf("Scanned %d Buyer Admin SuperUser accounts\n", scalar keys %$buyerSuperUsers);
+        $msg .= sprintf("Scanned %d RSA Safeguard accounts\n", scalar keys %$rsa);
+        $msg .= sprintf("Scanned %d RSA bastion app173 accounts\n", $num_app173_users);
+        $msg .= sprintf("Scanned %d RSA bastion violet accounts\n", $num_violet_users);
+        $msg .= sprintf("Scanned %d People DB accounts\n", scalar keys %$people);
+        $msg .= sprintf("Scanned %d Inspector Proxy accounts\n", scalar keys %$inspector);
+        $msg .= sprintf("Scanned %d Cybersource accounts\n", scalar keys %$cyberSource);
+        $logger->info($msg);
+    }
+
+    $logger->info("Completed check-user-accounts debug: $debug");
+
+    exit 0;
+}
+
+sub getBetaQuery {
+    my $qName = shift;
+
+    my $url = 'http://mon12.bou.ariba.com:8080/cgi-bin/object-server?type=query&';
+    $url .= "qname=$qName";
+
+    my $u = ariba::monitor::Url->new($url);
+    my @results = $u->request();
+
+    my %ret;
+    foreach my $line (@results) {
+        chomp($line);
+        $line =~ s/([^\\]),/$1\n/g;
+        $line =~ s/\\//g;
+        my ($k, $v) = split(/:\s+/,$line,2);
+        $ret{$k} = $v;
+    }
+
+    return(%ret);
+}
+
+sub scrapeBeta {
+    my $q = shift;
+    my $qName = shift;
+
+    my %betaQ = getBetaQuery($qName);
+
+    my ($crit, $info, $warn) = (0, 0, 0);
+    my $status = $betaQ{'status'};
+    my $qn = $betaQ{'queryName'};
+    my $results = $betaQ{'results'};
+    if ($status && $qn && $results) {
+        $crit = 1 if($status eq 'crit');
+        $warn = 1 if($status eq 'warn');
+        $info = 1 if($status eq 'info');
+
+        my $queryName = "Beta " . $qn;
+
+        $$q{$queryName} = {
+            perl => sub { return $results; },
+            info => $info,
+            crit => $crit,
+            warn => $warn,
+            uiHint => 'Beta',
+        };
+    }
+    else {
+        $logger->info("Skipping beta query entry for \"$qName\" because status, queryName and " .
+            "results attributes are not all defined") if $debug;
+    }
+}
+
+# The input "csv" string may be just "user, user2, user3, ..." or "user [some-data], user2 [some-data], ..."
+sub updateAllAccounts {
+    # csv list of accounts to check
+    my $accounts_csv_str = shift;
+    # reference to hash of all inactive accounts from different groups
+    my $all_accts_hashref = shift;
+    # string for type of group
+    my $type = shift;
+
+    my @users = split(', ', $accounts_csv_str); # splits into array of '[user, user2, user3, ...] or  "[user [some-data], user2 [some-data], ...]"
+    foreach my $user (@users) {
+        next if($user eq 'NONE');
+        next if ( $user =~ m/^ERROR:/ );
+        if($user =~ s/ \[([^\]]+)\]//) { # This will match and extract the "some-data" portion, if it exists.
+            my @customers = split(',', $1); # And presumably it is a string of "customer" names.
+            foreach my $customer (@customers) {
+                push(@{$all_accts_hashref->{$user}}, "$type/$customer"); # so we get "user => ['type/customer']"
+            }
+        } else {
+            push(@{$all_accts_hashref->{$user}}, $type);                 # OR "user => ['type']"
+        }
+    }
+}
+
+# _isDuplicateTicket(summary, account, service, ticketsRef)
+#  Looks to see if the ticket is a duplicate or not.
+# Return 0 if not a duplicate; 1 otherwise
+sub _isDuplicateTicket {
+    my $summary = shift;
+    my $account = shift;
+    my $service = shift;
+    my $ticketsRef = shift;
+
+    my %tickets = %{$ticketsRef};
+
+    if (%tickets) {
+        my $tr = $tickets{issues};
+        if ($tr) {
+            my @issues = @{$tr};
+            if (@issues) {
+                for my $issue (@issues) {
+                    my %fields = %{$issue->{fields}};
+                    if (%fields) {
+                        my $s = $fields{summary};
+                        if ($s && $summary eq $s) {
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# openTickets(allAccounts, service, tickets, conn_status_ref) - open Jira tickets
+sub openTickets {
+    my ( $allAccounts, $service, $tickets, $conn_status_ref, $cost_center_ref ) = @_;
+
+    my @tickets = keys %{ $tickets };
+
+    $logger->info("testing allAccounts hash ".Dumper($allAccounts)) if($debug);
+
+    my %accounts;
+    foreach my $account (sort keys(%{$allAccounts})) {
+        my $changed        = $cost_center_ref->{$account}{changed} || 'gone';
+        my $disclaimer     = '';
+        my $move_action    = '';
+        my $severity_level = 'immediately';
+        my $final_wording  = 'These accounts need to be immediately deleted from production.';
+        if ( $changed eq 'moved' ) {
+            my $cc_move_status = $cost_center_ref->{$account}{cc_move_status};
+            $move_action       = $cost_center_movement_map->{$cc_move_status}{action};
+            $disclaimer        = get_jira_ticket_disclaimer({trigger => $move_action});
+
+            if ( $move_action eq 'warn' ) {
+                $severity_level = 'potentially';
+                $final_wording  = 'Please wait 5 business days for manager approval. Please delete accounts if no action taken in 5 business days.';
+            }
+
+            $logger->info("cc_move_status is $cc_move_status  move_action is $move_action") if $debug;
+        }
+
+        my $subject = "delete accounts for $account $disclaimer";
+
+        my $accts = join("\n* ", @{$allAccounts->{$account}});
+        my $note = "----------\n$disclaimer\n";
+        if ( $changed eq 'moved' && not defined $cost_center_ref->{$account}{inactive}) {
+            # set current to the new values now
+            $cost_center_ref->{$account}{cost_center} = $cost_center_ref->{$account}{new_cost_center};
+            $cost_center_ref->{$account}{department}  = $cost_center_ref->{$account}{new_department};
+
+            my $old_cost_center = $cost_center_ref->{$account}{old_cost_center};
+            my $old_department  = $cost_center_ref->{$account}{old_department};
+            my $cost_center     = $cost_center_ref->{$account}{cost_center};
+            my $department      = $cost_center_ref->{$account}{department};
+            my $user_disp_email = $cost_center_ref->{$account}{user_email};
+            my $mgr_disp_email  = $cost_center_ref->{$account}{manager_email} || 'Not in system';
+
+            $note .= "The following employee has recently changed roles/departments within ";
+            $note .= "SAP and $severity_level needs to have Ariba production access removed: \n";
+            $note .= "* Employee: $account ($user_disp_email)\n";
+            $note .= "* Old Org: $old_cost_center, $old_department\n";
+            $note .= "* New Org: $cost_center, $department\n";
+            $note .= "* Manager: $mgr_disp_email\n\n";
+
+            # for those whose move require a warning email (rather than an immediate ticket
+            # to deactivate) queue them up for the email
+            if ($move_action eq 'warn') {
+                my $jira_search_query = $subject;
+                my $manager_assigned  = 0;
+                $jira_search_query =~ s/ /\+/g;
+
+                $cost_center_email_queue->{$account}{to} = $cost_center_ref->{$account}{user_email};
+
+                # contractors may not have manager assigned
+                if ( $cost_center_ref->{$account}{manager_email} ) {
+                    $cost_center_email_queue->{$account}{to} .= ',' . $cost_center_ref->{$account}{manager_email};
+                    $manager_assigned = 1;
+                }
+
+                $cost_center_email_queue->{$account}{subject} = "ACTION REQUIRED: Potential Loss of Ariba Production Access";
+                $cost_center_email_queue->{$account}{cc}      = 'SAP Ariba IAD <ariba.iad@sap.com>'; 
+                $cost_center_email_queue->{$account}{from}    = 'SAP Ariba IAD <ariba.iad@sap.com>';
+                $cost_center_email_queue->{$account}{body}    = get_warning_email_body({ user       => $account,
+                        old_org    => "$old_cost_center, $old_department",
+                        new_org    => "$cost_center, $department",
+                        jira_query => $jira_search_query,
+                        mgr_found  => $manager_assigned
+                    });
+            }
+        }
+        $note .= "User $account has the following accounts in $service:\n";
+        $note .= "* $accts\n\n";
+        $note .= "$final_wording\n\n";
+
+        my $dup = _isDuplicateTicket($subject, $account, $service, $tickets);
+        if ($dup) {
+            $logger->info("** Skipping '$account' ... A ticket already exists for this") if $debug;
+            next;
+        }
+
+        $logger->info("$subject, $note will be grouped based on useraccounts[$account] ") if($debug);
+        $accounts{$account}->[0]  = $subject;
+        # Originally, this was a .= operator, but %accounts is only assigned to here, once per loop, so array is always empty.
+        # So .= doesn't hurt but makes no sense, either.
+        $accounts{$account}->[1] = $note;
+    }
+
+    $logger->info("After building accounts hash ".Dumper(\%accounts)) if($debug > 1);
+
+    # Create new Jira tickets
+    foreach my $key ( keys %accounts ) {
+        if($debug) {
+            $logger->info("[debug] Ticket not opened [Summarized Jira Subject + note] "
+                .$accounts{$key}->[0]."\t".$accounts{$key}->[1]."");
+        }
+        else {
+            # create Jira ticket
+            my $ticket = create_jira_ticket( $accounts{$key}->[0], $accounts{$key}->[1], $conn_status_ref );
+            # The above will have tried 3 times to create a ticket, if it fails 4 times, it will return an
+            # empty string.  This needs to be logged for future reference, and the message body edited to
+            # remove the now useless reference to a Jira search.
+            if (! $ticket)
+            {
+                my $failed = "Ticket open failed after 3 tries. [Summarized Jira Subject + note] "
+                    .$accounts{$key}->[0]."\t".$accounts{$key}->[1].".";
+                $logger->error($failed);
+                $cost_center_email_queue->{$key}{body} =~ s/^That deletion.*$/$failed/;
+            }
+            else
+            {
+                # On the other hand, if we have a ticket, and there is an email body for this key (account),
+                # edit the body to change HOA-XXXXXX to a proper ticket number.
+                $cost_center_email_queue->{$key}{body} =~ s/HOA-XXXXXX/$ticket/ if $cost_center_email_queue->{$key}{body};
+
+                $logger->info("Ticket opened [Summarized Jira Subject + note] "
+                    .$accounts{$key}->[0]."\t".$accounts{$key}->[1]."");
+            }
+        }
+    }
+}
+
+# Input ref to hash of userId => ref to array OR a simple integer which is ignored.
+# compareAgainstCorpAccounts() - return comma separated string of usernames that are inactive, which may also include
+# a "data string" created from the input hash value, IF the value is an array ref.
+sub compareAgainstCorpAccounts {
+    my ($conn_status_ref, $cost_center_ref, $compare, $contextMsg) = @_;
+
+    my @ret = ();
+
+    my $date = strftime("%Y-%m-%d", @localTime);
+
+    my %inactive = ();
+    my @toks = get_inactive_ids($conn_status_ref, 500, keys(%$compare));
+    for my $t (@toks) {
+        $inactive{$t} = 1;
+        $cost_center_ref->{"$t"}{inactive} = 1;
+    }
+
+    foreach my $user (keys %$compare) {
+        my $data;
+        if(ref($compare->{$user}) =~ /ARRAY/) {
+            $data = join(',',@{$compare->{$user}});
+        }
+        $logger->info("checking $user ") if($debug > 1);
+        $logger->info("[$data] ") if($data && $debug > 1);
+        $logger->info(": ") if($debug > 1);
+
+        my $notactive = $inactive{$user};
+        if ($notactive) {
+            $user .= " [$data]" if ($data);
+            push(@ret, $user);
+            $logger->info("$user is not ok. (comparing in $contextMsg)") if($debug);
+            # update cost hash ref with the changed status
+            $cost_center_ref->{"$user"}{"changed"} = 'gone';
+        }
+        else {
+            $logger->info("$user is ok.") if($debug > 1);
+        }
+    }
+
+    # get the cost center information for all users NOTE:  get_cost_centers expects 4 scalars
+    # explicitely, plus the keys.  But the original call, here, used 3 explicit, plus keys,
+    # so the first key would always be lost, as it would be consumed by the 4th expected arg.
+    # And the design is poor to begin with:  always passing refs to complex data objects,
+    # and testing for the expected object type in the function/method, would avoid this
+    # problem, or at least flag it and exit.  However, in this case, the simple fix is to
+    # stay with the overall design, to prevent problems elsewhere (sad :()).
+    my @changes = get_cost_centers($conn_status_ref, 150, $cost_center_ref, $date, keys(%$compare));
+
+    # add the ids with the cost center changes onto the list of users
+    push(@ret,@changes);
+
+    my $retStr = "NONE";
+    $retStr = join(', ',@ret) if(@ret);
+
+    return($retStr);
+}
+
+# get_inactive_ids( $conn_status_ref, chunk_size , @ids )
+# This function receives size and array.
+# Array is spliced into the size and processed
+# %conn_status - hash of connection statuses
+sub get_inactive_ids
+{
+    my $conn_status_ref = shift;
+    my $chunk_size = shift;
+
+    my @inactiveIds = ();
+
+    while (my @cur_chunk = splice @_, 0, $chunk_size )
+    {
+        ### Build str of userids
+        my $userids = join ",", @cur_chunk;
+        my $userids_str = 'ids=[' . $userids . ']';
+
+        my $ret_str_ref = call_wget(\$userids_str, $conn_status_ref, 'get_inactive_ids');
+
+        # parse the response
+        my $inact_ids_str = '';
+        # get list of inactive users
+        if ( $$ret_str_ref =~ /\[(.*?)\]/ ) {
+            $inact_ids_str = $1;
+            push(@inactiveIds, split(",", $inact_ids_str) );
+        }
+    }
+    return ( wantarray() ? @inactiveIds :  \@inactiveIds );
+}
+
+# get_cost_centers( $conn_status_ref, chunk_size , @ids )
+# This function receives size and array.
+# Array is spliced into the size and processed
+# %conn_status - hash of connection statuses
+sub get_cost_centers
+{
+    my $conn_status_ref = shift;
+    my $chunk_size      = shift;
+    my $cost_center_ref = shift;
+    my $date_str        = shift;
+
+    my @changed_userids = ();
+
+    while (my @cur_chunk = splice @_, 0, $chunk_size )
+    {
+        ### Build str of userids
+        my $userids = join ",", @cur_chunk;
+        my $userids_str = 'ids=[' . $userids . ']';
+
+        my $ret_str_ref = call_wget(\$userids_str, $conn_status_ref, 'get_cost_centers');
+
+        # parse the response
+        my $changed_ids_str = '';
+        my @attrs = ();
+        # get list of user's cost center info
+        if ( $$ret_str_ref =~ /\[(.*?)\]/ ) {
+            my $cost_centers_str = $1;
+            if ( $cost_centers_str ) {
+                push(@attrs, split(",", $cost_centers_str) );
+            }
+        }
+        # for each of the user's attributes check against the stored information
+        foreach my $attr (@attrs) {
+            # split out each individual attributes
+            my($id, $cost_center, $department, $user_email, $manager_email) = split("!", $attr);
+
+            # skip updating cost center info for inactive id's
+            if ( defined $cost_center_ref->{$id}{inactive} ) {
+                $logger->info("skipping user $id, marked as inactive");
+                next;
+            }
+
+            # if cost center info does not exist, then add it
+            if ( defined $id && ! defined $cost_center_ref->{$id}{cost_center} ) {
+                $logger->info("No existing cost center info for user $id, adding");
+                if ($cost_center =~ /^\d+$/) {
+                    $cost_center_ref->{$id}{cost_center}   = $cost_center;
+                    $cost_center_ref->{$id}{department}    = $department;
+                    $cost_center_ref->{$id}{date}          = $date_str;
+                    $cost_center_ref->{$id}{user_email}    = $user_email;
+                    $cost_center_ref->{$id}{manager_email} = $manager_email;
+                } else {
+                    $logger->info("  ...skipping because cost center not defined in AD.");
+                }
+            } else {
+                if ($cost_center !~ /^\d+$/) {
+                    $logger->info("cost center not defined in AD for user $id, skipping");
+                    next;
+                }
+
+                my $old_cost_center = $cost_center_ref->{$id}{cost_center};
+                my $old_department  = $cost_center_ref->{$id}{department};
+
+                # check if cost center changed
+                my $move_direction = get_move_direction({old_cc_code => $old_cost_center, current_cc_code => $cost_center});
+                if ( $move_direction && ! defined $cost_center_ref->{$id}{inactive} ) {
+                    my $cc_move_dir_name = $cost_center_movement_map->{$move_direction}{name};
+                    $logger->info("cost centers changed for $id Old:$old_cost_center $old_department New:$cost_center $department ($cc_move_dir_name)");
+
+                    # update previous info
+                    $cost_center_ref->{$id}{old_cost_center} = $old_cost_center;
+                    $cost_center_ref->{$id}{old_department}  = $old_department;
+
+                    # update file with the new cost center for this user
+                    $cost_center_ref->{$id}{new_cost_center} = $cost_center;
+                    $cost_center_ref->{$id}{new_department}  = $department;
+
+                    $cost_center_ref->{$id}{changed}        = "moved";
+                    $cost_center_ref->{$id}{cc_move_status} = $move_direction;
+
+                    push(@changed_userids, $id);
+                }
+
+                $cost_center_ref->{$id}{user_email}     = $user_email;
+                $cost_center_ref->{$id}{manager_email}  = $manager_email;
+                $cost_center_ref->{$id}{date}           = $date_str;
+            }
+        }
+    }
+    return ( wantarray() ? @changed_userids :  \@changed_userids );
+}
+
+# call_wget - perform wget with post data string referenced by $post_str_ref
+# The returned data from the wget, in the file referred to by $ret_file_name,
+# is one huge string, with no terminator(no <NL> or <CR><NL>).
+sub call_wget {
+    my ($post_str_ref, $conn_status_ref, $cgi_file) = @_;
+
+    if ( !defined $cgi_file || !$cgi_file ) {
+        $logger->error('Missing cgi_file parameter, exiting call_wget');
+        return '';
+    }
+
+    my $post_file_name = "/var/tmp/${cgi_file}_post_file";
+    my $ret_file_name = "/var/tmp/${cgi_file}_ret_file";
+    my $POSTFILE;
+
+    my $status_str;
+
+    # open file with the POST data
+    if (!open $POSTFILE, '>', $post_file_name) {
+        $status_str = "Couldn't open '$post_file_name' for write: $!";
+        $conn_status_ref->{sapad}->{status_str} = $status_str;
+        $logger->error($status_str);
+        return '';
+    }
+
+    print $POSTFILE $$post_str_ref;
+    close $POSTFILE;
+
+    my @output = ();
+    # don't print command out to the screen
+    $main::quiet = 1;
+    my $centaurus_ip_addr = '10.163.2.39';
+    my $command = "wget --no-check-certificate https://$centaurus_ip_addr/cgi-bin/$cgi_file " .
+    "--post-file=$post_file_name --output-document=$ret_file_name";
+    eval { ariba::rc::Utils::executeLocalCommand($command, undef, \@output, undef, 1); };
+    if ( $@ ) {
+        $status_str = "Problems running $command: $@";
+        $logger->error($status_str);
+    }
+
+    # check for a 200 status for the wget.  Stop as soon as found, no reason to continue.
+    my $is_ok = 0;
+    foreach my $line (@output) {
+        if ( $line =~ /200 OK/ ) {
+            $is_ok = 1;
+            last;
+        }
+    }
+    if (!$is_ok) {
+        $status_str = "Did not receive 200 OK from wget to centaurus";
+        $conn_status_ref->{sapad}->{status_str} = $status_str;
+        $logger->error($status_str);
+    }
+
+    # open up the response from centaurus
+    my $RETFILE;
+    if (!open $RETFILE, '<', $ret_file_name) {
+        $status_str = "Couldn't open '$post_file_name' for read: $!";
+        $conn_status_ref->{sapad}->{status_str} = $status_str;
+        $logger->error($status_str);
+        return '';
+    }
+    my $ret_str = <$RETFILE>;
+    close $RETFILE;
+
+    # set status_str to OK if not set already
+    if ( !$conn_status_ref->{sapad}->{status_str} ) {
+        $conn_status_ref->{sapad}->{status_str} = 'OK';
+    }
+
+    return \$ret_str;
+}
+
+# compareAccounts() - return csv list of sapID's from $compare hashref that are not found in $corp hashref
+sub compareAccounts {
+    my $corp = shift; # peopledb hashref{ user (ariba or sap id) => hashref ...}
+    my $compare = shift; # buyerSuperUser SM accounts hashref {user (ariba or sap id) => ... }
+    my $msgContext = shift; # other than to add context to debug statements, this value has no use
+    my @ret = ();
+
+    foreach my $user (keys %$compare) {
+        my $data;
+        if(ref($compare->{$user}) =~ /ARRAY/) {
+            $data = join(',',@{$compare->{$user}});
+        }
+        $logger->info( "checking $user ") if($debug > 1);
+        $logger->info("[$data] ") if($data && $debug > 1);
+        $logger->info(": ") if($debug > 1);
+
+        if ($corp->{$user}) {
+            # Traditional direct case match
+            $logger->info("$user ok. (comparing $msgContext)") if($debug > 1);
+            next;
+        }
+
+        my $lcuser = lc $user;
+        my $ucuser = uc $user;
+        if ($corp->{$lcuser}) {
+            $logger->info("IMPROVED EDGE CASE: Found with uppercase match $user ok. (comparing $msgContext)") if($debug > 1);
+            next;
+        }
+        elsif ($corp->{$ucuser}) {
+            $logger->info("IMPROVED EDGE CASE: Found with uppercase match $user ok. (comparing $msgContext)") if($debug > 1);
+            next;
+        }
+
+        # Try and match firstname.lastname (forced lowercase match handles all combinations)
+        my $ok = 0;
+        if($user =~ /^([^\.]+)\.([^\.]+)$/) {
+            my $fname = lc $1;
+            my $lname = lc $2;
+            foreach my $cu (keys %$corp) {
+                if(lc($corp->{$cu}->{'Last Name'}) eq $lname &&
+                    lc($corp->{$cu}->{'First Name'}) eq $fname) {
+                    $ok = 1;
+                    last;
+                }
+            }
+        }
+        if($ok) {
+            $logger->info("ok. (fname.lname)") if($debug > 1);
+            next;
+        }
+
+        # Mismatch found
+        $user .= " [$data]" if ($data);;
+        push(@ret, $user);
+        $logger->info("$user not ok. (comparing $msgContext)") if($debug);
+    }
+
+    my $retStr = "NONE";
+    $retStr = join(', ',@ret) if(@ret);
+
+    return($retStr);
+}
+
+sub cyberSourceAccounts {
+    my $cipherStore = shift;
+    my $mon = shift;
+    my $ret = {};
+    my $csUrl = $mon->default('Cybersource.userlist.url');
+    my $csMerchantId = $mon->default('Cybersource.userlist.merchantId');
+    my $csUsername = $mon->default('Cybersource.userlist.user');
+    my $csPassword = $mon->default('Cybersource.userlist.password');
+    my $csFormat = "csv";
+
+    my %post = (
+        'merchantID' => $csMerchantId,
+        'username' => $csUsername,
+        'password' => $csPassword,
+        'format' => $csFormat,
+    );
+    my @postArray;
+
+    foreach my $arg (keys %post) {
+        my $val = uri_escape($post{$arg});
+        push(@postArray, "$arg=$val");
+    }
+
+    my $url = ariba::monitor::Url->new( $csUrl );
+    $url->setFollowRedirects(1);
+    $url->setUsername( $csUsername );
+    $url->setPassword( $csPassword );
+    $url->setPostBody( join('&', @postArray) );
+    $url->setContentType('application/x-www-form-urlencoded');
+    $url->setUseOutOfBandErrors(1);
+
+    my $response = $url->request();
+    unless ($response) {
+        $logger->error("CyberSource query returned no response");
+        return($ret);
+    }
+    if( $url->errors() ) {
+        return($ret);
+    }
+
+    my @lines = split(/\n+/,$response);
+
+    # Errors have line like: <td id="systemErrorMessage">An error has occurred. Please try again. If you continue to receive an error, please contact Customer Support.</td>
+    for my $l (@lines) {
+        if ($l =~ /systemErrorMessage/) {
+            $logger->error("CyberSource query returned: \"$l\"Check that the credentials are correct");
+            return($ret);
+        }
+    }
+
+    my $jnk = shift(@lines); # skip the extra header
+    # Like: User Listing,Version 1.0,2015-05-26 09:33 GMT
+
+    my $headerString = shift(@lines);
+    unless ($headerString) {
+        $logger->error("CyberSource query returned no csv header");
+        return($ret);
+    }
+    # Like: Username,CyberSource Merchant ID,First Name,Last Name,Email,Date Created,LastAccess,Status,Role,Permissions
+
+    my @headers = split(/,/,$headerString);
+    my %index;
+    for(my $i = 0; @headers; $i++) {
+        my $h = shift(@headers);
+        $index{$h} = $i;
+    }
+
+    foreach my $line (@lines) {
+        $line =~ s/\"//g;
+        my @data = split(/,/, $line);
+        my $user = $data[$index{'Username'}];
+        my $status = $data[$index{'Status'}];
+        my $account = $data[$index{'CyberSource Merchant ID'}];
+        next if($status eq 'Locked');
+        next if($account ne 'annetwork_acct');
+        next if($user =~ /(annetwork|ariba)/);
+        $ret->{$user} = 1;
+    }
+
+    return($ret);
+}
+
+sub aspAccounts {
+    my $prodName = shift;
+    my $me = shift;
+    my $ret = {};
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList($me->service(),$prodName);
+
+    foreach my $p (@products) {
+        if($prodName eq 's2') {
+            serviceManagerAccounts('s2', undef, $ret, $p);
+        }
+    }
+
+    return($ret);
+}
+
+sub serviceManagerAccounts {
+    my $prodName = shift;
+    my $me = shift;
+    my $ret = shift || {};
+    my $p = shift || ariba::rc::InstalledProduct->new($prodName, $me->service());
+    my $superUsersOnly = shift;
+    my @users;
+
+    my $connection = ariba::Ops::AQLConnection->newFromProduct($p);
+    my $aql = ariba::Ops::AQLClient->newFromAQLConnection($connection);
+    $aql->connect();
+
+    my $aqlStr = "SELECT u.UniqueName FROM ariba.user.core.User u WHERE u.PartitionNumber = 0";
+    $aqlStr = "SELECT g.Users.UniqueName FROM Group AS g WHERE g.UniqueName = 'SuperUser'" if ($superUsersOnly);
+
+    $aql->executeAQLWithTimeout($aqlStr, 60, \@users);
+
+    foreach my $user (@users) {
+        chomp $user;
+        $user = lc($user);
+        #
+        # defend against busy pages in return of AQL
+        #
+        return {} if($user =~ /temporarily unavailable/);
+        next if($user =~ /^(?:superuser|aribasystem|aribaguestsystem)$/);
+        # Remove leading domain name and separator from returned names.
+        $user =~ s@^[a-zA-Z0-9]+(\\|/)@@;
+        next if($user !~ /^[a-zA-Z0-9]+$/);
+        if($p->customer()) {
+            push(@{$ret->{$user}}, $p->customer());
+        } else {
+            $ret->{$user} = 1;
+        }
+    }
+
+    return($ret);
+}
+
+# rsaAccounts() - return safeguard accounts with link ending in -rsa
+sub rsaAccounts {
+    my $ret = {};
+
+    my $account_dir = ariba::Ops::Constants->safeguardAccountDir();
+    opendir(D, $account_dir);
+    while(my $acct = readdir(D)) {
+        next if($acct =~ /^\.+$/);
+        next if($acct =~ /\.ariba\.com$/);
+        next unless ( $acct =~ /^[icd]\d{6,7}$/i );
+        # read the account link
+        my $acct_link = readlink("$account_dir/$acct") || '';
+        # skip if not ending with -rsa
+        next unless ( $acct_link && $acct_link =~ /-rsa$/i );
+        $ret->{$acct} = 1;
+    }
+    close(D);
+
+    return($ret);
+}
+
+# bastionRsaAccounts() - return bastion RSA innactive accounts for host
+sub bastionRsaAccounts {
+    my ($host, $num_users_ref, $conn_status_ref) = @_;
+    my $inact_ids_str = '';
+    my @inact_ids = ();
+    if ($host eq 'app173' || $host eq 'violet') {
+        my $post_str = "host=$host";
+        my $ret_str_ref = call_wget(\$post_str, $conn_status_ref, 'get_inactive_ids');
+        # get list of inactive users
+        if ( $$ret_str_ref =~ /^num_users=(\d+)\[(.*?)\]/ ) {
+            $$num_users_ref = $1;
+            $inact_ids_str = $2;
+            @inact_ids = split(',', $inact_ids_str);
+        }
+    }
+    my $retStr = 'NONE';
+    $retStr = join(', ',@inact_ids) if(@inact_ids);
+    $logger->info("bastionRsaAccounts: host = $host num_users = $$num_users_ref ret_str = $retStr");
+    return $retStr;
+}
+
+sub safeguardAccounts {
+    my $ret = {};
+
+    my $safeguard_account_dir = ariba::Ops::Constants->safeguardAccountDir();
+    if ( !opendir(D, $safeguard_account_dir) ) {
+        $logger->error("Unable to open safeguard account dir $safeguard_account_dir: $!");
+        return($ret);
+    }
+    while(my $acct = readdir(D)) {
+        next if($acct =~ /^\.+$/);
+        next if($acct =~ /\.ariba\.com$/);
+        next unless ( $acct =~ /^[icd]\d{6,7}$/i );
+        $ret->{$acct} = 1;
+    }
+    close(D);
+
+    return($ret);
+}
+
+sub inspectorProxyAccounts {
+    my $ret = {};
+
+    my $inspector_profile_dir = ariba::Ops::Constants->inspectorProxyProfileDir();
+    if ( !opendir(D, $inspector_profile_dir) ) {
+        $logger->error("Unable to inspector proxy profile dir $inspector_profile_dir: $!");
+        return($ret);
+    }
+    my $acct;
+    while($acct = readdir(D)) {
+        next if($acct =~ /^\.+$/);
+        next if($acct =~ /^rw$/);
+        $ret->{$acct} = 1;
+    }
+    close(D);
+
+    if ( !opendir(D, $inspector_profile_dir . "/rw") ) {
+        $logger->error("Unable to inspector proxy profile dir $inspector_profile_dir/rw: $!");
+        return($ret);
+    }
+    while($acct = readdir(D)) {
+        next if($acct =~ /^\.+$/);
+        $ret->{$acct} = 1;
+    }
+    close(D);
+
+    return($ret);
+}
+
+sub anAdminAccounts {
+    my $ret = {};
+    my $me = shift;
+
+    my $p = ariba::rc::InstalledProduct->new("an", $me->service());
+
+    my $dbc = ariba::Ops::DBConnection->connectionsForProductOfDBType(
+        $p, ariba::Ops::DBConnection->typeMain()
+    );
+    my $oc = ariba::Ops::OracleClient->newFromDBConnection($dbc);
+    $oc->connect() || return($ret);
+
+    my $sql = "SELECT /*+ leading(o r pr p) use_nl(r pr p)*/ p.user_id " .
+    "FROM org o JOIN role r ON r.owningorg = o.id JOIN person_role pr ON pr.role = r.id JOIN person p ON p.id = pr.person " .
+    "WHERE o.anid = 'AN01000000001' AND p.status = 'Enabled' AND (r.name LIKE 'ADMIN_%' OR r.name = 'SUPER_USER')";
+
+    my @accounts = $oc->executeSql($sql);
+
+    foreach my $a (@accounts) {
+        next if($a eq "superuser\@ariba.com");
+        my $user = $a;
+        if($a =~ /^([^_]+)_admin/) {
+            $user = $1;
+        }
+        $user = lc($user);
+        $ret->{$user} = $a;
+    }
+
+    return($ret);
+}
+
+# The peopleDB file format changed in May/June of 2018, and now allows (maybe even encourages), having multiple group names.
+# This breaks the original processing, since the line "my $lcg = lc $p->group()->instance();" will get something that looks like:
+#   sysadmin<ARRAY>rsa<ARRAY>bastion<ARRAY>safeguardroot<ARRAY>safeguard
+# This will not match any single group name found in %$groups.  So this needs modifying to do a regex check, or convert to an
+# array and check against the array contents with grep.  I think I prefer the 'grep' method, since it can be used easily to
+# check for whole strings rather than matching substrings (safeguard would not match safeguardroot, for example).
+sub peopleDBAccounts {
+    # hash of group names to filter for
+    my ($groups) = @_;
+
+    # return hash
+    my $ret = {};
+
+    # Updating peopleDB files to mark the group with 'ex-employee' is manual and guaranteed to replace all possible group
+    # entries, the 'eq' test below is OK.
+    foreach my $p (ariba::Oncall::Person->listObjects()) {
+        next if ($p->group() && $p->group()->instance() eq 'ex-employee');
+        # The "instance" here is the user "name", such as 'C5255129' or 'grogers'.
+        next if ($p->instance() =~ /(?:^unassigned-|ticketmaster|infosec)/);
+
+        # if groups hash then only return users belonging to groups in groups hash
+        if ($groups) {
+            next unless $p->group();
+            # There may be more than one group for a user:  create an array of the groups from the peopleDB, and grep
+            # through it looking for the supplied group name.  Since either %$groups or the user group reference may
+            # have more than one element, this may need to loop.
+            my @lcGroups = map {s/\s*//g && lc $_} split ('<ARRAY>',  $p->group()->instance());
+            my $foundGroup;
+            for my $peopleDBGroup (@lcGroups)
+            {
+                $foundGroup = TRUE if grep /^$peopleDBGroup$/, keys (%$groups);
+                last if $foundGroup; # If found, they are in, no further questions asked!
+            }
+            # And if there is no match to any group in %$groups, do the next user.
+            next unless $foundGroup;
+        }
+
+        my $user = lc $p->instance();
+        $ret->{$user} = $p;
+    }
+
+    return($ret);
+}
+
+sub saveActiveAccounts {
+    my $thisProduct = shift;
+    my $thisService = shift;
+    my $accounts = shift;
+
+    foreach my $key (keys %{$accounts} ) {
+        # product,service,realm
+        # We will eventually add an 'inspector' field
+        print LOG "$thisProduct,$thisService,$key\n";
+    }
+}
+
+sub getJiraTickets {
+    ## Returns ALL Jira tickets that are not closed and have 'delete accounts for' in the subject
+
+    my ($type, $conn_status_ref) = @_;
+
+    my $json_file = "$logRoot/mockAllJiraResults.json";
+    if ( $type eq 'old' ) {
+        $json_file = "$logRoot/mockOldJiraResults.json";
+    }
+
+    my $results = {};
+    my $status_str = 'OK';
+
+    if ($useMock) {
+        # using mock, so read from json file instead of jira query
+        if (-f $json_file) {
+            my $fh;
+            if ( !open ($fh, $json_file) ) {
+                # not able to open json file
+                $status_str = "Couldn't open $json_file: $!";
+                $conn_status_ref->{jira}->{status_str} = $status_str;
+                $logger->error($status_str);
+                return {};
+            }
+            else {
+                # able to open json file
+                my $line_num = 0;
+                while (my $line = <$fh>) {
+                    chomp $line;
+                    eval { $results = JSON::decode_json($line); };
+                    if ( $@ ) {
+                        $status_str = "Error decoding $json_file on line $line_num: $@";
+                        $conn_status_ref->{jira}->{status_str} = $status_str;
+                        $logger->error($status_str);
+                        return {};
+                    }
+
+                    last if ! $line;
+                    $line_num++;
+                }
+            }
+        }
+    }
+    else {
+        # not using mock
+        #
+        my $jira = ariba::Ops::Jira->new();
+
+        # get list of open delete accounts for tickets
+        my $jql = 'project = HOA AND issuetype = OpsAutomated ' .
+        'AND status IN (Open, "In Progress", "All Clear", Stable) ' .
+        'AND summary ~ "delete accounts for"';
+        if ( $type eq 'old' ) {
+            $jql = 'project = HOA AND issuetype = OpsAutomated ' .
+            'AND status IN (Open, "In Progress", "All Clear", Stable) ' .
+            'AND summary ~ "delete accounts for" AND updated <= -2d';
+        }
+
+        eval { $results = $jira->search( $jql ); };
+
+        if (my $exception = $@) {
+            $status_str = "Error doing jira $type search $jql: $exception";
+            $conn_status_ref->{jira}->{status_str} = $status_str;
+            $logger->error($status_str);
+            return {};
+        }
+
+        # createMock - create json mock file from results of actual Jira query
+        if ($createMock) {
+            my $json;
+            eval { $json = JSON::encode_json($results); };
+            if ( $@ ) {
+                $status_str = "Error encoding $type jira results: $@";
+                $conn_status_ref->{jira}->{status_str} = $status_str;
+                $logger->error($status_str);
+                return {};
+            }
+            else {
+                if ( !open(MOCKJIRA, ">", "$json_file") ) {
+                    $status_str = "Error saving $type json file $json_file: $!";
+                    $conn_status_ref->{jira}->{status_str} = $status_str;
+                    $logger->error($status_str);
+                    return {};
+                }
+                else {
+                    print MOCKJIRA "$json\n";
+                    close(MOCKJIRA);
+                }
+            }
+        }
+    }
+
+    # set status as OK at this point if not set
+    if ( ! $conn_status_ref->{jira}->{status_str} ) {
+        $conn_status_ref->{jira}->{status_str} = 'OK';
+    }
+
+    return $results;
+}
+
+# create_jira_ticket - create new Jira ticket given summary and description. Use RESTful call to create the ticket.
+sub create_jira_ticket
+{
+    my ( $summary, $description, $conn_status_ref ) = @_;
+
+    # Certain things need to be set up for the JIRA::Client::Automated module to work correctly:
+    $ENV{PERL_LWP_SSL_CA_FILE} = 0;
+
+    my $jira_url = 'https://product-jira.ariba.com';
+    my $jira_user = 'hoa_auto_reporter';
+    my $jira_pwd = 'headless';
+    my $jira = JIRA::Client::Automated->new( $jira_url, $jira_user, $jira_pwd );
+
+    # Be sure the new object does not try to use SSL verification.
+    $jira->ua()->{ssl_opts} = { SSL_verify_mode => 'SSL_VERIFY_NONE' };
+
+    # Create Issue
+    # Note: some fields can have multiple values, hence the arrays
+    my $fields = { customfield_10622 =>   { value => "Security", } ,      # Incident Item:
+        customfield_10625 =>   { value => "SRE", } ,           # Team:
+        customfield_10618 =>   { value => "Monitoring", } ,    # Detection Method, Sub Method:
+        customfield_10609 => [ { value => "All", } ] ,         # Ops Application Products:
+        customfield_10608 => [ { value => "All Production Datacenters", } ] , # Data Center Location:
+        customfield_10611 => [ { value => "Production", } ] ,  # Service Name:
+    };
+    my $jira_id;
+    my $exception;
+    # Repeat this if creating failed, two more times, set $exception if 3 tries doesn't work.
+    for my $c (1 .. 3)
+    {
+        eval { $jira_id = $jira->create_issue( "HOA", "OpsAutomated", $summary, $description, $fields); };
+        last if $jira_id and $jira_id->{key} and $jira_id->{key} =~ /^HOA-\d+$/i; # we have an HOA-number
+        # If the create failed and there is no ticket, sleep a bit before the next try.
+        sleep 5;
+        if ($c == 3)
+        {
+            if ($@)
+            {
+                $exception = $@;
+            }
+            else
+            {
+                $exception = "ERROR:  JIRA ticket creation failed, unknown cause.";
+            }
+        }
+    }
+
+    my $status_str;
+
+    if ($exception) {
+        $status_str = "Error creating ticket for $summary: $exception";
+        $conn_status_ref->{jira}->{status_str} = $status_str;
+        $logger->error($status_str);
+        return {};
+    }
+
+    my $jira_key = '';
+    if ($jira_id) {
+        $jira_key = $jira_id->{key};
+        $logger->info("Created Jira ticket $jira_key: $summary");
+
+        my $edit_status = add_severity_and_watcher($jira_key,$conn_status_ref);
+        unless($edit_status) {
+            $status_str = "Unable to add watcher in jira ticket($jira_key)";
+            $conn_status_ref->{jira}->{status_str} = $status_str;
+            $logger->error($status_str);
+        }
+    }
+    else {
+        $status_str = "Unable to create Jira ticket";
+        $conn_status_ref->{jira}->{status_str} = $status_str;
+        $logger->error($status_str);
+    }
+
+    return ($jira_key);
+}
+
+# update_conn_status - update q with connection statuses
+sub update_conn_status
+{
+    my( $q_ref, $conn_status_ref  ) = @_;
+
+    foreach my $name ( keys (%{$conn_status_ref}) ) {
+        my $title = $conn_status_ref->{$name}->{title};
+        $q_ref->{"$title"} = {
+            perl => sub { return $conn_status_ref->{$name}->{status_str} },
+            info => "defined(answer) && answer eq 'OK'",
+            warn => "!defined(answer) || answer ne 'OK'",
+        }
+    }
+}
+
+# read cost center file
+# FORMAT <date>,<SAP ID>,<cost_center>,<department>
+sub read_cost_center_file
+{
+    my ($cost_center_ref, $file_name) = @_;
+
+    my $line_num = 1;
+    my $cost;
+    if ( open($cost, "<", $cost_center_file ) ) {
+        while (my $line = <$cost>) {
+            chomp $line;
+            my @fields = split ",", $line;
+            if ( $fields[0] && $fields[1] && $fields[2] && $fields[3] ) {
+                my $user = $fields[1];
+                $cost_center_ref->{"$user"} =
+                { date          => $fields[0],  # date:
+                    cost_center   => $fields[2],  # cost center:
+                    department    => $fields[3],  # department:
+                    user_email    => $fields[4],
+                    manager_email => $fields[5]
+                };
+            }
+            else {
+                $logger->error("Blank fields found for line_num: $line_num line :$line");
+            }
+            $line_num++;
+        }
+        close($cost);
+    }
+    else {
+        $logger->error("Unable to open $cost_center_file for read: $!");
+        return 0;
+    }
+    return 1;
+}
+
+sub write_cost_center_file
+{
+    my ($cost_center_ref, $file_name) = @_;
+
+    my $date      = strftime("%Y-%m-%d", @localTime);
+    my $timestamp = strftime('%Y%m%d%H%M',@localTime);
+
+    backup_as_gz({source_file => $cost_center_file, backup_file => "$cost_center_archive_file.$timestamp.gz"});
+
+    if ( open(my $cost, ">", $cost_center_file ) ) {
+        foreach my $id ( sort keys %{$cost_center_ref} ) {
+            my $cost_center   = $cost_center_ref->{"$id"}{"cost_center"} || '';
+            my $department    = $cost_center_ref->{"$id"}{"department"} || '';
+            my $user_email    = $cost_center_ref->{"$id"}{"user_email"} || '';
+            my $manager_email = $cost_center_ref->{"$id"}{"manager_email"} || '';
+
+            if ( $id && $department && $cost_center && $user_email ) {
+                print $cost "$date,$id,$cost_center,$department,$user_email,$manager_email\n";
+            }
+            else {
+                $logger->error("Blank fields found for id: $id department:$department cost_center:$cost_center user_email:$user_email manager_email:$manager_email");
+            }
+        }
+        close($cost);
+    }
+    else {
+        $logger->error("Unable to open $cost_center_file for write: $!");
+    }
+}
+
+# Checks to see if a given cost center code and name match
+#
+# input: cc_code (the cost center code)
+#        cc_name (the name for which we want to see if code matches)
+# output: 1 if code matches name, 0 otherwise
+sub is_matching_cost_center {
+    my $args = shift;
+
+    my $cc_code = $args->{cc_code};
+    my $cc_name = $args->{cc_name};
+
+    if ( grep( /^$cc_code$/, @{$cost_center_codes->{$cc_name}} ) ) {
+        return 1;
+    }
+
+    return 0;
+}
+
+# returns a disclaimer for jira tickets prior to 2017-08-01 vs after
+sub get_jira_ticket_disclaimer {
+    my $args = shift;
+
+    my $trigger = $args->{trigger} || '';
+
+    my $datestamp        = strftime('%Y%m%d',@localTime);
+    my $tag              = '';
+    my $switchover_stamp = 20170801;
+
+    if ( $trigger eq 'warn' ) {
+        $tag = "(cost center change)";
+    } elsif ( $trigger eq 'revoke' ) {
+        $tag = "(cost center change to non HANA/Ops)";
+    } else {
+        $tag = "";
+    }
+
+    if ( int($datestamp) < $switchover_stamp ) {
+        $tag .= ' TEST TICKET: TAKE NO ACTION';
+    }
+
+    return $tag;
+}
+
+# define movements here (with precedence) and return the 
+# corresponding movement code
+sub get_move_direction {
+    my $args = shift;
+
+    my $old_cc_code     = $args->{old_cc_code};
+    my $current_cc_code = $args->{current_cc_code};
+
+    # 0/false if codes are equal
+    return 0 if $old_cc_code eq $current_cc_code;
+
+    # hana migration to ops
+    if ( is_matching_cost_center({cc_code => $old_cc_code, cc_name => "hana_migration"}) &&
+        is_matching_cost_center({cc_code => $current_cc_code, cc_name => "ops"}) ) {
+        return 1;
+    }
+
+    # any to hana migration
+    if ( is_matching_cost_center({cc_code => $current_cc_code, cc_name => "hana_migration"}) ) {
+        return 2;
+    }
+
+    # hana migration to any
+    if ( is_matching_cost_center({cc_code => $old_cc_code, cc_name => "hana_migration"}) ) {
+        return 3;
+    }
+
+    return 4
+
+}
+
+sub send_emails {
+    my $args = shift;
+
+    my $mail_per_user = $args->{mail_per_user};
+
+    my $switchover_stamp = 20170801;
+    my $datestamp        = strftime('%Y%m%d',@localTime);
+
+    if ($debug) {
+        print "Switchover timestamp:  ", Dumper $mail_per_user;
+        return 0;
+    }
+
+    foreach my $user ( keys %{$mail_per_user} ) {
+
+        my $to      = $mail_per_user->{$user}{to};
+        my $subject = $mail_per_user->{$user}{subject};
+        my $body    = $mail_per_user->{$user}{body};
+        my $cc      = $mail_per_user->{$user}{cc};
+        my $from    = $mail_per_user->{$user}{from};
+
+        if ( int($datestamp) < $switchover_stamp ) { 
+            $to = 'satbir.chahal@sap.com';
+            $cc = 'Al Champagne <al.champagne@sap.com>';
+
+            $subject .= ' [TEST]';
+        }
+
+        ariba::Ops::Utils::email($to, $subject . "\nContent-Type: text/html", $body, $cc, $from);
+
+        sleep 1;
+    }
+
+    return 1;
+}
+
+sub get_cost_center_movers {
+    my $cost_center_ref = shift;
+
+    my @cc_movers = ();
+
+    foreach my $user ( keys %{$cost_center_ref} ) {
+        if ( defined $cost_center_ref->{$user}{changed} && $cost_center_ref->{$user}{changed} eq 'moved' ) {
+            push(@cc_movers, $user);
+        }
+    }
+
+    my $result = scalar(@cc_movers) > 0 ? join(', ', @cc_movers) : 'NONE';
+
+    return $result;
+}
+
+sub get_warning_email_body {
+    my $args = shift;
+
+    my $user       = $args->{user};
+    my $old_org    = $args->{old_org};
+    my $new_org    = $args->{new_org};
+    my $jira_query = $args->{jira_query};
+    my $mgr_found  = $args->{mgr_found};
+
+    my ($no_mgr_disclaimer, $no_mgr_details) = ("", "");
+    if ( ! $mgr_found ) {
+        $no_mgr_disclaimer = "Note: No manager found in system";
+        $no_mgr_details    = "Please forward this to your manager so your manager can take action, if needed.";
+    }
+
+    my $email_body = <<"EMAIL_BODY_TEMPLATE";
+<html>
+<h3 style="color:red">
+$no_mgr_disclaimer<br />$no_mgr_details
+</h3>
+
+<p>
+Hi,
+</p>
+
+<p>
+The following employee has recently changed roles/departments within SAP and needs to have Ariba production access removed:
+</p>
+
+<table>
+<tr><td>Employee:</td><td>$user</td></tr>
+<tr><td>Old Org:</td><td>$old_org</td></tr>
+<tr><td>New Org:</td><td>$new_org</td></tr>
+</table>
+
+<p>
+As per InfoSec and Audit requirements, this account will be deleted in five business days.
+That deletion is being tracked in the <a href="https://product-jira.ariba.com/browse/HOA-XXXXXX">JIRA ticket linked here</a>.
+</p>
+
+<p>
+If you still require production access in your new role, one of the following steps must be taken immediately:
+<ol>
+  <li>
+    The employee's manager can add a comment to the ticket above
+    with the text "Approved"
+  </li>
+  <li>
+    The employee can attach a PDF copy of an email from the manager
+    with the text "Approved"
+  </li>
+  <li>
+    It is the employee's responsibility to verify that their reporting manager,
+    or the next level manager, is aware to take action on this ticket.
+  </li>
+</ol>
+</p>
+
+<p>
+If one of these two steps is not taken, the account will be deleted and production access will be discontinued.
+</p>
+
+<p>
+-Cloud Operations
+</p>
+</html>
+EMAIL_BODY_TEMPLATE
+
+return $email_body;
+}
+
+# given a source file, gzip it and name as backup_fil
+# returns 1 on success, 0 otherwise
+sub backup_as_gz {
+    my $args = shift;
+
+    my $source_file = $args->{source_file};
+    my $backup_file = $args->{backup_file};
+
+    # The gz* symlinks found in RHEL 5.x in /usr/local/bin are not present in the RHEL 6.x and later systems,
+    # and there may not be certain "special" symlinks, either (such as for gzcat).  Search the PATH for the
+    # appropriate full file path and use that.
+    my $cmdPath = ariba::Ops::Utils::findSysCmd ('gzip');
+    if ($cmdPath &&
+        open(my $backup_cmd, '-|', "$cmdPath -c $source_file") &&
+        open(my $bck_fh, '>', $backup_file) ) {
+
+        while (my $cmdout = <$backup_cmd>) {
+            print $bck_fh $cmdout;
+        }
+
+        close $backup_cmd;
+        close $bck_fh;
+
+        return 1;
+    }
+
+    return 0;
+}
+
+sub pruneActiveCCmoverFromInactiveAccounts {
+
+    my $accounts_list_csv = shift; # e.g., "I999999, I999998, ..."
+    my $cost_center_ref   = shift;
+
+    my $pruned_list = [];
+    my $separator = ", ";
+    foreach my $account ( split($separator, $accounts_list_csv) ) {
+        if ( exists $cost_center_ref->{$account}{changed} && defined $cost_center_ref->{$account}{changed} &&
+            $cost_center_ref->{$account}{changed} eq "moved" && 
+            ! $cost_center_ref->{$account}{inactive} ) {
+
+            print "Removing '$account' from inactive list (it's a mover)\n" if ($debug);
+        } else {
+            push(@{$pruned_list}, $account);
+        }
+    }
+
+    return join($separator, @{$pruned_list});
+}
+
+sub add_severity_and_watcher {
+
+    my ($jira_id,$conn_status_ref) = @_;
+
+    my $jira = ariba::Ops::Jira->new();
+    my $issue = $jira->get_issue( $jira_id );
+
+    eval { $jira->add_watchers( $jira_id, $watcher_id );};
+    $jira->set_severity( $jira_id,"S1");
+
+    my $status_str;
+    if (my $exception = $@) {
+        $status_str = "Error while adding watcher for $jira_id: $exception";
+        $conn_status_ref->{jira}->{status_str} = $status_str;
+        $logger->error($status_str);
+        return {};
+    }
+
+    return 1;
+}
+
+main(@ARGV);
+
+__END__
+
+====
+
+URL for a simple search:  project = "Hosting Operations Ariba" AND severity = S0 AND assignee = currentUser()
+
+    https://product-jira.ariba.com/browse/HOA-185626?\
+        jql=project%20%3D%20%22Hosting%20Operations%20Ariba%22%20
+            AND%20
+            severity%20%3D%20S0%20
+            AND%20
+            assignee%20%3D%20currentUser()
+
+    Where the % escapes mean:
+        %20 a space
+        %22 a double quote
+        %3D an equal sign
+
+    Cleaned up for readability:
+    https://product-jira.ariba.com/browse/HOA-185626?jql=project = "Hosting Operations Ariba" AND severity = S0 AND assignee = currentUser()
+
+But then, I used a link as created by the 'check-user-accounts' (with the "secure" in it), while logged in and it got converted to:
+
+    https://product-jira.ariba.com/issues/?jql=project = "Hosting Operations Ariba" AND severity = S0 AND assignee = currentUser()
+
+    But the problem is the same as with the "secure" link, it generates an error rather than prompting to log in.
+
+    It looks like only the "browse" method URL will trigger a log in. :()

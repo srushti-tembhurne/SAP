@@ -1,0 +1,250 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/snapmirror#42 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::StatusPage;
+use ariba::monitor::QueryManager;
+use ariba::monitor::OutageSchedule;
+use ariba::Ops::Machine;
+use ariba::rc::InstalledProduct;
+use ariba::SNMP::Session;
+
+my $debug = 0;
+
+sub main {
+        my $sendEmail = 0;
+        my $sendPage  = 0;
+
+        while( my $arg = shift(@ARGV) ){
+                if($arg =~ /^-e/o){ $sendEmail = 1; };
+                if($arg =~ /^-p/o){ $sendPage = 1; };
+                if($arg =~ /^-d/o){ $debug = 1; };
+        }
+
+        my $me      = ariba::rc::InstalledProduct->new();
+        my @hosts   = $me->hostsForRoleInCluster('fs-replication-dest', $me->currentCluster());
+        my $email   = $me->default('notify.email');
+        my $tab     = ariba::monitor::StatusPage::disasterRecoveryProduct();
+        my $now     = time();
+
+        # reduce the service to it's base name.  eg prodksams becomes 'ksa'
+        my $service = $me->service();
+        my ($serviceBase) = $service =~ /prod(.*)/;
+        my $serviceIsMs;
+        if ( $serviceBase =~ /ms/ ) {
+            $serviceIsMs = 1;
+            $serviceBase =~ s/ms//;
+        }
+
+        my %queries = ();
+        my %processed;
+
+        for my $host (@hosts) {
+
+                my $machine = ariba::Ops::Machine->new($host) || next;
+                my $snmp    = ariba::SNMP::Session->newFromMachine($machine) || next;
+                my %oid = getOIDs($machine->os);
+
+                my %indexes = $snmp->walkOidExpr($oid{index});
+
+                for my $index (sort keys %indexes) {
+
+                        # we only want the digit
+                        $index =~ s/^\w+\.//;
+
+                        # Human readable.
+                        my $volumeName = $snmp->valueForOidExpr("$oid{dst}.$index") || do {
+                                warn "Couldn't get a volume name for $host: snapmirrorDst.$index !";
+                                next;
+                        };
+
+                        # netapp in ksa2 serves 4 services.  Only proceed if the volume 
+                        # is of the service we're monitoring.
+                        #
+                        # Hack for Mena.  May need to lib this out and deal with prod/prod2 too.
+                        # Here's hoping we don't introduce volumes that break this pattern matching.
+                        if ( $service =~ /prodksa/ || $service =~ /produae/ ) {
+                            next if $processed{$volumeName};
+                            next unless ($volumeName =~ /$serviceBase/);
+                            my $volumeIsMs = 1 if ( $volumeName =~ /-ms/ || $volumeName =~ /cobalt/ );
+                            next if (($serviceIsMs && !$volumeIsMs) || (!$serviceIsMs && $volumeIsMs));
+                        }
+                        # CDOT clusters will have the same volumes on each.  We only need to proccess
+                        # each volume once.
+                        $processed{$volumeName} = 1;
+
+                        $volumeName =~ s/^.+?://;
+
+                        $queries{"$host:$volumeName last successful snapmirror"} = {
+                                info => "answer ne 'failed'",
+                                crit => "answer eq 'failed'",
+                                snmp => "$host, $oid{timestamp}.$index",
+                        };
+
+                        ######################
+                        # Map the other direction
+                        my $snapMirrorLag = $snmp->valueForOidExpr("$oid{lag}.$index");
+
+                        my $lagInMinutes;
+
+                        if (defined $snapMirrorLag && $snapMirrorLag != -1) {
+                                $lagInMinutes = timeTicksToSeconds($snapMirrorLag) / 60;
+                        } else {
+                                $lagInMinutes = -1;
+                        }
+
+                        # Get results for previous snapmirror transfer
+                        my $snapMirrorLastTransTimeSeconds = $snmp->valueForOidExpr("$oid{lasttranstimeseconds}.$index");
+
+                        my $lastTransferInMinutes;
+
+                        if (defined $snapMirrorLastTransTimeSeconds && $snapMirrorLastTransTimeSeconds != -1) {
+                                $lastTransferInMinutes = $snapMirrorLastTransTimeSeconds / 60.0;
+                        } else {
+                                $lastTransferInMinutes = -1;
+                        }
+
+                        # XXX - hackish. There's no way to determine *what*
+                        # vol2 really is. thresholds are arbritrary right now too.
+                        my $info = 15;
+                        my $crit = 100;#As per Jira HOA-59825
+                        my $path = "//ariba/services/operations/documentation/prodops/common/snapmirror_lag.txt";
+
+                        # increasing buyerprod crit threshold until giant jdbc logs are under control
+                        if ($volumeName eq 'buyerprod') {
+                                $crit = 400;
+                        }
+
+                        # mon is replicated less frequently than other volumes.
+                        if ($volumeName eq 'vol2' || $volumeName =~ /^mon/) {
+                                $info = 1000;
+                                $crit = 1500;
+                        }
+
+                        # archive volume is also replicated less frequently.  See TMID:60241
+                        if ($volumeName eq 'archive' ) {
+                                $info = 1440;
+                                $crit = 2880;
+                        }
+
+                        my $outage = undef;
+                        # see TMID 59893 / CR 1-9XZN22
+                        if ($volumeName eq "s4prod" && $host eq "nfs14.bou.ariba.com") {
+                                $outage = ariba::monitor::OutageSchedule->new('daily 00:00-09:00');
+                        }
+
+			if($volumeName eq "oracle_backupdata" || $volumeName eq "oracle_backuparch"){
+                                $crit = 240;
+                        }
+
+                        $queries{"$host:$volumeName snapmirror lag from source"} = {
+                                recordMaxResults => 110000,
+                                recordDataType => "gauge",
+                                graphRecorded => 1,
+
+                                format => "%d mins ago\n",
+                                outageSchedule => $outage,
+                                info => "answer <= $info",
+                                warn => "answer > $info or answer == -1",
+                                crit => "answer > $crit",
+                                perl => "return $lagInMinutes",
+                                note => "For initial debugging refer to $path",
+                        };
+
+                        ######################
+                        ##Retry 2 times
+                        my $state = $snmp->valueForOidExpr("$oid{state}.$index");
+                        print "state for $volumeName: $state\n" if ($debug);
+                        unless ( $state ){
+                                sleep 5;
+                                $state = $snmp->valueForOidExpr("$oid{state}.$index");
+                                print "state (2nd time) for $volumeName: $state\n";
+                        }
+                        $queries{"$host:$volumeName snapmirrorState"} = {
+                                info => "answer eq 'snapmirrored'",
+                                warn => "answer eq 'unknown'",
+                                crit => "answer ne 'snapmirrored'",
+                                perl => sub {return $state;},
+                        };
+
+                        ######################
+                        $queries{"$host:$volumeName snapmirrorStatus"} = {
+                                info => "answer ne 'aborting' && answer ne 'unknown'",
+                                warn => "answer eq 'unknown'",
+                                crit => "answer eq 'aborting'",
+                                snmp => "$host, $oid{status}.$index",
+                        };
+
+                        ######################
+                        $queries{"$host:$volumeName snapmirror last transfer MBs"} = {
+                                recordMaxResults => 110000,
+                                recordDataType => "gauge",
+                                info => "1",
+                                snmp => "$host, $oid{lasttransMBs}.$index",
+                        };
+
+                        ######################
+                        $queries{"$host:$volumeName snapmirror last transfer time in minutes" } = {
+                                recordMaxResults => 110000,
+                                recordDataType => "gauge",
+                                info => "1",
+                                perl => "return $lastTransferInMinutes",
+                        };
+                }
+        }
+
+        my $q = ariba::monitor::QueryManager->newWithDetails(
+                'netapp-snap-mirror', $tab, $service, $me->customer(), \%queries
+        );
+
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+sub timeTicksToSeconds {
+        my $ticks = shift;
+
+        $ticks /= 100;
+        $ticks %= (60 * 60 * 24);
+
+        return $ticks;
+}
+
+sub getOIDs {
+        my $os = shift;
+
+        my %snapmirrorOids = (
+                'index'                => "snapmirrorIndex.0",
+                'dst'                  => 'snapmirrorDst',
+                'timestamp'            => 'snapmirrorMirrorTimestamp',
+                'lag'                  => 'snapmirrorLag',
+                'lasttranstimeseconds' => 'snapmirrorLastTransTimeSeconds',
+                'state'                => 'snapmirrorState',
+                'status'               => 'snapmirrorStatus',
+                'lasttransMBs'         => 'snapmirrorLastTransMBs',
+        );
+
+        my %snapmirrorCDOTOids = (
+                'index'                => "snapmirrorRelIndex.0",
+                'dst'                  => 'snapmirrorRelDestPath',
+                'timestamp'            => 'snapmirrorRelNewestSnapshotTimeStamp',
+                'lag'                  => 'snapmirrorRelLag',
+                'lasttranstimeseconds' => 'snapmirrorRelLastTransferTimeSeconds',
+                'state'                => 'snapmirrorRelState',
+                'status'               => 'snapmirrorRelStatus',
+                'lasttransMBs'         => 'snapmirrorRelLastTransferSize',
+        );
+
+        if ($os eq "cdot" ){
+                return %snapmirrorCDOTOids;
+        } else {
+                return %snapmirrorOids;
+        }
+}
+
+main();
+
+__END__

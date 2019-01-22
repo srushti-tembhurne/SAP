@@ -1,0 +1,222 @@
+#!/usr/local/tools/bin/perl
+
+use strict;
+use warnings;
+
+use FindBin;
+use lib (
+    # This is for all ariba::monitor modules.
+    "$FindBin::Bin/../../lib",
+    # This one picks up JIRA, Crypt, with others at that level, plus things in ariba/Ops/.
+    "$FindBin::Bin/../../../tools/lib/perl",
+    # This one finds shellwords.pl and two .ph files (??).
+    "$FindBin::Bin/../../../branch/monitor/repos/tools",
+    # This finds the pieces in Net, perhaps others, not covered by previous paths.
+    "$FindBin::Bin/../../../operations/cfengine/dist/common/ariba/lib",
+);
+
+use JIRA::Client::Automated;
+use File::Basename;
+use JSON;
+use Data::Dumper;
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::DateTime;
+use ariba::Ops::Constants;
+use ariba::monitor::StatusPage;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Machine;
+
+my $cfg;
+
+# We slurp this in, using an isolated block to isolate the $/ change.  See __DATA__ at file end for the contents.
+{
+  local $/ = undef;
+  $cfg = <DATA>;
+  $cfg = decode_json $cfg;
+}
+
+my $logfile = $cfg->{logfile};
+
+# This script, as modified, does not send 'pages'.  The operational mode does not generate
+# critical issues and does not need to take this action.  The sendPage variable is set to 0,
+# to ensure it does nothing and the option is removed to prevent use.
+
+my $sendEmail = 0;
+my $sendPage = 0;
+my $debug = 0;
+my $jiraenv = "dev";
+my @hosts;
+my @openError; # Was scalar, and never used.  Now, saves file name and exit code, for possible
+               # inclusion in emails or JIRA incident.
+
+my $program = basename ($0);
+my $usage = "\nusage:  $program [-e] [-d] [-jprod]\n";
+
+while(my $arg = shift) {
+    if ($arg =~ /^-d$/i) {
+        $debug++;
+    }
+    elsif ($arg =~ /^-e$/i) {
+        $sendEmail = 1;
+    } 
+    elsif ($arg =~ /^-jprod$/i) {
+        $jiraenv = "prod";
+    } else {
+        die "ERROR:  invalid argument '$arg'.\n$usage\n";
+    }
+}
+
+my $jiracfg = $cfg->{jira}{$jiraenv};
+
+my $hostname = ariba::Ops::NetworkUtils::hostname();
+my $machine = ariba::Ops::Machine->new($hostname);
+my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($machine->datacenter());
+
+my $me = ariba::rc::InstalledProduct->new();
+my $email = $me->default('notify.email');
+
+if ($debug)
+{
+  print "         hostname:  $hostname\n",
+        "          machine:  ", ref ($machine), "\n",
+        "       primary dc:  $tab\n",
+        "installed product:  ", ref ($me), "\n",
+        "            email:  $email\n";
+}
+
+unless (grep /^syslog$/, $machine->providesServices()) {
+    print "This script must run on the loghost server.\n";
+    exit;
+}
+
+my ($s, $min, $h, $d, $mon, $y) = localtime();
+my $displayDate = sprintf("%4d-%02d-%02d", $y+1900, $mon+1, $d);
+
+# The original processed a partial Monday spew file, and the last 6 gzip'd files.  Since this
+# script runs once a week, at 9 am, the combination of cron job timing and rotation means there
+# are 24 - 9 hours of data on Monday that rotate off the end of the list, without ever being
+# processed.  This is fixed by *not* processing the 9 hour old spew file, and only processing
+# 7 gzip'd files.  Only the most recent 7 are handled, so only one week is done on each run.
+# Note that there may be more logfiles present, but they are ignored.
+my @logs;
+for(my $i = 1; $i <= 7; $i++) {
+    unshift(@logs, "$logfile.$i.gz");
+}
+
+foreach my $file (@logs) {
+    my $LOG;
+    my $status = open ($LOG, '-|', 'zcat', $file);
+
+    if($status) {
+        while(my $line = <$LOG>) {
+            chomp $line;
+
+            # This matches the explicit CC line only, host saved in $1.  Do 'next' here only,
+            # as every line in the log file has an associated date.  Note, removed the /o
+            # option to patterns since it is only useful when a variable is interpolated into
+            # the pattern.
+            next unless ($line =~ /CC:\s+\[([^[]+)]\s+contains possible/);
+            my $host = $1;
+            # This matches the date part of $line, saved in $1.
+            my ($date) = ($line =~ /^(\w+\s+\d+\s+\d+:\d\d:\d\d)/);
+
+            my $datestamp = ariba::Ops::DateTime::syslogToTimestamp($date);
+            my @dates = localtime($datestamp);
+            $date = sprintf("%02d-%02d-%04d", $dates[4]+1, $dates[3], $dates[5]+1900);
+
+            push(@hosts, [$host, $date]);
+        }
+        close($LOG);
+    } else {
+        # Save the file name and the error code for possible future reference.
+        push @openError, [$file, $!];
+    }
+}
+
+my $reportdir = ariba::Ops::Constants->creditCardScanDir();
+
+my $result = "";
+my $description = "";
+foreach my $entry (@hosts) {
+    my $host = $entry->[0];
+    my $datestring = $entry->[1];
+    $result .= "$host $reportdir/cc-scan-$datestring\n";
+    $description .= "$host $reportdir/cc-scan-$datestring\n";
+}
+
+my $q = {};
+$q->{"Possible credit card numbers found in $tab"} = {
+    "info"        => 1,
+    "perl"        => sub { return $result; },
+    "description" => $description,
+};
+
+# Certain things need to be set up for the JIRA::Client::Automated module to work correctly:
+$ENV{PERL_LWP_SSL_CA_FILE}=0;
+# Use the password and user name from our config file to access JIRA and create a JIRA object.
+my $jira = JIRA::Client::Automated->new ($jiracfg->{jiraURL}, $jiracfg->{jirauser}, $jiracfg->{jirapwd});
+# Be sure the new object does not try to use SSL verification.
+$jira->ua()->{ssl_opts} = {SSL_verify_mode => 'SSL_VERIFY_NONE'};
+
+# This is to save return values from the add_watcher() method, for debug, maybe more.
+my @watchers;
+
+my $summary = "Possible credit card numbers found $displayDate in " . $me->service();
+if($debug) {
+    print "\nSubject:  $summary\n",
+          "\nDescription:\n$description",
+          "\nResult:\n$result\n";
+} else {
+    # This method returns a hash element, from which we need to extract the correct id value.
+    my $jira_id = $jira->create_issue (
+        $cfg->{project},
+        $cfg->{issuetype},
+        $summary,
+        $description
+    );
+    $jira_id = $jira_id->{key};                            
+
+    # We have a newly created ticket, add any watchers listed in the configuration file.  The
+    # value in the configuration under the 'watchers' key is an array of arrays, we want only
+    # the first element of each contained array.  Each must apparently be processed separately.
+    foreach my $watcher (@{$cfg->{watchers}})
+    {
+      # It looks like we can just assume this works (yuck).  It looks like, from the JIRA code,
+      # that the method actually returns the new watcher's name?  So maybe they can simply be 
+      # compared to verify it worked?  Will check into this later.
+      push @watchers, $jira->add_watcher ($jira_id, $watcher->[0]);
+    }
+}
+
+my $qm = ariba::monitor::QueryManager->newWithDetails ("credit-card-scan", $me->name (),
+            $me->service (), undef, $q);
+$qm->processQueries ($debug, $email, $sendEmail, $sendPage);
+
+__DATA__
+
+{
+            "comment" : ["to generate ticket in production jira ticket, use command line ",
+                         "option -jprod. To add watchers to the ticket, use the config here,",
+                         "adding array refs with jira user and comment."
+                        ],
+           "watchers" : [
+                        ],
+          "issuetype" : "OpsAutomated",
+  "customfield_10625" : "ProdOps Deployment",
+            "project" : "HOA",
+           "severity" : "S3",
+            "logfile" : "/var/log/spew",
+               "jira" : {
+                   "prod" : {
+                        "jiraURL" : "https://product-jira.ariba.com",
+                       "jirauser" : "hoa_auto_reporter",
+                        "jirapwd" : "headless"
+                    },
+                    "dev" : {
+                        "jiraURL" : "https://product-jira-test.ariba.com",
+                       "jirauser" : "hoa_auto_reporter",
+                        "jirapwd" : "headless"
+                    }
+                }
+}

@@ -1,0 +1,109 @@
+#!/usr/local/bin/perl -w
+###############################################################################
+# $Id: //ariba/services/monitor/bin/check-for-obsolete-nodes#2 $
+#
+# Copyright (c) 2014 SAP
+#
+###############################################################################
+
+=head1 NAME
+
+check-for-obsolete-nodes - Check for nodes running an old build
+
+=head1 SYNOPSIS
+
+check-for-obsolete-nodes -product <product> -service <service> [options]
+
+=head1 OPTIONS
+
+=over
+
+=item B<-help|h>
+
+Print this usage information and exit
+
+=item B<-product>
+
+=item B<-service>
+
+=item B<-buildname>
+
+=item B<-customer>
+
+Product, service, buildname, customer to get configs from
+
+=item B<-cluster>
+
+Cluster to use
+
+=back
+
+=head1 DESCRIPTION
+
+C<check-for-obsolete-nodes> - Checks the nodes for a given build, asks them
+which build they are running (if they are running, and reports any that are
+running the requested build
+
+=head1 AUTHOR
+
+Nathan Sullivan C<< <nathan.sullivan@sap.com> >>
+
+=head1 LICENSE
+
+Copyright 2014 SAP
+
+=cut
+
+use strict;
+use FindBin;
+use lib ("$FindBin::Bin/../lib", "$FindBin::Bin/../lib/perl");
+
+use Pod::Usage;
+use Getopt::Long;
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::AppInstanceStats;
+
+sub main {
+    my($prodname, $service, $buildname, $customer, $altConfigDir);
+    my $cluster = "primary";
+
+    GetOptions(
+        'help|h' => sub { pod2usage(1); },
+        'product=s' => \$prodname,
+        'service=s' => \$service,
+        'buildname=s' => \$buildname,
+        'customer=s' => \$customer,
+        'cluster=s' => \$cluster,
+    );
+
+    pod2usage("Missing argument: -product") unless $prodname;
+    pod2usage("Missing argument: -service") unless $service;
+
+    my $product;
+    if(ariba::rc::InstalledProduct->isInstalled($prodname, $service, $buildname, $customer)) {
+        $product = ariba::rc::InstalledProduct->new($prodname, $service, $buildname, $customer);
+    } else {
+        pod2usage("Cannot find $prodname/$service" . ($buildname ? "/$buildname" : ""));
+    }
+    $product->setClusterName($cluster);
+    $buildname = $product->buildName();
+
+    my @apps = $product->appInstancesInCluster($cluster);
+    foreach my $app (@apps) {
+        my $monitorStats = ariba::monitor::AppInstanceStats->newFromAppInstance($app);
+        next unless defined($monitorStats);
+        $monitorStats->fetch();
+
+        if ($monitorStats->error()) {
+            print $app->instanceName() . " not responding\n";
+            next;
+        } 
+        my $nodeBuild = $monitorStats->applicationBuildName();
+        next if !defined($nodeBuild);
+
+        print $app->instanceName() . " is running $buildname\n" if $nodeBuild eq $buildname;
+    }
+}
+
+main();

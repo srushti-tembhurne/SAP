@@ -1,0 +1,183 @@
+#!/usr/bin/env perl
+
+use strict;use warnings;
+use Data::Dumper;
+use Sys::Hostname;
+use Getopt::Std;
+
+my $opts = {};
+getopts('nr:', $opts);
+
+$ENV{PATH}="/usr/local/git/bin:$ENV{PATH}";
+my $repo_name = shift or die 'first argument must be repo_name';
+
+#check to see if we have 'git' and 'gpg'
+{   my $ret = `gpg --list-keys > /dev/null 2>&1;echo \$?`;
+    chomp $ret;
+    die "gpg command-line not available or not setup.  See https://devwiki.ariba.com/bin/view/Main/MonXMultiAssemble\n" unless $ret == 0;
+}
+{   my $ret = `git --help > /dev/null 2>&1; echo \$?`;
+    chomp $ret;
+    die "git command-line not available.  See https://devwiki.ariba.com/bin/view/Main/MonXMultiAssemble\n" unless $ret == 0;
+}
+
+my $userid = $ENV{P4USER} || $ENV{USER} || $ENV{USERNAME} || $ENV{LOGNAME} || die "unable to determine userid.  I examine the following environmentals, in this order: P4USER,USER,USERNAME,LOGNAME\n";
+
+my $gpgKeyID = "$userid\@ariba.com";
+#Now validate that the gpgKeyID we derived is correct
+{   my $ret = `gpg --list-keys $gpgKeyID > /dev/null 2>&1;echo \$?`;
+    chomp $ret;
+    die "Unable to find a valid gpg key for ID $gpgKeyID (via gpg --list-keys $gpgKeyID)  See https://devwiki.ariba.com/bin/view/Main/MonXMultiAssemble\n"
+        unless $ret == 0;
+}
+
+print "Preparing to use $gpgKeyID as the GPG Key ID to sign this package.
+Press control-C to abort this operation if that is not correct.
+See https://devwiki.ariba.com/bin/view/Main/MonXMultiAssemble for details.
+Press enter to continue.\n";
+<>;
+
+my $targets = {
+    tools => {
+        binarches => ['glibc-x86_64-2.3.4','glibc-x86_64-2.5','glibc-x86_64-2.11.3'],
+    }
+};
+#first, let's get a basic repo going
+my $workdir = "$ENV{HOME}/.multiAssemble";
+if(not -d $workdir) {
+    mkdir $workdir or die "failed to create $workdir: $!";
+}
+chdir $workdir or die "failed to chdir $workdir: $!";
+sys("git clone git://monx.lab1.ariba.com./$repo_name.git")
+    unless -d "$repo_name/.git";
+chdir $repo_name or die "Unable to chdir $repo_name: $!\n";
+
+#next, get all tags on the remote
+my $remote_tags = {};
+my $next_release_id = 0; #and get the next release ID in case we need it
+{   my $ret = `git ls-remote --tags origin 2>&1`;
+    chomp $ret;
+    foreach my $line (split "\n", $ret) {
+        next if $line =~ /\}$/;
+        next unless $line =~ /.*?\s+refs\/tags\/(.*)/;
+        my $remote_tag = $1;
+        $remote_tags->{$remote_tag} = 1;
+        if($remote_tag =~ /^release-$repo_name-(\d+)-/) {
+            $next_release_id = $1 if $1 > $next_release_id;
+        }
+    }
+    $next_release_id++;
+}
+
+#find all of the local branches
+my $local_branches = {};
+{   my $ret = `ls .git/refs/heads`;
+    foreach my $b (split "\n", $ret) {
+        $local_branches->{$b} = 1;
+    }
+}
+#print Dumper $local_branches;
+
+#find all of the branches that need to be sync'd and sync them
+foreach my $branch_name (branches_to_sync($repo_name)) {
+    sync_branch($branch_name);
+}
+sys('git pull --all');
+
+#derive a release_id, if necessary
+my $release_id = $opts->{r} || $next_release_id;
+print "\$release_id=$release_id\n";
+
+#derive the target to merge code from
+my $code_target = $repo_name; #for now; later we'll pass that in on the
+#command-line.
+#IMPORTANT: we have to make sure that any alternate merge targets are
+#sync'd.  The existing logic doesn't do that
+
+
+#now create the tags
+foreach my $suffix (get_tag_suffixes($repo_name)) {
+    my $release_tag = "release-$repo_name-$release_id-$suffix";
+    print "\$release_tag=$release_tag\n";
+    sys('git checkout root');
+    sys("git checkout -b $release_tag");
+    if($suffix eq 'noarch') {
+        sys("git merge --no-edit $code_target");
+    } else {
+        sys("git merge --no-edit $suffix $code_target");
+    }
+    open my $fh, '>', 'version_info.txt';
+    print $fh Dumper {
+        binarch => $suffix,
+        base_branch_commit_id => get_commit_id_from_branch_name($suffix),
+        code_commit_id => get_commit_id_from_branch_name($code_target),
+        release_tag => $release_tag,
+        release_tag_commit_id => get_commit_id(),
+        ts => time,
+        build_hostname => hostname,
+        build_userid => $userid,
+    };
+    close $fh;
+    sys('git add .');
+    sys('git commit -a -m "automatic version_info.txt creation"');
+    if($opts->{'n'}) {
+        sys("git tag -a $release_tag -m 'release $release_tag'");
+    } else {
+        sys("git tag -s $release_tag -m 'release $release_tag'");
+    }
+}
+sys('git push --all');
+sys('git push --tags');
+sys('git checkout root');
+
+sub sys {
+    my $sys = shift;
+    print "$sys\n";
+    system($sys);
+}
+sub sync_branch {
+    my $branch = shift;
+    sys("git checkout $branch");
+    track_branch($branch);
+    sys("git pull");
+}
+sub track_branch {
+    my $branch = shift;
+    sys("git branch --track $branch remotes/origin/$branch")
+        unless $local_branches->{$branch};
+}
+sub branches_to_sync {
+    #we need to add awareness of specific branches or tags passed on the
+    #command-line
+    my $repo_name = shift;
+    my @branches = ('root', $repo_name);
+    if($targets->{$repo_name} and $targets->{$repo_name}->{binarches}) {
+        push @branches, $_ for @{$targets->{$repo_name}->{binarches}};
+    }
+    return @branches;
+}
+sub get_tag_suffixes {
+    my $repo_name = shift;
+    my @binarches;
+    if($targets->{$repo_name} and $targets->{$repo_name}->{binarches}) {
+        push @binarches, $_ for @{$targets->{$repo_name}->{binarches}};
+    }
+    push @binarches, 'noarch' if not scalar @binarches;
+    return @binarches;
+}
+sub get_commit_id_from_branch_name {
+    my $branch_name = shift;
+    my $id;
+    open my $fh, '<', ".git/refs/heads/$branch_name" or return 'unknown';
+    read $fh, $id, 1024;
+    close $fh;
+    return $id;
+}
+sub get_commit_id {
+    my $tag_name = shift;
+    my $sys = `git show 2> /dev/null |grep ^commit | awk '{print \$2}'`;
+    chomp $sys;
+    return $sys;
+}
+
+

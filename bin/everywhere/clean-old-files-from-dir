@@ -1,0 +1,193 @@
+#!/usr/local/bin/perl -w
+#
+# Cleanup cruft in a specified dir which is older than specified days
+#
+# use this script to:
+# - archive data
+# - delete old data
+#
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+use File::Basename;
+use File::Path;
+use File::Copy;
+use Compress::Zlib;
+use ariba::util::Simplefind;
+use ariba::rc::Utils;
+
+sub usage {
+	print "Error: $_[0]\n" if $_[0];
+	print "usage: $0 [-d <days> [-t]] [-a <archiveroot> [-z]] <path-to-clean>\n";
+	print "       <days> clean/archive files older than num days\n";
+	print "       -t to truncate instead of delete\n";
+	print "       <archiveroot> archive files under this root dir\n";
+	print "       -z to compress archived files\n";
+	print "       <path-to-clean> dir/file/pattern to clean\n";
+	exit(1);
+}
+
+sub createArchiveDir {
+	my ($root) = @_;
+	my $archiveDir;
+
+	return $archiveDir unless($root);
+
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+	$year += 1900;
+	$mon++;
+	$mon = "0". $mon if ($mon < 10);
+	$mday = "0". $mday if ($mday < 10);
+	$hour = "0".  $hour if ($hour < 10);
+
+	$archiveDir = "$root/$year/$mon/$mday";
+
+	mkpath($archiveDir);
+
+	return $archiveDir;
+}
+
+sub main {
+	my ($verbose, $quiet, $arg, $archiveRoot, $compress, $days, $truncate, @dirs);
+	while($arg=shift(@ARGV)) {
+		if($arg =~ /^-v/o) { $verbose = 1; next }
+		if($arg =~ /^-q/o) { $quiet = 1; next }
+		if($arg =~ /^-d/o) { $days = shift(@ARGV); next }
+		if($arg =~ /^-t/o) { $truncate = 1; next }
+		if($arg =~ /^-a/o) { $archiveRoot = shift(@ARGV); next }
+		if($arg =~ /^-z/o) { $compress = 1; next }
+		if($arg !~ /^-/o)  { push(@dirs, $arg); next }
+	}
+
+	if ($#dirs < 0 ) { usage("Need to specify dirs to clean") }
+	if (!defined $days) { $days = 1 }
+
+	my $archiveDir = createArchiveDir($archiveRoot);
+
+	foreach my $path (@dirs) {
+		my $dir;
+
+		# sanity-check supplied path
+		if (-d $path) {
+			# specified path to clean is a dir -- and exists!  woo-hoo.
+			# set $dir and continue
+			$dir = $path;
+		} else {
+			# uh-oh.  this isn't a dir to clean.  this can mean two things.
+			# either the dir simply doesn't exist, and we should skip it,
+			# or the path specified was /a/dir/*fileglob*
+			#
+			# to qualify as a glob to clean, the base dir must exist, and
+			# the pattern must have a * or ? in it.
+			#
+
+			if (( -f $path ) || ( -d dirname($path) ) && ( basename($path) =~ /(\?|\*)/ )) {
+				# a-ha.  continue using this dir
+				$dir = dirname($path);
+			} else {
+				# the pattern specified is unusable.  quietly move on
+				next;
+			}
+		}
+
+		my $sf = ariba::util::Simplefind->new();
+		my $cmd;
+
+		my ($root, @files);
+		if ( -f $path ) {
+			lstat($path) &&
+			((-M $path) > $days) &&
+			push(@files, $path);
+			$root = $dir;
+		} elsif ( $path =~ /\*/o || $path =~ /\?/o) {
+			my $pattern = basename($path);
+			$pattern =~ s/\*/.*/og;
+			$pattern =~ s/\?/./og;
+			$sf->setPath($dir);
+			$sf->find();
+			foreach ($sf->found()) {
+				basename($_) =~ /^$pattern$/ &&
+				lstat($_) &&
+				((-M _) > $days) &&
+				push(@files, $_);
+			}
+			$root = $dir;
+		} else {
+			$sf->setPath($path);
+			$sf->find();
+			foreach ($sf->found()) {
+				lstat($_) &&
+				((-M _) > $days) &&
+				push(@files, $_);
+			}
+			$root = $path;
+		}
+
+
+		foreach my $filename (@files) {
+			chomp($filename);
+			if ($archiveDir) {
+				my $dest = $filename;
+				$dest =~ s|^$root/||;
+				$dest = "$archiveDir/$dest";
+
+				print "Archiving $filename to $dest\n" if (defined $verbose);
+
+				mkpath(dirname($dest));
+				if ($compress) {
+					unless (open(IN, "<$filename")) {
+						print "Could not open $filename, skipping\n";
+						next;
+					}
+					binmode(IN);
+
+					unless(open(OUT, ">$dest.gz")) {
+						print "Could not write $dest.gz, skipping\n";
+						next;
+					}
+					binmode(OUT);
+	
+					my $gz = gzopen(\*OUT, "wb");
+					unless($gz) {
+						print "Error opening gzip stream, skipping\n";
+						next;
+					}
+					my $buffer;
+					while(read(IN, $buffer, 4096)) {
+						unless($gz->gzwrite($buffer)) {
+							print "Error writing to gzip, skipping\n";
+							last;
+						}
+					}
+
+					$gz->gzclose();
+					close IN;
+					close OUT;
+				} else {
+					unless (copy($filename, $dest)) {
+						print "Could not archive $filename, will not remove\n";
+						next;
+					}
+				}
+			}
+			print (($truncate ? 'Truncating' : 'Deleting') . " $filename\n") if (defined $verbose);
+	
+			if ($truncate) {
+				if (my $exitCode = r("cat /dev/null > $filename")) {
+					warn "error while truncating $filename: $! ($exitCode)\n" unless $quiet; 
+				}
+			} else {	
+				unless ( unlink($filename) ) {
+					unless ( $! =~ /No such file or directory/ ) {
+						warn "could not unlink $filename: $!\n" unless $quiet;
+					}
+				}
+			}
+		}
+	}
+}
+
+main();
+
+__END__
+

@@ -1,0 +1,100 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::Globals;
+use ariba::monitor::Url;
+use ariba::Ops::NotificationRequest;
+use XML::Simple;
+
+my $debug = 0;
+
+sub usage {
+    print "Usage: $0\n";
+    print "\n";
+    print "\t-d\tDebug mode\n";
+    exit(1);
+}
+
+sub main {
+    while(my $arg = shift) {
+        if($arg =~ m/^-d$/o) { $debug++; next; }
+        usage("Unknown arg: $arg");
+    }
+
+    my @services = ariba::rc::Globals::devlabServices();
+
+    my $message = "Devlab DR status summary:\n";
+
+    foreach my $service (@services) {
+        my %seen;
+        my $error;
+        my $product = ariba::rc::InstalledProduct->new("mon", $service);
+        my $monserver = ($product->hostsForRoleInCluster("monserver", "primary"))[0];
+        my $baseUrl = "http://$monserver:8080/cgi-bin/xml-server?dataTypes=queryManager";
+        my @productList = ariba::rc::InstalledProduct->installedProductsList($service);
+        $message .= "\nService $service:\n";
+        foreach my $prod (@productList) {
+            my $name = $prod->name();
+            next if $seen{$name}++;
+            my $url = $baseUrl . "&qm=$name/dataguard-status";
+            my $request = ariba::monitor::Url->new($url);
+            $request->setTimeout(30);
+
+            my $response;
+            eval { $response = $request->request(); };
+
+            if($request->error() || $@) {
+                $error = $request->error() || $@;
+            }
+
+            my $xml = eval { XMLin($response); };
+            if($@) {
+                $error = "XML parse error";
+            }
+
+            unless($xml && ref($xml) eq 'HASH') {
+                $error = "Response is empty or not XML";
+            }
+
+            if($error) {
+                $message .= "$error for service $service, product $name\n";
+                next;
+            }
+
+            my $metrics = $xml->{'queryManager'}->{'dataguard-status'}->{'groups'}->{'group'}->{'metrics'}->{'metric'};
+            my %sid;
+            foreach my $key (keys %$metrics) {
+                $key =~ m/\[([^[]+)\]/;
+                $sid{$1} = [] unless $sid{$1};
+                push(@{$sid{$1}}, $key);
+            }
+            next unless %sid;
+            $message .= "\tProduct $name:\n";
+            foreach my $key (keys (%sid)) {
+                $message .= "\t\t[$key]\n";
+                foreach my $query (@{$sid{$key}}) {
+                    $message .= "\t\t\t$query: ";
+                    my $results = $metrics->{$query}->{'results'};
+                    if(ref($results) eq 'HASH' && !keys(%$results)) {
+                        $results = "none";
+                    }
+                    $message .= "$results\n";
+                }
+            }
+        }
+    }
+    if($debug) {
+        print $message;
+    } else {
+        my $subject = "Devlab DR status";
+        my $req = ariba::Ops::NotificationRequest->newWarn("devlab-dr-status", "mon", "dev", undef, undef, $subject, $message, "arb_dept_an_ops_dba_notifications\@sap.com");
+        $req->send();
+    }
+    return 0;
+}
+
+main();

@@ -1,0 +1,280 @@
+#!/usr/local/bin/perl -w
+#
+# Monitoring for acm performance metrics and certain scheduled tasks.
+# $Id: $
+#
+# 
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+use ariba::monitor::QueryManager;
+
+require "geturl";
+
+use File::Path;
+use DirHandle;
+use Time::Local;
+
+my ($debug, $sendEmail, $sendPage) = (0, 0, 0);
+
+sub usage {
+	print 	"Error: $_[0]\n" if $_[0];
+	print	"\n",
+		"Usage: \n",
+		"$0 [-d|-e|-p|-h]\n",
+		"-d			turns on debugging\n",
+		"-e			send email notification\n",
+		"-p			send pager notification\n",
+		"-h			this help\n",
+		"\n";
+	exit(1);
+}
+
+sub main {
+	while (my $arg = shift(@ARGV)) {
+		if ($arg eq '-d') { ++$debug; next; }
+		if ($arg eq '-e') { $sendEmail = 1; next;}
+		if ($arg eq '-p') { $sendPage = 1; next;}
+		if ($arg eq '-h') { usage(); next;}
+
+		usage("uknown option: $arg");
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $prodname = "acm";
+	my $email = $me->default('notify.email');
+
+	my $dataLoadsInProgress = 0;
+
+	my @products = ariba::rc::InstalledProduct->installedProductsList( $me->service(), $prodname );
+	foreach my $product (@products) {
+
+		my %statusQueries = ();
+		my %scheduledTaskQueries = ();
+
+		my $customer = $product->customer();
+
+		#
+		# queries related to scheduled tasks
+		#
+
+		my $timeFormat = "%s, %s ago queryError";
+
+		$scheduledTaskQueries{ "$customer intermedia index last updated" } = { 
+			'format' => $timeFormat,
+			'info' => "answer",
+			'crit' => "!answer || answer =~ /ERROR/i",
+			'customer' => $customer,
+			'sql' => q`
+						select 
+							sch1.sts_endtime
+						from 
+							scheduledtaskstatustab sch1 
+						where
+   							sch1.sts_active=1 and sch1.sts_purgestate=0 and
+   							sch1.sts_taskname='UpdateFreeTextSearchIndexTask'
+			`,
+			'processAnswer' => sub { main::formatDate() },
+		};
+
+		$scheduledTaskQueries{ "$customer last user pull from sourcing" } = { 
+			'format' => $timeFormat,
+			'info' => "answer",
+			'crit' => "!answer || answer = ~/ERROR/i",
+			'sql' => q`
+						select 
+							inc1.sns_lastuserpulldate
+						from 
+							IncrementalPullStatusTab inc1 
+						where 
+							inc1.sns_Active=1 and inc1.sns_PurgeState=0
+			`,
+			'processAnswer' => sub { main::formatDate() },
+		};
+
+		my $infoState = "defined(answer) && answer > -1";
+		my $critState = "!defined(answer) || answer =~ /error/i";
+
+		my $recordMaxResults = 110000; # 1 year at 12 samples / hr
+		my $recordDataType = "gauge";
+
+
+		#
+		# Queries related to performance metrics
+		#
+		$statusQueries{ "$customer total number of active workspaces" } = {
+            'recordMaxResults' => $recordMaxResults,
+			'recordDataType' => $recordDataType,
+			'info' => $infoState,
+			'crit' => $critState,
+			'sql' => q`
+					SELECT COUNT(*)
+					FROM WorkspaceTab Wor1
+					WHERE (Wor1.ws_Active = 1) AND (Wor1.ws_PurgeState = 0)
+			`,
+		};
+
+		$statusQueries{ "$customer total number of inactive workspaces" } = {
+            'recordMaxResults' => $recordMaxResults,
+			'recordDataType' => $recordDataType,
+			'info' => $infoState,
+			'crit' => $critState,
+			'sql' => q`
+					SELECT COUNT(*)
+					FROM WorkspaceTab Wor1
+					WHERE (Wor1.ws_Active = 0) AND (Wor1.ws_PurgeState = 0)
+			`,
+		};
+
+		$statusQueries{ "$customer total number of active documents" } = {
+            'recordMaxResults' => $recordMaxResults,
+			'recordDataType' => $recordDataType,
+			'info' => $infoState,
+			'crit' => $critState,
+			'sql' => q`
+					SELECT COUNT(*)
+					FROM DocumentTab Doc1
+					WHERE (Doc1.doc_Active = 1) AND (Doc1.doc_PurgeState = 0)
+			`,
+		};
+
+		$statusQueries{ "$customer total number of inactive documents" } = {
+            'recordMaxResults' => $recordMaxResults,
+			'recordDataType' => $recordDataType,
+			'info' => $infoState,
+			'crit' => $critState,
+			'sql' => q`
+					SELECT COUNT(*)
+					FROM DocumentTab Doc1
+					WHERE (Doc1.doc_Active = 0) AND (Doc1.doc_PurgeState = 0)
+			`,
+		};
+
+		$statusQueries{ "$customer total number of active tasks" } = {
+            'recordMaxResults' => $recordMaxResults,
+			'recordDataType' => $recordDataType,
+			'info' => $infoState,
+			'crit' => $critState,
+			'sql' => q`
+					SELECT COUNT(*)
+					FROM TaskTab Pla1
+					WHERE (Pla1.prt_Active = 1) AND (Pla1.prt_PurgeState = 0)
+			`,
+		};
+
+		$statusQueries{ "$customer total number of inactive tasks" } = {
+            'recordMaxResults' => $recordMaxResults,
+			'recordDataType' => $recordDataType,
+			'info' => $infoState,
+			'crit' => $critState,
+			'sql' => q`
+					SELECT COUNT(*)
+					FROM TaskTab Pla1
+					WHERE (Pla1.prt_Active = 0) AND (Pla1.prt_PurgeState = 0)
+			`,
+		};
+
+		my ($instance) = ($product->appInstancesInCluster($product->currentCluster()));
+
+		my $url = $instance->applicationActivityURL();
+
+		$statusQueries{ "$customer number of active users" } = {
+            'recordMaxResults' => $recordMaxResults,
+			'recordDataType' => $recordDataType,
+			'info' => 'defined(answer) && answer > -1',
+			#'warn' => 'defined(answer) && answer > 70',
+			#'crit' => '!defined(answer) || answer =~ "none" || answer < 0 || answer > 100',
+			'perl' => sub { main::activeUsersFromUrl($url) },
+		};
+
+		my $statusQM = ariba::monitor::QueryManager->newWithDetails( 
+				"performance-metrics", $product->name(), $product->service(), $product->customer(), \%statusQueries);
+
+		my $scheduledTasksQM = ariba::monitor::QueryManager->newWithDetails( 
+				"scheduled-tasks", $product->name(), $product->service(), $product->customer(), \%scheduledTaskQueries);
+
+		my @connections = ariba::Ops::DBConnection->connectionsFromProducts($product);
+		unless (@connections) {
+			print "Invalid config for $customer! $@\n";
+			next;
+		}
+
+		my ($dbc) = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSidAndSchema(@connections);
+
+		my $oc = ariba::Ops::OracleClient->newFromDBConnection($dbc);
+
+		unless ($oc->connect()){ 
+			warn "Can't connect to Oracle ". $dbc->sid() . "\@" . $dbc->user() . " for $customer: " . $oc->error();
+			# if connection failed the error will be in the
+			# results string so just keep going because we want
+			# it to be displayed on the query expando
+		} else {
+
+			$oc->handle()->do(qq{alter session set nls_date_format = 'YYYY-MM-DD:HH24:MI:SS'}) or warn $oc->handle()->errstr();
+		}
+
+		$statusQM->setSQLConnectInfoFromOracleClient($oc);
+		$statusQM->processQueries( $debug, $email, $sendEmail, $sendPage );
+
+		$scheduledTasksQM->setSQLConnectInfoFromOracleClient($oc);
+		$scheduledTasksQM->processQueries( $debug, $email, $sendEmail, $sendPage );
+	}
+}
+
+sub formatDate {
+	my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+	my ($timeLastRanString, $timeLapsedString);
+
+	my ($results) = $query->results();
+	print "processing :$results:\n" if $debug;
+
+	if (!$results || $results =~ /error/i) {
+		$timeLastRanString = -1;
+		$timeLapsedString = -1;
+	} else {
+
+		my ($year, $month, $day, $hour, $minute, $second) = ( $results =~ /^(\d{4})-(\d{2})-(\d{2}):(\d{2}):(\d{2}):(\d{2})$/ );
+
+		my $timeLastRan = timegm($second, $minute, $hour, $day , $month-1, $year);
+		$timeLastRanString = ariba::Ops::DateTime::prettyTime($timeLastRan);
+		my $timeLapsed = time() - $timeLastRan;
+
+		$timeLapsedString = ariba::Ops::DateTime::scaleTime($timeLapsed);
+	}
+
+	return "$timeLastRanString\t$timeLapsedString";
+	
+}
+
+sub fetchActivityURL {
+	my $url = shift;
+	my @results = ();
+
+	eval { geturl("-e","-q","-timeout", '15', "-results",\@results,$url) };
+
+	return \@results;
+}
+
+sub activeUsersFromUrl {
+	my $url = shift;
+
+	my $results = fetchActivityURL($url);
+	my $userCount;
+
+	for my $line (@$results) {
+		if ($line =~ m!<ConcurrentUsers>(\d+)</ConcurrentUsers>!o) {
+			$userCount = $1;
+			last;
+		}
+	}
+
+	return $userCount;
+}
+
+main();

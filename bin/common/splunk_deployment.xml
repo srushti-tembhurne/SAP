@@ -1,0 +1,38 @@
+<splunk_deployment>
+    <region id="us">
+        <primary>
+            <domain>sc1-ms</domain>
+            <num_sea>3</num_sea>
+            <num_idx>2</num_idx>
+        </primary>
+        <secondary>
+            <domain>us1-ms</domain>
+            <num_sea>2</num_sea>
+            <num_idx>1</num_idx>
+        </secondary>
+    </region>
+    <region id="eu">
+        <primary>
+            <domain>eu1-ms</domain>
+            <num_sea>2</num_sea>
+            <num_idx>1</num_idx>
+        </primary>
+        <secondary>
+            <domain>eu2-ms</domain>
+            <num_sea>2</num_sea>
+            <num_idx>1</num_idx>
+        </secondary>
+    </region>
+    <region id="cn">
+        <primary>
+            <domain>cn1-ms</domain>
+            <num_sea>2</num_sea>
+            <num_idx>1</num_idx>
+        </primary>
+        <secondary>
+            <domain>cn2-ms</domain>
+            <num_sea>2</num_sea>
+            <num_idx>1</num_idx>
+        </secondary>
+    </region>
+</splunk_deployment>

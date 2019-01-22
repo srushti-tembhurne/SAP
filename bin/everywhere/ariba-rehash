@@ -1,0 +1,278 @@
+#!/usr/local/bin/perl
+
+# ariba-rehash - Modified OpenSSL tools c_rehash
+# 
+# Perl c_rehash script, scan all files in a directory
+# and add symbolic links to their hash values.
+
+use lib qw(/usr/local/ariba/lib);
+
+use ariba::Ops::Constants;
+
+use Log::Log4perl qw(get_logger :levels);
+use Log::Log4perl::Level;
+
+use strict;
+use warnings;
+
+# set bin dir
+my $bindir = '/usr/local/ariba/bin';
+
+# set logging settings
+Log::Log4perl->init("$bindir/log4perl.conf");
+
+my $log = Log::Log4perl->get_logger("certs");
+$log->level($WARN);
+
+# directory where the certs directory is located under
+my $dir     = '/usr/local/ariba/lib/certs';
+
+# on CFengine-managed hosts (i.e. RHEL5), we must use ToolsX's openssl, because system
+# openssl is too old. on SALT-manager hosts (i.e. RHEL >= 6), we can use default system
+# openssl (plus, toolsx openssl doesn't exist). we can satisfy this by simply setting
+# the PATH search order.
+$ENV{PATH} = '/usr/local/tools/bin:/bin:/usr/bin:/sbin:/usr/sbin';
+my $openssl = 'openssl';
+
+my $x509hash    = '-subject_hash';
+my $crlhash     = '-hash';
+my $verbose     = 0;
+my $removelinks = 0;
+
+##  Parse flags.
+my $flag;
+
+while ( defined $ARGV[0] && $ARGV[0] =~ /^-/ ) {
+    $flag = shift @ARGV || '';
+
+    if ( $flag eq '-old' ) {
+        $x509hash = '-subject_hash_old';
+        $crlhash  = '-hash_old';
+    }
+    elsif ( $flag eq '-dir' ) {
+        my $arg_dir = shift @ARGV || '';
+        if ( !$arg_dir ) {
+            $log->logwarn("Exiting, missing dir value");
+            exit;
+        }
+        if ( -d $arg_dir ) {
+            $dir = $arg_dir;
+        }
+        else {
+            $log->logwarn("Exiting, dir $arg_dir does not exist as directory");
+            exit;
+        }
+    }
+    elsif ( $flag eq '-h' ) {
+        usage();
+    }
+    elsif ( $flag eq '-redo' ) {
+        $removelinks = 1;
+    }
+    elsif ( $flag eq '-v' ) {
+        $verbose++;
+    }
+    else {
+        print STDERR "\nUsage error; try -h\n";
+        exit 1;
+    }
+}
+
+# rehash the directory
+hash_dir( $dir, $log );
+
+# check_file($filename) - will return if the filename is a certificate or a CRL
+sub check_file {
+    my ($filename) = @_;
+    my ( $is_cert, $is_crl ) = ( 0, 0 );
+    open my $IN, '<', $filename or die "Unable to open file $filename: $!"; 
+    while (<$IN>) {
+        if (/^-----BEGIN (.*)-----/) {
+            my $hdr = $1;
+            if ( $hdr =~ /^(X509 |TRUSTED |)CERTIFICATE$/ ) {
+                $is_cert = 1;
+                last if ($is_crl);
+            }
+            elsif ( $hdr eq "X509 CRL" ) {
+                $is_crl = 1;
+                last if ($is_cert);
+            }
+        }
+    }
+    close $IN;
+    return ( $is_cert, $is_crl );
+}
+
+# hash_dir($dir, $log) - create the hashes in the directory
+sub hash_dir {
+    my ( $dir, $log ) = @_;
+
+    if ( !defined($dir) || !$dir || !defined($log) ) {
+        print STDERR "\nError: missing dir paramater to hash_dir()\n";
+        return;
+    }
+
+    if ( !-d $dir ) {
+        $log->logwarn(
+            "Dir parameter to hash_dir() does not exist as a directory");
+        return;
+    }
+
+    # change directory to the directory
+    chdir $dir;
+
+    $log->info("Processing certs/crls for $dir") if $verbose;
+
+    opendir( my $DIR, "." ) or die "Unable to read directory $dir for hash_dir(): $!"; 
+
+    # get the list of files
+    my @flist = readdir($DIR);
+    closedir $DIR;
+
+    if ($removelinks) {
+
+        # Delete any existing symbolic links
+        foreach ( grep { /^[\da-f]+\.r{0,1}\d+$/ } @flist ) {
+            if ( -l $_ ) {
+                unlink $_;
+                $log->info("unlink $_") if $verbose;
+            }
+        }
+    }
+
+    # For each certificate like file:
+  FILE:
+    foreach my $filename ( grep { /\.(pem)|(crt)|(cer)|(crl)$/ } @flist ) {
+
+        # Check to see if certificates and/or CRLs present.
+        my ( $cert, $crl ) = check_file($filename);
+        if ( !$cert && !$crl ) {
+            $log->error(
+                "$filename does not contain a certificate or CRL: skipping");
+            next;
+        }
+
+        my $type = '';
+        $type = 'cert' if ($cert);
+        $type = 'crl'  if ($crl);
+
+        link_hash( $filename, $type, $verbose, $log );
+    }
+}
+
+# hash_filename( $hash, $filename, $is_crl, $verbose, $log ) -
+#     returns the hash link name.
+sub hash_filename {
+    my ( $hash, $filename, $is_crl, $verbose, $log ) = @_;
+
+    # Check for undefined parameters
+    if (   !defined($hash)
+        || !defined($filename)
+        || !defined($is_crl)
+        || !defined($verbose)
+        || !defined($log) )
+    {
+        print STDERR "\nError: missing argument to hash_filename()\n";
+        return;
+    }
+
+    my $suffix_r = '';
+    $suffix_r = 'r' if ($is_crl);
+    my $suffix        = 0;
+    my $linkname      = "$hash.$suffix_r$suffix";
+    my $resolved_link = 0;
+
+    # Search for an unused hash filename
+    while ( !$resolved_link ) {
+        if ( !-l "$hash.$suffix_r$suffix" ) {
+            $resolved_link = 1;
+            $linkname      = "$hash.$suffix_r$suffix";
+        }
+        else {
+            my $target = readlink("$hash.$suffix_r$suffix") || '';
+            if ( $target && $filename ne $target ) {
+                $log->info(
+"link $hash.$suffix_r$suffix already in use, filename:+$filename+ target:|$target|"
+                ) if $verbose;
+
+                # increment suffix
+                $suffix++;
+            }
+            else {
+                $log->info(
+                    "link $hash.$suffix_r$suffix to $filename already exists")
+                  if $verbose;
+                $resolved_link = 1;
+
+                # set blank linkname for pre-existing link
+                $linkname = '';
+            }
+        }
+    }
+    return $linkname;
+}
+
+# Link a certificate to its subject name hash value, each hash is of
+# the form <hash>.<n> where n is an integer. If the hash value already exists
+# then we need to up the value of n, unless its a duplicate in which
+# case we skip the link.
+
+sub link_hash {
+    my ( $filename, $type, $verbose, $log ) = @_;
+
+    # Check for undefined parameters
+    if ( !defined($filename) || !defined($type) || !defined($verbose) ) {
+        print STDERR "\nError: missing argument to link_hash()\n";
+        return;
+    }
+
+    if ( !$filename ) {
+        $log->error("Empty filename argument to link_hash()");
+        return;
+    }
+
+    $filename =~ s/'/'\\''/g;
+
+    my $hash = `$openssl x509 $x509hash -noout -in $filename`;
+    if ( $type eq 'crl' ) {
+        $hash = `$openssl crl $crlhash -noout -in $filename`;
+    }
+
+    chomp $hash;
+
+    my $is_crl = 0;
+    $is_crl = 1 if $is_crl;
+
+    my $linkname = hash_filename( $hash, $filename, $is_crl, $verbose, $log );
+    link_file( $linkname, $filename, $verbose, $log ) if $linkname;
+}
+
+# link_file( $linkname, $filename, $verbose, $log) - performs a link
+sub link_file {
+    my ( $linkname, $filename, $verbose, $log ) = @_;
+
+    # Check for undefined parameters
+    if (   !defined($linkname)
+        || !defined($filename)
+        || !defined($verbose)
+        || !defined($log) )
+    {
+        print STDERR "\nError: missing argument to link_file()\n";
+        return;
+    }
+
+    my $ret_val = symlink( $filename, $linkname );
+    $log->info("unable to ") if $verbose && !$ret_val;
+    $log->info("link $linkname -> $filename") if $verbose;
+}
+
+# usage() - prints out the usage for this script
+sub usage {
+    print "Usage: ariba_rehash [-old] [-d dir] [-h] [-redo] [-v] \n";
+    print "   -old use old-style digest\n";
+    print "   -dir directory to rehash \n";
+    print "   -h print this help text\n";
+    print "   -redo remove links first\n";
+    print "   -v print files removed and linked\n";
+    exit 0;
+}

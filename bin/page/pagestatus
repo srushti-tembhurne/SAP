@@ -1,0 +1,135 @@
+#!/usr/local/bin/perl -w
+#
+# cgi program to peek into acked paging system
+#
+# $Id: //ariba/services/monitor/bin/page/pagestatus#27 $
+#
+
+use strict;
+use FindBin;
+use lib ("$FindBin::Bin/../../lib");
+use lib ("$FindBin::Bin/../lib");
+use Date::Parse;
+
+use ariba::Ops::PageStatus;
+
+my $scriptname = "pagestatus";
+my $shortFormat;
+
+sub usage {
+	print "./pagestatus [-html] [-start YYYY-MM-DD:hh:mm -end YYYY-MM-DD:hh:mm | -startUnixTime XXXX -endUnixTime XXXX\n";
+	exit;
+}
+
+sub main {
+	my $html = 0;
+
+	my $startUnixTime;
+	my $endUnixTime;
+
+	my $amStandaloneCGI = 0;
+	my $showPageFilters = 1;
+
+	if (defined($ENV{'REQUEST_METHOD'}) && (scalar(@ARGV) == 0)) {
+		$amStandaloneCGI = 1;
+		$showPageFilters = 0;
+	}
+
+	if ($amStandaloneCGI) {
+
+		my @argPairs = split('&',$ENV{'QUERY_STRING'});
+
+		$html = 1;
+
+		print "Content-type: text/html\n\n";
+
+		printHtmlHeader();
+
+		for my $pair (@argPairs) {
+
+			my ($arg, $val) = split('=', $pair);
+
+			if ($arg eq 'start') { $startUnixTime = str2time($val) }
+			if ($arg eq 'startUnixTime') { $startUnixTime = $val }
+			if ($arg eq 'end') { $endUnixTime = str2time($val) }
+			if ($arg eq 'endUnixTime') { $endUnixTime = $val }
+			if ($arg eq 'shortFormat') { $shortFormat = 1 }
+		}
+
+	} else {
+
+		while (my $arg = shift(@ARGV)) {
+        		if ($arg =~ /^-html/) { $html = 1; next }
+        		if ($arg =~ /^-start$/) { $startUnixTime = str2time(shift(@ARGV)) }
+        		if ($arg =~ /^-startUnixTime/) { $startUnixTime = shift(@ARGV) }
+        		if ($arg =~ /^-end$/) { $endUnixTime = str2time(shift(@ARGV)) }
+        		if ($arg =~ /^-endUnixTime/) { $endUnixTime = shift(@ARGV) }
+        		if ($arg =~ /^-shortFormat/) { $shortFormat = 1 }
+        		if ($arg =~ /^-h/) { usage(); }
+		}
+	}
+
+	ariba::Ops::PageStatus->setShortFormat($shortFormat);
+	
+	if ($html) {
+
+		print ariba::Ops::PageStatus->displayRecentPageRequestsAsHTML($showPageFilters, $startUnixTime, $endUnixTime);
+
+	} else {
+
+		print ariba::Ops::PageStatus->displayRecentPageRequests($showPageFilters, $startUnixTime, $endUnixTime);
+	}
+
+	if ($amStandaloneCGI) { 
+		printFormatLink($startUnixTime, $endUnixTime); 
+		printHtmlFooter(); 
+	}
+}
+
+sub printFormatLink {
+	my $startUnixTime = shift;
+	my $endUnixTime   = shift;
+
+	my $queryString = '?';
+	my $linkText = 'Show';
+
+	if (defined($startUnixTime)) {
+		$queryString .= "startUnixTime=$startUnixTime&";
+		$queryString .= "endUnixTime=$endUnixTime&";
+	}
+
+	if (!defined($shortFormat)) {
+		$linkText     = 'Hide';
+		$queryString    .= "shortFormat=1&";
+	}
+
+	print "<p><b><a href=\"$scriptname$queryString\">$linkText escalation info</a></b></p>\n\n";
+}
+
+sub printHtmlHeader {
+	print <<EOF
+<html>
+<head>
+  <title>Pages</title>
+
+<style type="text/css">
+BODY { margin-top: 0; background-color: white; font-family: arial, helvetica, geneva, sans-serif;}
+TABLE, TD, TH { font-family: arial, helvetica, geneva, sans-serif; }
+PRE { font-family: lucida-console,courier,monospace; font-size: -2;}
+A:link, A:visited { text-decoration: none; }
+A:active { text-decoration: none; }
+</style>
+
+</head>
+<body>
+
+<h3>Pages</h3>
+
+EOF
+}
+
+sub printHtmlFooter {
+	print "</body>\n</html>\n";
+}
+
+main();

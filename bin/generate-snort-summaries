@@ -1,0 +1,209 @@
+#!/usr/local/bin/perl -w
+
+# automatically parse snort logs into directorys.
+
+use strict;
+use File::Path;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use IO::Zlib;
+use ariba::Ops::Utils;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Constants;
+
+my $snortSummaryDirBase = "/var/mon/logs/snort-summaries/";
+my $signatureIgnoreFile = "/usr/local/ariba/snort/signatureIgnoreFile";
+my $logDirBase  = "/var/log";
+my $DEBUG   = 0;
+
+sub main {
+
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-d$/) { $DEBUG = 1; }
+    }
+
+    my $lastday  = time() - 86400;
+    
+    # need this for naming the file, and email subject
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+
+    (my $domain = $hostname ) =~ s/\w+\.(\w+)\.ariba\.com/$1/;
+    
+    my ($mon,$day,$year) = (localtime($lastday))[4,3,5];
+
+    $year += 1900;
+    $mon++;
+
+    # 2003/11/2003-11-10-snv-summary.txt
+    my $outLogDir  = "$snortSummaryDirBase/$year/$mon";
+    my $outFile    = "$year-$mon-$day-$domain-summary.txt";
+
+        unless (-d $outLogDir) {
+                print "\tCreating directory: [$outLogDir]\n" if $DEBUG;
+                File::Path::mkpath($outLogDir) or die "Can't create directory: [$outLogDir]: $!";
+    }
+        
+    # sort and print out the summaries.
+    open(SUMMARY, ">$outLogDir/$outFile") or die $!;
+
+    # read through the snort logs
+    chdir $logDirBase or die "Can't get into [$logDirBase]: $!";
+    opendir(DIR, $logDirBase) or die "Can't open [$logDirBase]: $!";
+
+    for my $file (sort readdir(DIR)) {
+
+        # skip unless this is a file
+        next unless -f $file;
+        
+        # don't operate on zero-length files - later add one line
+        # "nothing for today" note for email.           
+
+        next if -z $file;
+
+        next unless $file =~ /^snort\.alert\.1(\.gz)?$/;
+
+        if ($DEBUG) {
+            print "Working on:\n";
+            print "[$year/$mon/$day] [$file]\n";
+            print "Will write summary to: [$outLogDir/]\n";
+        }
+    
+        parseSnortLog($file, $domain);
+    }
+
+    close(SUMMARY);
+
+    # reading the file back in for the email
+    open(SUMMARY, "$outLogDir/$outFile") or die $!;
+
+    # avoiding the perl "read file in" new line makes a new element in an
+    # array deal - putting it all in one string
+    local $/ = undef;
+
+    my $summary = <SUMMARY>;
+    close(SUMMARY);
+
+    # copied from bin/on-call/notify-schedule
+    ariba::Ops::Utils::email(
+        ariba::Ops::Constants->operationsSecurityAddress(),
+        "Snort log summary for $domain",
+        "This summary is stored on $hostname as $outFile\n\n" .$summary
+    );
+}
+
+sub parseSnortLog {
+    my $file = shift;
+    my $domain = shift;
+    
+    my %alerts = ();
+    my @signatures = signaturesToIgnore();
+    my %ignore = map { $_ => 1 } @signatures;
+
+    my $snortFh = IO::Zlib->new($file, 'rb') or die "generate-snortlog-summaries: $!";
+    while (my $line = <$snortFh>) {
+
+        chomp $line;
+
+        # strip out "last message repeated" lines
+        if ($line =~ /last message repeated/) {
+            next;
+        }
+
+        # strip out dates and snort pid
+        $line =~ s/^.*snort\[\d+\]: //g;
+
+        my ($signature, $description, $class, $priority, $protocol, $pair);
+
+        # [1:485:5] ICMP Destination Unreachable Communication Administratively Prohibited [Classification: Misc activity] [Priority: 3]: <eth1> {ICMP} 172.22.1.254 -> 172.22.2.193 ]
+        # [1:11687:5] WEB-MISC Apache SSI error page cross-site scripting [Classification: Web Application Attack] [Priority: 1]: <eth1> {TCP} 202.131.112.18:4074 -> 216.109.104.16:80
+        if ($line =~ /^\[(.+?)\]\s*([^\[]+)\s+\[Classification:\s*(.+?)\]\s*\[Priority:\s*(\d+)\]:\s*<\w+>\s*\{(\w+)\}\s*(\d+\.\d+\.\d+\.\d+.*\->\s*\d+\.\d+\.\d+\.\d+\S*)/) {
+            $signature   = $1;
+            $description = $2;
+            $class       = $3;
+            $priority    = $4;
+            $protocol    = $5;
+            $pair        = $6;
+
+            if ( $ignore{$signature} ) {
+                print "Ignoring signature [$signature]\n" if $DEBUG;
+                next;
+            }
+
+            # make our key a combination of priority and signature
+            my $key = "$priority:$signature";
+
+            # if we know about a key increment its hit counter
+            if (exists( $alerts{$key} )) {
+                $alerts{$key}->{'pairHits'}->{$pair}++;
+            }
+
+            # otherwise add new alert
+            else {
+                $alerts{$key} = {
+                    'signature' => $signature,
+                    'description'   => $description,
+                    'class'     => $class,
+                    'priority'  => $priority,
+                    'protocol'  => $protocol,
+                    'pairHits'  => {
+                        "$pair" => 1,
+                    },
+                };
+                    
+            }
+
+        }
+    }
+    $snortFh->close;
+
+        ################################################################
+        # sort and print out the summaries.
+
+    print(SUMMARY "\n------------------------ Snort summary for $domain ------------------------\n\n");
+
+    foreach my $key (sort keys %alerts) {
+        my $signature   = $alerts{$key}->{'signature'};
+        my $description = $alerts{$key}->{'description'};
+        my $priority    = $alerts{$key}->{'priority'};
+        my $class       = $alerts{$key}->{'class'};
+        my $protocol    = $alerts{$key}->{'protocol'};
+
+        print SUMMARY "$description\n" .
+            "   Priority: $priority\n" .
+            "   Class: $class\n" .
+            "   Protocol: $protocol\n" .
+            "   Signature: $signature\n" .
+            "   Source -> Destination (hits):\n";
+
+        my %pairHits = %{ $alerts{$key}->{'pairHits'} };
+        foreach my $pair ( sort { $pairHits{$b} <=> $pairHits{$a} } keys %pairHits ) {
+            my $hits = $pairHits{$pair};
+            print SUMMARY "      $pair ($hits)\n";
+        }
+
+        print SUMMARY "\n";
+    }
+}
+
+sub signaturesToIgnore {
+    my @signatures = ();
+
+    open(IN, $signatureIgnoreFile) or warn "Unable to open file for reading: $!";
+    while (my $line = <IN>) {
+        chomp $line;
+
+        # ignore empty line or lines starting with a comment
+        next if $line =~ /^$/;
+        next if $line =~ /^#/;
+
+        push @signatures, $line;
+    }
+    close(IN);
+
+    return @signatures;
+}
+ 
+main();
+
+exit(0);

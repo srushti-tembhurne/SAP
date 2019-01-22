@@ -1,0 +1,102 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/etc/monitor-query-template#6 $
+
+use strict;
+use warnings;
+
+use LWP::UserAgent;
+use Data::Dumper;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+my $rc_dc = ariba::monitor::StatusPage::rcProductName();
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new( 'buyer', 'test');
+    my $me = ariba::rc::InstalledProduct->new('s4', $mon->service());
+    my %queries;
+
+
+    $queries{ "Status" } = {
+#        warn    => 'answer eq "b" or numrows > 10',
+#        crit    => "answer ne $good_resp",
+#        info    => "answer eq $good_resp",
+#        perl    => sub { return main::checkStatus( $url ); },
+#        format  => "%d%%\n",
+#        uiHint  => '',
+#        ticketOnWarnOpenAfterMinutes    => 1,
+#        ticketOwner => 'unassigned-rc',
+#        severity    => 2,
+#        description => "Checking status for [$url]", 
+#        correctiveActions => [
+#            Ops => 'Call RC', 
+#        ],
+    };
+
+    $queries{ "Timing" } = {
+#        warn    => 'answer eq "b" or numrows > 10',
+#        crit    => "answer ne $good_resp",
+#        info    => "answer eq $good_resp",
+#        perl    => sub { return main::checkStatus( $url ); },
+#        format  => "%d%%\n",
+#        uiHint  => '',
+#        ticketOnWarnOpenAfterMinutes    => 1,
+#        ticketOwner => 'unassigned-rc',
+#        severity    => 2,
+#        description => "Checking status for [$url]", 
+#        correctiveActions => [
+#            Ops => 'Call RC', 
+#        ],
+
+    };
+
+    my $email = 'ask_rc@ariba.com';
+
+    my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($rc_dc);
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('Url Status', $tab, $me->service(), $me->customer(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);
+
+__END__

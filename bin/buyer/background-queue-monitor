@@ -1,0 +1,184 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/buyer/background-queue-monitor#1 $
+#
+
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DateTime;
+use Data::Dumper;
+use dmail::LockLib;
+use File::Basename;
+
+my $prog = basename($0);
+my $LOCKFILE = "/tmp/$prog";
+
+sub main {
+    my $debug = 0;
+    my $quiet = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $productName;
+
+    while(my $arg=shift(@ARGV)){
+        print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+        if($arg =~ /^-d/o){ $debug=1; }
+        if($arg =~ /^-e/o){ $sendEmail=1; };
+        if($arg =~ /^-p$/o){ $sendPage=1; };
+        if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+    }
+
+    unless(dmail::LockLib::requestlock($LOCKFILE, 5)) {
+        warn "can't grab lock\n";
+        exit(2);
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+    my $product;
+    unless (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
+        exit(0);
+    }
+    $product = ariba::rc::InstalledProduct->new($productName, $service);
+    my %queries  = ();
+
+    for my $instance ($product->appInstancesInCluster($cluster)) {
+        my $url = $instance->backgroundQueueMonitor();
+        my $node = $instance->instanceName();
+        my $community = $instance->community();
+        my $backgroundQueueMonitorStatus = ariba::monitor::Url->new($url);
+        $backgroundQueueMonitorStatus->setTimeout(30);
+        $backgroundQueueMonitorStatus->useOutOfBandErrors(1);
+        if ($backgroundQueueMonitorStatus->errors()) {
+            # this app instance had errors, try the next one
+            next;
+        }
+
+        my @response = $backgroundQueueMonitorStatus->request();
+        my $uiHint;
+        if ($community) {
+            $community = "community $community";
+        } else {
+            $community = "default community";
+        }
+
+        $uiHint = "$community/" . $instance->appName();
+
+
+        my ($instance_size, $instance_total_threads, $instance_free_threads) = main::backgroundQueueMonitorSize("Thread", \@response);
+
+        if ($debug) {
+             print "Printing the info for $node\n";
+             print "*****************************************************\n";
+             print "The instance size is: $instance_size\n";
+             print "Number of total threads are: $instance_total_threads\n";
+             print "Number of free threds are: $instance_free_threads\n";
+             print "*****************************************************\n";
+         }
+
+         $queries{"Size for the node $node"} = {
+              'recordMaxResults' => 35040,  #15 mins cron interval. Storing an year worth data in CDB.
+              'recordDataType' => "gauge",
+              'info' => 1,
+              'uiHint' => "$uiHint/$node",
+              'perl' => sub { return $instance_size }
+         };
+
+         $queries{"Total threads in the node $node"} = {
+              'recordMaxResults' => 35040,
+              'recordDataType' => "gauge",
+              'info' => 1,
+              'uiHint' => "$uiHint/$node",
+              'perl' => sub { return $instance_total_threads }
+         };
+
+         $queries{"Free threads in the node $node"} = {
+              'recordMaxResults' => 35040,
+              'recordDataType' => "gauge",
+              'info' => 1,
+              'uiHint' => "$uiHint/$node",
+              'perl' => sub { return $instance_free_threads }
+         };
+
+
+         $queries{"Additional Information about the node $node"} = {
+              'info' => 1,
+              'uiHint' => "$uiHint/$node",
+              'perl' => sub { main::backgroundQueueMonitor("Thread", \@response) },
+         };
+
+
+    }
+
+    my $email = $me->default('notify.email');
+    my $q = ariba::monitor::QueryManager->newWithDetails("Background Queue Monitor", $product->name(), $service, $product->customer(), \%queries);
+    $q->processQueries($debug, $email, $sendEmail, $sendPage);
+    dmail::LockLib::releaselock($LOCKFILE);
+
+}
+
+
+sub backgroundQueueMonitorSize {
+    my $property = shift;
+    my $responseLinesRef = shift;
+
+    my $size = 0;
+    my $threadCount = 0;
+    my $freeThreads = 0;
+    for ( my $i=0; $i < @$responseLinesRef; $i++ ) {
+        my $line = $responseLinesRef->[$i];
+        if ($line =~ m|<Size>(.*)</Size>|i) {
+             $size = $1;
+             if ($size eq "none"){
+                 $size = 0;
+             }
+         } elsif ($line =~ m|<$property>|i) {
+             $threadCount++;
+             #now getting the status here
+             if ($responseLinesRef->[($i+3)] =~ m|<Status>(.*)</Status>|i)  {
+                 if ($1 eq "Free"){
+                     $freeThreads++;
+                 }
+             }
+         }
+    }
+
+    return ($size, $threadCount, $freeThreads);
+}
+
+
+#I know but that's how they spelled it
+sub backgroundQueueMonitor {
+    my $property = shift;
+    my $responseLinesRef = shift;
+    my @results;
+    for ( my $i=0; $i < @$responseLinesRef; $i++ ) {
+        my $line = $responseLinesRef->[$i];
+        if ($line =~ m|<Size>(.*)</Size>|i) {
+            push(@results, "Size: $1");
+        } elsif ($line =~ m|<$property>|i) {
+            my $thread_id;
+            my $thread_work;
+            my $thread_status;
+            if ($responseLinesRef->[++$i] =~ m|<Id>(.*)</Id>|i) { $thread_id = $1; }
+            if ($responseLinesRef->[++$i] =~ m|<Work>(.*)</Work>|i)  { $thread_work = $1; }
+            if ($responseLinesRef->[++$i] =~ m|<Status>(.*)</Status>|i)  { $thread_status = $1; }
+            push(@results, "Thread ID:$thread_id    Work:$thread_work   Status:$thread_status");
+        }
+
+    }
+
+    return (join("\n", @results));
+}
+
+
+main();

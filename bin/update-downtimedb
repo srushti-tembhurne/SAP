@@ -1,0 +1,139 @@
+#!/usr/local/bin/perl -w
+#
+# update the note field of an entry in the downtime db
+#
+# $Id: //ariba/services/monitor/bin/update-downtimedb#10 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::monitor::DowntimeEntry;
+use ariba::monitor::AuthenticationSession;
+
+my $debug = 0;
+
+sub usage {
+	my $errmsg = shift;
+
+	print "ERROR: $errmsg\n" if $errmsg;
+	print "Usage: update-downtimedb [options]\n";
+	print "Options: \n";
+	print "  -d            debug mode\n";
+	print "  -h            Display this help\n";
+	print "  -id           Select downtime event id, multiple separated by comma's\n";
+	print "  -[un]planned  Set downtime to planned or unplanned\n";
+	print "\n";
+	print "Example: ./update-downtimedb -id 2313,2354,1245,1133,2441,2444,2222\n";
+	print "This program allows you to set the opsnote and/or planned status\n";
+	print "for one or more events in the downtime database.\n";
+	print "\n";
+	print "Use this to clarify the downtime\n";
+	print "\n";
+	print "This will prompt for your two-factor username & password\n";
+	print "\n";
+	exit(1);       
+} 
+
+sub updateOpsNote {
+	my $entry = shift;
+	my $note = shift;
+	my $username = shift;
+	my $planned = shift;
+	
+	my $comment = sprintf("%s (added by %s @ %s)", $note, $username, scalar(localtime()));
+
+	$entry->setOpsnote($comment);
+	$entry->setPlanned($planned) if defined($planned);
+	$entry->save();
+}
+
+sub interact {
+	my $username = shift;	
+	my $planned = shift;	
+	my @ids = @_;
+
+	my @entries = ();
+
+	for my $id (@ids) {
+
+		my $entry = ariba::monitor::DowntimeEntry->new($id) || do {
+			print "Entry for $id does not exist. Skipping!\n";
+			next;
+		};
+
+		$entry->print();
+
+		push @entries, $entry;
+	}
+
+	print "Are these the correct records? (y/N): ";
+
+	my $isOkay = <STDIN>; 
+
+	unless ( $isOkay =~ /^(y|Y)/ ) {
+		print "update aborted\n";
+		exit(1);	
+	}
+
+	print "Please enter your comment; press return twice when finished:\n\n" ;
+
+	my $note = ''; 
+	
+	while ( my $line = <STDIN> ) { 
+		last if $line =~ /^$/;	
+		chomp($line);
+		$note .= $line;
+	}		
+	
+	print "\nWARNING - You are setting this event to " . ($planned ? "planned" : "unplanned") if defined($planned);
+	print "\nWARNING - Please confirm to update opsnote(s) in downtime database (y/N): ";
+	
+	my $goahead = <STDIN>; 
+
+	unless ( $goahead =~ /^(y|Y)/ ) {
+			
+		print "update aborted\n";	
+		exit(1);
+	}
+
+	print "\n\nExecuting updates.\n";
+	
+	for my $entry (@entries) {
+		
+		updateOpsNote($entry, $note, $username, $planned);
+		$entry->print();
+	}
+
+	print "\n\nUpdated the Downtime database.\n";
+}
+
+sub main {
+	my $id;
+	my $username;
+	my $planned = undef;
+
+	while( my $arg = shift( @ARGV ) ){
+		if ( $arg =~ /^-d/o ) { $debug =1; }
+		if ( $arg =~ /(^-h)/o ) { usage(''); }
+		if ( $arg =~ /^-planned/o ) { $planned = 1; }
+		if ( $arg =~ /^-unplanned/o ) { $planned = 0; }
+		if ( $arg =~ /^-id/ ) { $id = shift( @ARGV ); }
+	}
+
+	unless (defined $id) {
+		usage("Please use -id id[,ids...]");
+	}
+		
+	if ( my $auth = ariba::monitor::AuthenticationSession->check() ) {
+		ariba::monitor::DowntimeEntry->connectToDatabase( ariba::rc::InstalledProduct->new('mon') );
+		interact($auth->username(), $planned, (split(/,/, $id)));
+	} else { 
+		print "Failed to authenticate with provided user / password.\n"; 
+	} 
+}
+
+main();

@@ -1,0 +1,788 @@
+#!/usr/local/bin/perl -w
+#
+# Shareplex switchover script.
+#
+# $Id: //ariba/services/monitor/bin/dba/splex-switch#20 $
+#
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+
+my %filesToTransfer=();
+my $debug = 0;
+my $test = 0;
+$main::quiet = 1;
+
+my @filters = (
+		'IDL\\_%',
+		'ARCHIVE\\_TEMP\\_%',
+		'TEMP\\_%',
+		'%\\_38',
+		'BLOB\\_MIGRATION\\_%',
+		'CATALOG\\_BLOB',
+		'CXML\\_DOCUMENT\\_BLOB',
+		'CXML\\_BLOB',
+		'CHAINED\\_ROWS%',
+		'DR$%',
+                'NDR\\_%',
+		);
+
+
+my $schemaOwnersSql = "select username from dba_users where default_tablespace not in ('SYSTEM','TOOLS','DRSYS','GENTRAN')";
+
+sub usage 
+{
+	print "Error: $_[0]\n" if $_[0];
+	print "usage: $0 \n";
+	print "          [-h] this help\n";
+	print "          [-d] turn on debug\n";
+	print "          [-x] run in test mode, no writes\n";
+	print "          [-cfg] generate shareplex config file\n";
+	print "          [-seq] recreate sequences on target db\n";
+	print "          [-srccons] enable constraints and triggers on new source\n";
+	print "          [-destcons] disable constraints and triggers on new dest\n";
+	print "          -switchto <primary|secondary> which cluster to make live\n";
+	print "          -products <an[/buildname]|ibx|...> <an|ibx[/buildname]|...>\n";
+	print "\n";
+	exit(1);
+
+}
+
+sub getPassword
+{
+	my $prompt = shift();
+
+	my $oldState = $|;
+	$| = 1;
+	print "$prompt";
+	$| = $oldState;
+
+	if (-t STDIN) {
+		CORE::system("stty -echo");
+	}
+
+	my $key = <STDIN>;
+	chop($key);
+
+	if (-t STDIN) {
+		CORE::system("stty echo");
+		print "\n";
+	}
+
+	return $key;
+}
+
+sub main 
+{
+	my @products;
+	my $clusterToEnable;
+	my $clusterToDisable;
+	my $createCfg = 0;
+	my $recreateSeq = 0;
+	my $doSrcConsAndTrigs = 0;
+	my $doDestConsAndTrigs = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-h$/) { usage();}
+		if ($arg =~ /^-d$/) { $debug++; next;}
+		if ($arg =~ /^-x$/) { $test = 1; next;}
+		if ($arg =~ /^-switchTo/i) { $clusterToEnable = shift(@ARGV); next;}
+		if ($arg =~ /^-cfg/) { $createCfg = 1; next;}
+		if ($arg =~ /^-seq/) { $recreateSeq = 1; next;}
+		if ($arg =~ /^-srccons/) { $doSrcConsAndTrigs = 1; next;}
+		if ($arg =~ /^-destcons/) { $doDestConsAndTrigs = 1; next;}
+		if ($arg =~ /^-pro/) { push(@products, shift(@ARGV)); next; }
+		if ($arg !~ /^-/) {
+			if ( scalar(@products) ){
+				push(@products, $arg);
+				next;
+			}
+		}
+	}
+
+
+	unless ($clusterToEnable) {
+		usage("need to specify -switchto <primary|secondary>");
+	}
+
+	unless (@products) {
+		usage("need to specify -products <an|ibx|..>...");
+	}
+
+
+	if ($clusterToEnable eq "primary") {
+		$clusterToDisable = "secondary";
+	} elsif ($clusterToEnable eq "secondary") {
+		$clusterToDisable = "primary";
+	}
+
+	unless ($clusterToDisable) {
+		usage("need to specify -switchto <primary|secondary>");
+	}
+
+	if ($debug) {
+		print "d(1)\n";
+		print "d(1) config for enabling cluster = $clusterToEnable\n";
+		print "d(1) createCfg = $createCfg\n";
+		for my $p (@products) {
+			print "d(1) product = $p\n";
+		}
+		print "d(1)\n";
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+
+	# get the master password
+	ariba::rc::Passwords::initialize($me->service());
+	my $oracleUnixPassword = getPassword("Enter Oracle UNIX Password (not validated):");
+
+	my $systemUser = "system";
+	my $systemPass = $me->default("DBAInfo.$systemUser.password");
+
+
+	my @enablePost;
+	my @enableExport;
+
+	for my $productIdentifier (@products) {
+
+		my ($productName, $buildName) = split(/\//, $productIdentifier);
+		#allocate the product
+		my $product = ariba::rc::InstalledProduct->new($productName, 
+							       $me->service(), $buildName);
+
+		#
+		# COMMENT1:
+		#
+		# force the clusterName so that the dbconnection for the
+		# the cluster being disabled comes back as the 'dr' db and
+		# the dbconnection for the cluster being enabled comes back
+		# as 'main' db.
+		#
+		# See also: COMMENT2
+		#
+
+		$product->setClusterName($clusterToEnable);
+
+		#
+		# COMMENT2:
+		#
+		# get the dbserver being disabled from the dbconnection of
+		# type 'dr'. This is related to how clustername was
+		# initialized above.
+		#
+		# See also: COMMENT1
+		#
+		my @dbconnections = ariba::Ops::DBConnection->connectionsForProductOfDBType($product, ariba::Ops::DBConnection->typeDr());
+
+		my $varDir = $product->default('shareplex.vardir');
+		my $port = $product->default('shareplex.spcopport');
+
+		for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbconnections)) {
+
+
+			my $productDbSid = $dbc->sid();
+			my $productDbUser = $dbc->user();
+			my $disableDBServer = $dbc->host();
+
+			my $enableDBServer;
+			my $reportingDbServer;
+			my $reportingSid;
+
+			my $peer;
+
+			$peer = $dbc->reportingDBPeer();
+			if ($peer) {
+				$reportingDbServer = $peer->host();
+				$reportingSid = $peer->sid();
+			}
+
+			$peer = $dbc->mainDBPeer();
+			if ($peer) {
+				$enableDBServer = $peer->host();
+			}
+
+			if ($debug) {
+				print "d(1)\n";
+				print "d(1) productName = $productName\n";
+				print "d(1) user = $systemUser\n";
+				print "d(1) pass = $systemPass\n";
+				print "d(1) enable cluster = $clusterToEnable\n";
+				print "d(1) disable cluster = $clusterToDisable\n";
+				print "d(1) productDbSid = $productDbSid\n";
+				print "d(1) reportingSid = $reportingSid\n" if ($reportingSid);
+				print "d(1) enable on server = $enableDBServer\n";
+				print "d(1) disable on server = $disableDBServer\n";
+				print "d(1) reporting server = $reportingDbServer\n" if ($reportingDbServer);
+				print "d(1) vardir = $varDir\n";
+				print "d(1) port = $port\n";
+				print "d(1)\n";
+			}
+
+
+			#
+			# halt all shareplex activity.
+			# stop post on dest and export on src
+			#
+			print "\n\n";
+			print ">> press <enter> to stop 'post' and 'export'\n";
+			my $ans = <STDIN>;
+			for my $dbServer ($enableDBServer, $disableDBServer, $reportingDbServer) {
+				next unless ($dbServer);
+				shareplexControl($dbServer, $oracleUnixPassword,
+						 $varDir, $port,
+						 "stop post", "stop export");
+			}
+			push(@enablePost, "$disableDBServer:$varDir:$port");
+			push(@enablePost, "$reportingDbServer:$varDir:$port") if ($reportingDbServer);
+			push(@enableExport, "$enableDBServer:$varDir:$port");
+
+			print "\n\n";
+			print ">> press <enter> to proceed with enabling and disabling of constraints and triggers\n";
+			$ans = <STDIN>;
+
+			# oracle connection to currently enabled database
+			# we are going to disable it
+			my $ocEnabled = ariba::Ops::OracleClient->new(
+							$systemUser, 
+							$systemPass, 
+							$productDbSid,
+
+							#this one is *currently* enabled
+							#we are going to disable it
+							$disableDBServer,
+							);
+			my $sourceIsDown = 0;
+			$ocEnabled->connect() || do {
+				print "ERROR: could not connect to $productDbSid on $disableDBServer\n";
+				$sourceIsDown = 1;
+			};
+
+			my $ocReporting;
+			if ($reportingDbServer) {
+				# oracle connection to reporting db.
+				# we are going to enable it
+				$ocReporting = ariba::Ops::OracleClient->new(
+								$systemUser, 
+								$systemPass, 
+								$reportingSid,
+
+								#this one is *currently* disabled
+								#we are going to enable it
+								$reportingDbServer,
+								);
+				$ocReporting->connect() || 
+					die "ERROR: could not connect to $reportingSid on $reportingDbServer\n";
+			}
+
+			#
+			# Disable constraints and triggers.
+			# 
+			print "\n";
+			print "disable constraints and triggers on $disableDBServer\n";
+
+			if ($doDestConsAndTrigs) {
+				disableConstraints($ocEnabled);
+				disableTriggers($ocEnabled);
+
+				if ($ocReporting) {
+					disableConstraints($ocReporting);
+					disableTriggers($ocReporting);
+				}
+			}
+
+			my @replicatesTo = ($enableDBServer);
+			my @replicatesSid = ($productDbSid);
+			if ($reportingDbServer) {
+				push(@replicatesTo, $reportingDbServer);
+				push(@replicatesSid, $reportingSid);
+			}
+			if ($createCfg) {
+				# generate target side config file
+				my $file = createShareplexConfig(
+							$ocEnabled,
+							\@replicatesTo,
+							"trg",
+							\@replicatesSid,
+							$clusterToDisable,
+								 ); 
+				$filesToTransfer{$file} = 
+						"$disableDBServer:$port:$varDir";
+			}
+
+			# oracle connection to currently disabled database
+			# we are going to enable it
+			my $ocDisabled = ariba::Ops::OracleClient->new(
+							$systemUser, 
+							$systemPass, 
+							$productDbSid,
+
+							#this one is *currently* disabled
+							#we are going to enable it
+							$enableDBServer,
+							);
+			$ocDisabled->connect() || 
+				die "ERROR: could not connect to $productDbSid on $enableDBServer\n";
+			#
+			# Enable constraints and triggers.
+			# 
+			print "\n";
+			print "enable constraints and triggers on $enableDBServer\n";
+
+			if ($doSrcConsAndTrigs) {
+				enableConstraints($ocDisabled);
+				enableTriggers($ocDisabled);
+			}
+
+			@replicatesTo = ($disableDBServer);
+			@replicatesSid = ($productDbSid);
+			if ($reportingDbServer) {
+				push(@replicatesTo, $reportingDbServer);
+				push(@replicatesSid, $reportingSid);
+			}
+
+			if ($createCfg) {
+				# generate source side config file
+				my $file = createShareplexConfig(
+							$ocDisabled,
+							\@replicatesTo,
+							"src",
+							\@replicatesSid,
+							$clusterToEnable,
+								 ); 
+				$filesToTransfer{$file} = 
+						"$enableDBServer:$port:$varDir";
+			}
+
+			if ($recreateSeq) {
+				if($sourceIsDown) {
+					print "\n";
+					print "sequence bump up on $enableDBServer ($disableDBServer is down)\n";
+					recreateSequenceOnTarget( 
+							 $ocDisabled, 
+							 $ocDisabled);
+				} else {
+					print "\n";
+					print "sequences $disableDBServer -> $enableDBServer\n";
+					recreateSequenceOnTarget(
+							 $ocEnabled, 
+							 $ocDisabled);
+				}
+			}
+
+			$ocEnabled->disconnect();
+			$ocDisabled->disconnect();
+
+			if ($reportingDbServer) {
+				$ocReporting->disconnect();
+			}
+		} 
+	}
+	#
+	# transfer the created config files and apply them on the servers
+	#
+	if ($createCfg) {
+		print "\n\n";
+		print ">> press <enter> to apply the generated configs and reactivate shareplex\n";
+		my $ans = <STDIN>;
+		transferSplexConfigFiles($oracleUnixPassword, 
+					 keys(%filesToTransfer));
+		applyNewShareplexConfig($oracleUnixPassword, 
+					keys(%filesToTransfer));
+	}
+
+	if (@enablePost && @enableExport) {
+		print "\n\n";
+		print ">> press <enter> to start 'post' and 'export'\n";
+		my $ans = <STDIN>;
+
+		for my $info (@enablePost) {
+			my ($host, $varDir, $port) = split(':', $info);
+			shareplexControl($host, $oracleUnixPassword,
+					 $varDir, $port,
+					 "start post");
+
+		}
+		for my $info (@enableExport) {
+			my ($host, $varDir, $port) = split(':', $info);
+			shareplexControl($host, $oracleUnixPassword,
+					 $varDir, $port,
+					 "start export");
+
+		}
+	}
+}
+
+sub _subQueryToFilterQualtity
+{
+	my $quantity = shift;
+	my $filterString;
+
+	for my $filterItem (@filters) {
+		if ($filterString) {
+			$filterString .= " and ";
+		} else {
+			$filterString = "";
+		}
+
+		my $filter = $filterItem;
+		if ($quantity eq "sequence_name") {
+			$filter = "$filterItem\\_SEQ";
+		}
+		$filterString .= "$quantity not like \'$filter\' ESCAPE '\\'";
+	}
+
+	return $filterString;
+}
+
+sub _subQueryToFilterConstraints
+{
+	return _subQueryToFilterQualtity("constraint_name");
+}
+
+sub _subQueryToFilterTriggers
+{
+	return _subQueryToFilterQualtity("trigger_name");
+}
+
+sub _subQueryToFilterTables
+{
+	return _subQueryToFilterQualtity("table_name");
+}
+
+sub _subQueryToFilterSequences
+{
+	return _subQueryToFilterQualtity("sequence_name");
+}
+
+sub _constraintOperation
+{
+	my $oc = shift;
+	my $operation = shift;
+
+	my $sql = "select owner || '.' || table_name, ".
+		  "constraint_name from dba_constraints ".
+		  "where owner in ($schemaOwnersSql) and ".
+		  "(CONSTRAINT_TYPE in ('C','R') or DELETE_RULE='CASCADE') and ".
+		  _subQueryToFilterConstraints();
+
+	my @generatedSql = $oc->executeSql($sql);
+
+	print "  ", scalar(@generatedSql), " $operation constraints\n";
+	for my $row (@generatedSql) {
+		my ($table, $constraint)  = split(/\s+/, $row);
+
+		print "d(4) table = $table, constraint = $constraint\n" if ($debug >= 4);
+
+		my $alterSql;
+		if ($operation eq "enable") {
+			$alterSql = "alter table $table ".
+				    "enable novalidate ".
+				    "constraint $constraint";
+		} elsif ($operation eq "disable") {
+			$alterSql = "alter table $table ".
+		                    "disable ".
+				    "constraint $constraint";
+		}
+		print "d(2) $alterSql\n" if ($debug >= 2);
+		next if ($test);
+
+		$oc->executeSql($alterSql);
+	}
+}
+####
+sub disableConstraints 
+{
+	my $oc = shift;
+
+	## disable constraints:
+	_constraintOperation($oc, "disable");
+}
+
+sub enableConstraints 
+{
+	my $oc = shift;
+
+	## enable constraints:
+	_constraintOperation($oc, "enable");
+}
+
+####
+sub _triggerOperation
+{
+	my $oc = shift;
+	my $operation = shift;
+
+	my $sql = "select owner || '.' || trigger_name ".
+		  "from dba_triggers where owner in ($schemaOwnersSql) and " .
+		  _subQueryToFilterTriggers();
+
+	my @generatedSql = $oc->executeSql($sql);
+
+	print "  ", scalar(@generatedSql), " $operation triggers\n";
+
+	for my $row (@generatedSql) {
+
+		print "d(4) row = $row\n" if ($debug >= 4);
+
+		my $alterSql;
+
+		if ($operation eq "enable") {
+			$alterSql = "alter trigger $row enable";
+		} elsif ($operation eq "disable") {
+			$alterSql = "alter trigger $row disable";
+		}
+
+		print "d(2) $alterSql\n" if ($debug >= 2);
+		next if ($test);
+
+		$oc->executeSql($alterSql);
+	}
+}
+
+sub enableTriggers 
+{
+	my $oc = shift;
+
+	## enable triggers:
+	_triggerOperation($oc, "enable");
+}
+
+sub disableTriggers 
+{
+	my $oc = shift;
+
+	## disable triggers:
+	_triggerOperation($oc, "disable");
+}
+
+sub createShareplexConfig 
+{
+	my $oc = shift;
+	my $peerServersRef = shift;
+	my $spRole = shift; # "src" or "trg"
+	my $replicatesSidsRef = shift;
+	my $cluster = shift;
+
+	my $productDbSid = $replicatesSidsRef->[0];
+
+	my $sql_tab = "select owner || '.' || table_name ".
+		      "from dba_tables where ".
+		      "owner in ($schemaOwnersSql) and ".
+		      "table_name != 'PLAN_TABLE' and ".
+			  _subQueryToFilterTables();
+
+	my $sql_seq = "select sequence_owner || '.' || sequence_name ".
+		      "from dba_sequences where ".
+		      "sequence_owner in ($schemaOwnersSql) and ".
+			  _subQueryToFilterSequences();
+	my $sql_sp = "select (nvl(actid,0)+1) from splex.shareplex_actid";
+
+
+	my @generatedSql_tab = $oc->executeSql($sql_tab);
+	my @generatedSql_seq = $oc->executeSql($sql_seq);
+	my $generatedSql_sp = $oc->executeSql($sql_sp);
+
+	my @tab_seq;
+
+	my $filename = lc($productDbSid) . "_" .
+		       $cluster . "_" . 
+		       $spRole . "_" . $generatedSql_sp;
+
+	if ( $spRole eq 'src') {
+		push(@tab_seq, @generatedSql_tab, @generatedSql_seq);
+		print "  ", scalar(@tab_seq), " $filename ($spRole) with tables and sequences\n";
+	} elsif ( $spRole eq 'trg') {
+		push(@tab_seq, @generatedSql_tab);
+		print "  ", scalar(@tab_seq), " $filename ($spRole) with tables\n";
+	}
+
+
+	my $ucProductDbSid = uc($productDbSid);
+	unless($filesToTransfer{$filename}) {
+		open (OUTPUTFILE,">$filename") || 
+				die "ERROR: could not open file $filename\n";
+		print OUTPUTFILE "datasource:o.$ucProductDbSid\n";
+	} else {
+		open (OUTPUTFILE,">>$filename") || 
+				die "ERROR: could not open file $filename\n";
+	}
+
+	for (my $i = 0; $i < @$peerServersRef; $i++) {
+		my $peerServer = $peerServersRef->[$i];
+		my $ucSid = uc($replicatesSidsRef->[$i]);
+
+		print "    cfg-line: peerserver = $peerServer (sid = $ucSid)\n";
+
+		for my $row (@tab_seq) {
+			print OUTPUTFILE "$row $row $peerServer\@o.$ucSid\n";
+		}
+	}
+	close OUTPUTFILE;
+
+	return $filename;
+}
+
+sub recreateSequenceOnTarget 
+{
+	my $ocSrc = shift;
+	my $ocTrg = shift;
+
+	my $sqlCreateSeq = 
+	     "select sequence_owner, sequence_name, min_value, ".
+	     "increment_by, cache_size, to_char(last_number+cache_size+100), ".
+	     "decode(cycle_flag,'N',' ',' CYCLE '), ".
+	     "decode(order_flag,'N',' ',' ORDER ') from dba_sequences ".
+	     "where sequence_owner in ($schemaOwnersSql) and ".
+		  _subQueryToFilterSequences();
+
+	my @generatedSqlCreateSql = $ocSrc->executeSql($sqlCreateSeq);
+
+	print "  ", scalar(@generatedSqlCreateSql), " sequence(s)\n";
+	for my $row (@generatedSqlCreateSql) {
+		my ($seqOwn, 
+		    $seqName, 
+		    $minVal, 
+		    $incr, 
+		    $cacheSize, 
+		    $startWith, 
+		    $cycle, 
+		    $order)  = split(/\s+/, $row);
+
+		$cycle = "" unless(defined($cycle));
+		$order = "" unless(defined($order));
+
+		my $dropSql = "drop sequence $seqOwn.$seqName";
+		my $createSql = "create sequence $seqOwn.$seqName minvalue ".
+				"$minVal increment by $incr ".
+				"cache $cacheSize start with $startWith ".
+				"$cycle $order";
+
+		#print "d(2) $dropSql\n" if ($debug >= 2);
+		#print "d(2) $createSql\n" if ($debug >= 2);
+
+		next if ($test);
+
+		print "d(2) $dropSql\n" if ($debug >= 2);
+		$ocTrg->executeSql($dropSql);
+
+		print "d(2) $createSql\n" if ($debug >= 2);
+		$ocTrg->executeSql($createSql);
+	}
+}
+
+sub transferSplexConfigFiles
+{
+	my $oracleUnixPassword = shift;
+	my @files = @_;
+
+	for my $file (@files) {
+		my $pathDetails = $filesToTransfer{$file};
+		my ($host, $port, $varDir) = split(':', $pathDetails);
+
+		my $srcRoot = ".";
+		my $dstRoot = "$varDir/config";
+		my $cmd = "rsync -e ssh --archive --temp-dir=/tmp $srcRoot/$file oracle\@$host:$dstRoot";
+
+		print "d(3) will run $cmd\n" if ($debug >= 3);
+		next if ($test);
+
+		unless(ariba::rc::Utils::executeRemoteCommand(
+							$cmd,
+							$oracleUnixPassword,
+							)) {
+			print "ERROR: could not copy $srcRoot/$file to oracle\@$host:$dstRoot\n";
+		}
+	}
+
+}
+
+sub applyNewShareplexConfig
+{
+	my $oracleUnixPassword = shift;
+	my @files = @_;
+
+	for my $file (@files) {
+		my $pathDetails = $filesToTransfer{$file};
+		my ($host, $port, $varDir) = split(':', $pathDetails);
+
+		my $spCmd = "export SP_SYS_HOST_NAME=$host; ".
+			    "export SP_SYS_VARDIR=$varDir; ".
+			    "export SP_COP_UPORT=$port; ".
+			    "export SP_COP_TPORT=$port; ".
+			    "/opt/splex/bin/sp_ctrl";
+
+		my $cmd = "ssh oracle\@$host \"$spCmd activate config $file on $host:$port\"";
+
+		print "\n\n";
+		print "************************************************\n";
+		print "**** Applying new shareplex config on $host ****\n";
+		print "************************************************\n";
+		print "\n\n";
+
+		print "d(3) will run $cmd\n" if ($debug >= 3);
+
+		unless ($test) {
+			print ">>> activate config $file on $host:$port\n\n";
+			unless(ariba::rc::Utils::executeRemoteCommand(
+							$cmd,
+							$oracleUnixPassword,
+								)) {
+				print "ERROR: cmd $cmd failed!\n";
+			}
+		}
+
+		$cmd = "ssh oracle\@$host \"$spCmd show config on $host:$port\"";
+
+		print "d(3) will run $cmd\n" if ($debug >= 3);
+
+		print ">>> show config on $host:$port\n\n";
+		unless(ariba::rc::Utils::executeRemoteCommand(
+							$cmd,
+							$oracleUnixPassword,
+							)) {
+			print "ERROR: cmd $cmd failed!\n";
+		}
+	}
+}
+
+sub shareplexControl
+{
+	my $host = shift;
+	my $oracleUnixPassword = shift;
+	my $varDir = shift;
+	my $port = shift;
+	my @cmds = @_;
+
+	my $spCmd = "export SP_SYS_HOST_NAME=$host; ".
+		    "export SP_SYS_VARDIR=$varDir; ".
+		    "export SP_COP_UPORT=$port; ".
+		    "export SP_COP_TPORT=$port; ".
+		    "/opt/splex/bin/sp_ctrl";
+
+	for my $subCommand (@cmds) {
+		my $cmd = "ssh oracle\@$host \"$spCmd $subCommand on $host:$port\"";
+
+		print "$subCommand on $host:$port\n";
+
+		print "d(3) will run $cmd\n" if ($debug >= 3);
+
+		unless ($test) {
+			unless(ariba::rc::Utils::executeRemoteCommand(
+							$cmd,
+							$oracleUnixPassword,
+								)) {
+				#looks like sp_ctrl returns 'fail' status
+				#if subcommand was already performed previously
+				#print "ERROR: cmd $cmd failed!\n";
+			}
+		}
+	}
+}
+
+main();

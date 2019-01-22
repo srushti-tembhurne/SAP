@@ -1,0 +1,103 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/common/pq-delivered-messages
+#
+
+#use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::monitor::OutageSchedule;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use dmail::LockLib;
+
+sub main {
+	my $debug = 0;
+	my $quiet = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $productName;
+
+	while(my $arg=shift(@ARGV)){
+		print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+		if($arg =~ /^-d/o){ $debug=1; }
+		if($arg =~ /^-e/o){ $sendEmail=1; };
+		if($arg =~ /^-p$/o){ $sendPage=1; };
+		if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+	}
+
+	print "running pq-delivered-messages...\n" if($debug);
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $cluster = $me->currentCluster();
+	my $service = $me->service();
+	my $email = $me->default('notify.email');
+
+
+	my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+	unless (@products) {
+		exit(0);
+	}
+
+	for my $product (@products) {
+
+		my $lockfile = "/tmp/pq-delivered-messages";
+		$lockfile .= "-" . $product->name();
+		$lockfile .= "-" . $product->customer() if($product->customer());
+		if (!dmail::LockLib::requestlock($lockfile,5)) {
+			print STDERR "can't grab lock $lockfile\n";
+			next;
+		}
+		my %queries  = ();
+
+		my $msgSql = "select count(*) FROM SmallMessageTab WHERE msml_MessageId IN (SELECT ms_MessageId FROM MessageStatusTab WHERE ms_TimeCreated < sysdate-1 AND ms_StateValue >= 2)";
+
+#my @schemaIds = ariba::Ops::ProductAPIExtensions::transactionSchemaIdsForProduct($product);
+		my @schemaIds = qw(1);#As per SRE we are running on schema 1 only 
+
+			$queries{"SmallMessageTab # of delivered messages"} = {
+				'recordMaxResults' => 10000,
+				'recordDataType' => "gauge",
+				'runForSchemaIds' => join(", ", @schemaIds),
+				'info' => "!defined(answer) || answer >= 0",
+				'severity' => 2,
+				'warn' => "defined(answer) && answer >= 100000",
+				'ticketOnWarnOpenAfterMinutes' => 1,
+				'crit' => "defined(answer) && answer >= 200000",
+				'timeout' => 10 * 60,
+				'sql'  => $msgSql,
+				'correctiveActions' => [
+					Ops => "Upon Critical,Raise an alert on Engineering as Manager Nodes will become unresponsive and gets hung as the table SmallMessageTab is locked for deleted the old delivered messages \n Upon warning,This is an indication that the scheduled task that deletes delivered messages has not run. Log a ticket on Engineering to look into the issue",
+				],
+			};
+
+		my $q = ariba::monitor::QueryManager->newWithDetails(
+				"persistent-queue", $product->name(), $service, $product->customer(), \%queries
+				);
+
+#
+# set a sane default -- if we don't have sub schemas, this needs to
+# get set to something because...
+#
+		my $defaultDbc=ariba::Ops::DBConnection->connectionsForProductOfDBType(
+				$product, ariba::Ops::DBConnection::typeMain()
+				);
+		$q->setSQLConnectInfoFromDBConnection( $defaultDbc );
+
+
+# this call only sets overrides for individual schemas, and misses a
+# default that is not numbered
+#
+		ariba::Ops::ProductAPIExtensions::setTransactionSchemaSQLConnectInfoOnQueryManager($product, $q);
+		$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+		dmail::LockLib::releaselock($lockfile);
+	}
+
+}
+
+main();

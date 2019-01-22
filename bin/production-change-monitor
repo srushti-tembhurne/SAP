@@ -1,0 +1,75 @@
+#!/usr/local/bin/perl -w
+#
+# Monitors and records production changes
+#
+# $Id: //ariba/services/monitor/bin/production-change-monitor#3 $
+#
+
+use strict;
+use FindBin;
+
+use lib "$FindBin::Bin/../lib"; 
+
+use dmail::LockLib;
+use ariba::monitor::ProductionChange;
+use ariba::monitor::ProductionChangeMonitor;
+
+my $RUN_LOCK_FILE = '/tmp/production-change-monitor';
+
+package main;
+
+my $debug = 0;
+
+sub usage {
+	my $error = shift; 
+
+	print "Usage: $0 [-d|-h]\n"; 
+	print "Monitors and records production changes.\n\n"; 
+	print "\t-d    Turns on debug mode\n"; 
+	print "\t-h    Shows this help\n\n"; 
+
+	error($error) if ($error);
+	exit();
+}
+
+sub error {
+	my $msg = shift;
+	my $exitCode = shift || 1;
+
+	print "(error) $msg\n"; 
+	exit($exitCode);
+}
+
+sub debug {
+	my $msg = shift; 
+
+	print "(debug) $msg\n" if ($debug && defined($msg));
+}
+
+
+sub main {
+
+	while (my $arg = shift) {
+		if ($arg =~ /-d/) { $debug++; next; } 
+		if ($arg =~ /-h/) { usage();  next; } 
+		usage("Invalid argument: $arg");
+	}
+
+	dmail::LockLib::forceQuiet(); 
+	exit() unless (dmail::LockLib::requestlock($RUN_LOCK_FILE, 1));
+
+	my $changeMonitor = ariba::monitor::ProductionChangeMonitor->new();
+
+	my $cfEngineLastPushed = $changeMonitor->lastCFEnginePushTime();
+	my $cfEngineChanges = $changeMonitor->checkCFEngineChanges();
+	debug("Found and added $cfEngineChanges CFEngine change(s)" . 
+		($cfEngineLastPushed ? ' since ' . localtime($cfEngineLastPushed) : ''));
+
+	my $productChanges = $changeMonitor->checkProductChanges();
+	debug("Found and added $productChanges product change(s)");
+
+	dmail::LockLib::releaselock($RUN_LOCK_FILE);
+}
+
+main(@ARGV);
+

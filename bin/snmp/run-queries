@@ -1,0 +1,226 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/snmp/run-queries#16 $
+#
+# A front end to run a bunch of snmp queries and graph the results.
+#
+use strict;
+use File::Path;
+use File::Basename;
+use Sys::Hostname;
+use POSIX qw(ceil); 
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query; 
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct; 
+use ariba::Ops::SharedMemoryChild; 
+use ariba::Ops::DateTime; 
+use dmail::LockLib;
+
+my $debug = 0;
+my $snmpMonitorDir = ariba::monitor::misc::snmpDir();
+my $snmpDir = basename($snmpMonitorDir);
+my $MAX_PROCESSES = 3; # Number of processes to use when running queries. 
+
+sub runAndProcessQueries { 
+	my $queriesRef = shift; 
+
+	for my $query ( @$queriesRef ) {
+		next if ($query->skip());
+		
+		$query->run();
+		$query->runProcessAnswer();
+
+		if ($debug) { 
+			$query->displayResults(*STDOUT); 
+			$query->displayDetails(*STDOUT); 
+		} else { 
+			$query->recordResults();	
+			$query->graphResults();
+		}
+	}
+}
+
+sub cdbAgeForQueries { 
+	my $queriesRef = shift; 
+	my $query = $ariba::monitor::Query::_ourGlobalQuerySelf; 
+	
+	return 0 unless (@$queriesRef); 
+
+	my $cdb = $queriesRef->[0]->cdb();  # Just first one
+	my $cdbAge = time() - $cdb->lastUpdated(); 
+	$query->setCdbLastUpdated($cdb->lastUpdated()); 
+
+	return $cdbAge; 
+} 
+
+sub run
+{
+	my $qm = shift;
+	my $monQueriesRef = shift; 
+	my $startTime = time();
+	my $qmName = $qm && $qm->name(); 
+
+	return unless ($qmName); ;
+
+	my $lockFile = "/tmp/run-queries-$qmName";
+	die "can't grab lock\n" if (!dmail::LockLib::requestlock($lockFile,5)); 
+
+	$qm->_inProgress();
+
+	my @queries = $qm->queries(); 
+	my $numQueries = scalar(@queries); 
+	my $maxQueryBatchCount = ($numQueries > 100) ? ceil($numQueries / $MAX_PROCESSES) : $numQueries; 
+	my $maxQueryIndex = $#queries; 
+	my $queryIndex = 0; 
+	my $batchCount = 0; 
+
+	$monQueriesRef->{"$qmName number of queries"} = { 
+		info => 1, 
+		uiHint => $qmName, 
+		perl => sub { return $numQueries; },  
+	}; 
+	
+	print "Total of $numQueries queries to be processed.\n" if ($debug); 
+	if ($maxQueryIndex >= 0) {
+		my @queriesBatch; 
+		while ($queryIndex <= $maxQueryIndex) { 
+			push(@queriesBatch, $queries[$queryIndex]); 	
+			if ((($queryIndex + 1) % $maxQueryBatchCount == 0) || 
+				$queryIndex == $maxQueryIndex) {
+				$batchCount++; 
+				my $childCodeRef = sub {
+					print "Processing batch #$batchCount with " . scalar(@queriesBatch) . " queries...\n" if ($debug); 
+					runAndProcessQueries(\@queriesBatch); 
+					return 1;
+				}; 
+				my $child = ariba::Ops::SharedMemoryChild->new($childCodeRef, 0);
+				$child->run(); 
+				@queriesBatch = (); 
+			};
+			$queryIndex++; 
+		}
+	}
+
+	while (ariba::Ops::SharedMemoryChild->waitForChildren(1)) {}; 
+
+	my $runTime = time() - $startTime; 
+	$monQueriesRef->{"$qmName run time"} = {
+		info => 1, 
+		uiHint => $qmName, 
+		perl => sub { return $runTime; }, 
+		format => 'scaleTime(answer)', 
+		recordMaxResults => 110000,
+		recordDataType => 'gauge',
+	}; 
+	$monQueriesRef->{"$qmName cdb age"} = { 
+		info => 1, 
+		warn => 'answer > 600', 	# 10 mins
+		crit => 'answer > 1800',	# 30 mins
+		uiHint => $qmName, 
+		perl => sub { main::cdbAgeForQueries(\@queries); },
+		format => 'scaleTime(answer)', 
+	}; 
+
+	dmail::LockLib::releaselock($lockFile);
+}
+
+sub graph
+{
+	my $qm = shift;
+	my $type = shift;
+	my $monQueriesRef = shift; 
+	my $startTime = time();
+	my $qmName = $qm && $qm->name();
+
+	return unless ($qmName); ;
+
+	for my $query ($qm->queries()) {
+
+		print "graphing ($type) for ", $query->queryName(), "\n" if ($debug);
+
+		# undocumented feature
+		if ($debug >= 2 ) {
+			$query->printDB();
+		}
+
+		$query->graphResults($type);
+	}
+
+	my $runTime = time() - $startTime; 
+	$monQueriesRef->{"$qmName run time for $type graph"} = {
+		info => 1, 
+		uiHint => $qmName, 
+		perl => sub { return $runTime; }, 
+		format => 'scaleTime(answer)', 
+		recordMaxResults => 110000,
+		recordDataType => 'gauge',
+	}; 
+}
+
+sub usage
+{
+	print "Error: $_[0]\n" if $_[0];
+	print "usage: $0 [-h|-d] [-r] [-g <graph type>] <queries-name>...\n";
+	print "		  -h: this help\n";
+	print "		  -d: turn on debugging\n";
+	print "		  -r: run queries to gather new samples\n"; 
+	print "		  -g <graph type>: generate graphs of the requested type:\n";
+	print "						   daily, weekly, monthly, quarterly, yearly\n";
+	print "		  <queries-name>: names of queries to run/graph\n";
+
+	exit(1);
+}
+
+sub main
+{
+	my ($runQuery, $graphType, @snmpQueryManager);
+	my $sendEmail = 0; 
+	my $sendPage = 0;  
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-h/) { usage();}
+		if ($arg =~ /^-d/) { $debug++; next;}
+		if ($arg =~ /^-r/) { $runQuery = 1; next;}
+		if ($arg =~ /^-e/) { $sendEmail = 1; next;}
+		if ($arg =~ /^-p/) { $sendPage = 1; next;}
+		if ($arg =~ /^-g/) { $graphType = shift(@ARGV); next;}
+		if ($arg !~ /^-/) { push(@snmpQueryManager, $arg); next;}
+	}
+
+	unless (@snmpQueryManager) {
+		usage("Need to specify queries to run.");
+	}
+
+	unless($runQuery || $graphType) {
+		usage("Need to specify at least on operation run and/or graph.");
+	}
+
+	my %queries; 
+	my $me = ariba::rc::InstalledProduct->new(); 
+
+	for my $qmName (@snmpQueryManager) {
+		my $qm = ariba::monitor::QueryManager->new("$snmpDir/$qmName");
+
+		if ($graphType) {
+			$qm->setGraphRecorded($graphType);
+		}
+		
+		if ($runQuery) {
+			run($qm, \%queries);
+		} elsif ($graphType) {
+			graph($qm, $graphType, \%queries);
+		}
+	}
+
+	my $email = $me->default('notify.email');
+	my $qm = ariba::monitor::QueryManager->newWithDetails("snmp", $me->name(), $me->service(), undef, \%queries);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+main();
+
+__END__

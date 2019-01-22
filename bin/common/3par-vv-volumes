@@ -1,0 +1,107 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/common/3par-vv-volumes $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::NetworkDeviceManager;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Startup::Common;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::FileSystemUtilsRPC;
+
+# keep about a year's worth of results, at 1 sample every day
+my $MAX_RESULTS = 365;
+$| = 1;
+
+sub main {
+
+    my $debug     = 0;
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while ( my $arg = shift ( @ARGV ) ) {
+        if ( $arg =~ /^-d/o ) { $debug++; }
+        if ( $arg =~ /^-e/o ) { $sendEmail = 1; }
+        if ( $arg =~ /^-p/o ) { $sendPage = 1; }
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+
+    # set this so that inserv logs to the right place
+    $ENV{ 'LOGSDIR' } = ariba::Ops::Startup::Common::logsDirForProduct( $me );
+
+    $main::quiet = 1 unless $debug >= 1;
+
+    my $email       = $me->default( 'notify.email' );
+    my $cipherStore = ariba::rc::CipherStore->new( $me->service() );
+    my $username    = "svc" . $me->service();
+    my $password    = $cipherStore->valueForName( $username );
+
+    my $hostname   = ariba::Ops::NetworkUtils::hostname();
+    my $machine    = ariba::Ops::Machine->new( $hostname );
+    my $datacenter = $machine->datacenter();
+
+    my @inservDevices = ariba::Ops::NetworkDeviceManager->newFromDatacenter( $datacenter, 'inserv' );
+
+    unless ( scalar ( @inservDevices ) ) {
+        print "no 3par units found in $datacenter" if $debug;
+        exit 1;
+    }
+
+    my %queries;
+
+    for my $nm ( @inservDevices ) {
+
+        $nm->setDebug( $debug - 1 ) if $debug >= 2;
+        $nm->setLogResponses( 0 );
+
+        my $limit;
+        my $inservHostname = $nm->hostname();
+        my $osVersion      = $nm->cmdInservVersion();
+
+        if ( $osVersion =~ /^2\./ ) {
+            # For version 2.x the max total # of VV's is:
+            $limit = 8192;
+        } elsif ( $osVersion =~ /^3\./ ) {
+            # For version 3.x the max total # of VV's is:
+            $limit = 32768;
+        } else {
+            # If osversion fails set $limit to undef
+            $limit = undef;
+        }
+
+        ## Warn if we reach 75% of the total available VVs
+        my $warn = 0.75 * $limit;
+        ## And crit if we reach 90%
+        my $crit    = 0.9 * $limit;
+        my $totalVv = $nm->totalNumVv();
+
+        print "For $inservHostname version is $osVersion and limit is $limit\n" if $debug;
+        print "For $inservHostname number of vvs is $totalVv\n"                 if $debug;
+
+        $queries{ "$inservHostname: Crit VVs - $crit, Total VVs" } = {
+            uiHint                       => $inservHostname,
+            recordMaxResults             => $MAX_RESULTS,
+            warn                         => "answer eq '' or answer > $warn",
+            ticketOnWarnOpenAfterMinutes => 1,
+            ticketOwner                  => "unassigned-sysadmin",
+            crit                         => "answer > $crit",
+            perl                         => sub { return $totalVv; },
+        };
+
+    }
+
+    my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter( $datacenter );
+    my $q =
+      ariba::monitor::QueryManager->newWithDetails( "3par-storage-health", $tab, $me->service(), $me->customer(),
+        \%queries );
+    $q->processQueriesUsingServer( $debug, $email, $sendEmail, $sendPage );
+}
+
+main();

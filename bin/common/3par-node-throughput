@@ -1,0 +1,185 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/common/3par-node-throughput#12 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::NetworkDeviceManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::Startup::Common;
+
+# keep about a year's worth of results, at 1 sample every 5 minutes
+my $MAX_RESULTS = 105120;
+
+sub main {
+
+	my $debug=0;
+	my $sendEmail=0;
+	my $sendPage=0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug++; }
+		if($arg =~ /^-e/o){ $sendEmail=1; };
+		if($arg =~ /^-p/o){ $sendPage=1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+
+	# set this so that inserv logs to the right place
+	$ENV{'LOGSDIR'} = ariba::Ops::Startup::Common::logsDirForProduct($me);
+
+        my $hostname = ariba::Ops::NetworkUtils::hostname();
+        my $machine = ariba::Ops::Machine->new($hostname);
+        my $datacenter = $machine->datacenter();
+
+	my @inservDevices = ariba::Ops::NetworkDeviceManager->newFromDatacenter($datacenter, 'inserv');
+
+	unless (scalar(@inservDevices)) {
+		print "no 3par units found in $datacenter" if $debug;
+		exit 1;
+	}
+
+	my %queries;
+
+	for my $nm (@inservDevices) {
+
+		$nm->setDebug($debug -1 ) if $debug >= 2;
+		$nm->setLogResponses(0);
+
+		my $inservHostname = $nm->hostname();;
+
+		for my $node ( $nm->nodeList() ) {
+
+			$queries{"$inservHostname: Node $node Front End Read IO/Sec"} = {
+				uiHint => "$inservHostname/Throughput/Node $node",
+				recordMaxResults => $MAX_RESULTS,
+				info => "answer ne '' && answer >= 0",
+				warn => "answer eq ''",
+				perl => sub { return $nm->nodeFeReadIOPerSec($node) },
+			};
+
+			$queries{"$inservHostname: Node $node Front End Read Mbits/Sec"} = {
+				uiHint => "$inservHostname/Throughput/Node $node",
+				recordMaxResults => $MAX_RESULTS,
+				info => "answer ne '' && answer >= 0",
+				warn => "answer eq ''",
+				perl => sub { return $nm->nodeFeReadMBitsPerSec($node) },
+			};
+
+			$queries{"$inservHostname: Node $node Front End Write IO/Sec"} = {
+				uiHint => "$inservHostname/Throughput/Node $node",
+				recordMaxResults => $MAX_RESULTS,
+				info => "answer ne '' && answer >= 0",
+				warn => "answer eq ''",
+				perl => sub { return $nm->nodeFeWriteIOPerSec($node) },
+			};
+
+			$queries{"$inservHostname: Node $node Front End Write Mbits/Sec"} = {
+				uiHint => "$inservHostname/Throughput/Node $node",
+				recordMaxResults => $MAX_RESULTS,
+				info => "answer ne '' && answer >= 0",
+				warn => "answer eq ''",
+				perl => sub { return $nm->nodeFeWriteMBitsPerSec($node) },
+			};
+
+			my $nodeReadIOPsPerSecReadThreshold = $nm->nodeMaxReadIOPsPerSec($node) * $nm->nodeBeReadRatio($node);
+			$queries{"$inservHostname: Node $node Back End Read IO/Sec"} = {
+				uiHint => "$inservHostname/Throughput/Node $node",
+				recordMaxResults => $MAX_RESULTS,
+				info => "answer ne '' && answer >= 0",
+				warn => "answer eq '' || answer >= $nodeReadIOPsPerSecReadThreshold",
+				perl => sub { return $nm->nodeBeReadIOPerSec($node) },
+			};
+
+			my $nodeReadMBitsPerSecReadThreshold = $nm->nodeMaxReadMBitsPerSec($node) * $nm->nodeBeReadRatio($node);
+			$queries{"$inservHostname: Node $node Back End Read Mbits/Sec"} = {
+				uiHint => "$inservHostname/Throughput/Node $node",
+				recordMaxResults => $MAX_RESULTS,
+				info => "answer ne '' && answer >= 0",
+				warn => "answer eq '' || answer >= $nodeReadMBitsPerSecReadThreshold",
+				perl => sub { return $nm->nodeBeReadMBitsPerSec($node) },
+			};
+
+			my $nodeWriteIOPsPerSecReadThreshold = $nm->nodeMaxWriteIOPsPerSec($node) * $nm->nodeBeWriteRatio($node);
+			$queries{"$inservHostname: Node $node Back End Write IO/Sec"} = {
+				uiHint => "$inservHostname/Throughput/Node $node",
+				recordMaxResults => $MAX_RESULTS,
+				info => "answer ne '' && answer >= 0",
+				warn => "answer eq '' || answer >= $nodeWriteIOPsPerSecReadThreshold",
+				perl => sub { return $nm->nodeBeWriteIOPerSec($node) },
+			};
+
+			my $nodeWriteMBitsPerSecReadThreshold = $nm->nodeMaxWriteMBitsPerSec($node) * $nm->nodeBeWriteRatio($node);
+			$queries{"$inservHostname: Node $node Back End Write Mbits/Sec"} = {
+				uiHint => "$inservHostname/Throughput/Node $node",
+				recordMaxResults => $MAX_RESULTS,
+				info => "answer ne '' && answer >= 0",
+				warn => "answer eq '' || answer >= $nodeWriteMBitsPerSecReadThreshold",
+				perl => sub { return $nm->nodeBeWriteMBitsPerSec($node) },
+			};
+
+		}
+
+		for my $portIdentifier ($nm->portList()) {
+
+			my $hbaBrand = uc($nm->portParameters()->{$portIdentifier}->brand());
+			my $hbaSpeed = $nm->portParameters()->{$portIdentifier}->maxrate();
+
+			my $hbaLimit = -1;
+			if ($hbaSpeed eq "2Gbps") {
+				$hbaLimit = 497 if $hbaBrand eq "QLOGIC";
+				$hbaLimit = 510 if $hbaBrand eq "LSI";
+			}
+			if ($hbaSpeed eq "4Gbps") {
+				$hbaLimit = 959 if $hbaBrand eq "EMULEX";
+				$hbaLimit = 1984 if $hbaBrand eq "3PAR";
+			}
+
+			if ($nm->portStats->{$portIdentifier}) {
+
+				my $queueLength = $nm->portStats()->{$portIdentifier}->queueLength();
+				my $uiHint = "$inservHostname/Queue Length";
+				my $portName = $nm->portStats()->{$portIdentifier}->name();
+				my $note;
+				if ($nm->isFrontEndPort($portIdentifier)) {
+					my $connectedHost = $nm->portParameters()->{$portIdentifier}->connectedHost();
+					$connectedHost = "<host not found>" if !$connectedHost;
+					$note = "Connected Host: $connectedHost";
+					$uiHint .= "/Front End";
+				} elsif ($nm->isBackEndPort($portIdentifier)) {
+					$uiHint .= "/Back End";
+				} elsif ($nm->isFreePort($portIdentifier)) {
+					$uiHint .= "/Unused";
+				} else {
+					$uiHint .= "/Unknown Port Type";
+				}
+
+				$queries{"$inservHostname: $portName Queue Length"} = {
+					uiHint => $uiHint,
+					recordMaxResults => $MAX_RESULTS,
+					info => "answer ne '' && answer >= 0",
+					warn => "!defined(answer) || answer >= $hbaLimit * .75",
+					crit => "!defined(answer) && answer >= $hbaLimit * .90",
+					perl => sub { return $queueLength },
+					note => $note,
+				};
+			}
+		}
+
+	}
+
+	my $email = $me->default('notify.email');
+	my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+	my $q = ariba::monitor::QueryManager->newWithDetails("3par-performance-stats", $tab, $me->service(), undef, \%queries);
+	$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+}
+
+main();

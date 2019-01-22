@@ -1,0 +1,23 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/everywhere/read-qbr-stdin#2 $
+#
+# Take a QueryBehaviorRequest on stdin and save it to disk.
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../lib/perl";
+
+use ariba::monitor::QueryBehaviorRequest;
+
+sub main {
+	$| = 1;
+	print "\n\n\nqbr\n";
+	my @objs = ariba::monitor::QueryBehaviorRequest->createObjectsFromStream(*STDIN, 1);
+	$objs[0]->save();	
+}
+
+main();
+

@@ -1,0 +1,189 @@
+#!/usr/local/bin/perl -w
+
+# $Id: $
+
+use strict;
+use FindBin;
+use lib "/usr/local/ariba/lib";
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Machine;
+
+my $debug = 0;
+
+sub usage {
+	my $error = shift;
+
+	print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+	-e    Enables sending of email for monitor query.
+	-p    Enables sending of pages for monitor query.
+	-d    Turns on debug mode.
+	-h    Shows this help.
+
+USAGE
+
+	print "(error) $error\n" if ($error);
+
+	exit();
+}
+
+sub run {
+	my $cmd = shift;
+
+	print "Running $cmd\n" if ($debug);
+
+	open(STDERR, ">/dev/null"); # Avoid spew from STDERR
+	my $output = `$cmd`;
+
+	print "Output: $output\n" if ($debug);
+
+	return $output;
+}
+
+sub allDisks {
+	my %disks;
+	my $cmd = '/usr/sbin/vxdisk list -o alldgs -e';
+
+	my $diskList = run($cmd);
+	if ($diskList) {
+		foreach my $line (split(/\n/, $diskList)) {
+			next unless $line;
+
+			my @columns = split(/\s+/, $line);
+			my $disk = $columns[$#columns];
+			my $diskGroup = $columns[3];
+
+			next unless ($disk && $disk =~ /^[a-z]+$/);
+			next if (!$diskGroup || $diskGroup eq '-');
+
+			$disks{$disk} = 1;
+		}
+	}
+
+	my @disks = sort keys(%disks);
+	print "Returning '@disks'\n" if ($debug);
+
+	return @disks;
+}
+
+sub nonActiveVolumesAndPlexesFromString {
+	my $diskInfo = shift;
+	my $stateColumnIndex = shift;
+	my @nonActiveVolumesAndPlexes;
+
+	if ($diskInfo) {
+		foreach my $line (split(/\n/, $diskInfo)) {
+			next unless $line;
+
+			my @columns = split(/\s+/, $line);
+			next unless ($#columns > $stateColumnIndex);
+
+			if ($columns[0] =~ /^(?:v|pl)$/) {
+				my $state = $columns[$stateColumnIndex];
+				print "Looking at '$line'\n" if ($debug);
+				print "State: '$state'\n" if ($debug);
+				if ($state ne 'ACTIVE') {
+					push(@nonActiveVolumesAndPlexes, $line);
+				}
+			}
+		}
+	}
+
+	return join("\n", @nonActiveVolumesAndPlexes);
+}
+
+sub nonActiveVolumesAndPlexesFromConfig {
+	my @disks = allDisks();
+	my $diskInfo = '';
+
+	if (@disks) {
+		foreach my $disk (@disks) {
+			my $diskPath = "/dev/$disk";
+			my $cmd = "/etc/vx/diag.d/vxprivutil dumpconfig  $diskPath | /usr/sbin/vxprint -D - -ht";
+
+			my $info = run($cmd);
+
+			next unless ($info);
+
+			$diskInfo .= $info;
+		}
+	}
+
+	return nonActiveVolumesAndPlexesFromString($diskInfo, 4);
+}
+
+sub nonActiveVolumesAndPlexesFromMemory {
+	my $diskInfo = run('/usr/sbin/vxprint -A');
+
+	return nonActiveVolumesAndPlexesFromString($diskInfo, 6);
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while (my $arg = shift) {
+		if ($arg =~ /^-h/o) { usage(); 			next; }
+		if ($arg =~ /^-d/o) { $debug++; 		next; }
+		if ($arg =~ /^-e/o) { $sendEmail = 1; 	next; }
+		if ($arg =~ /^-p/o) { $sendPage = 1; 	next; }
+
+		usage("Invalid argument: $arg");
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $service = $me->service();
+	my $machine = ariba::Ops::Machine->new();
+	my $datacenter = $machine->datacenter();
+	my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+	my %queries;
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+
+	my %configTypes = (
+		'memory' => sub { main::nonActiveVolumesAndPlexesFromMemory() },
+		'config' => sub { main::nonActiveVolumesAndPlexesFromConfig() }
+	);
+
+while (my ($type, $subRef) = each(%configTypes)) {
+	$queries{"$hostname - $service - non-active disk volumes and plexes from $type"} = {
+		info	=> 'numrows == 0',
+		warn	=> 'numrows > 0',
+		perl	=> $subRef,
+		ticketOnWarnOpenAfterMinutes	=> 1,
+		ticketOwner 					=> 'unassigned-sysadmin',
+	};
+	# for now squeeze the spaces out and send only 1st 20 chars.
+	# when we have the grafana ajax endabled we will then have a better
+	# way to display this type of text data
+	my $result_str = &$subRef;
+	$result_str =~ s/\s//g;
+	my $result = ( $result_str eq "" ) ? 0 : 1;
+	$result_str = ( $result_str eq "" ) ? "none" : substr($result_str, 0, 20);
+	my %influx_data = ();
+	$influx_data{'measurement'} = 'veritas_disk_state';
+	$influx_data{'tags'} = { host => $hostname, service => $service, product => $datacenter, type => $type, result_str => $result_str };
+	$influx_data{'data'}->{'result'} = $result;
+
+	eval {
+			my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+			ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line);
+	};
+	}
+
+	my $email = $me->default('notify.email');
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails('veritas-disk-state', $tab, $me->service(), $me->customer(), \%queries);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);
+
+__END__
+

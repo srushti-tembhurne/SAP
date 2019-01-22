@@ -1,0 +1,382 @@
+#!/usr/local/bin/perl -w
+#
+# job to analyze AN dirctory and communities databases in primary and dr 
+# databases
+#
+# $Id: //ariba/services/monitor/bin/an/analyze-all-an-schemas#5 $
+#
+
+use strict;
+
+use lib qw(/usr/local/ariba/lib);
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::OracleClient;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::Passwords;
+use dmail::LockLib;
+
+my $client;
+my $user;
+my $debug = 0;
+my $job;
+
+sub debug {
+    my $arg = shift;
+
+    if ($debug) {
+        print "[$$: " . localtime() . "] $arg\n";
+    }
+}
+
+#
+# Important:
+# - Monitoring assumes that
+#   a) all tables/indexes should be analyzed within 2 days
+#   b) any table/index should be analyzed at least once within 60 days
+# The number "60" is encoded here in the parameters table as maxInterval
+#
+
+#
+# rationale for the sample size & frequencies:
+# - once the number of rows is large enough (10-100k), full scan vs index scan
+#   is usually always the same decision. At that point absolute numbers don't
+#   matter anymore, but relative numbers (column densities, index selectivity) 
+#   do.
+# - big tables will have a reasonably stable set of statistics. It doesn't 
+#   generally matter if a big table has 10mio or 20mio rows - explain plans 
+#   will stay the same based on the densities
+# - oracle appears to systematically underestimate column densities as sample
+#   sizes go down (i.e. # distinct values).
+# - as a result, it is probably better to analyze large tables with high
+#   sample size, but less often than smaller tables
+# - since small tables are cheap to analyze, why not do it with high sample 
+#   size AND often
+# - note that it does not help to analyze a table at 5% and the index at 50%
+#   the relevant selectivity - if the row is gotten, not if only the index 
+#   suffices - comes from the table! 
+#
+
+# note: those parameters can be overridden by entries in IDL_ANA_PARAMETERS
+
+my %parameters = (
+  'degree'  => 1,        # degree of parallelity (note: saw some crashes >1)
+  'window' =>  4,        # max hours per run (note: last table can run over)
+  'maxInterval' => 60    # max days between analyze
+);
+
+#
+# values for the sample size/interval by row number
+#
+
+my %samples =
+(
+   20000    => 50,    
+   100000   => 40,
+   500000   => 30,
+   1000000  => 25,
+   10000000 => 25
+ );
+
+my %intervals =
+(
+   20000    =>  7,    
+   100000   =>  7,
+   500000   => 14,
+   1000000  => 20,
+   10000000 => 30
+ );
+
+my @filters = (
+		'DR$%'
+ );
+
+my %backedUp = ();
+   
+sub logBegin {
+    my $type = shift;
+    my $name = shift;
+    my $info = shift;
+
+    my $r = $client->executeSql("SELECT IDL_ANA_LOG_SEQ.NEXTVAL FROM DUAL");
+    
+    if (!defined($job)) {
+        $job = $r;
+    }
+
+    $info =~ s/\'/\'\'/g;
+    $client->executeSql("INSERT INTO IDL_ANA_LOG (ID, JOB, START_TIME, OBJECT_TYPE, OBJECT_NAME, INFO) VALUES ($r, $job, SYSDATE, '$type', '$name', '$info')");
+    return $r;
+}
+
+sub logEnd {
+    my $id = shift;
+    my $err = shift;
+    
+    if (! defined($err) || $err eq '') {
+        $err = 0;
+    }
+
+    $client->executeSql("UPDATE IDL_ANA_LOG SET END_TIME = SYSDATE, SQLERROR = $err WHERE ID = $id") if !$debug;
+}
+
+sub filterSubquery
+{
+	my $filterString;
+
+	for my $filterItem (@filters) {
+		if ($filterString) {
+			$filterString .= " and ";
+		} else {
+			$filterString = "";
+		}
+
+		$filterString .= "TABLE_NAME not like \'$filterItem\' ESCAPE '\\'";
+	}
+
+	return $filterString;
+}
+
+# back up table statistics if needed
+
+sub backupStatistics {
+    my $tableName = shift;
+
+    if (defined($backedUp{$tableName})) {
+        return;
+    }
+    $client->executeSql("exec DBMS_STATS.EXPORT_TABLE_STATS(USER, '$tableName', NULL, 'IDL_ANA_TABLE_STATS', '$job', TRUE);");
+    $backedUp{$tableName} = 1;
+}
+
+
+sub analyzeIndex {
+    my $tableName = shift;
+    my $indexName = shift;
+    my $sample = shift;
+    my $interval = shift;
+    my $last = shift;
+
+    debug("Index: $indexName Sample: $sample Interval: $interval Last: $last");
+
+    die "Sample size for $indexName is 0 - table not analyzed" if $sample <= 0;
+
+    if ($last < $interval) {
+        return;
+    }
+
+    my $sql = "exec DBMS_STATS.GATHER_INDEX_STATS('$user', '$indexName', NULL, $sample)";
+    
+    debug($sql);
+
+    my $log = logBegin('INDEX', $indexName, $sql);
+
+    backupStatistics($tableName);
+
+    $client->executeSql($sql) if !$debug;
+
+    logEnd($log, $client->handle()->err);
+}
+    
+sub analyzeTable {
+    my $tableName = shift;
+    my $sample = shift;
+    my $interval = shift;
+    my $method = shift;
+    my $degree = shift;
+    my $cascade = shift;
+    my $last = shift;
+
+    debug("Table: $tableName Sample $sample Interval $interval Method $method Degree $degree Cascade $cascade Last $last");
+
+    die "Sample size for $tableName is 0 - table not analyzed" if $sample <= 0;
+
+    if ($last < $interval) {
+        return;
+    }
+
+    my $sql = "exec DBMS_STATS.GATHER_TABLE_STATS('$user','$tableName',NULL,$sample,FALSE,'$method',$degree,'DEFAULT',$cascade)";
+
+    debug($sql);
+
+    my $log = logBegin('TABLE', $tableName, $sql);
+
+    backupStatistics($tableName);
+
+    $client->executeSql($sql) if !$debug;
+ 
+    logEnd($log, $client->handle()->err);
+}       
+
+sub generic_map {
+    my $rows = shift;
+    my $list = shift;
+
+    my @steps = sort {$a <=> $b} keys(%$list);
+    my $index;
+    for ($index = 0;$index < scalar(@steps) && $steps[$index] < $rows;$index++) { };
+    if ($index >= scalar(@steps)) {
+        $index = scalar(@steps)-1;
+    }
+    return $list->{$steps[$index]};
+}
+
+sub interval {
+    my $table = shift;
+    my $rows = shift;
+
+    my $int = generic_map($rows, \%intervals);
+    
+    if ($int > $parameters{'maxInterval'}) {
+        return $parameters{'maxInterval'};
+    } else {
+        return $int;
+    }
+}
+
+sub sample {
+    my $table = shift;
+    my $rows = shift;
+
+    return generic_map($rows, \%samples);
+}
+
+sub handleTable {
+    my $tableName = shift;
+
+    my $row = $client->executeSql("SELECT sysdate - nvl(LAST_ANALYZED, sysdate-1000), nvl(NUM_ROWS, 0), TEMPORARY FROM USER_TABLES WHERE TABLE_NAME = '$tableName'");
+    my ($last, $rows, $temp) = split($client->colsep(), $row);
+    if ($temp eq 'Y') {
+        return;
+    }
+    
+    my $int = interval($tableName, $rows);
+    my $samp = sample($tableName, $rows);
+    my $degree = $parameters{'degree'};
+    my $method = 'FOR ALL COLUMNS SIZE 1';
+    my $cascade = "TRUE";
+
+    my @rows = $client->executeSql("SELECT SAMPLE, INTERVAL, METHOD_OPT, DEGREE, CASCADE FROM IDL_ANA_OVERRIDES WHERE OBJECT_TYPE = 'TABLE' AND OBJECT_NAME = '$tableName'");
+
+    if (scalar(@rows) > 0) {
+        for $row (@rows) {
+            my ($orsample, $orint, $ormethod, $ordegree, $orcascade) = split($client->colsep(), $row);
+            analyzeTable($tableName,
+                         $orsample ne '' ? $orsample : $samp,
+                         $orint ne '' ? $orint : $int,
+                         $ormethod ne '' ? $ormethod : $method,
+                         $ordegree ne '' ? $ordegree : $degree,
+                         $orcascade ne '' ? $orcascade : $cascade,
+                         $last);
+        }
+    } else {
+        analyzeTable ($tableName, $samp, $int, $method, $degree, $cascade, $last);
+    }
+
+    my @indexes = $client->executeSql("SELECT INDEX_NAME, SYSDATE - nvl(LAST_ANALYZED,sysdate-1000) FROM USER_INDEXES WHERE TABLE_NAME = '$tableName'");
+    for my $indexRow (@indexes) {
+        my ($indexName, $lastIx) = split($client->colsep(), $indexRow);
+        my @rows = $client->executeSql("SELECT SAMPLE, INTERVAL, METHOD_OPT, DEGREE, CASCADE FROM IDL_ANA_OVERRIDES WHERE OBJECT_TYPE = 'INDEX' AND OBJECT_NAME = '$indexName'");
+
+        if (scalar(@rows) > 0) {
+            for $row (@rows) {
+                my ($orsample, $orint, $ormethod, $ordegree, $orcascade) = split($client->colsep(), $row);
+                analyzeIndex($tableName, $indexName,
+                             $orsample ne '' ? $orsample : $samp,
+                             $orint ne '' ? $orint : $int,
+                             $lastIx);
+            }
+        } else {
+            analyzeIndex ($tableName, $indexName, $samp, $int, $lastIx);
+        }
+    }        
+}
+
+sub loadParameters {
+    my @par = $client->executeSql("SELECT NAME, VALUE FROM IDL_ANA_PARAMETERS");
+
+    for my $row (@par) {
+        my ($name, $val) = split($client->colsep(), $row);
+        $parameters{$name} = $val;
+        print "Overriding $name to $val\n" if $debug;
+    }
+}
+
+sub analyze {
+    my $dbc = shift;
+
+    my $resource = "/tmp/analyze-" . $dbc->host() . "-" . $dbc->sid() . "-" . $dbc->user();
+
+    if (!dmail::LockLib::requestlock($resource,10)) {
+       die "can't grab lock\n";
+    }
+
+
+
+    debug($dbc->user() . "\@" . $dbc->sid . ":" . $dbc->host());
+
+    $client = ariba::Ops::OracleClient->newFromDBConnection($dbc); 
+
+    $client->connect() || die "could not connect, $!\n";
+
+    $user = $client->executeSql("SELECT USER FROM DUAL");
+
+    loadParameters();
+
+    my $sql = "SELECT TABLE_NAME FROM".
+            " (SELECT TABLE_NAME, NVL(LAST_ANALYZED, SYSDATE-1000)".
+            " FROM USER_TABLES WHERE ".
+            filterSubquery().
+            " AND TEMPORARY = 'N' ORDER BY 2)";
+
+    my @t1 = $client->executeSql($sql);
+
+    my $log = logBegin("SCHEMA",$user,"Checking " . scalar(@t1) . " tables.");
+
+    my $startTime = time();
+
+    for my $table (@t1) {
+
+        handleTable($table);
+
+        my ($s, $m, $hour) = localtime;
+        if (time() - $startTime > $parameters{'window'} * 3600) {
+            last;
+        }
+    }
+
+    logEnd($log, 0);
+    $client->disconnect();
+
+    dmail::LockLib::releaselock($resource);
+}
+
+sub main {
+    $debug = defined($ARGV[0]) && ($ARGV[0] =~ /^-d/);
+
+    if(-f "/etc/noanalyze" && !(time() > (stat(_))[9] + 24*60*60)) {
+        die "Skipped analyze because /etc/noanalyze exists";
+    }
+
+    my @types = (ariba::Ops::DBConnection->typeMain());
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $an = ariba::rc::InstalledProduct->new("an", $me->service());
+
+    my @connections = ();
+
+    for my $type (@types) {
+        push @connections, ariba::Ops::DBConnection->connectionsForProductOfDBType($an, $type);
+    }
+
+    @connections = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSidAndSchema(@connections);
+
+    for my $dbc (@connections) {
+        if (fork() == 0) {
+            analyze($dbc);
+            return;
+        }
+    }
+}
+
+main();

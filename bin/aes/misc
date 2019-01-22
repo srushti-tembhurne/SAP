@@ -1,0 +1,141 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/aes/misc#14 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::OracleClient;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+
+sub main {
+	my $debug = 0;
+	my $quiet = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $productName  = 'aes';
+
+	while(my $arg=shift(@ARGV)){
+			print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+			if($arg =~ /^-d/o){ $debug=1; }
+			if($arg =~ /^-e/o){ $sendEmail=1; };
+			if($arg =~ /^-p$/o){ $sendPage=1; };
+			if($arg =~ /^-product/o){ $productName = shift(@ARGV); next; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $cluster = $me->currentCluster();
+	my $email = $me->default('notify.email');
+
+	my @products = ariba::rc::InstalledProduct->installedProductsList($me->service(), $productName);
+
+	foreach my $product (@products) {
+
+		my %queries  = ();
+		my $customer = $product->customer();
+		my $baseMajorRelease = $product->baseMajorReleaseName();
+
+		$queries{"$customer schema version"} = {
+			format => "%s.%s.%s build_number %s build_date %s\n",
+			info => "numrows >= 1",
+			warn => "numrows < 1",
+			customer => $customer,
+			sql => q`
+				select major_version, minor_version, revision, build_number, build_date from schema_version;
+			`,
+		};
+
+		$queries{"$customer potentially active user sessions"} = {
+			recordMaxResults => 15000,
+			recordDataType => "gauge",
+			info => "answer >= 0 || answer eq ''",
+			warn => "answer >= 100",
+			customer => $customer,
+			sql => q`
+				select count(sessionid) from sessions where state = 1 and starttime > sysdate - 1/24
+			`,
+		};
+
+		my $inactiveDaysCount = 30;
+
+		#FIXME there's a bug here, as elsewhere where we assume some
+		# run time (another place is fax sent status in
+		# an/order-status) because this code and the cron job code in
+		# the startup hook are logicaly tied but have separate
+		# sources of truth, so if the cronjob period changes this
+		# may break
+		#
+		my $samplesPerDay = 144; # 6 times an hour * 24 
+
+		$queries{"$customer sessions for past $inactiveDaysCount days"} = {
+			info => "answer > 0",
+			warn => "answer eq '' or answer < 1",
+			extractRecorded => "sum($productName/$customer/$customer" . "_potentially_active_user_sessions, ". ($inactiveDaysCount * $samplesPerDay) .")",
+		};
+
+		# status:
+		# open = 1
+		# pendingclear = 7
+		# scheduled = 8
+		# preview = 10
+		# pendinglaunch = 11
+		#
+		# See
+		# //TD/Market_Suite/Releases/4.0.0/GA/dev/core/TradingDynamics/api/data/State.java
+		#
+		# Too many customer leave auctions in pending clear;  try to guess if
+		# they are really "active".
+
+		my $twoDaysAgo =  time() - (2 * 86400);
+
+		my $lastBidTimeColumn = "lastactivitytime";
+		if ($baseMajorRelease >= 4.1) {
+			$lastBidTimeColumn = "lastbidactivity";
+		}
+
+		$queries{"$customer running auctions"} = {
+			recordMaxResults => 15000,
+			recordDataType => "gauge",
+			info => "answer >= 0 || answer eq ''",
+			customer => $customer,
+			sql => "
+				select 
+					( select count(auctionid) from auctions where status in (1, 10) ) +
+					( select count(auctionid) from auctions where 
+						status = 7 and
+						$lastBidTimeColumn > ( $twoDaysAgo * 1000)
+					)
+				from dual;
+			",
+		};
+
+		# starttime is unix time, in milliseconds
+
+		$queries{"$customer scheduled auctions"} = {
+			info => "numrows >= 0",
+			customer => $customer,
+			sql => q`
+				select name, 
+					to_char( new_time( (to_date('01-01-1970', 'MM-DD-YYYY')
+							+ starttime / ( 86400 * 1000) ), 'GMT', 'PST'),
+					'YYYY-MM-DD HH24:MI:SS')
+				from auctions where status = 8;
+			`,
+		};
+
+		my $q = ariba::monitor::QueryManager->newWithDetails(
+			"misc", $product->name(), $product->service(), $product->customer(), \%queries
+		);
+
+		$q->setSQLConnectInfo($product->connectInfoForOracleClient());
+
+		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	};
+};
+
+main();

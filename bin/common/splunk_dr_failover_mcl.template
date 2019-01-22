@@ -1,0 +1,42 @@
+
+Step SplunkDrFailover
+Title: Splunk DR Failover
+Options: expando
+
+Step splunk_1
+Title: configure and start the standby master node
+Expando: SplunkDrFailover
+Action: Shell ${user}@${mst_standby} {
+    $ sudo /home/${user}/splunk/bin/cfg_node_dr 
+    SuccessString: Configuration Change Completed
+    $ sudo ${spk_cmd} restart
+    SuccessString: The Splunk web interface is at
+    $ sudo /home/${user}/splunk/bin/spk_cmd_wrapper set indexing-ready
+    SuccessString: Success
+}
+
+Step splunk_2
+Title: configure and start indexers (loop)
+Depends: splunk_1
+Expando: SplunkDrFailover
+Loop: hostnm=${idxlist}
+Action: Shell ${user}@${hostnm} {
+    $ sudo /home/${user}/splunk/bin/cfg_node_dr
+    SuccessString: Configuration Change Completed
+    $ sudo ${spk_cmd} restart
+    SuccessString: The Splunk web interface is at
+}
+
+
+Step splunk_3
+Title: configure and start search heads (loop)
+Depends: splunk_1
+Expando: SplunkDrFailover
+Loop: hostnm=${shlist}
+Action: Shell ${user}@${hostnm} {
+    $ sudo /home/${user}/splunk/bin/cfg_node_dr
+    SuccessString: Configuration Change Completed
+    $ sudo ${spk_cmd} restart
+    SuccessString: The Splunk web interface is at
+}
+

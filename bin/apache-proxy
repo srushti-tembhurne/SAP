@@ -1,0 +1,46 @@
+#!/usr/local/bin/perl -w
+#
+# $Id:$
+#
+# This scripts maps a url to a completely different url listed in url.proxy
+# file.
+#
+# We do this so a url like http://ops.ariba.com/cgi-bin/vm can be mapped
+# to http://mon11.snv.ariba.com/cgi-bin/vm by just listing the second url
+# in vm.proxy file.
+#
+#
+#
+use strict;
+use FindBin;
+
+$| = 1;
+
+# Apache 2.0 doesn't pass any environment along.
+my $docRoot = "$FindBin::Bin/../docroot";
+my $cgiRoot = "$docRoot/cgi-bin";
+
+while(my $input = <STDIN>) {
+	chomp($input);
+	my ($srcUrl, $args) = split(/\?/o, $input, 2);
+
+	my $file;
+	if ($srcUrl =~ s|/?cgi-bin/||){
+		$file = "$cgiRoot/$srcUrl.proxy";
+	} else {
+		$file = "$docRoot/$srcUrl.proxy";
+	}
+
+	open(URL, $file ) || die $!;
+	my $url = <URL>;
+	chomp($url);
+	close(URL);
+
+	if ($args){
+		print $url . "?". $args,"\n";
+	} else {
+		print $url,"\n";
+	}
+}
+
+__END__

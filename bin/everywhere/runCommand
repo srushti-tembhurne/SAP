@@ -1,0 +1,207 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/everywhere/runCommand#11 $
+# $Author: bob.mcgowan $
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+use ariba::Ops::Machine;
+use ariba::Ops::Constants;
+use ariba::rc::Utils;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ServiceController;
+
+my $DEBUG = 0;
+
+my $DIRECT = 1;
+my $INDIRECT = 2;
+
+sub usage {
+	print STDERR<<"EOF";
+$0 Usage:
+
+This script is used to run a command on multiple hosts.  It will prompt you for
+the command to run (which can include ';' and '&', but no quotes), the data
+center to run it in, the OS to run it on, the value of providesServices that
+the host must match, the value of rackNumber that the host must match, the
+username (which defaults to 'root', and the password for that user.  If the
+command will be run in prod, this script will prompt for every different tier
+password that it will need.
+
+EOF
+}
+
+main();
+sub main {
+	my @fields = qw(datacenter providesServices rackNumber os);
+
+	my ($choice,$cmd,$username,$password,@tier_password);
+	my (@array) = ();
+
+	if (@ARGV > 0) {
+		usage;
+		exit 1;
+	}
+
+	print "\nRun command:\n\n";
+	print "    $DIRECT) locally on mon2\n";
+	print "    $INDIRECT) via ssh to remote machine\n\n";
+	print "Enter your choice: ";
+	chomp($choice = <STDIN>);
+	if ($choice !~ /^[0-9]+$/ || ($choice != $DIRECT && $choice != $INDIRECT)) {
+		die "Invalid choice: '$choice'";
+	}
+	
+	print "Enter command: ";
+	chomp($cmd = <STDIN>);
+	if ($cmd =~ s/^"(.*)"$/$1/ ||
+	    $cmd =~ s/^'(.*)'$/$1/) {
+		print "\nThe entire command is now implicitly quoted; you do not need to put explicit\nquotes.  Your quotes have been removed.\n\n";
+	}
+	elsif ($cmd =~ /[`"']/) {
+		print "Quoting is too dangerous.  Find another way to do it (or rewrite runCommand\nto do it more safely).\n";
+		exit 1;
+	}
+
+	my %query = ('status' => 'inservice,spare');
+
+	for my $field (sort @fields) {
+		print "Enter $field: ";
+		chomp(my $value = <STDIN>);
+
+		next unless $value;
+
+#		unless ( ariba::Ops::Machine->validateField($field, $value) ) {
+#			die "'$value' is an invalid $field\n";
+#		}
+
+		$query{$field} = $value;
+
+		print "$query{$field}\n" if $DEBUG;
+	}
+
+	my @machines = ariba::Ops::Machine->machinesWithProperties(%query);
+
+	if ($choice == $INDIRECT) {
+		print "Enter username [root]: ";
+		chomp($username = <STDIN>);
+		$username = "root" if not $username;
+		if ($username =~ /[^a-z0-9]/) {
+			die "Illegal username: '$username'";
+		}
+
+		if ( $username ne "root" ) {
+			print "Enter password for $username: ";
+			system("stty -echo");
+			chomp($password = <STDIN>);
+			system("stty echo");
+			print "\n";
+
+		} elsif ( $query{'datacenter'} =~ /(?:devlab|opslab|beta|demo)/i ) {
+			print "Enter root password for $query{'datacenter'}: ";
+			system("stty -echo");
+			chomp($password = <STDIN>);
+			system("stty echo");
+			print "\n";
+
+		} elsif ( $query{'datacenter'} =~ /(?:snv|bou|us1)/ ) {
+
+			for my $machine ( sort byname @machines ) {
+				my $name = $machine->hostname();
+				my $tier = ariba::Ops::NetworkUtils::hostnameToTier($name);
+
+				# If $tier isn't defined, or if it is defined
+				# but doesn't begin with a digit, make some
+				# noise about it, but keep going.
+				if ((not defined $tier) ||
+				    $tier =~ m,^\D,) {
+					print "\nSkipping host with unknown tier: $name\n";
+					next;
+				} else {
+					$tier =~ s/\D.*//;
+				}
+
+				if ( not defined ($tier_password[$tier]) ) {
+					print "\nEnter tier $tier $username password: ";
+					system("stty -echo");
+					chomp($tier_password[$tier] = <STDIN>);
+					system("stty echo");
+					print "\n";
+				}
+			}
+
+		} else {
+			die "Unknown data center: " . $query{'datacenter'};
+		}
+	}
+
+	for my $machine ( sort byname @machines ) {
+		my $host = $machine->hostname();
+		my $service = $machine->service();
+		my $name = $machine->hostname();
+		my $tier = ariba::Ops::NetworkUtils::hostnameToTier($name);
+
+		# If $tier isn't defined, or if it is defined but doesn't begin
+		# with a digit, make some noise about it, but keep going.
+		if (ariba::Ops::ServiceController::isProductionServicesOnly($service)) {
+			if ((not defined $tier) || $tier =~ m,^\D,) {
+				print "\nSkipping host with unknown tier: $name\n";
+				next;
+			} else {
+				$tier =~ s/\D.*//;
+			}
+		}
+
+		print "Username -> $username\n" if $DEBUG;
+		print "Password -> $password\n" if (defined $password && $DEBUG);
+		print "T1 Password -> $tier_password[1]\n" if (defined $tier_password[1] && $DEBUG);
+		print "T2 Password -> $tier_password[2]\n" if (defined $tier_password[2] && $DEBUG);
+		print "T3 Password -> $tier_password[3]\n" if (defined $tier_password[3] && $DEBUG);
+		print "Host -> $host\n" if $DEBUG;
+
+		if ( $choice == $DIRECT ) {
+			direct($host, $cmd);	
+		} elsif ( $choice == $INDIRECT ) {
+			if ( $username ne "root" ) {
+				indirect($host, $cmd, $username, $password);	
+			} elsif (!(ariba::Ops::ServiceController::isProductionServicesOnly($service))) {
+				indirect($host, $cmd, $username, $password);	
+			} else {
+				indirect($host, $cmd, $username, $tier_password[$tier]);	
+			} 
+		}
+	}
+
+	exit(0);
+}
+
+sub direct {
+	my $host = shift;
+	my $cmd = shift;
+
+	print "\n\n *** Working on $host: \n\n";
+
+	$cmd =~ s/host/$host/g;
+
+	system("$cmd");
+}
+
+sub indirect {
+	my $host = shift;
+	my $cmd = shift;
+	my $username = shift;
+	my $password = shift;
+
+	print "\n\n *** Working on $host: \n\n";
+
+	my $action = "ssh $username\@$host '$cmd'";
+	ariba::rc::Utils::sshCover($action, $password, undef, 60, 0);
+}
+
+sub byname {
+        my $an = $a->instance();
+        my $bn = $b->instance();
+
+        return $an cmp $bn;
+}
+

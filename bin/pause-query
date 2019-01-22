@@ -1,0 +1,128 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/pause-query#8 $
+#
+# This program creates a QueryBehaviorRequest object, and sets various
+# attributes on it. It will login to remote machines, if the query was run on them.
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../lib/perl";
+
+use ariba::monitor::AuthenticationSession;
+use ariba::monitor::Query;
+use ariba::monitor::QueryBehaviorRequest;
+
+my $debug = 0;
+
+my $mode = "pause";
+
+sub main {
+
+        my $queryToPause = '';
+        my ($ttl, $status, $comment, $ticketId, $requestor);
+
+        # have a hidden -pause or -downgrade flags to force?
+        if ( $0 =~ /pause/ ) {
+                $mode = "pause";
+        } elsif( $0 =~ /annotate/ ) {
+                $mode = "annotate";
+        } else {
+                $mode = "downgrade";
+        }
+
+
+        while (my $arg = shift @ARGV) {
+                if ($arg =~ /-status/i) { $status = shift @ARGV; }
+                if ($arg =~ /-ttl/i) { $ttl = shift @ARGV; }
+                if ($arg =~ /-comment/i) { $comment = shift @ARGV; }
+                if ($arg =~ /-query/i) { $queryToPause = shift @ARGV; }
+                if ($arg =~ /-jira/i) { $ticketId = shift @ARGV; }
+                if ($arg =~ /-user/i) { $requestor = shift @ARGV; }
+                if ($arg =~ /-d/) { $debug = 1 }
+                if ($arg =~ /-h/) { usage(); }
+        }
+
+
+        usage() unless $queryToPause;
+
+        # We need at least one of these.
+        unless ($ttl) {
+                if( $mode eq "annotate") {
+                        $ttl = 315360000; # 10 years
+                } else {
+                        print "Time-to-live for $mode required.\n";
+                        usage();
+                }
+        }
+
+        unless ($comment && $ticketId ) {
+                print "Comment and ticketId for $mode required.\n";
+                usage();
+        }
+
+        if ( $mode eq "downgrade" && !$status ) {
+                print "-status <status> required.\n";
+                usage();
+        }
+
+        # Handle cut-and-paste.
+        $queryToPause =~ s/\.query$//o;
+
+        # Load the query off of disk.
+        unless (ariba::monitor::Query->objectWithNameExists($queryToPause)) {
+                printf("No such query: [%s] exists on disk! Exiting.\n", $queryToPause);
+                exit;
+        }
+
+        my $query = ariba::monitor::Query->new($queryToPause);
+
+        $query->setDebug(1) if $debug;
+
+        # create a 2-factor authentication object unless the user name was supplied on the command line
+        unless ( $requestor ) {
+            my $auth = ariba::monitor::AuthenticationSession->check();
+            $requestor = $auth->username() if $auth;
+            unless ( $requestor ) {
+                print "Couldn't successfully authenticate user! Exiting!\n";
+                exit(1);
+            }
+        }
+
+        if ( $mode eq "downgrade" ) {
+                $query->downgrade($status, $ttl * 60, $comment, $ticketId, $requestor);
+        }
+
+        if ( $mode eq "pause" ) {
+                $query->pause($ttl * 60, $comment, $ticketId, $requestor);
+        }
+
+        if( $mode eq "annotate" ) {
+                $query->annotate($comment,$ticketId,$requestor);
+        }
+}
+
+sub usage {
+        print "\n";
+        print "$0 -query <query> -jira <jiraID> -comment <comment> -ttl <minsFromNow> [see below]\n";
+
+        print "\n";
+        print "    -debug\n";
+        print "    -help\n";
+        print "    -query <queryName>   Query instance name (from query inspector)\n";
+        print "    -jira <jiraID>\n";
+        print "    -comment <comment>\n";
+        print "    -user <userID>    Using this option bypasses the 2-factor authentication\n";
+        print "    -ttl <minsFromNow>\n";
+
+        if ( $mode eq "downgrade" ) {
+                print "    -status <info|warn|crit>\n";
+        }
+        print "\n";
+        exit(0);
+}
+
+main();
+
+__END__

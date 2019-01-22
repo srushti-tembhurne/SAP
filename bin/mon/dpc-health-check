@@ -1,0 +1,110 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use Getopt::Long qw(GetOptions);
+use Pod::Usage;
+use Data::Dumper;
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::Ops::ProductConfigFactory;
+use ariba::Ops::ProductConfig::Monitors();
+
+=head1 SYNOPSIS
+
+    dpc-health-check -q "monitor_dpc"  [-d|-e|-p|-h]
+
+    Options:
+        --help|h             Show this help.
+        --query|q            Required. Specify queryname to monitor
+        --debug              Show debug messages.
+
+=cut
+
+pod2usage(2) unless (scalar (@ARGV));
+
+my $debug      = 0;
+my $send_email = 0;
+my $send_page  = 0;
+my $help       = 0;
+my $query      = undef;
+
+GetOptions(
+           "debug|d"   => \$debug,
+           "email|e"   => \$send_email,
+           "page|p"    => \$send_page,
+           "help|h"    => sub {pod2usage(1)},
+           "query|q=s" => \$query,
+          ) || pod2usage(2);
+
+sub main
+{
+    ### setup like this for future expansions
+    my %hash = ('monitor_dpc' => \&query_monitor_dpc );
+
+    ### Basic validation
+    unless ($hash{$query})
+    {
+        print "Invalid query name: $query \n";
+        die pod2usage(1);
+    }
+
+    eval {
+        my $method = $hash{$query};
+        $method->();
+    };
+
+}
+
+main();
+
+#### This runs from monserver
+sub query_monitor_dpc
+{
+    my %queries;
+
+    ### Get data from db
+    my $me   = ariba::rc::InstalledProduct->new("mon");
+    my $data = ariba::Ops::ProductConfig::Monitors::monitor_dpc();
+
+    ### Get respective data structures for further processing
+    my $prod2sid    = $data->{"product2sid"};
+    my $dpc_enabled = $data->{"dpc_enabled"};
+
+    ### Prod to sid mapping monitor
+    foreach my $sid (sort keys %{$prod2sid})
+    {
+        ### Ignore if sid is MON or RMAN
+        next if ($sid =~ /^(mon|rmn)/i);
+
+        my $qname = ($prod2sid->{$sid}->{"DB_NAME"}) ? $sid . ":" . $prod2sid->{$sid}->{"DB_NAME"} : $sid;
+
+        $queries{$qname} = {
+                            uiHint => "product-sid-mapping/" . $prod2sid->{$sid}->{"APP_DBTYPE"},
+                            info   => 'answer',
+                            perl   => sub {return $prod2sid->{$sid}->{"APP_NAME"}},
+                            crit   => 'answer eq ""',
+                           };
+    }
+
+    ### DPC enabled monitor
+    foreach my $sid (sort keys %{$dpc_enabled})
+    {
+        my $qname = ($dpc_enabled->{$sid}->{"DB_NAME"}) ? $sid . ":" . $dpc_enabled->{$sid}->{"DB_NAME"} : $sid;
+        $qname .= " " . $dpc_enabled->{$sid}->{"APP_NAME"};
+
+        $queries{$qname} = {
+                            uiHint => "dpc-turned-on/" . $dpc_enabled->{$sid}->{"APP_DBTYPE"},
+                            info   => 'answer',
+                            perl   => sub {return $dpc_enabled->{$sid}->{"ENABLED"}},
+                            crit   => 'answer eq "N"',
+                           };
+    }
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails("dpc-health-check", $me->name(), $me->service(), undef, \%queries, undef);
+    $qm->processQueries($debug);
+}

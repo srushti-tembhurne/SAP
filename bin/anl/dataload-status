@@ -1,0 +1,485 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: $
+#
+# Monitoring script to monitor status and duration of dataloads for each
+# analysis customer, as well as a count of how many dataloads are happening at
+# once.
+#
+# This works on the basis of dbinit.txt files.  For each customer, it will
+# pull down (rsync) the current dbinit.txt and all archived, then parse
+# them in order starting from most recent.
+# 
+# The first dbinit.txt it finds that has a completed starting "header" (see
+# the comments in parseDataLoadLog() ) will count as the current integrated
+# data load and will have its start time, end time, and status (if finished)
+# displayed.  
+#
+# This script has an additional mode that is enabled by specifiying
+# -recordAll. This option will cause the dbinit files to be processed in
+# reversed order (earliest to latest), and the duration for each to be
+# recorded in the customer's cdb.  This is intended to be used as a way to
+# initially populate the cdbs.
+#
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::rc::Utils;
+use ariba::rc::Globals;
+
+use DateTime::Format::HTTP;
+
+my ($debug, $sendEmail, $sendPage) = (0, 0, 0);
+
+$main::quiet = 1;
+my $CONSECUTIVE_FAILURE_THRESHOLD = 2;
+
+# need this for rsync to work from crontab
+$ENV{'PATH'} = '/usr/local/bin:' . $ENV{'PATH'};
+
+sub usage {
+	print 	"Error: $_[0]\n" if $_[0];
+	print	"\n",
+		"Usage: \n",
+		"$0 [-d|-e|-p|-h]\n",
+		"-d			turns on debugging\n",
+		"-e			send email notification\n",
+		"-p			send pager notification\n",
+		"-h			this help\n",
+		"-recordAll attempt to recreate all loads from the dbinit logs\n",
+		"-customer  run for specific customer\n",
+		"\n";
+	exit(1);
+}
+
+sub main {
+
+	my $recordAllDataLoads = 0;
+	my $customerName;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg eq '-d') { ++$debug; next; }
+		if ($arg eq '-e') { $sendEmail = 1; next;}
+		if ($arg eq '-p') { $sendPage = 1; next;}
+		if ($arg eq '-h') { usage(); next;}
+		if ($arg =~ /^-recordAll/i ) { $recordAllDataLoads = 1; next; }
+		if ($arg =~ /^-cust/i) { $customerName = shift(@ARGV); next; }
+
+		usage("uknown option: $arg");
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $prodname = "anl";
+	my $service = $me->service();
+	my $email = $me->default('notify.email');
+
+	my @products = ariba::rc::InstalledProduct->installedProductsList($service, $prodname, $customerName);
+
+	# password for anl*service* user
+	my $username = ariba::rc::Globals::deploymentUser($prodname, $service);
+	my $cipherStore = ariba::rc::CipherStore->new($service);
+	my $password    = $cipherStore->valueForName($username);
+	if (!$password and -t STDIN) {
+		ariba::rc::Passwords::initialize($service);
+		$password = ariba::rc::Passwords::lookup($username);
+	}
+
+	# don't ever page if initializing from all dbinit logs
+	if ($recordAllDataLoads) {
+		$sendEmail = 0;
+		$sendPage = 0;
+	}
+
+	my $dataloadsInProgress = 0;
+	my @customersInDataLoad;
+
+	foreach my $product (@products) {
+
+		my $customer = $product->customer();
+
+		# skip non-integrated customers
+		next unless $product->isInstanceSuiteDeployed();
+
+		print "Fetching logs for $customer\n" if ($recordAllDataLoads);
+		my $logFilePath = fetchLogs($product, $username, $password);
+		print "Processing Logs for $customer\n" if ($recordAllDataLoads);
+		my @allLoads = processDataLoads($logFilePath, $recordAllDataLoads);
+
+		while (my $load = shift @allLoads) {
+
+			my %queries = ();
+			my ($status, $note, $startTime, $endTime) = @$load;
+
+			unless (defined $status) {
+				++$dataloadsInProgress;
+				push(@customersInDataLoad, $customer);
+			}
+
+			my $warnDuration = 30; # 30 min
+			my $critDuration = 60; # 1 hour
+
+			if ($product->default("System.Analysis.Admin.DynamicSourceSystemEnabled")) {
+				$warnDuration = 60 * 2.5; # 2.5 hours
+				$critDuration = 60 * 3.0; # 3.0 hours
+			}
+
+			unless ($recordAllDataLoads) {
+
+				$queries{"$customer integrated dataload status"} = {
+					'info' => 0, #
+					'warn' => 0, # see processDataLoadStatus for threshold calculation
+					'crit' => 0, #
+					'noRowCount' => 1,
+					'note' => $note,
+					'customer' => $customer,
+					'perl' => sub { main::processDataLoadStatus($status, $startTime, $endTime, $note); },
+				};
+			}
+
+			$queries{"$customer integrated dataload duration"}  = {
+				'info' => "1",
+				'warn' => "answer >= $warnDuration",
+				'crit' => "answer >= $critDuration",
+				'noRowCount' => 1,
+				'customer' => $customer,
+				'format' => '%.0f minutes',
+				'recordDataUnits' => 'minutes',
+				'perl' => sub { main::processDataLoadDuration($startTime, $endTime, $status); },
+			};
+
+			my $qm = ariba::monitor::QueryManager->newWithDetails( 
+					"dataload-status", $product->name(), $product->service(), $product->customer(), \%queries);
+
+			if ($recordAllDataLoads) {
+				$qm->run();
+				$qm->archiveResults();
+			} else {
+				$qm->processQueries( $debug, $email, $sendEmail, $sendPage );
+			}
+		}
+	}
+
+	unless ($recordAllDataLoads) {
+
+		my %dataLoadAggQuery = ();
+
+		$dataLoadAggQuery{"Ongoing Data Loads for " . $prodname} = {
+			'crit' => "answer > 8",
+			'warn' => "answer > 4",
+			'info' => "answer <= 4",
+			'perl' => "$dataloadsInProgress",
+			'note' => join(",", @customersInDataLoad),
+			'recordMaxResults' => 15000,
+		};
+
+		my $pn = $prodname;
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+				"dataload-summary", $pn, $me->service(), undef, \%dataLoadAggQuery);
+		$qm->processQueries( $debug, $email, $sendEmail, $sendPage );
+	}
+
+}
+
+sub fetchLogs {
+	my $product = shift;
+	my $username = shift;
+	my $password = shift;
+
+	my $host = $product->singleHostForRoleInCluster("analysis");
+	my $dbinitLogName = "dbinit.txt";
+	my $dbinitLogPath = $product->baseInstallDir() . "/logs";
+	my $logDest = "/var/tmp/anl-dataload-logs/" . $product->customer();
+
+	ariba::rc::Utils::mkdirRecursively($logDest);
+
+	my $outputRef = [];
+
+	# fetch current log
+	my $ret = ariba::rc::Utils::transferFromSrcToDestNoCheck(
+			$host,
+			$username,
+			$dbinitLogPath,
+			$dbinitLogName,
+
+			undef,
+			undef,
+			$logDest,
+			$dbinitLogName,
+
+			0,0,0,
+
+			$password,
+			$outputRef,
+	);
+	
+	# fetch archive logs
+	$ret = ariba::rc::Utils::transferFromSrcToDestNoCheck(
+			$host,
+			$username,
+			"$dbinitLogPath/archive",
+			"dbinit*",
+
+			undef,
+			undef,
+			"$logDest/archive/",
+			undef,
+
+			0,0,0,
+
+			$password,
+			$outputRef,
+	);
+
+	return "$logDest";
+}
+
+sub processDataLoads {
+	my $logPath = shift;
+	my $recordAllDataLoads = shift;
+
+	my @allLoads = ();
+	my @archiveLogs = ();
+
+	my $archivePath = "$logPath/archive";
+	if (opendir (ARCHIVEDIR, "$archivePath")) {
+		@archiveLogs = sort { -M $a <=> -M $b } # sort latest files first
+			map { "$archivePath/$_" }  # prepend full path
+			grep { /^dbinit/ }   # only dbinit.txt files
+			readdir(ARCHIVEDIR);   
+		close(ARCHIVEDIR);
+	}
+
+	unshift (@archiveLogs, "$logPath/dbinit.txt");
+
+	if ($recordAllDataLoads) {
+		# if doing all dbinit logs, reverse logs array so latest dbinit logs
+		# come first
+
+		@archiveLogs = reverse @archiveLogs;
+
+		for my $file (@archiveLogs) {
+			push(@allLoads, [ parseDataLoadLog($file) ]);
+		}
+	} else {
+		# only process the latest valid one
+		#
+		for my $file (@archiveLogs) {
+			my @loadInfo = parseDataLoadLog($file);
+			if (defined $loadInfo[0]) {
+				push (@allLoads, \@loadInfo);
+				last;
+			}
+		}
+	}
+
+	return @allLoads;
+}
+
+#
+# parses dbinit.txt, returns a list consisting of (in order):
+#
+# status - exit status of load (0 for success, 1 for failure)
+# startTime - in seconds since epoch
+# endTime - in seconds since epoch
+#
+# Or returns undef if this dbinit.txt doesn't exist or is not an integrated
+# load (or does not have enough contents to determine)
+#
+sub parseDataLoadLog {
+	my $logPath = shift;
+
+	my ($startTime, $endTime, $lastCommandStarted, $lastCommandFinished,
+	$lastCommandStartTime, $lastCommandFinishTime, $status, $loadType);
+	my ($startTimeString , $endTimeString, $lastLine);
+	my @args = ();
+
+	# Thu May 15 09:20:13 PDT 2008
+	my $DATETIMEREGEX = q(\w{3} \w{3} \d{2} \d{2}:\d{2}:\d{2} \w{3} \d{4});
+
+	open (LOGFILE, "$logPath") || return undef;
+
+	# find header
+	while (my $line = <LOGFILE>) {
+		# find start time
+		unless ($startTimeString) {
+			next unless $line =~ /($DATETIMEREGEX) \(util:info:\d+\): Starting server AnalysisLoadDB/;
+			$startTimeString = $1;
+			next;
+		}
+
+		# find args to loadmeta to determine if this is the right type of data
+		# load
+		last unless $line =~ /$DATETIMEREGEX \(util:info:\d+\): args\[\d+\] = \(([^)]+)\)/;
+		push (@args, $1);
+	}
+
+	my $TZ = 'US/Pacific';
+	$startTimeString =~ s/P[SD]T //;
+	$startTime = DateTime::Format::HTTP->parse_datetime($startTimeString, $TZ)->epoch() if $startTimeString;
+
+	# exclude logs with missing start times (incomplete) or missing
+	# -noCompleteDBOLAP and -noDropIndexes (not an AES/ACM load)
+	return undef unless ($startTime && grep(/noDropIndexes/, @args) && grep(/noCompleteDBOLAP/, @args ));
+
+	while (my $line = <LOGFILE>) {
+			# find end time and optionally exit code
+			if ($line =~ /($DATETIMEREGEX) \([^:]+:[^:]+:\d+\): (?:\(None\): )?(.+)$/) {
+				$endTimeString = $1;
+				my $foo = $2;
+				if ($foo =~ /Server shutting down with exit code: (\d)/) {
+					$status = $1;
+				} else {
+					$lastLine = $foo;
+				}
+			}
+	}
+
+	$endTimeString =~ s/P[SD]T //;
+	$endTime =  DateTime::Format::HTTP->parse_datetime($endTimeString, $TZ)->epoch();
+
+	close (LOGFILE);
+
+	return ($status, $lastLine, $startTime, $endTime);
+}
+
+sub processDataLoadDuration {
+	my $startTime = shift;
+	my $endTime = shift;
+	my $status = shift;
+
+    my $self  = $ariba::monitor::Query::_ourGlobalQuerySelf;
+	my $duration;
+
+
+	# Defined status means the data load has finished.
+	# Record the duration (query answer) at the exact time the load
+	# finished.
+	# CircularDB should handle this correctly if this turns out to be an
+	# update of an existing record (see recordResults() in Query.pm).
+	if ($startTime && defined($status)) {
+		$self->setRecordDataType("gauge");
+		$self->setRecordMaxResults(2000);
+		$self->setRecordTime($endTime);
+
+	} else { 
+		# if duration is undef (never done) or status is undef (query
+				# still running) don't record anything
+		$self->setRecordDataType(undef);
+		$self->setRecordMaxResults(undef);
+		$self->setRecordTime(undef);
+
+		# fake the link so that this query will still be graphable
+		$self->setShowGraphLink($self->instance());
+
+		if ($startTime) { 
+			# if dataload is still running, set endtime to now
+			# so that we can detect stuck dataloads
+			$endTime = time();
+		}
+	}
+
+	if ($startTime) {
+		$duration = $endTime - $startTime;
+		$duration /= 60; # convert to minutes
+	}
+
+	return $duration;
+}
+
+# 
+# processes the status returned by parseDataLoadLog 
+#
+# 1) Returns a status string based on current and past states:
+#
+# statusString - "Finished Successfully" or "Failed" or "Running"
+#
+# 2) Controls query status by resetting all status attributes (info, warn,
+# crit) to 0 (false) and setting only the appropriate one to a non-zero length
+# string (true).
+#
+sub processDataLoadStatus {
+	my $status = shift;
+	my $startTime = shift;
+	my $endTime = shift;
+	my $note = shift;
+
+    my $self  = $ariba::monitor::Query::_ourGlobalQuerySelf;
+	my $failCount = $self->dataLoadFailCount() || 0;
+	my $previousStartTime = $self->dataLoadPreviousStartTime() || 0;
+
+	my $lastUpdateString = ( $endTime ? ariba::Ops::DateTime::prettyTime($endTime) : "(none)");
+
+	my $statusString;
+
+	my $validatingError = ($note && $note =~ /Problems validating dimension/);
+
+	# on success:
+	#   - clear note
+	#   - clear failure count
+	if (defined $status && $status eq 0) {
+		$failCount = 0;
+		$statusString = "Finished Successfully at $lastUpdateString";
+		$self->setNote(undef);
+
+	# on validation failure:
+	#   - retain failure count, but do not increment
+	} elsif ($validatingError) {
+		$statusString = "Finished with validation errors at $lastUpdateString";
+
+	# on failure:
+	#   - increment failure count if this is a new dataload failure
+	#     
+	} elsif (defined $status && $status eq 1) {
+		++$failCount if ($previousStartTime != $startTime);
+		$statusString = "Failed at $lastUpdateString";
+    # currently running:
+	#  - matain previous status
+	} else {
+		$statusString = "Running, last update at $lastUpdateString";
+	}
+
+	# State transition table
+	#
+	#  current |   failcount
+	#   state  | 0    | 1    | 2    | >2
+	# ---------+------+------+------+
+	#  info    | info | info | warn | X
+	#  warn    | info | X    | warn | X
+	#  crit    | X    | X    | X    | X   
+	#
+	$self->setWarn(0);
+	$self->setInfo(0);
+	$self->setCrit(0);
+
+	# this needs to be reset every time through
+	$self->setTicketOnWarnOpenAfterMinutes(undef);
+	$self->setTicketDueInDays(undef);
+
+	if ($failCount >= $CONSECUTIVE_FAILURE_THRESHOLD) {
+		$self->setWarn(qq{"failed $failCount consecutive times, >= $CONSECUTIVE_FAILURE_THRESHOLD"});
+		$self->setTicketOnWarnOpenAfterMinutes(1);
+		$self->setTicketDueInDays('today');
+
+	} elsif ($validatingError) {
+		# for validation errors, just open a ticket
+		# see the reset above
+		$self->setWarn(qq{"validation error"});
+		$self->setTicketOnWarnOpenAfterMinutes(1);
+
+	} elsif ( $failCount > 0) {
+		$self->setInfo(qq{"failed $failCount time"});
+
+	} else { # $failCount == 0
+		$self->setInfo(qq{"last dataload successful"});
+	}
+
+	$self->setDataLoadPreviousStartTime($startTime);
+	$self->setDataLoadFailCount($failCount);
+
+	return $statusString;
+}
+main();

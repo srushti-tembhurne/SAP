@@ -1,0 +1,114 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+use ariba::Ops::Constants;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Utils;
+use POSIX qw(strftime);
+
+my $debug = 0;
+
+sub main {
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-d/o) { $debug++; };
+	}
+
+	my $email = ariba::Ops::Constants->operationsSysadminEmailAddress();
+	my $host  = ariba::Ops::NetworkUtils::hostname();
+	my @body  = ();
+
+	my (%hourStats, %appStats, %from, %to) = ();
+	my ($toCount,$fromCount) = (0,0);
+
+	my $maillog = '/var/log/syslog';
+
+	my $today   = strftime("%b %d", localtime());
+	$today =~ s/ 0/  /;
+
+	open(FILE, $maillog) or die "Can't open [$maillog]: [$!]";
+	while (<FILE>) {
+
+		next unless /$today/;
+
+		my @line = split(/ /);
+
+		if ($line[6] =~ /to=/) {
+
+			$toCount++;
+
+			my $hour = (split(/:/, $line[2]))[0];
+
+			$hourStats{$hour}++;
+		}
+
+		if ($line[6] =~ /from=/) {
+
+			$fromCount++;
+
+			$line[6] =~ s/from=<//;
+			$line[6] =~ s/,>.*//;
+			$line[6] =~ s/>.*//;
+
+			next unless $line[6] !~ /^\s*$/;
+
+			$from{$line[6]}++;
+
+			$line[10] =~ s/.*@//;
+			$line[10] =~ s/>,//;
+
+			next if $line[10] =~ /=/;
+
+			$appStats{$line[10]}++;
+		} 
+	}
+	close(FILE);
+
+	if ($toCount == 0 && $fromCount == 0) {
+		exit(0);
+	}
+
+	my $subject = "$host mail stats for $today";
+
+	push (@body, (
+		sprintf("%5d - Total messages from $host", $fromCount),
+		sprintf("%5d - Total messages to   $host\n", $toCount),
+		"Hourly stats:\n",
+	));
+
+	foreach my $key (sort keys %hourStats) {
+		push @body, "\tHour $key: $hourStats{$key}";
+	}
+
+	push (@body, "\nNumber of messages from (min 10):\n");
+
+	foreach my $key (sort { $from{$b} <=> $from{$a} } keys %from) {
+
+		next if $from{$key} < 10;
+		push @body, sprintf("\t%5d - $key", $from{$key});
+	}
+
+	push (@body, "\nNumber of messages from server (min 10):\n");
+
+	foreach my $key (sort { $appStats{$b} <=> $appStats{$a} } keys %appStats) {
+
+		next if $appStats{$key} < 10;
+		push @body, sprintf("\t%5d - $key", $appStats{$key});
+	}
+
+	if ($debug) {
+
+		print join("\n", ($subject, "\n", @body, "\n"));
+
+	} elsif (scalar @body > 0) {
+
+		ariba::Ops::Utils::email($email,$subject,join("\n", @body),'',$email,'');
+	}
+}
+
+main();
+
+exit(0);
+
+__END__

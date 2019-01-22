@@ -1,0 +1,282 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/everywhere/httpd-process-watcher#74 $
+#
+# Get a list of Products for this machine, walk the process table
+# periodically, and make memory size information available to client.
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+
+use FindBin;
+use lib "$FindBin::Bin";
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../lib/perl";
+use ariba::Ops::Url;
+
+use Linux::Smaps;
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::Product;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProcessTable;
+use ariba::Ops::Machine;
+use ariba::monitor::QueryManager;
+use ariba::Ops::Utils;
+
+my $debug = 0;
+
+sub main {
+	my $sendEmail = 0;
+        my $sendPage  = 0;
+	my @args      = ();
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; };
+		if ($arg =~ /^-d/o) { $debug = 1; };
+		if ($arg !~ /^-/o ) { push @args, $arg; next }
+	}
+
+	my $me       = ariba::rc::InstalledProduct->new(@args);
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $machine  = ariba::Ops::Machine->new($hostname);
+
+	#
+	# We'll warn at 70% used for private mem, and crit at 80%
+	#
+	my $memorySize = ($machine->memorySize() || 8192) * 1024;
+	my $totPrivateWarn = int(0.7 * $memorySize);
+	my $totPrivateCrit = int(0.8 * $memorySize);
+
+	if ($debug) {
+		print "Host Memory Size: $memorySize\n";
+		print "Total Private Warn: $totPrivateWarn\n";
+		print "Total Private Crit: $totPrivateCrit\n\n";
+	}
+	#
+	# ssws apaches seem to have a bigger footprint
+	# tmid:83650 - setting aesws with the same footprint as ssws
+	#
+	# 700 apaches times 12000kb == 8GB
+	# 800 apaches times 10000kb == 8GB
+	#
+	# only once in the graph history did ssws reach or exceed 700 apaches
+	# the peak is less than 800 apaches.  I think these numbers are fair
+	#
+	my $memoryWarn = 23000;
+	my $memoryCrit = 24500;
+
+	#
+	if ($me->name() eq 'ws') {
+		# we're setting the threshold for ws artificially low just to
+		# catch changes... there is nothing horribly dangerous if we clip these,
+		# just will want to see why it grew.
+		#
+		$memoryWarn    = 5000;
+		$memoryCrit    = 6500;
+
+		#
+	}
+
+	# Grok the PID out of the keepRunning logfiles that are stored on disk.
+	printf("Checking httpd processes on $hostname for %s%s\n", $me->name(), $me->service()) if $debug;
+
+	my $processes = getProcDataForHttpdProcesses($me);
+
+	#
+	# do this here to avoid possible divide by zero errors
+	#
+	my $avgPrivateMemory=0;
+	my $avgRSSMemory=0;
+	my $avgSharedMemory=0;
+
+	if($processes->{'count'} && $processes->{'count'} != 0) {
+		$avgPrivateMemory = $processes->{'privateMemSize'} / $processes->{'count'};
+		$avgPrivateMemory = int($avgPrivateMemory);
+
+		$avgRSSMemory = $processes->{'rssMemSize'} / $processes->{'count'};
+		$avgRSSMemory = int($avgRSSMemory);
+
+		$avgSharedMemory = $processes->{'sharedMemSize'} / $processes->{'count'};
+		$avgSharedMemory = int($avgSharedMemory);
+	}
+
+	# Get the warn/crit values for 'number of processes' from web server configs.
+	# warn 75% and crit 90% of max processes allowed.
+	# tmid: 145631
+	my $maxConnections = $me->default('preforkmaxclients');
+	my ($maxConnectionsCrit, $maxConnectionsWarn);
+	if ($maxConnections) {
+		$maxConnectionsCrit = $maxConnections * .90;
+		$maxConnectionsWarn = $maxConnections * .75;
+	}
+    if($me->name() eq 'ssws'){
+                my $ssws_maxConnections = $me->default('workermaxclients');
+                if($ssws_maxConnections){
+                    $maxConnectionsCrit = ($ssws_maxConnections * .90);
+                    $maxConnectionsWarn = ($ssws_maxConnections * .75);
+                }
+    }
+
+
+
+	my %queries   = (
+
+		# 11/16/05 Setting crit value for low end of httpd procs to
+		# be < 4 procs as frequent pages seen during httpd recycling
+		# while 4 procs active - agutman
+		#
+                # 05/27/09 GR: Crit levels raised again.  Once 850 is exceeded
+                # we need to open a ticket to swap the 8gb boxes for 16 gb boxes
+		"httpd on $hostname number of connections" => {
+			'recordMaxResults' => 106000,
+			'recordDataType' => 'gauge',
+			'info' => "answer ne '' and answer > -1",
+			'warn' => "answer ne '' and answer > $maxConnectionsWarn",
+			'crit' => "answer eq '' or answer < 1 or answer > $maxConnectionsCrit",
+			'severity' => 1,
+			'perl' => "return $processes->{'count'}",
+		},
+
+		"httpd on $hostname total private memory size in KBytes" => {
+			'recordMaxResults' => 106000,
+			'recordDataType' => 'gauge',
+			'info' => "answer eq '' or answer > -1",
+			'warn' => "answer ne '' and answer > $totPrivateWarn",
+			'crit' => "answer ne '' and answer > $totPrivateCrit",
+			'perl' => "return $processes->{'privateMemSize'}",
+		},
+
+	 	# The decision is to not page on average private memory size for web servers
+		# use the monitoring for the host memory for web servers instead
+		# this change was confirmed by Rich Steenburg as an alert that is not needed.
+		"httpd on $hostname: average private memory size per apache in KBytes" => {
+			'recordMaxResults' => 106000,
+			'recordDataType' => 'gauge',
+			'info' => "answer eq '' or answer > -1",
+			#'warn' => "answer ne '' and answer > $memoryWarn",
+			#'crit' => "answer ne '' and answer > $memoryCrit",
+			'perl' => "return $avgPrivateMemory",
+		},
+
+		"httpd on $hostname: average shared memory size per apache in KBytes" => {
+			'recordMaxResults' => 106000,
+			'recordDataType' => 'gauge',
+			'info' => "answer eq '' or answer > -1",
+			'perl' => "return $avgSharedMemory",
+		},
+
+		"httpd on $hostname: average RSS memory size per apache in KBytes" => {
+			'recordMaxResults' => 106000,
+			'recordDataType' => 'gauge',
+			'info' => "answer eq '' or answer > -1",
+			'perl' => "return $avgRSSMemory",
+		},
+
+		# 11/16/05 Changing calculation of warn and crit to reflect
+		# average cpu usage seen in powergraph over time - agutman
+		"httpd on $hostname total percent CPU usage" => {
+			'recordMaxResults' => 106000,
+			'recordDataType' => 'gauge',
+			'info' => "answer eq '' or answer > -1",
+			'warn' => "answer ne '' and answer > ($processes->{'count'} * 5) and answer > 50",
+			'crit' => "answer ne '' and answer > ($processes->{'count'} * 8) and answer > 75",
+			'perl' => "return $processes->{'pctcpu'}",
+		},
+	);
+
+	my %influx_data = ( 'measurement' => 'httpd_process_watcher',
+											'data'        => {  'num_connection'                 => $processes->{'count'} || 0,
+																					'private_mem_size'               => $processes->{'privateMemSize'} || 0,
+																					'private_mem_size_per_apache'    => "$avgPrivateMemory" || 0,
+																					'avg_shared_mem_size_per_apache' => "$avgSharedMemory" || 0,
+																					'avg_rss_mem_size_per_apache'    => "$avgRSSMemory" || 0,
+																					'total_pct_cpu'                  => "$processes->{'pctcpu'}" || 0,
+																					'max_connections_warn'           => "$maxConnectionsWarn"|| 0,
+																					'max_connections_crit'           => "$maxConnectionsCrit"|| 0,
+																					'tot_private_warn'               => "$totPrivateWarn"|| 0,
+																					'tot_private_crit'							 => "$totPrivateCrit"|| 0
+																			},
+											'tags' => { 'product' => $me->name(), 'service'  => $me->service() },
+										);
+
+	eval {
+			my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+			ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line );
+	};
+
+	my $email = $me->default('ops.notify.email') || $me->default('notify');
+	my $pager = $me->default('ops.notify.pagers') || $me->default('notifypagers');
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails("httpd-process-watcher", $me->name(), $me->service(), $me->customer(), \%queries);
+	$qm->run();
+
+	if ( $debug ) {
+		$qm->displayToStdout();
+	} else {
+		$qm->checkStatus();
+		my $monserver = ($me->hostsForRoleInCluster('monitor', $me->currentCluster()))[0];
+
+		if ((my $ret = $qm->appendToServer($monserver)) != 0) {
+
+			# this will just start being stale
+			if ($ret == EX_UNAVAILABLE()) {
+				exit(0);
+			} else {
+				warn $ret;
+				exit(1);
+			}
+		}
+
+		$qm->archiveResultsOnServer();
+		$qm->notifyAboutStatusOnServer(ariba::monitor::QueryManager::notifyList($sendEmail, $sendPage, $email, $pager) );
+	}
+}
+
+sub getProcDataForHttpdProcesses {
+	my $me    = shift;
+
+	my $proc  = ariba::Ops::ProcessTable->new();
+	my $table = {};
+
+	my $match = sprintf('^%s/\S+/httpd', $me->installDir());
+
+	for my $pid ($proc->pidsForProcessName($match)) {
+
+		my $data = $proc->dataForProcessID($pid);
+
+		$table->{'rssMemSize'} += $data->{'privateMemSize'} || 0;
+		$table->{'pctcpu'} += $data->{'pctcpu'} || 0;
+		if(-r "/proc/$pid/smaps") {
+			my $smap = Linux::Smaps->new($pid);
+			$table->{'privateMemSize'} += $smap->private_clean + $smap->private_dirty;
+			$table->{'sharedMemSize'} += $smap->shared_clean + $smap->shared_dirty;
+            $table->{'count'}++;
+		}
+	}
+
+	for my $requiredKey ( qw(count privateMemSize pctcpu) ) {
+		$table->{$requiredKey} ||= '';
+	}
+
+    # At this point $table->{'count'} is the total number of process, both active and idle.
+    # Where possible query apache directly and use its reported number of active processes.
+
+    my $port = $me->default('WebServerHTTPSPort');
+    my $url = "https://localhost:$port/httpdstatus";
+    my $request = ariba::Ops::Url->new($url);
+    my $results = $request->request(30);
+    unless ($request->error()) {
+        my ($number) = ($results =~ m/>(\d+) requests currently/);
+        if ($number) {
+            $table->{'count'} = $number;
+        }
+    }
+
+	return $table;
+}
+
+main();
+
+__END__

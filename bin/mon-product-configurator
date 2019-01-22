@@ -1,0 +1,169 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/mon-product-configurator#3 $
+#
+# A script to generate configs for fake products based on the mon role
+#
+use strict;
+use warnings;
+use Data::Dumper;
+use File::Basename;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../lib/perl";
+use Getopt::Long qw(GetOptions);
+use Pod::Usage qw(pod2usage);
+
+use ariba::Ops::ProductConfig::Constants    qw(:all);
+use ariba::Ops::Utils;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductConfigFactory;
+use ariba::Ops::ProductConfig;
+use dmail::LockLib;
+
+# Global variables
+my $prog      = basename($0);
+my $LOCKFILE  = "/tmp/$prog";
+my $debug = 0;
+my $userName;
+my $type;
+
+=head1 SYNOPSIS
+
+    mon-product-configurator -product "product name" -t "db type"
+
+    Options:
+        --help|-h            Show this help.
+        --debug|-d           Debug.
+        -product             Product Name
+        --type|t             DB type Name
+        
+
+=cut
+
+sub main {
+
+    my ($help,$product);
+
+    GetOptions(
+               'help|h'     => sub {pod2usage(1)},
+               'debug|d'    => sub { $debug++ },
+               'product=s'  => \$product,
+               'type|t=s'   => \$type,
+    );
+
+    unless ($product && $type){
+        pod2usage("Error: product and type must require");
+    }
+
+    unless(dmail::LockLib::requestlock($LOCKFILE, 5)) {
+        warn "can't grab lock\n";
+        exit(2);
+    }
+
+    my $mon  = ariba::rc::InstalledProduct->new();
+    my $cluster = $mon->currentCluster();
+
+    my $action = "gen-config";   ## generate config
+    $type = $cluster =~ /Secondary/i ? "DR".$type : $type;
+
+    my $match = "monitoring.".$product.".".$type;
+    my @hosts;
+    my @dbConns;
+    $userName = $mon->default('dbainfo.'.lc($type).'.system.username');
+
+    for my $dictKeypath ( $mon->defaultKeysForPrefix($match) ) {
+        my $host = $mon->default("$dictKeypath.server");
+        my $sid = $mon->default("$dictKeypath.sid");
+        next if(! $host || ! $sid);
+        push @hosts,$host;
+        push @dbConns, addDBConnection($host,$sid);   ## adding Default Tenant
+
+        for my $tenantPort ( split(" ",$mon->default("$dictKeypath.tenantport")) ){
+            next unless($tenantPort);
+            push @dbConns, addDBConnection($host,$sid,$tenantPort);
+        }
+    }
+
+    unless ( @dbConns ){
+        print "Info: No configs found for product: $product in ".$mon->service()." service\n";
+        dmail::LockLib::releaselock($LOCKFILE);
+        exit;
+    }
+
+    my ($monhost) = $mon->hostsForRoleInCluster('monserver', $cluster);
+    my $args = {dbtype => $type, mon_obj => $mon, action => $action, debug => $debug};
+    my $pc   = ariba::Ops::ProductConfigFactory->new($args);
+
+    @dbConns = { map {$_->{instanceName}  => [$_]} @dbConns };
+
+    my $xml = getDBConnsXml($mon,$product,\@dbConns);
+    my $hanaDBRoles = getHanaDBRoles(\@hosts);
+
+    my $cfg = {xml => $xml, roles => {'primary' => {monitor => $monhost, %$hanaDBRoles} }};
+    $pc->write_app_config($product, $cfg, GENCONFIG_TMPDIR);
+    $pc->copy_config_dir(GENCONFIG_TMPDIR."/$product", "/home/".$pc->svcuser);
+
+    dmail::LockLib::releaselock($LOCKFILE);
+}
+
+sub getDBConnsXml {
+    my ($mon,$product,$dbConns) = @_;
+
+    my $xml;
+    $xml->{MetaData} = {
+    	ReleaseName => ucfirst($product) . 'Rel',
+	BranchName  => "//ariba/ond/$product/trunk",
+	ServiceName => $mon->service(),
+	ClusterName => $mon->currentCluster(),
+    };
+
+    $xml->{DBConnections} = $dbConns;
+
+    return $xml;
+}
+
+sub getHanaDBRoles{
+    my $hanaHosts = shift;
+
+    my $idx = '';
+    my $hanaDBRoles;
+    for my $host (@$hanaHosts){
+        if ($host =~ /^hanacvip(\d+)(.*)$/i) {
+            my $domain = $2 ? $2 : '';
+            my @realHosts = ("hanac${1}a$domain", "hanac${1}b$domain");
+            $hanaDBRoles->{"hanadatabase${idx}"} = sprintf("%s { %s }", $host, join(" ", @realHosts));
+        } else {
+           $hanaDBRoles->{"hanadatabase${idx}"} = $host;
+           $hanaDBRoles->{"hanadatabasehosts${idx}" }= $host;
+        }
+        $idx = $idx ? $idx+1 : 2;
+    }
+
+    return $hanaDBRoles;
+
+}
+
+sub addDBConnection{
+    my ($host,$sid,$tenantPort) = @_;
+
+    my ($tenant,$port);
+    my $instanceName = uc($type).'_'.$sid;
+
+    if ( $tenantPort ){
+        ($tenant, $port) = split (":",$tenantPort);
+        $instanceName = uc($type).'_'.$tenant;
+    }
+
+    return {
+        instanceName => $instanceName,
+        hostName     => $host,
+        userName     => $userName,
+        serverid     => $sid,
+        dbName       => $tenant || "" ,
+        port         => $port || 30015,
+    };
+
+}
+
+main();

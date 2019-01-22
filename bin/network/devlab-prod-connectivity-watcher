@@ -1,0 +1,63 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use dmail::LockLib;
+use ariba::monitor::Url;
+use ariba::monitor::QueryManager;
+use Data::Dumper;
+use ariba::Ops::ProductAPIExtensions;
+
+my $lockFile = "/tmp/$0";
+dmail::LockLib::forceQuiet(); 
+exit(0) unless (dmail::LockLib::requestlock($lockFile),5);
+
+my $sendEmail = 0;
+my $sendPage = 0;
+my $debug = 0;
+
+while(my $arg=shift(@ARGV)){
+  if($arg =~ /^-d/o){ $debug = 1; };
+  if($arg =~ /^-e/o){ $sendEmail = 1; };
+  if($arg =~ /^-p/o){ $sendPage = 1; };
+}
+
+my $url = ariba::monitor::Url->new ("https://10.163.2.39/cgi-bin/devProdNetworkConnectMonitor.pl");
+
+my $results = $url->request(10);
+
+my $decoded_json = JSON::decode_json($results);
+
+my %queries;
+
+foreach my $key (keys %$decoded_json) {
+      foreach my $innerkey (keys %{$decoded_json->{$key}}) {
+                $queries{"Connection to $innerkey"} = { 
+                                                             crit => "answer eq 'connectivity_is_lost'",
+                                                             warn => "answer eq 'network_latency_detected'",
+                                                             info => "answer eq 'connectivity_is_fine'",
+                                                             uiHint => $key,
+                                                             perl => sub {  return $decoded_json->{$key}{$innerkey}{'connection_status'}; },
+                                                             correctiveActions => [
+                                                                                  Ops => 'Contact network engineering team'
+                                                                                  ],
+                                                      };
+      }
+}
+
+print Dumper(\%queries) if $debug;
+
+my $me = ariba::rc::InstalledProduct->new();
+my $email = $me->default('notify.email');
+my $host = ariba::Ops::NetworkUtils::hostname();
+my $currentMachine = ariba::Ops::Machine->new($host);
+my $datacenter = $currentMachine->datacenter();
+my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+my $qm = ariba::monitor::QueryManager->newWithDetails('Devlab to production monitor', $pn, $me->service(), $me->customer(), \%queries);
+$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+END {
+    dmail::LockLib::releaselock($lockFile);
+}

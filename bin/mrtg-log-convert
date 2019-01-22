@@ -1,0 +1,215 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/mrtg-log-convert#3 $
+# Convert MRTG logfiles to CircularDB format.
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use ariba::monitor::CircularDB;
+use ariba::monitor::misc;
+use File::Basename;
+use File::Find;
+
+my $debug = 0;
+
+sub main {
+	my $name = $ARGV[0] || die "Usage: $0 <dir|configfile>";
+	my @list = ();
+
+	# Sift an entire directory?
+	if (-d $name) {
+		File::Find::find(sub {
+			return unless $_ =~ /\.cfg$/o;
+			return unless -f $_;
+			push @list, $File::Find::name;
+		}, $name);
+
+	} elsif (-f $name) {
+		push @list, $name;
+	} else {
+		die "Not a valid directory or file!";
+	}
+
+	my $circularDBDir = ariba::monitor::misc::circularDBDir();
+	
+	for my $configFile (sort @list) {
+
+		my ($queryName, $prettyName, $queryType) = ('','','counter');
+
+		my $baseDir = dirname($configFile);
+		my %queries = ();
+
+		# PageTop[app11.snv.ariba.com.2]: <H1>Traffic Analysis for app11.snv.ariba.com hme0
+		print "Parsing MRTG Config: $configFile...\n";
+		open  (CFG, $configFile) || die "Can't open config [$configFile]: $!";
+		while(<CFG>) {
+			chomp;
+			
+			if (/^PageTop\[(\S+)\]:\s*<\S+>(.*?)<?/) {
+				$queryName  = $1;
+				$prettyName = $2;
+
+				print "Found: $queryName - $prettyName\n" if $debug;
+				$queries{$queryName}->{'prettyName'} = $prettyName;
+			}
+
+			if (/^Options\[\S+\]:.+?gauge/) {
+				$queries{$queryName}->{'queryType'} = 'gauge';
+			}
+		}
+		close (CFG);
+
+		##########################################################
+
+		while( my ($queryName,$queryInfo) = each %queries) {
+
+			# convert the data into a format that CircularDB can handle
+			my ($inSeries,$outSeries) = readAndConvertMRTGLog( "$baseDir/$queryName.log" );
+
+			# Fill in defaults
+			unless (defined $queries{$queryName}->{'queryType'}) {
+				$queries{$queryName}->{'queryType'} = 'counter';
+			}
+
+			# format like rebuild-queries does
+			$queryName =~ s|\.(\w+)$|/$1|;
+
+			# This is icky- check if the data is a network
+			# interface that has input/outputs.
+			my @circularDBs = ();
+			if ($queryName =~ m|/\d+$|) {
+				push @circularDBs, $queryName.".in";
+				push @circularDBs, $queryName.".out";
+			} else {
+				push @circularDBs, $queryName;
+			}
+
+			for my $queryName (@circularDBs) {
+				print "Removing old CDB: $circularDBDir/$queryName\n" if $debug;
+				unlink "$circularDBDir/$queryName";
+
+				print "Building CDB for: $queryName\n";
+				my $cdb = ariba::monitor::CircularDB->new(
+					$queryName,
+					$queryName,
+					525600,
+					$queryInfo->{'queryType'}, 
+					$queryInfo->{'prettyName'}
+				);
+
+				if ($queryName =~ /\.out$/) {
+					$cdb->writeRecords( @{$outSeries} );
+				} else {
+					$cdb->writeRecords( @{$inSeries} );
+				}
+			}
+		}
+	}
+}
+
+sub readAndConvertMRTGLog {
+	my $logfile   = shift;
+	my @inSeries  = ();
+	my @outSeries = ();
+	my %timeInts  = ();
+	my $counter   = 0;
+
+	# First line: <most recent time> <last read inbound> <last read outbound>
+	# All others: <timestamp> <average in> <average out> <max in> <max out>
+	
+	open(FH, $logfile) || die "Can't open [$logfile]: $!";
+
+	# Get the starting points
+	my ($mostRecent, $lastIn, $lastOut) = split /\s+/, <FH>;
+	
+	while(<FH>) {
+		chomp;
+
+		my ($time,$line) = (split /\s+/, $_, 2);
+		my ($in,$out)    = (split /\s+/, $line)[2,3];
+
+		# first 2 days
+		if ($counter <= 600) {
+			#$timeInts{$time} = [ ($lastIn -= $in), ($lastOut -= $out) ];
+			$timeInts{$time} = [ $in, $out ];
+		}
+
+		$counter++;
+		next;
+
+		# two weeks
+		if ($counter > 600 and $counter <= 1800) {
+
+			for (my $i = 0; $i <= 6; $i++) {
+				$time -= 300;
+				$timeInts{$time} = [ $in, $out ];
+			}
+		}
+
+		# two months
+		if ($counter > 1800 and $counter <= 2400) {
+
+			for (my $i = 0; $i <= 24; $i++) {
+				$time -= 300;
+				$timeInts{$time} = [ $in, $out ];
+			}
+		}
+
+		# two years
+		if ($counter > 2400) {
+
+			for (my $i = 0; $i <= 288; $i++) {
+				$time -= 300;
+				$timeInts{$time} = [ $in, $out ];
+			}
+		}
+
+		$counter++;
+	}
+	close(FH);
+
+	for my $time (sort keys %timeInts) {
+		push @inSeries,  [ $time, $timeInts{$time}->[0] ];
+		push @outSeries, [ $time, $timeInts{$time}->[1] ];
+	}
+
+	return (\@inSeries, \@outSeries);
+}
+
+main();
+
+__END__
+First line: <most recent time> <last read inbound> <last read outbound>
+All others: <timestamp> <average in> <average out> <max in> <max out>
+(you may substitute anything for in and out to suite your needs)
+
+The first series is two days of five-minute averages and max values
+Starting at line 3 and continuing to line 600 the interval is 300 seconds (5 min).
+
+The next series is two weeks of 30-minute averages and max values
+Starting at line 601 the interval is 1800 seconds (30 min).
+
+The next series is two months of one-hour averages and max values
+Starting at line 1801 the interval is 7200 seconds (2 hours).
+
+The last series is two years of one-day averages and max values
+Starting at line 2401 the interval is 86400 seconds (24 hours).
+
+You will have to convert the existing data into delta's and build the MRTG
+logfile from this. See the example below.
+
+Make sure you use the right options "gauge" or "absolute" if applicable!
+
+example: piece of log
+905424930 31869839 21478944    current values as measured
+905424930 20 25 20 25          differences between last time and now
+905424900 251 59 251 59        result five minutes ago
+905424600 16 20 16 20          etc. etc.
+
+This means I received the following values from my equipment:
+
+at 905424600: 31869568 for counter 1 and 21478860 for counter 2
+at 905424900: 31869819 for counter 1 and 21478919 for counter 2
+at 905424930: 31869839 for counter 1 and 21478944 for counter 2

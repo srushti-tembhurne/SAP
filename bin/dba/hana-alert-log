@@ -1,0 +1,106 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/dba/hana-alert-log#5 $
+#
+# This script parses the oracle alert log file. It will page people if
+# it sees something bad in the alert logs.
+#
+# This script can be run as 'monprod' unix user.
+# It does not need to know any passwords.
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::monitor::misc;
+use ariba::monitor::StatusPage;
+use ariba::Ops::LogParser::AlertLogParser;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::util::OraInfo;
+use ariba::Ops::DBConnection;
+
+use Date::Calc;
+
+my $debug = 0;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+        my $shortusername;
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-e/o) { $sendEmail = 1; };
+        if ($arg =~ /^-p/o) { $sendPage = 1; };
+        if ($arg =~ /^-d/o) { $debug = 1; };
+                if ($arg =~ /^-usersid/o) { $shortusername = shift @ARGV; };
+    }
+
+    my $me          = ariba::rc::InstalledProduct->new();
+    my $service     = $me->service();
+    my $customer    = $me->customer();
+
+    my @products    = ariba::rc::InstalledProduct->installedProductsList($service);
+    my $hostname    = ariba::Ops::NetworkUtils::fqdnToShortHostname(ariba::Ops::NetworkUtils::hostname());
+    my $cluster     = $me->currentCluster();
+
+    my $machine     = ariba::Ops::Machine->new($hostname);
+    my $datacenter  = $machine->datacenter();
+    my $tab         = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+    my $currentHour = (localtime)[2];
+    my @connections = ();
+    for my $productitem (@products) {
+          my $productitemname = $productitem->name();
+          push (@connections, ariba::Ops::DBConnection->connectionsForProductOfDBServerType($productitem, ariba::Ops::DBConnection->hanaDBServerType()));
+    }
+    @connections = ariba::Ops::DBConnection->uniqueConnectionsByHost(@connections);
+    my $dbc = shift(@connections);
+    my %queries = ();
+
+    my $alertLogParser = ariba::Ops::LogParser::AlertLogParser->newFromDBConnectionAndHost($dbc, $hostname);
+    my $alertLogFile = "/usr/sap/$shortusername/HDB00/$hostname/trace/indexserver_alert_$hostname.trc";
+    $alertLogParser->parseHanaAlertLogFile($alertLogFile);
+
+    my ($errors, $warnings) = ($alertLogParser->errors(), $alertLogParser->warnings());
+    my $results = join("\n", @$errors, @$warnings);
+ 
+    my %influx_data;
+    $influx_data{measurement} = 'cookies_dba_hana_alert_log_counts'; 
+
+    $queries{"Alert log for Hana DB host $hostname"} = {
+        info    => "numrows > -1",
+        warn    => scalar(@$errors) > 0 || scalar(@$warnings) > 0,
+        ticketOnWarnOpenAfterMinutes => 10,
+        ticketOwner => "unassigned-dba", 
+        timeout => 60,
+        perl    => sub { return $results; },
+        uiHint  => 'alert-log',
+    };
+
+    $influx_data{tags} = { cluster => $cluster, service => $service, hostname => $hostname, product => $tab };
+    
+    $influx_data{data}{err_count} = @$errors;
+    $influx_data{data}{warn_count} = @$warnings;
+
+    my $email = $me->default('notify.email');
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails(
+        'dba', $tab, $service, $customer, \%queries
+    );
+
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+    eval {
+        my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+        ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line );
+    };
+
+}
+
+main();
+
+__END__

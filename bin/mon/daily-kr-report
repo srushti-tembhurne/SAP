@@ -1,0 +1,158 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+
+use FindBin;
+use lib (
+    "$FindBin::Bin/../lib/perl",
+    "$FindBin::Bin/../../lib/perl",
+    "$FindBin::Bin/../lib",
+    "$FindBin::Bin/../../lib",
+    "$FindBin::Bin/../../tools/lib/perl",
+    "$FindBin::Bin/../../../tools/lib/perl",
+    "$FindBin::Bin/../../tools/lib",
+    "$FindBin::Bin/../../../tools/lib",
+);
+
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::DateTime;
+use ariba::Ops::Constants;
+use ariba::Ops::Utils;
+use ariba::monitor::Ticketmaster;
+use ariba::Oncall::Schedule;
+use ariba::rc::InstalledProduct;
+use Time::Local;
+
+my $logfile = ariba::Ops::Constants->keepRunningEventLogFile();
+
+sub main {
+    my $openError;
+    my $debug      = 0;
+    my $oneDay     = 24 * 60 * 60;
+    my $eightHours = ariba::Oncall::Schedule->eightHours();
+
+    while ( my $arg = shift ) {
+        if ( $arg =~ /^-d$/i ) { $debug++; }
+    }
+
+    my $hostname   = ariba::Ops::NetworkUtils::hostname();
+    my $machine    = ariba::Ops::Machine->new($hostname);
+    my $datacenter = $machine->datacenter();
+    my $me         = ariba::rc::InstalledProduct->new();
+
+    unless ( grep /^syslog$/, $machine->providesServices() ) {
+        print "This script must run on the loghost server.\n";
+        exit;
+    }
+
+    my $now = time();
+    my ( $s, $min, $h, $d, $mon, $y ) = localtime();
+    ## Since we have the day, we can get a Schedule here:
+    my $schedule = ariba::Oncall::Schedule->new( $mon + 1, $y + 1900 );
+    my $shiftTime = $schedule->currShiftStartTime();
+    my $endDate = timelocal( 0, 0, $shiftTime, $d, $mon, $y );
+    ( $s, $min, $h, $d, $mon, $y ) = localtime( time() + $oneDay * 3 );
+    my $dueDate = sprintf( "%4d-%02d-%02d", $y + 1900, $mon + 1, $d );
+    ## Old logic, pre 3 shifts, looked for the past day,
+    ## now we'll look for the past 8 hours
+    ( $s, $min, $h, $d, $mon, $y ) = localtime( time() - $eightHours );
+    ## Adjust to 8 hours earlier
+    my $day = $d;
+    my $year = $y;
+    if ( $shiftTime < 8 ){
+        if ( $d == 1 ){
+            ## First day of month, get last month's last day
+            if ( $mon == 1 ){
+                ## First month of year, get last year's last day
+                $mon = 12;
+                $y--;
+            }
+            my $tmpSched = ariba::Oncall::Schedule->new( $mon, $y + 1900 );
+            $d = $tmpSched->{ 'days' };
+        }
+    }
+    $shiftTime = $schedule->prevShiftStartTime();
+    my $startDate = timelocal( 1, 0, $shiftTime, $d, $mon, $y );
+    my $displayDate = sprintf( "%4d-%02d-%02d", $year + 1900, $mon + 1, $day );
+
+    my %events;
+    my @logs = ($logfile);
+    if ( -C $logfile < 1 ) {
+        if ( -f "$logfile.1" ) {
+            unshift( @logs, "$logfile.1" );
+        } elsif ( -f "$logfile.1.gz" ) {
+            unshift( @logs, "$logfile.1.gz" );
+        }
+    }
+
+    my $zcat = ariba::Ops::Utils::findSysCmd('zcat');
+    die "Could not find zcat on host $hostname\n" unless $zcat;
+
+    foreach my $file (@logs) {
+        my $status;
+        if ( $file =~ m/.gz$/ ) {
+            $status = open( LOG, '-|', $zcat, $file );
+        } else {
+            $status = open( LOG, "<", $file );
+        }
+        if ($status) {
+            while ( my $line = <LOG> ) {
+                chomp $line;
+
+                next unless ( $line =~ /^(\w+\s+\d+\s+\d+:\d\d:\d\d)/ );
+                my $date      = $1;
+                my $datestamp = ariba::Ops::DateTime::syslogToTimestamp($date);
+
+                next unless ( $datestamp > $startDate and $datestamp < $endDate );
+
+                my ( $instance,  $product,  $service, $community, $severity, $action);
+                next unless ( $line =~ m/\[([^]]+)]: KR\s+(\w+):(\w+):([^:]*?):?(\w+):(\w+) / );
+                $instance  = $1;
+                $product   = $2;
+                $service   = $3;
+                $community = $4;
+                $severity  = lc $5;
+                $action    = lc $6;
+
+                next if ( $service and $service ne $me->service() );
+
+                $events{$product} = [] unless defined( $events{$product} );
+                push( @{ $events{$product} }, [ $instance, $community, $severity, $action, $date, $line ]);
+            }
+            close(LOG);
+        } else {
+            $openError = $!;
+        }
+    }
+
+    my $report = "";
+    $report .= "Error opening syslog: $openError\n" if $openError;
+
+    foreach my $prod ( keys %events ) {
+        $report .= "Product $prod:\n";
+        foreach my $event ( sort { $a->[3] cmp $b->[3] } @{ $events{$prod} } ) {
+            my ( $instance, $community, $severity, $action, $date, $line ) = @$event;
+            $report .= "\t" . $instance . " " . $community . " " . $action . " at " . $date . "\n";
+        }
+        $report .= "\n";
+    }
+
+    # exit without opening ticket if there is nothing to report
+    exit(0) unless $report;
+
+    $report = "Please investigate these $datacenter keepRunning events from your shift.\n\n" . $report;
+
+    $report .= "\ntm-category: documentation\ntm-priority: medium\ntm-duedate: $dueDate\n";
+
+    if ($debug) {
+        print "$report";
+    } else {
+        # We get the primary on-call for the start of the shift
+        my $primary = $schedule->primaryForNow();
+
+        ariba::monitor::Ticketmaster::newTicket( "keepRunning investigations needed for $displayDate", $report, "dept_an_ops_prod\@ariba.com", $primary ) unless $debug;
+    }
+}
+
+main(@ARGV);

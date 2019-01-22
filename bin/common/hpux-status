@@ -1,0 +1,97 @@
+#!/usr/local/bin/perl -w
+
+# $Id$
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Machine;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::NetworkUtils;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $debug = 0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; };
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $cluster  = $me->currentCluster();
+	my %queries  = ();
+
+	$queries{"$hostname system file descriptors used"} = {
+		format => "%d%%\n",
+		info => "answer > -1",
+		warn => "answer > 80",
+		crit => "answer > 90",
+		uiHint => $hostname,
+		recordMaxResults => 110000,
+		recordDataType => 'gauge',
+		perl => "main::getSarData('nfile')",
+	};
+
+	$queries{"$hostname system process table used"} = {
+		format => "%d%%\n",
+		info => "answer > -1",
+		warn => "answer > 80",
+		crit => "answer > 90",
+		uiHint => $hostname,
+		recordMaxResults => 110000,
+		recordDataType => 'gauge',
+		perl => "main::getSarData('nproc')",
+	};
+
+	my $email = $me->default('notify.email');
+
+	my $machine = ariba::Ops::Machine->new($hostname);
+	my $datacenter = $machine->datacenter();
+	
+	my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+	my $q = ariba::monitor::QueryManager->newWithDetails("hpux-status", $pn, $me->service(), $me->customer(), \%queries);
+	$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+sub getSarData {
+	my $type = shift;
+
+	# HP-UX hawaii B.11.00 U 9000/800    02/20/02
+	#
+	# 16:29:24 text-sz  ov  proc-sz  ov  inod-sz  ov  file-sz  ov
+	# 16:29:25   N/A   N/A 514/1264  0  1624/12160 0  6823/21018 0
+
+	my $line = '';
+
+	# just want the last line
+	open(SAR, "/usr/sbin/sar -v 1|") || die "Can't open sar: $!";
+	while(<SAR>) {
+		chomp;
+		$line = $_;
+	}
+	close(SAR);
+
+	# which column from the sar output do we want?
+	# 3 is nproc, 7 is nfile
+	# XXX - maybe move to a mapping hash?
+	my $column = $type eq 'nproc' ? 3 : 7;
+
+	my $usage = (split /\s+/, $line)[$column];
+
+	my ($used,$avail) = split /\//, $usage;
+
+	return int(($used / $avail) * 100);
+}
+
+main();
+
+__END__

@@ -1,0 +1,209 @@
+#! /usr/local/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use Pod::Usage;
+use XML::Simple;
+
+use Data::Dumper;
+
+my $debug = 0;
+my $help = 0;
+my $cfgfile;
+my $region = "us";
+my $output = ".";
+
+my $service = "prodms";
+my $monuser = "monprodms";
+
+GetOptions (
+    "debug" => \$debug,
+    "region=s"  => \$region,
+    "output=s"  => \$output,
+    "cfg=s" => \$cfgfile,
+    "help|?" => \$help,
+) or pod2usage(2);
+
+pod2usage(1) if $help;
+
+my $binpath=`dirname $0`;
+chomp $binpath;
+$cfgfile = "$binpath/splunk_deployment.xml" unless $cfgfile;
+
+my $xs = XML::Simple->new();
+my $conf = $xs->XMLin($cfgfile);
+print Dumper($conf) if $debug;
+
+$region = lc($region);
+
+my %regions = %{$conf->{region}};
+if ( not exists $regions{$region} ) {
+    die "Region $region is not configured\n";
+}
+
+unless ( $region eq "us" ) {
+    $service = "prod${region}ms";
+    $monuser="mon${service}";
+}
+print "User: $monuser\n" if $debug;
+
+my $primary = $conf->{region}->{$region}->{primary};
+my $secondary = $conf->{region}->{$region}->{secondary};
+
+my $dc_pr = $primary->{domain};
+my $dc_dr = $secondary->{domain};
+my $num_sea_pr = $primary->{num_sea};
+my $num_sea_dr = $secondary->{num_sea};
+my $num_idx_pr = $primary->{num_idx};
+my $num_idx_dr = $secondary->{num_idx};
+
+my $sea_list;
+my $idx_list;
+my $sea_list_pr;
+my $sea_list_dr;
+my $idx_list_pr;
+my $idx_list_dr;
+my $mst_active;
+my $mst_standby;
+my $ds_active;
+my $ds_standby;
+
+#---master node
+$mst_active = "spkmaster1.$dc_pr.ariba.com";
+$mst_standby = "spkmaster1.$dc_dr.ariba.com";
+print "Master Node Information\n" if $debug;
+print "\tPrimary: $mst_active \n" if $debug;
+print "\tSecondary: $mst_standby \n" if $debug;
+
+#---deployment node
+$ds_active = "spksea001.$dc_pr.ariba.com";
+$ds_standby = "spksea001.$dc_dr.ariba.com";
+print "Deployment Server Node Information\n" if $debug;
+print "\tPrimary: $ds_active \n" if $debug;
+print "\tSecondary: $ds_standby \n" if $debug;
+
+#---search head information
+print "Search Head Information\n" if $debug;
+for ( my $i = 1; $i <= $num_sea_pr; $i++ ) {
+    my $node = "spksea00$i.$dc_pr.ariba.com";
+    $sea_list_pr = $sea_list_pr ? "$sea_list_pr $node" : $node;
+    print "\t$node\n" if $debug;
+}
+for ( my $i = 1; $i <= $num_sea_dr; $i++ ) {
+    my $node = "spksea00$i.$dc_dr.ariba.com";
+    $sea_list_dr = $sea_list_dr ? "$sea_list_dr $node" : $node;
+    print "\t$node\n" if $debug;
+}
+$sea_list = "$sea_list_pr $sea_list_dr";
+
+#---indexer information
+print "Indxer Information\n" if $debug;
+for ( my $i = 1; $i <= $num_idx_pr; $i++ ) {
+    my $node = "spkidx00$i.$dc_pr.ariba.com";
+    $idx_list_pr = $idx_list_pr ? "$idx_list_pr $node" : $node;
+    print "\t$node\n" if $debug;
+}
+for ( my $i = 1; $i <= $num_idx_dr; $i++ ) {
+    my $node = "spkidx00$i.$dc_dr.ariba.com";
+    $idx_list_dr = $idx_list_dr ? "$idx_list_dr $node" : $node;
+    print "\t$node\n" if $debug;
+}
+$idx_list = "$idx_list_pr $idx_list_dr";
+
+#----- build the variables for the mcl
+my $ftmp = "mcl_head.dat";
+open(FTMP, ">", $ftmp) or die "Error creating file $ftmp: $!";
+print FTMP "Variable: SERVICE=$service\n";
+print FTMP "\n";
+print FTMP "#--- get from command line\n";
+print FTMP "\n";
+print FTMP "Variable: spk_cmd=/opt/splunk/bin/splunk\n";
+print FTMP "\n";
+print FTMP "Variable: shlist_pr=$sea_list_pr\n";
+print FTMP "Variable: shlist_dr=$sea_list_dr\n";
+print FTMP "Variable: shlist=$sea_list\n";
+print FTMP "Variable: idxlist_pr=$idx_list_pr\n";
+print FTMP "Variable: idxlist_dr=$idx_list_dr\n";
+print FTMP "Variable: idxlist=$idx_list\n";
+print FTMP "Variable: mst_active=$mst_active\n";
+print FTMP "Variable: mst_standby=$mst_standby\n";
+print FTMP "Variable: ds_active=$ds_active\n";
+print FTMP "Variable: ds_standby=$ds_standby\n";
+print FTMP "\n";
+print FTMP "Variable: dc_pr=$dc_pr\n";
+print FTMP "Variable: dc_dr=$dc_dr\n";
+print FTMP "Variable: user=$monuser\n";
+
+close(FTMP);
+
+gen_mcl_dr();
+
+`rm $ftmp` unless $debug;
+
+#------------subs
+
+sub gen_mcl_dr {
+    my $fo_template = "$binpath/splunk_dr_failover_mcl.template";
+    my $fb_template = "$binpath/splunk_dr_failback_mcl.template";
+
+    my $fo_file = "$output/splunk_dr_failover.mcl";
+    my $fb_file = "$output/splunk_dr_failback.mcl";
+
+
+    `cat $ftmp > $fo_file`;
+    `cat $ftmp > $fb_file`;
+    `cat $fo_template >> $fo_file`;
+    `cat $fb_template >> $fb_file`;
+}
+
+sub gen_mcl_mst {
+    my $fo_template = "splunk_mst_failover_mcl.template";
+    my $fb_template = "splunk_mst_failback_mcl.template";
+
+    my $fo_file = "splunk_mst_failover.mcl";
+    my $fb_file = "splunk_mst_failback.mcl";
+
+
+    `cat $ftmp > $fo_file`;
+    `cat $ftmp > $fb_file`;
+    `cat $fo_template >> $fo_file`;
+    `cat $fb_template >> $fb_file`;
+}
+
+sub gen_mcl_idx {
+    # instruction only
+}
+
+sub gen_mcl_sea {
+    # no action expected
+}
+
+sub gen_mcl_ds {
+    # no action expected
+}
+
+
+#------------------------------------------
+=pod
+
+=head1 NAME
+
+Generate MCL scritps for failover and failback with Splunk failures
+
+=head1 SYNOPSIS
+
+Usage: splunk_failure_mcl_gen [--debug] [--help] [--cfg <conf-file>] [--region <region>] [--output <path>]
+    --cfg: specify a configuration xml file for splunk deployment
+        default is splunk_deployment.xml
+    --region: specify a region 
+        default is us
+    --output: specify a location for the generated mcl files
+
+=head1 DESCRIPTION
+
+This script is developed to generate MCL scripts to handle failover and failback with Splunk failures. The current
+version offers the functinality for full site DR situation.
+
+=cut

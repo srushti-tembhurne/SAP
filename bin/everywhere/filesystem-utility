@@ -1,0 +1,216 @@
+#!/usr/local/bin/perl -w
+#
+# This script gives all details of a devices that make up a filesystem.
+#
+
+use strict;
+use FindBin;
+
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../lib/perl";
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+use lib "$FindBin::Bin/../../../tools/lib/perl";
+
+use ariba::Ops::FileSystemUtils;
+
+my $debug = 0;
+my @validActions = qw(offline online offlineremove initdg growfs removelun onlineluns scanonline removeluns removedisks renamedg joindg scsiscan mountmultipath updatehana loadhanadisks );
+
+sub usage {
+    my $message = shift;
+
+    print "ERROR: $message\n\n" if $message;
+    print "$0 [-hd] (-g <diskgroup> | -f <filesystem>[,<filesystem>...] | -v <volume> | -l <lun>[,<lun>...] -k <vxname>[,<vxname>...]) <action>\n";
+    print " Actions:\n";
+    print "     offline           offline all disks in a diskgroup belonging to the given filesystem\n";
+    print "     online            online all disks in a diskgroup previously offlined with this utlity\n";
+    print "     scanonline        scan and online all disks based on diskgroup\n";
+    print "     scsiscan          issue a scsi rescan only (no vx commands)\n";
+    print "     offlineremove     offline as above and but also remove the VX disk\n";
+    print "     initdg            initialize a disk group.\n";
+    print "     growfs            grow a volume.\n";
+    print "     removeluns        issues the command to release OS LUN mapping.\n";
+    print "     removedisks       remove a list of VX disks from a diskgroup.\n";
+    print "     renamedg          change the name of a diskgroups, as oldname,newname.\n";
+    print "     joindg            merge two disk groups, specified as newDG,targetDG.\n";
+    print "\n";
+    print " Options:\n";
+    print " -h     #  this help\n";
+    print " -d     #  debug\n";
+    print "\n";
+    print "\n";
+
+    exit(1);
+}
+
+$main::quiet = 1;
+
+sub main {
+    my $diskgroup;
+    my $volume;
+    my $luns;
+    my @filesystems = ();
+    my @vxDisks = ();
+    my $action;
+	my $sid;
+	my $oldMapperId;
+
+    while(my $arg=shift(@ARGV)) {
+        if( $arg =~ /^-h/o ){ usage(); };
+        if( $arg =~ /^-d/o ){ $debug++; };
+        if( $arg =~ /^-g/o ){ $diskgroup = shift(@ARGV); next; };
+        if( $arg =~ /^-v/o ){ $volume = shift(@ARGV); next; };
+        if( $arg =~ /^-l/o ){ $luns = shift(@ARGV); next; };
+        if( $arg =~ /^-f/o ){ @filesystems = split(/,/, shift(@ARGV)); next; }
+        if( $arg =~ /^-k/o ){ @vxDisks = split(/,/, shift(@ARGV)); next; }
+		if( $arg =~ /^-s/o ){ $sid = shift(@ARGV); next; }
+		if( $arg =~ /^-i/o ){ $oldMapperId = shift(@ARGV); next; }
+        if( $arg !~ /^-/o ) { $action = $arg; next;};
+    }
+
+    unless (defined($action)) {
+        usage("An action must be be specified");
+    } 
+
+    unless (grep($_ eq $action, @validActions)) {
+        usage("$action is not a valid action");
+    } 
+
+    print "debug level in $debug\n" if $debug;
+    ariba::Ops::FileSystemUtils::setDebug($debug);	
+    $main::quiet = 0 if $debug >= 2;
+
+	if ( $action eq "scsiscan" ) {
+        unless(ariba::Ops::FileSystemUtils::scsiScan()) {
+            die(ariba::Ops::FileSystemUtils::getError());
+		}
+		exit(0);
+	}
+	if ( $action eq "mountmultipath" ) {
+        unless(ariba::Ops::FileSystemUtils::mountMultiPathLunAsVolume($luns, $volume)) {
+            die(ariba::Ops::FileSystemUtils::getError());
+		}
+		exit(0);
+	}
+	if ( $action eq "updatehana" ) {
+        unless(ariba::Ops::FileSystemUtils::updateHanaConfig($luns, $sid, $oldMapperId)) {
+            die(ariba::Ops::FileSystemUtils::getError());
+		}
+		exit(0);
+	}
+	if ( $action eq "loadhanadisks" ) {
+        unless(ariba::Ops::FileSystemUtils::loadHanaDisksByLuns($luns)) {
+            die(ariba::Ops::FileSystemUtils::getError());
+		}
+		exit(0);
+	}
+    if ( $action eq "onlineluns" || $action eq "scanonline" )         {
+        unless(ariba::Ops::FileSystemUtils::scanAndOnlineDiskGroup($diskgroup)) {
+            #
+            # occasionally this gets confused, so try this before dying:
+            #
+            ariba::Ops::FileSystemUtils::waitForDisksInErrorState();
+            ariba::Ops::FileSystemUtils::offlineDiskgroup($diskgroup, 1);
+            unless(ariba::Ops::FileSystemUtils::scanAndOnlineDiskGroup($diskgroup)) {
+            
+                die(ariba::Ops::FileSystemUtils::getError());
+            }
+        }
+        exit(0);
+    }
+    if ( $action eq "initdg" )         {
+        unless(ariba::Ops::FileSystemUtils::initDiskGroup($diskgroup, $volume, $luns)) {
+            die(ariba::Ops::FileSystemUtils::getError());
+        }
+        exit(0);
+    }
+
+    if ( $action eq "growfs" )         {
+        unless(ariba::Ops::FileSystemUtils::growFS($diskgroup, $volume, $luns)) {
+            die(ariba::Ops::FileSystemUtils::getError());
+        }
+        exit(0);
+    }
+
+    if ( $action eq "removelun" || $action eq "removeluns" )      {
+        foreach my $lun (split(/,/,$luns)) {
+            print "Removing $lun...\n";
+            unless(ariba::Ops::FileSystemUtils::removeOSLun($lun)) {
+                die(ariba::Ops::FileSystemUtils::getError());
+            }
+        }
+        exit(0);
+    }
+
+    if ( $action eq "removedisks" ) {
+        foreach my $fs (@filesystems) {
+            unless(ariba::Ops::FileSystemUtils::removeDisksForMountPoint($fs, @vxDisks)) {
+                die(ariba::Ops::FileSystemUtils::getError());
+            }
+        }
+        exit(0);
+    }
+
+    if ( $action eq "renamedg" ) {
+        my ($oldname, $newname) = split(/,/, $diskgroup);
+        unless(ariba::Ops::FileSystemUtils::renameDG($oldname, $newname)) {
+            die(ariba::Ops::FileSystemUtils::getError());
+        }
+        exit(0);
+    }
+
+    if ( $action eq "joindg" ) {
+        my ($source, $target) = split(/,/, $diskgroup);
+        unless(ariba::Ops::FileSystemUtils::joinDG($source, $target)) {
+            die(ariba::Ops::FileSystemUtils::getError());
+        }
+        exit(0);
+    }
+
+    if (!scalar(@filesystems) && !$diskgroup) {
+        usage("Either a set of filesystems that make up diskgroup or a diskgroup must be specified");
+    }
+
+    unless ($diskgroup) {
+        for my $fs (@filesystems) {
+            my $dgFromMountPoint = ariba::Ops::FileSystemUtils::diskgroupForMountPoint($fs);
+
+            if (!$dgFromMountPoint) {
+                print "ERROR: could not get the diskgroup for filesystem '$fs'\n";
+                exit(1);
+            }
+
+            $diskgroup = $dgFromMountPoint if !$diskgroup; 
+            if ($diskgroup ne $dgFromMountPoint) {
+                print "ERROR: The specified filesystems must be part of only one diskgroup";
+                exit(1);
+            }
+        }
+
+        # If the fileystem argument was given, make sure it includes all the filesystems for a diskgroup
+        for my $filesystemsFromDiskgroup (ariba::Ops::FileSystemUtils::filesystemsForDiskgroup($diskgroup)) {
+            unless (grep($_ eq $filesystemsFromDiskgroup, @filesystems)) {
+                usage("Not all filesystems for diskgroup $diskgroup were listed on the commandline");
+            }
+        }
+    }
+
+    if ( $action eq "offline" )        {
+        unless(ariba::Ops::FileSystemUtils::offlineDiskgroup($diskgroup)) {
+            die(ariba::Ops::FileSystemUtils::getError());
+        }
+    }
+    if ( $action eq "online" )         {
+        unless(ariba::Ops::FileSystemUtils::onlineDiskgroup($diskgroup)) {
+            die(ariba::Ops::FileSystemUtils::getError());
+        }
+    }
+    if ( $action eq "offlineremove" )  {
+        unless(ariba::Ops::FileSystemUtils::offlineDiskgroup($diskgroup, 1)) {
+            die(ariba::Ops::FileSystemUtils::getError());
+        }
+    }
+}
+
+main();

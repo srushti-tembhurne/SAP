@@ -1,0 +1,136 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/add-records-to-downtime-db#13 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use ariba::monitor::DowntimeEntry;
+use ariba::monitor::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use Date::Parse;
+use Time::Local;
+
+my $debug = 1;
+
+sub main {
+	my ($arg, $start, $end, $product, $planned, $note, $opsnote, $customer, $appname);
+
+	warn("DO NOT RUN THIS UNLESS YOU ARE SURE YOU SHOULD\n");
+
+	while ( $arg = shift(@ARGV) ) {
+		if ( $arg =~ /^-h/ ) { usage(); }
+		if ( $arg =~ /^-d/ ) { $debug = 1; }
+		if ( $arg =~ /^-start/ ) { $start = shift(@ARGV); }
+		if ( $arg =~ /^-end/ ) { $end = shift(@ARGV); }
+		if ( $arg =~ /^-product/ ) { $product = shift(@ARGV); }
+		if ( $arg =~ /^-note/ ) { $note = shift(@ARGV); }
+		if ( $arg =~ /^-opsnote/ ) { $opsnote = shift(@ARGV); }
+		if ( $arg =~ /^-customer/ ) { $customer = shift(@ARGV); }
+		if ( $arg =~ /^-planned/ ) { $planned = 1; }
+		if ( $arg =~ /^-appname/ ) { $appname = shift(@ARGV); }
+	}
+
+	usage("need product name") unless $product;	
+	usage("need start date") unless $start;	
+	usage("need end date") unless $end;	
+
+	# convert the human string into local unix time, and then into gmtime for storing.
+	my $startTime = str2time($start);
+	my $endTime   = str2time($end);
+
+	my $me   = ariba::rc::InstalledProduct->new('mon');
+	my $prod = ariba::rc::InstalledProduct->new($product, $me->service(), undef, $customer);
+
+	my @apps = ();
+
+	# for items that aren't marked as recordstatus
+	if ($appname) {
+		push @apps, $appname;
+	} else {
+		@apps = sort $prod->appNamesWithRecordDowntimeStatus();
+	}
+
+	unless ($planned) {
+		print "Marking product $product unplanned down\n";
+	} else {
+		print "Marking product $product planned down\n";
+	}
+
+	print "\n";
+	print "product: $product\n";
+	print "customer $customer\n" if $customer;
+	print "  start: $start ($startTime)\n";
+	print "    end: $end ($endTime)\n";
+	print "   apps: \n          ";
+	print     join("\n          ", @apps),"\n";
+
+	# transition type  0 == up->down, 1 == down->up
+	# planned? 0 == unplanned, 1 == planned
+
+	$planned = 0 unless defined $planned;
+
+	$note = "this needs to to updated by ProdOps" unless defined $note;
+
+	ariba::monitor::DowntimeEntry->connectToDatabase($me);
+
+	for my $app (@apps) {
+		print "writing down for $app\n";
+
+		my $entry = ariba::monitor::DowntimeEntry->newWithDetails({
+			'productname' => $product,
+			'appname' => $app,
+			'transitiontype' => 0,
+			'planned' => $planned,
+			'timestamp' => $startTime,
+			'note' => $note,
+		});
+
+		$entry->setOpsnote($opsnote) if $opsnote;
+		$entry->setCustomer($customer) if $customer;
+		$entry->save();
+	}
+
+	for my $app (@apps) {
+		print "writing up for $app\n";
+
+		my $entry = ariba::monitor::DowntimeEntry->newWithDetails({
+			'productname' => $product,
+			'appname' => $app,
+			'transitiontype' => 1,
+			'planned' => $planned,
+			'timestamp' => $endTime,
+			'note' => $note,
+		});
+
+		$entry->setOpsnote($opsnote) if $opsnote;
+		$entry->setCustomer($customer) if $customer;
+		$entry->save();
+	}
+}
+
+sub usage {
+	print "Error: $_[0]\n" if $_[0];
+	print "usage: $0 [args below]\n";
+	print "       -help  this help\n";
+	print "       -product <an|ibx|...>\n";
+	print "       -start YYYY-MM-DD:hh:mm\n";
+	print "       -end YYYY-MM-DD:hh:mm\n";
+	print "       [-debug]\n";
+	print "       [-planned]\n";
+	print "       [-customer <customer>]\n";
+	print "       [-note <note>]\n";
+	print "       [-opsnote <note>]\n";
+	print "       [-appname <appname>] - optional for specific urls.\n";
+	print "\n";
+	print "This connects to the monitor product's opsmetrics database\n";
+	print "and manually adds downtimes.\n";
+	print "\n";
+	print "     Do not run this!\n";
+	print "\n";
+	exit(1);
+}
+
+main();

@@ -1,0 +1,314 @@
+#!/usr/local/bin/perl -w
+
+#
+# go through applogs on a daily basis and munge them
+# 
+
+use DateTime;
+use FindBin;
+use File::Path;
+use File::Basename;
+use IO::File;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use ariba::rc::Globals;
+use ariba::rc::CipherStore;
+use ariba::rc::Passwords;
+use ariba::Ops::Constants;
+use ariba::Ops::DateTime;
+
+use ariba::util::Simplefind;
+
+use ariba::monitor::misc;
+use ariba::monitor::LogMiner::Plugin;
+
+use dmail::LockLib;
+
+my $debug = 0;
+$main::quiet = 1;
+
+my $PROG = basename($0);
+
+
+sub usage {
+	my $msg = shift;
+
+	print "$msg\n\n" if $msg;
+
+	print "Usage: $PROG [<$PROG options>] -product <prodname> -service <service> [-customer <customer>] [-startdate <date> -enddate <date>] <report module> [ <report module options> ]\n";
+	print "       $PROG [<$PROG options>] -files <path> <report module> [ <report module options> ]\n";
+	print "\n";
+	print "  -product <prod> -service <service> [-customer <customer>]\n";
+	print "     This will work on logs for the given product/service; it is intended to be run\n";
+	print "     from a monitoring host as a cron job\n";
+	print "\n";
+	print " -filesDir <path>  use files in <path> instead of downloading for a product\n";
+	print "      This is meant for creating one-off reports by hand\n";
+	print "\n";
+	print "  -startdate and -enddate take a date in the following forms:\n";
+	print "    dd/MM/yyyy  23/dec/2008\n";
+	print "    mm/dd/yyyy  12/23/2008\n";
+	print "\n";
+	print "    Any format supported by Date::Parse::str2time will work\n";
+	print "\n";
+	print "  <report module> is the full name of the report module to use, e.g.\n";
+	print "    ariba::monitor::LogMiner::ExceptionCollector\n";
+	print "\n";
+	print "  <report module options> is a list of one or more space separted key=value pairs that\n";
+	print "    will be passed to the report module; e.g. debug=1 numberOfLines=6\n";
+	print "    Use -help <full module name> to see all options a module supports\n";
+	print "\n";
+	print " $PROG options:\n";
+	print "  -output <file>  output to <file>\n";
+	print "\n";
+	print "  -help  print this message; if a module is specified, also print the module's usage\n";
+	print "\n";
+
+	exit(0);
+}
+
+sub main {
+	
+	my ($productName, $service, $customer);
+	my ($startDateString, $endDateString);
+	my $filesDir;
+	my $reportName;
+	my %pluginArgs;
+	my $outputFileName;
+
+	my $showHelp = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-prod/i) { $productName = shift(@ARGV); next; }
+		if ($arg =~ /^-serv/i) { $service = shift(@ARGV); next; }
+		if ($arg =~ /^-cust/i) { $customer = shift(@ARGV); next; }
+		if ($arg =~ /^-files/i) { $filesDir = shift(@ARGV); next; }
+		if ($arg =~ /^-startdate/i) { $startDateString = shift(@ARGV); next; }
+		if ($arg =~ /^-enddate/i) { $startDateString = shift(@ARGV); next; }
+		if ($arg =~ /^-h(elp)?/i ) { $showHelp = 1; next; }
+		if ($arg =~ /^-d(ebug)?/i) { ++$debug; $main::quiet = 0; next;}
+		if ($arg =~ /^-output/i ) { $outputFileName = shift(@ARGV); next;}
+		if ($arg !~ /^-/i) { 
+			unless ($reportName) {
+				$reportName = $arg; next;
+			} else {
+				my ($key,$value) = split(/\s*=\s*/, $arg);
+				$pluginArgs{$key} = $value;
+			}
+		}
+
+	}
+
+	my $logMiner;
+
+	print "Debug is ON\n" if $debug;
+
+	if ($reportName) {
+		$logMiner = ariba::monitor::LogMiner::Plugin->newFromPluginClass($reportName, \%pluginArgs);
+		usage("Couldn't find report module $reportName") unless $logMiner;
+
+		if ($showHelp) {
+			$logMiner->usage();
+			exit(0);
+		}
+	}
+
+	if ($showHelp) {
+		usage();
+	}
+
+	unless ($reportName) {
+		usage("Must specify a report module name");
+	}
+
+	if ($filesDir) {
+		processFilesInDir($logMiner, $filesDir, $outputFileName);
+	} else {
+		processFilesForProduct($logMiner, $productName, $service, $startDateString, $endDateString, $outputFileName);
+	}
+
+}
+
+sub processFilesInDir {
+	my $logMiner = shift;
+	my $filesDir = shift;
+	my $outputFileName = shift;
+
+	my @files;
+	if (-d $filesDir) {
+		my $find = ariba::util::Simplefind->new($filesDir);
+		@files = $find->find();
+	} elsif (-f $filesDir) {
+		@files = ($filesDir);
+	} else {
+		die "Error: $filesDir not a file or directory";
+	}
+
+	my $errorFH = IO::File->new(">&=STDOUT");
+	$logMiner->setErrorFH($errorFH);
+
+	for my $file (@files) {
+		print "working on $file\n" if ($debug);
+		$logMiner->processFile($file);
+	}
+
+	$outputFileName = "report.txt" unless $outputFileName;
+
+	print "Output to $outputFileName\n";
+	$logMiner->printReport($outputFileName);
+}
+
+sub processFilesForProduct {
+	
+	my $logMiner = shift;
+	my $productName = shift;
+	my $service = shift;
+	my $startDateString = shift;
+	my $endDateString = shift;
+	my $outputFileName = shift;
+
+	unless (ariba::rc::InstalledProduct->isInstalled($productName, $service, undef, $customer)) {
+		die "$productName not installed in service $service";
+	}
+
+	my $lockFile = "/tmp/$PROG-$productName";
+	if (!dmail::LockLib::requestlock($lockFile,10)) {
+		die "can't grab lock\n";
+	}
+
+	#
+	# get service username/password 
+	my $username = ariba::rc::Globals::deploymentUser($productName, $service);
+	my $cipherStore = ariba::rc::CipherStore->new($service);
+	my $password    = $cipherStore->valueForName($username);
+	if (!$password and -t STDIN) {
+		ariba::rc::Passwords::initialize($service);
+		$password = ariba::rc::Passwords::lookup($username);
+	}
+
+	#
+	# verify start/end dates
+	my ($startDate, $endDate);
+
+	my $today = DateTime->now( time_zone => 'local' )->truncate( to => 'day' );
+
+	if ($startDateString) {
+		$startDate = ariba::Ops::DateTime->parseDateFromString($startDateString);
+		usage("Error parsing $startDateString") unless ($startDate);
+	}
+
+	if ($endDateString) {
+		$endDate = ariba::Ops::DateTime->parseDateFromString($endDateString);
+		usage("Error parsing $endDateString") unless ($endDate);
+	}
+
+	if (!$startDateString && !$endDateString) {
+		$startDate = $today->clone()->add( days => -1 );
+		$endDate = $today->clone();
+	} elsif (!$startDateString) {
+		$startDate = $endDate->clone()->add( days => -1);
+	} elsif (!$endDateString) {
+		$endDate = $startDate->clone()->add( days => 1);
+	}
+
+    $startDate->truncate( to => 'day' );
+    $endDate->truncate( to => 'day' );
+
+	my $product = ariba::rc::InstalledProduct->new($productName, $service, undef, $customer);
+	my $archivedLogsDir = ariba::Ops::Constants::archiveLogDir($service, $productName, $customer);
+	($productName, $service) = ($product->name(), $product->service());
+
+	my $outputRef = [];
+	my $logDestPrefix = "/var/tmp/$PROG/$productName/$service";
+
+	my @instances = $product->appInstances();
+	my %hosts = map({ $_->host() => 1 } @instances);
+
+	my $reportDir = ariba::monitor::misc::autoGeneratedDocsDir() . "/logreports/$productName/" . $logMiner->descriptionString();
+	File::Path::mkpath($reportDir);
+	my $fileNameDateString = $startDate->ymd("-") . "_" . $endDate->ymd("-");
+	my $errorLogFilePath = "$reportDir/$fileNameDateString-error.txt";
+
+	my $errorFH;
+	if ($debug) {
+		$errorFH = IO::File->new(">&=STDOUT");
+	} else {
+		$errorFH = IO::File->new(">$errorLogFilePath");
+	}
+	$logMiner->setErrorFH($errorFH);
+	
+	print "Working on " . $startDate->ymd() . " to " . $endDate->ymd() . "\n" if ($debug);
+
+	for my $host (keys %hosts) {
+		for (my $date = $startDate->clone(); DateTime->compare($date, $endDate) < 0; $date->add( days => 1 )) {
+
+			my $dateString = $date->ymd('/');
+
+			my $logDest = "$logDestPrefix/$dateString";
+			File::Path::mkpath($logDest);
+
+			#
+			# fetch logs
+			#
+			print "fetching files from $host for $dateString to $logDest\n" if ($debug);
+
+			my $ret = ariba::rc::Utils::transferFromSrcToDestNoCheck(
+				$host,
+				$username,
+				"$archivedLogsDir/$dateString",
+				"keepRunning*",
+
+				undef,
+				undef,
+				"$logDest/",
+				undef,
+
+				0,0,0,
+
+				$password,
+				$outputRef,
+			);
+
+			unless ($ret) {
+				my $error = "Error: failed to copy files from $host: ".join("\n",@$outputRef)."\n";
+				print $errorFH $error;
+				next;
+			}
+
+			#
+			# process and remove logs
+			#
+
+			opendir(DIR, "$logDest") or die "Can't open dir $logDest: $!";
+			my @files = grep { !/^\./ } readdir(DIR);
+			close(DIR);
+
+			for my $file (@files) {
+				print "working on $logDest/$file\n" if ($debug);
+				$logMiner->processFile("$logDest/$file");
+			}
+
+			#
+			# remove logs
+			#
+			print "Removing $logDest" if $debug;
+			File::Path::rmtree($logDest);
+		}
+	}
+
+	$outputFileName = "$fileNameDateString-report.txt" unless $outputFileName;
+	$logMiner->printReport("$reportDir/$outputFileName");
+
+	close($errorFH);
+
+	if (-f $errorLogFilePath && -z $errorLogFilePath) {
+		unlink $errorLogFilePath;
+	}
+
+	dmail::LockLib::releaselock($lockFile);
+}
+
+main();
+
