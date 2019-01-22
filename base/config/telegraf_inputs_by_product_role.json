@@ -1,0 +1,3624 @@
+{
+    "mon": {
+        "mon": {
+            "primary": [{
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/product-info\"]",
+                        "interval = \"60s\"",
+                        "timeout = \"60s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/s4/material-master-jobs-status -prod s4\"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/db-locking-check -prod mon\"]",
+                        "interval = \"900s\"",
+                        "timeout = \"900s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/product-filesystem-check\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/machine-watcher\"]",
+                        "interval = \"180s\"",
+                        "timeout = \"500s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/cpu-watcher\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"599s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/disk-usage\"]",
+                        "interval = \"1560s\"",
+                        "timeout = \"1559s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/load-average-watcher\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"500s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/node-health\"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/hana-multipath-status\"]",
+                        "interval = \"900s\"",
+                        "timeout = \"900s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/listener-log\"]",
+                        "interval = \"900s\"",
+                        "timeout = \"900s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/focus-customers\"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/mon/fyst-status\"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/query-frequency\"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/mon/record-pagerequest-volume\"]",
+                        "interval = \"86400s\"",
+                        "timeout = \"86400s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/mon/record-vm-tab-status\"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/mon/spew-status\"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/redis/redis-db-stats\"]",
+                        "interval = \"240s\"",
+                        "timeout = \"240s\"",
+                        "data_format = \"influx\""                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/redis/redis-nodes-status\"]",
+                        "interval = \"240s\"",
+                        "timeout = \"240s\"",
+                        "data_format = \"influx\""                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/state-of-machine-db\"]",
+                        "interval = \"86400s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/stats-job-status\"]",
+                        "interval = \"86400s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 1 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 2 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 3 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 4 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 5 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 6 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 7 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 8 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 9 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 10 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 11 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 12 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 13 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 14 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 15 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 16 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 17 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 18 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 19 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 20 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 21 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 22 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 23 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 24 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 25 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 26 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 27 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 28 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 29 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/mon<<SERVICE>>/stratus/config/hana_metrics.cfg --service <<SERVICE>> --bucket_number 30 --bucket_total 30\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_oracle --metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg --service <<SERVICE>> --prodName an\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                        "input_type": "exec",
+                        "parameters": [
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_oracle --metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg --service <<SERVICE>> --prodName buyer --bucket_number 1 --bucket_total 5\"]",
+                                "interval = \"900s\"",
+                                "timeout = \"900s\"",
+                                "data_format = \"influx\""
+                        ]
+                },
+                {
+                        "input_type": "exec",
+                        "parameters": [
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_oracle --metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg --service <<SERVICE>> --prodName buyer --bucket_number 2 --bucket_total 5\"]",
+                                "interval = \"900s\"",
+                                "timeout = \"900s\"",
+                                "data_format = \"influx\""
+                        ]
+                },
+                {
+                        "input_type": "exec",
+                        "parameters": [
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_oracle --metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg --service <<SERVICE>> --prodName buyer --bucket_number 3 --bucket_total 5\"]",
+                                "interval = \"900s\"",
+                                "timeout = \"900s\"",
+                                "data_format = \"influx\""
+                        ]
+                },
+                {
+                        "input_type": "exec",
+                        "parameters": [
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_oracle --metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg --service <<SERVICE>> --prodName buyer --bucket_number 4 --bucket_total 5\"]",
+                                "interval = \"900s\"",
+                                "timeout = \"900s\"",
+                                "data_format = \"influx\""
+                        ]
+                },
+                {
+                        "input_type": "exec",
+                        "parameters": [
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_oracle --metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg --service <<SERVICE>> --prodName buyer --bucket_number 5 --bucket_total 5\"]",
+                                "interval = \"900s\"",
+                                "timeout = \"900s\"",
+                                "data_format = \"influx\""
+                        ]
+                },
+                {
+                        "input_type": "exec",
+                        "parameters": [
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_oracle --metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg --service <<SERVICE>> --prodName s4\"]",
+                                "interval = \"600s\"",
+                                "timeout = \"600s\"",
+                                "data_format = \"influx\""
+                        ]
+                },
+                {
+                        "input_type": "exec",
+                        "parameters": [
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_oracle --metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg --service <<SERVICE>> --prodName community\"]",
+                                "interval = \"600s\"",
+                                "timeout = \"600s\"",
+                                "data_format = \"influx\""
+                        ]
+                },
+                {
+                        "input_type": "exec",
+                        "parameters": [
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_oracle --metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg --service <<SERVICE>> --prodName dms\"]",
+                                "interval = \"600s\"",
+                                "timeout = \"600s\"",
+                                "data_format = \"influx\""
+                        ]
+                },
+                {
+                        "input_type": "exec",
+                        "parameters": [
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_oracle --metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg --service <<SERVICE>> --prodName gb\"]",
+                                "interval = \"600s\"",
+                                "timeout = \"600s\"",
+                                "data_format = \"influx\""
+                        ]
+                },
+                {
+                        "input_type": "exec",
+                        "parameters": [
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_oracle --metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg --service <<SERVICE>> --prodName mobile\"]",
+                                "interval = \"600s\"",
+                                "timeout = \"600s\"",
+                                "data_format = \"influx\""
+                        ]
+                },
+                {
+                        "input_type": "exec",
+                        "parameters": [
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_oracle --metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg --service <<SERVICE>> --prodName sdb\"]",
+                                "interval = \"600s\"",
+                                "timeout = \"600s\"",
+                                "data_format = \"influx\""
+                        ]
+                },
+                {
+                        "input_type": "exec",
+                        "parameters": [
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_oracle --metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg --service <<SERVICE>> --prodName sellerdirect\"]",
+                                "interval = \"600s\"",
+                                "timeout = \"600s\"",
+                                "data_format = \"influx\""
+                        ]
+                },
+                {
+                        "input_type": "exec",
+                        "parameters": [
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_oracle --metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg --service <<SERVICE>> --prodName spotbuy\"]",
+                                "interval = \"600s\"",
+                                "timeout = \"600s\"",
+                                "data_format = \"influx\""
+                        ]
+                },
+                {
+                        "input_type": "exec",
+                        "parameters": [
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_oracle --metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg --service <<SERVICE>> --prodName suppliermanagement\"]",
+                                "interval = \"600s\"",
+                                "timeout = \"600s\"",
+                                "data_format = \"influx\""
+                        ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/ws-cert-expire\"]",
+                        "interval = \"86400s\"",
+                        "timeout = \"60s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                       "input_type":"exec",
+                       "parameters":[
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/cert-bundle-expire\"]",
+                                "interval = \"86400s\"",
+                                "timeout = \"60s\"",
+                                "data_format = \"influx\""
+                        ]
+                 },
+                 {
+                       "input_type":"exec",
+                       "parameters":[
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/check-console-hostnames\"]",
+                                "interval = \"10800s\"",
+                                "timeout = \"600s\"",
+                                "data_format = \"influx\""
+                        ]
+                 },
+                 {
+                        "input_type":"exec",
+                        "parameters":[
+                                 "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/dns-watcher\"]",
+                                 "interval = \"300s\"",
+                                 "timeout = \"300s\"",
+                                 "data_format = \"influx\""
+                         ]
+                 },
+                 {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/logsize-watcher\"]",
+                        "interval = \"14400s\"",
+                        "timeout = \"7200s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/hadoop/zookeeper-status hadoop\"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/hadoop/zookeeper-status logi\"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/hadoop/zookeeper-status arches5\"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/mon/kr-status\"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/sdb/sdb-activity\"]",
+                        "interval = \"900s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/redis-status-embedded\"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/db-conn-status\"]",
+                         "interval = \"240s\"",
+                         "timeout = \"240s\"",
+                         "data_format = \"influx\""
+                     ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/instance-heap-usage\"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/client-cert-expire\"]",
+                        "interval = \"120s\"",
+                        "timeout = \"120s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/netapp-cluster-status \"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/netapp-domain \"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/netapp-latency \"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/etherchannel-status \"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/vip-pool \"]",
+                        "interval = \"7200s\"",
+                        "timeout = \"7200s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/mem-watcher \"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/os-revision \"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/object-tracking \"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/redundancy-check \"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/bgp \"]",
+                        "interval = \"43200s\"",
+                        "timeout = \"43200s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/network-errors \"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"1200s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/power \"]",
+                        "interval = \"21600s\"",
+                        "timeout = \"21600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/switch-usage \"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/sendmail-status   \"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/sysadmin/spare-check   \"]",
+                        "interval = \"86400s\"",
+                        "timeout = \"86400s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/network-bad-duplex    \"]",
+                        "interval = \"7200s\"",
+                        "timeout = \"7200s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/switch-port-name    \"]",
+                        "interval = \"14400s\"",
+                        "timeout = \"14400s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/product-status\"]",
+                        "interval = \"14400s\"",
+                        "timeout = \"60s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/common/influxlp_import.sh /nfs/never 250\"]",
+                        "interval = \"60s\"",
+                        "timeout = \"15s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/bpm/purchase-order\"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/bpm/invoice\"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/bpm/influxdb-monitoring\"]",
+                        "interval = \"120s\"",
+                        "timeout = \"120s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ],
+            "secondary" : [
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/disk-usage\"]",
+                        "interval = \"1560s\"",
+                        "timeout = \"1559s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/machine-watcher -host mon11.snv.ariba.com\"]",
+                        "interval = \"180s\"",
+                        "timeout = \"500s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/cpu-watcher\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"599s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/load-average-watcher\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"500s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/hana-multipath-status\"]",
+                        "interval = \"900s\"",
+                        "timeout = \"900s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                       "input_type":"exec",
+                       "parameters":[
+                                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/check-console-hostnames\"]",
+                                "interval = \"10800s\"",
+                                "timeout = \"600s\"",
+                                "data_format = \"influx\""
+                        ]
+                 },
+                 {
+                        "input_type":"exec",
+                        "parameters":[
+                                 "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/dns-watcher\"]",
+                                 "interval = \"300s\"",
+                                 "timeout = \"300s\"",
+                                 "data_format = \"influx\""
+                         ]
+                 },
+                 {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/logsize-watcher\"]",
+                        "interval = \"14400s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/etherchannel-status \"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/mem-watcher \"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/os-revision \"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/object-tracking \"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/redundancy-check \"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/bgp \"]",
+                        "interval = \"43200s\"",
+                        "timeout = \"43200s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/network-errors \"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"1200s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/power \"]",
+                        "interval = \"21600s\"",
+                        "timeout = \"21600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/network/switch-usage \"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/sysadmin/spare-check   \"]",
+                        "interval = \"86400s\"",
+                        "timeout = \"86400s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/instance-heap-usage -cluster secondary\"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/mon/kr-status\"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/logsize-watcher -cluster secondary\"]",
+                        "interval = \"14400s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/node-health -cluster secondary\"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/mon/spew-status\"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+
+        },
+        "db": {
+            "primary": [{
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/numa-status  \"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+    },
+    "an": {
+        "mon": {
+            "primary": [{
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/mobile/an-mobile-status\"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/db-locking-check -prod an\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/mobile/ANmobile-backend-stats \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                    ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/discovery-status \"]",
+                    "interval = \"600s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                    ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/datalink-status \"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                    ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/exchange-rate-status\"]",
+                    "interval = \"600s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/flowExtension\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"60s\"",
+                    "data_format = \"influx\""
+                 ]
+            },
+            {
+                "input_type":"exec",
+                 "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/rfx-digest-status\"]",
+                    "interval = \"3600s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/rfx-notification\"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/supplierTracker\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/intermedia-status\"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/edi-interchange-status\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/daily-order-status\"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/misc-status-account-deprecated\"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/misc-status-account\"]",
+                    "interval = \"600s\"",
+                    "timeout = \"600s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/replication-status\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/scheduled-tasks an\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/scheduled-tasks an-edi\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/schedule-task-failure\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/edi-queue-status\"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/messaging-queue-status\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/micro-queue-status\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/esig-status\"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName an /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName an /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                 "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName an /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                   "interval = \"300s\"",
+                   "timeout = \"300s\"",
+                   "data_format = \"influx\""
+               ]
+           },
+           {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName an /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+           {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/node-status -prod an \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/oracle-long-running-transactions -product an \"]",
+                    "interval = \"3600s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/order-methods \"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+             {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/smi-status \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+             {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/an/aribapay-status \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+             }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName an /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName an /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+    },
+    "buyer":{
+      "mon":{
+        "primary" : [
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/aql-metrics -product buyer\"]",
+                    "interval = \"3600s\"",
+                    "timeout = \"600s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/durable-email-monitoring -prod buyer\"]",
+                    "interval = \"3600s\"",
+                    "timeout = \"3600s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/buyer/catalog-status -prod buyer\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/persistent-queue -prod buyer\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/encryption-length-hwm-stats -prod buyer\"]",
+                    "interval = \"180s\"",
+                    "timeout = \"180s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/physical-dataguard-status-replicated -product buyer\"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/realm-delete-status -prod buyer\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"600s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/realm-community-mapping -prod buyer\"]",
+                    "interval = \"1200s\"",
+                    "timeout = \"600s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/realm-schema-mapping -prod buyer\"]",
+                    "interval = \"1200s\"",
+                    "timeout = \"600s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/current-activity -prod buyer\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"600s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/cds-health -prod buyer\"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"600s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/buyer/usage-status -prod buyer\"]",
+                    "interval = \"3600s\"",
+                    "timeout = \"600s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/sizeof-bulk-allocated-resources -prod buyer\"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/conversational-api-status -product buyer\"]",
+                    "interval = \"3600s\"",
+                    "timeout = \"3600s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/buyer/queue-status -prod buyer\"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/persisted-mail-queue -prod buyer\"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/integration-events -prod buyer\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/master-data-service-monitoring -prod buyer\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+           },
+           {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/scheduled-tasks -prod buyer\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+           },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName buyer /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName buyer /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName buyer /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName buyer /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+           {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/node-status -prod buyer\"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/reporting-job-stats -prod buyer\"]",
+                    "interval = \"3600s\"",
+                    "timeout = \"3600s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/buyer/contract-status\"]",
+                    "interval = \"86400s\"",
+                    "timeout = \"360s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/db-sequence-check -prod buyer\"]",
+                    "interval = \"3600s\"",
+                    "timeout = \"3600s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/db-locking-check -prod buyer\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+             }
+        ],
+        "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName buyer /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName buyer /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+    },
+    "s4":{
+        "mon":{
+            "primary":[
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/aql-metrics -product s4\"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/node-health-detail -prod s4 -type normal\"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/web-server-isup -prod s4 -cluster primary\"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/persisted-mail-queue -prod s4\"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/s4/esignature-status -prod s4\"]",
+                        "interval = \"60s\"",
+                        "timeout = \"60s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/encryption-length-hwm-stats -prod s4\"]",
+                        "interval = \"180s\"",
+                        "timeout = \"180s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/realm-delete-status -prod s4\"]",
+                        "interval = \"900s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/realm-community-mapping -prod s4\"]",
+                        "interval = \"1200s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/realm-schema-mapping -prod s4\"]",
+                        "interval = \"1200s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/persistent-queue -prod s4\"]",
+                        "interval = \"900s\"",
+                        "timeout = \"900s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/current-activity -prod s4\"]",
+                        "interval = \"900s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/s4/activity-stats -prod s4\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/s4/intermedia-index-health -prod s4 \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/cds-health -prod s4\"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/physical-dataguard-gap-delay -prod s4\"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/s4/sizeof-bulk-allocated-resources -prod s4\"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/sizeof-bulk-allocated-resources -prod s4\"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/integration-events -prod s4\"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/master-data-service-monitoring -prod s4\"]",
+                        "interval = \"900s\"",
+                        "timeout = \"900s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/cgroups-status -prod s4\"]",
+                        "interval = \"600s\"",
+                        "timeout = \"600s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/scheduled-tasks -prod s4\"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/s4/activity-stats-lli -prod s4\"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName s4 /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName s4 /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName s4 /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName s4 /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/node-status -prod s4\"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/db-sequence-check -prod s4\"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "data_format = \"influx\""
+                    ]
+                 },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/db-locking-check -prod s4\"]",
+                        "interval = \"900s\"",
+                        "timeout = \"900s\"",
+                        "data_format = \"influx\""
+                    ]
+                 }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName s4 /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName s4 /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+    },
+    "ws":{
+        "mon":{
+            "primary" : [
+            {
+                "input_type":"exec",
+                "parameters":[
+                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/ws/cache-and-log-size -product ws\"]",
+                "interval = \"900s\"",
+                "timeout = \"360s\"",
+                "data_format = \"influx\""
+                ]
+             },
+            {
+                "input_type":"exec",
+                "parameters":[
+                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/ws/modjk-worker-status\"]",
+                "interval = \"1800s\"",
+                "timeout = \"1800s\"",
+                "data_format = \"influx\""
+                ]
+             },
+            {
+                "input_type":"exec",
+                "parameters":[
+                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/ws/modjk-workers-consistency\"]",
+                "interval = \"900s\"",
+                "timeout = \"900s\"",
+                "data_format = \"influx\""
+                ]
+             },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName ws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName ws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName ws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName ws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName ws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName s4 /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+    },
+    "cws":{
+        "mon":{
+            "primary" : [
+            {
+                "input_type":"exec",
+                "parameters":[
+                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/ws/cache-and-log-size -product cws\"]",
+                "interval = \"900s\"",
+                "timeout = \"360s\"",
+                "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/auc/auc-balancer-status -service <<SERVICE>>\"]",
+                    "interval = \"300s\"",
+                    "timeout = \"60s\"",
+                    "data_format = \"influx\""
+                 ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName cws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+             {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName cws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                 "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName cws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                   "interval = \"300s\"",
+                   "timeout = \"300s\"",
+                   "data_format = \"influx\""
+               ]
+           },
+           {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName cws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName cws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName cws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+    },
+    "mws":{
+        "mon":{
+            "primary" : [
+            {
+                "input_type":"exec",
+                "parameters":[
+                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/ws/cache-and-log-size -product mws\"]",
+                "interval = \"900s\"",
+                "timeout = \"360s\"",
+                "data_format = \"influx\""
+                ]
+             },
+             {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName mws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+             {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName mws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                 "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName mws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                   "interval = \"300s\"",
+                   "timeout = \"300s\"",
+                   "data_format = \"influx\""
+               ]
+           },
+           {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName mws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName mws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName mws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+    },
+    "ssws":{
+        "mon":{
+            "primary" : [
+            {
+                "input_type":"exec",
+                "parameters":[
+                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/ws/cache-and-log-size -product ssws\"]",
+                "interval = \"900s\"",
+                "timeout = \"360s\"",
+                "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/ws/realm-community-map-file\"]",
+                "interval = \"600s\"",
+                "timeout = \"360s\"",
+                "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/ws/http-connection-status -product ssws\"]",
+                "interval = \"300s\"",
+                "timeout = \"300s\"",
+                "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/ws/modjk-worker-status \"]",
+                "interval = \"600s\"",
+                "timeout = \"600s\"",
+                "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName ssws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName ssws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName ssws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName ssws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName ssws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName ssws /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+    },
+    "aesws":{
+        "mon":{
+            "primary" : [
+            {
+                "input_type":"exec",
+                "parameters":[
+                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/ws/cache-and-log-size -product aesws\"]",
+                "interval = \"900s\"",
+                "timeout = \"360s\"",
+                "data_format = \"influx\""
+                ]
+             }
+            ]
+        }
+    },
+    "arches5":{
+        "mon":{
+            "primary" : [
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/arches/arches-node-health -prod arches5\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/arches/search-index -prod arches5\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/arches/index-manager -prod arches5\"]",
+                    "interval = \"3600s\"",
+                    "timeout = \"3600s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/arches/index-manager -daily -prod arches5\"]",
+                    "interval = \"14400s\"",
+                    "timeout = \"14400s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/arches/queue-message-status -prod arches5\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+             {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName arches5 /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+             {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName arches5 /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName arches5 /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName arches5 /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                 "input_type":"exec",
+                 "parameters":[
+                 "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/arches/system-rebuild -prod arches5\"]",
+                    "interval = \"7200s\"",
+                    "timeout = \"7200s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/arches/shard-status -prod arches5\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/arches/shard-status -summary -prod arches5\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName arches5 /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName arches5 /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+    },
+    "sellerdirect":{
+        "mon":{
+            "primary" : [
+            {
+                "input_type":"exec",
+                "parameters":[
+                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/auc/current-memcached-connections -product sellerdirect\"]",
+                "interval = \"300s\"",
+                "timeout = \"300s\"",
+                "data_format = \"influx\""
+                ]
+             },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/db-locking-check -prod sellerdirect\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+             {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName sellerdirect /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName sellerdirect /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/auc/memcached-status -product sellerdirect\"]",
+                "interval = \"300s\"",
+                "timeout = \"300s\"",
+                "data_format = \"influx\""
+                ]
+             }
+            ]
+        }
+    },
+    "spotbuy":{
+        "mon":{
+            "primary" : [
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/auc/current-memcached-connections -product spotbuy\"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/db-locking-check -prod spotbuy\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName spotbuy /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName spotbuy /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName spotbuy /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName spotbuy /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/auc/memcached-status -product spotbuy\"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/spotbuy/ebay-watcher\"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName spotbuy /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName spotbuy /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+    },
+    "mobile":{
+        "mon":{
+            "primary" : [
+            {
+                "input_type":"exec",
+                "parameters":[
+                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/mobile/mobile-oauth-check\"]",
+                "interval = \"600s\"",
+                "timeout = \"360s\"",
+                "data_format = \"influx\""
+                ]
+             },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/db-locking-check -prod mobile\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+             {
+                "input_type":"exec",
+                "parameters":[
+                "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/mobile/mobile-status\"]",
+                "interval = \"300s\"",
+                "timeout = \"300s\"",
+                "data_format = \"influx\""
+                ]
+             },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName mobile  /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName mobile /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                 "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName mobile /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                   "interval = \"300s\"",
+                   "timeout = \"300s\"",
+                   "data_format = \"influx\""
+               ]
+           },
+           {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName mobile /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName mobile /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName mobile /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+    },
+   "dms":{
+        "mon":{
+            "primary" : [
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dms/dms-metrices -ds \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"360s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/db-locking-check -prod dms\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dms/dms-metrices -n\"]",
+                    "interval = \"43200s\"",
+                    "timeout = \"360s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dms/dms-metrices -r\"]",
+                    "interval = \"43200s\"",
+                    "timeout = \"360s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName dms /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName dms /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                 "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName dms /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                   "interval = \"300s\"",
+                   "timeout = \"300s\"",
+                   "data_format = \"influx\""
+               ]
+           },
+           {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName dms /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName dms /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName dms /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+     },
+   "gb":{
+        "mon":{
+            "primary" : [
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName gb /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/db-locking-check -prod gb\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName gb /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                 "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName gb /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                   "interval = \"300s\"",
+                   "timeout = \"300s\"",
+                   "data_format = \"influx\""
+               ]
+           },
+           {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName gb /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName gb /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName buyer /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+     },
+    "ebs":{
+        "mon":{
+            "primary" : [
+             {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/ebs/ebs-database\"]",
+                    "interval = \"86400s\"",
+                    "timeout = \"360s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+             {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/ebs/filesys-queue-status\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"360s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+             {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName ebs /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName ebs /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName ebs /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                   "interval = \"300s\"",
+                   "timeout = \"300s\"",
+                   "data_format = \"influx\""
+               ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName ebs /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                   "interval = \"900s\"",
+                   "timeout = \"900s\"",
+                   "data_format = \"influx\""
+               ]
+           }
+           ],
+           "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName ebs /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName ebs /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+     },
+   "arecibo":{
+        "mon":{
+            "primary" : [
+             {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/visualizer/current-activity\"]",
+                    "interval = \"600s\"",
+                    "timeout = \"360s\"",
+                    "data_format = \"influx\""
+                ]
+             }
+             ]
+        }
+    },
+  "help":{
+        "mon":{
+            "primary" : [
+             {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName help /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName help /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+          ],
+          "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName help /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName help /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+    },
+  "community":{
+        "mon":{
+            "primary" : [
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/auc/current-memcached-connections -product community\"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/db-locking-check -prod community\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/auc/memcached-status -product community\"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+             {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/auc/auc-comm-creation-monitoring\"]",
+                    "interval = \"21600s\"",
+                    "timeout = \"360s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+             {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/auc/auc-comm-content-import-status\"]",
+                    "interval = \"14400s\"",
+                    "timeout = \"360s\"",
+                    "data_format = \"influx\""
+                ]
+             },
+             {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/auc/auc-solr-status\"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+              },
+             {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/auc/auc-cache-status\"]",
+                    "interval = \"3600s\"",
+                    "timeout = \"360s\"",
+                    "data_format = \"influx\""
+                ]
+              },
+              {
+                "input_type":"exec",
+                 "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/auc/auc-siebel-routing\"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+               },
+               {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/auc/auc-clamAV-status\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"360s\"",
+                    "data_format = \"influx\""
+                ]
+               },
+               {
+                "input_type":"exec",
+                "parameters":[
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/auc/auc-validateLinks-status\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"360s\"",
+                    "data_format = \"influx\""
+                 ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/auc/auc-notifications-status\"]",
+                        "interval = \"900s\"",
+                        "timeout = \"360s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/boe/boe-status\"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"360s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type":"exec",
+                    "parameters":[
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/auc/learning-center-status\"]",
+                        "interval = \"3600s\"",
+                        "timeout = \"3600s\"",
+                        "name_suffix = \"_json_auc_lc_status\"",
+                        "data_format = \"json\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName community /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName community /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName community /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"300s\"",
+                        "timeout = \"300s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName community /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName community /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName  /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+   },
+    "suppliermanagement": {
+        "mon": {
+            "primary": [
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName suppliermanagement /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/db-locking-check -prod suppliermanagement\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName suppliermanagement /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName suppliermanagement /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName suppliermanagement /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName suppliermanagement /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName suppliermanagement /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+   },
+    "sdb": {
+        "mon": {
+            "primary": [
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName sdb /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/dba/db-locking-check -prod sdb\"]",
+                    "interval = \"900s\"",
+                    "timeout = \"900s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName sdb /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName sdb /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName sdb /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName sdb /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName sdb /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+   },
+    "ows": {
+        "mon": {
+            "primary": [
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName ows /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName ows /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName ows /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName ows /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName ows /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName ows /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+   },
+   "cxml": {
+        "mon": {
+            "primary": [
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName cxml /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName cxml /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName cxml /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName cxml /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName cxml /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName cxml /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+   },
+   "supplierrisk": {
+        "mon": {
+            "primary": [
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName supplierrisk /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName supplierrisk /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName supplierrisk /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName supplierrisk /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName supplierrisk /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName supplierrisk /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+   },
+   "hanasim": {
+        "mon": {
+            "primary": [
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type critical -prodName hanasim /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -prodName hanasim /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/front-door-lite -type normal -prodName hanasim /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"300s\"",
+                    "timeout = \"300s\"",
+                    "data_format = \"influx\""
+                ]
+            },
+            {
+                "input_type": "exec",
+                "parameters": [
+                    "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -prodName hanasim /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                    "interval = \"1800s\"",
+                    "timeout = \"1800s\"",
+                    "data_format = \"influx\""
+                ]
+            }
+            ],
+            "secondary" : [
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type critical -cluster secondary -prodName hanasim /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                },
+                {
+                    "input_type": "exec",
+                    "parameters": [
+                        "commands = [\"/home/mon<<SERVICE>>/stratus/bin/lineprotocol_wrapper /home/mon<<SERVICE>>/stratus/bin/common/http-watcher -type normal -cluster secondary -prodName hanasim /home/mon<<SERVICE>>/stratus/etc/http-watcher-urls \"]",
+                        "interval = \"1800s\"",
+                        "timeout = \"1800s\"",
+                        "data_format = \"influx\""
+                    ]
+                }
+            ]
+        }
+   }
+}

@@ -1,0 +1,124 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/dba/alert-log#45 $
+#
+# This script parses the oracle alert log file. It will page people if
+# it sees something bad in the alert logs.
+#
+# This script can be run as 'monprod' unix user.
+# It does not need to know any passwords.
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::monitor::misc;
+use ariba::monitor::StatusPage;
+use ariba::Ops::LogParser::AlertLogParser;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::util::OraInfo;
+use ariba::Ops::DBConnection;
+
+use Date::Calc;
+
+my $debug = 0;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; };
+		if ($arg =~ /^-d/o) { $debug = 1; };
+	}
+
+	my $me          = ariba::rc::InstalledProduct->new();
+	my $service     = $me->service();
+	my $customer    = $me->customer();
+
+	my @products    = ariba::rc::InstalledProduct->installedProductsList($service);
+	my $hostname    = ariba::Ops::NetworkUtils::hostname();
+	my $cluster     = $me->currentCluster();
+
+	my $machine     = ariba::Ops::Machine->new($hostname);
+	my $datacenter  = $machine->datacenter();
+	my $tab         = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+	my $currentHour = (localtime)[2];
+
+	my @connections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+
+	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections)) {
+
+		my $type        = $dbc->type();
+		my $virtualHost = $dbc->host();
+		my $instance    = uc($dbc->sid());
+
+		my $product     = $dbc->product();
+		my $activeHost  = $product->activeHostForVirtualHostInCluster($virtualHost, $cluster);
+
+		if (!$activeHost || $activeHost ne $hostname) {
+			next;
+		}
+
+		# if the sid does not exist on this db, skip
+		my $oraHome = ariba::util::OraInfo::sidToOracleHome($instance) || next;
+
+		my %queries = ();
+
+		my $alertLogParser = ariba::Ops::LogParser::AlertLogParser->newFromDBConnectionAndHost($dbc, $hostname);
+		$alertLogParser->parseAlertLogFile();
+
+		my ($errors, $warnings) = ($alertLogParser->errors(), $alertLogParser->warnings());
+		my @result = (@$errors, @$warnings);	
+		my $oracount = 0;
+		my $oracount1 = 0;
+		my $othercount = 0;
+		foreach my $errwarn (@result) {
+			if ( $errwarn =~ m/ORA-609/) {
+				$oracount++;
+			}
+			elsif ( $errwarn =~ m/ORA-3136/) {
+				$oracount1++;
+			}
+			elsif ( $errwarn =~ m/ORA-/) {
+				$othercount++;
+			}
+		}
+				
+	
+		$queries{"Alert log for DB instance [$instance] on $hostname"} = {
+			info    => "numrows > -1",
+			warn    => $othercount > 0 || $oracount > 20 || $oracount1 > 20,
+			ticketOnWarnOpenAfterMinutes => 10,
+			ticketOwner => "unassigned-dba", 
+			timeout => 60,
+			#perl    => sub {return join("\n", @result); },
+			perl    => sub {return scalar (@result); },
+			uiHint  => 'alert-log',
+            inf_field => "instanceCount",
+            inf_tags => "datacenter=\"$datacenter\",hostname=\"$hostname\",instance=\"$instance\",uihint=\"alert-log\"",
+            inf_default => 0,
+            group_by => "$datacenter",
+		};
+
+		my $email = $me->default('notify.email');
+
+        queries{"influx_details"} = {measurement => "dba"}; 
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			'dba', $tab, $service, $customer, \%queries
+		);
+
+		$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+main();
+
+__END__

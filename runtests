@@ -1,0 +1,11 @@
+#!/bin/bash
+#
+# will run the spec bdd tests.  These tests at the time are only
+# testing integrity of config files
+#
+docker pull docker-dev-repo.aws.ariba.com/ariba-ops/node-mocha
+docker run --rm \
+     -v `pwd`:/host --workdir /host \
+     -v /var/run/docker.sock:/var/run/docker.sock \
+     -v `which docker`:/usr/bin/docker \
+     docker-dev-repo.aws.ariba.com/ariba-ops/node-mocha /bin/bash -c 'mocha --recursive --reporter progress ./spec'

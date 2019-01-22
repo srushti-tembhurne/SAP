@@ -1,0 +1,218 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: $ 
+#
+# This script checks the physical memory, shared memory, used/available 
+# memory for sga.  
+#
+# This script has to be run as 'oracle' unix user
+# It does not need to know any passwords.
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use Linux::Smaps;
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProcessTable;
+use ariba::Ops::Utils; 
+use ariba::util::Throttle;
+use ariba::util::OraInfo;
+
+my $debug = 0;
+
+sub debug {
+	my $msg = shift; 
+
+	print "[debug] $msg\n" if ($debug);
+}
+
+sub privateMemoryUsageForProcessRegex {
+	my $processRegex = shift; 
+	my $processTable = shift || ariba::Ops::ProcessTable->new();
+	my $privateMemoryUsage = 0;
+	my $throttle = ariba::util::Throttle->new(50);	
+
+	my @pids = $processTable->pidsForProcessName($processRegex);
+	foreach my $pid (@pids) {
+		my $smapsFile = "/proc/$pid/smaps";
+		if (-r $smapsFile) {
+			my $smap = Linux::Smaps->new($pid);
+			$privateMemoryUsage += $smap->private_clean() + $smap->private_dirty();
+			$throttle->sleep();
+		} else {
+			debug("$smapsFile is not readable or does not exist");
+		}
+	}
+
+	return $privateMemoryUsage >> 10;
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	while (my $arg = shift) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; };
+		if ($arg =~ /^-d/o) { $debug = 1; };
+	}
+
+	ariba::util::OraInfo::setDebug($debug); 
+
+	my $me          = ariba::rc::InstalledProduct->new();
+	my $email       = $me->default('notify.email');
+
+	my $hostname    = ariba::Ops::NetworkUtils::hostname();
+	my $machine     = ariba::Ops::Machine->new($hostname);
+	my $datacenter  = $machine->datacenter();
+	my $tab         = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+	my $totalPhysicalMemory = ariba::Ops::Utils::systemMemorySize(); 
+	my $totalSharedMemory = ariba::Ops::Utils::sharedMemorySize(); 
+	my $usedHugePages = ariba::Ops::Utils::usedHugePagesSize();
+	my $percentHugePages = ariba::Ops::Utils::usedHugePagesPercent();
+	my $totalUsedSga = ariba::util::OraInfo::totalUsedSga();
+	# ora_ = background processes. oracle = server/shadow processes
+	my $totalUsedPga = privateMemoryUsageForProcessRegex('^(?:ora\_|oracle)');
+	my $availableSga = $totalSharedMemory - $totalUsedSga; 
+	my $sharedToPhysicalRatio = $totalSharedMemory / $totalPhysicalMemory; 
+	
+	my $sgaDetails = "<html><blockquote><table style='text-align:left'><tr><th width=100>SID</th><th width=100>SGA</th><th width=100>SGA Type</th></tr>"; 
+	my $ps = ariba::Ops::ProcessTable->new(); 
+	my @processNames = $ps->processNamesMatching("ora_pmon"); 
+	for my $processName (sort @processNames) { 
+		my $sid =  ariba::util::OraInfo::sidFromProcessName($processName); 
+		my %sgaInfo = ariba::util::OraInfo::sgaInfoForSid($sid); 
+		my $sga = defined($sgaInfo{size}) ? (($sgaInfo{size} >= 0) ? $sgaInfo{size} : 'Failed to convert value') : 'n/a'; 
+		my $sga_type = $sgaInfo{type} || 'n/a'; 
+		$sgaDetails .= "<tr><td>$sid</td><td>$sga MB(s)</td><td>$sga_type</td></tr>"; 
+	} 
+	$sgaDetails .= "</table></blockquote></html>"; 
+
+	my %queries = ();
+
+	$queries{"1. $hostname total physical"} = {
+		'warn'		=> "!answer", 
+		'info'		=> "answer",
+		'perl'		=> $totalPhysicalMemory,
+		'format' 	=> "%i MB(s)", 
+		'uiHint'	=> "memory/$hostname",
+        "inf_field" => "totalPhysicalMemory",
+        "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
+        "default"   => 0,
+        "group_by"  => "$datacenter,memory/$hostname",
+	};
+
+	$queries{"2. $hostname total shared"} = { 
+		'warn'		=> "!answer", 
+		'info'		=> "answer", 
+		'perl' 		=> $totalSharedMemory, 
+		'format' 	=> "%i MB(s)", 
+		'uiHint' 	=> "memory/$hostname",
+        "inf_field" => "totalSharedMemory",
+        "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
+        "default"   => 0,
+        "group_by"  => "$datacenter,memory/$hostname",
+	};
+	 
+	$queries{"3. $hostname shared to physical ratio"} = { 
+		'warn'		=> "answer > 0.5", 
+		'info'		=> "answer", 
+		'perl' 		=> $sharedToPhysicalRatio, 
+		'format' 	=> "%.2f", 
+		'uiHint' 	=> "memory/$hostname",
+        "inf_field" => "SharedToPhysicalRatio",
+        "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
+        "default"   => 0,
+        "group_by"  => "$datacenter,memory/$hostname",
+	};
+
+	$queries{"4. $hostname sga - available"} = { 
+		'crit'		=> "answer <= 0",
+		'info'		=> "answer > 0", 
+		'perl' 		=> $availableSga, 
+		'format' 	=> "%i MB(s)", 
+		'uiHint' 	=> "memory/$hostname",
+        "inf_field" => "SGAAvailable",
+        "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
+        "default"   => 0,
+        "group_by"  => "$datacenter,memory/$hostname",
+	};
+	
+	$queries{"5. $hostname sga - used"} = { 
+		'info'		=> "defined(answer)", 
+		'perl' 		=> $totalUsedSga, 
+		'format' 	=> "%i MB(s)", 
+		'uiHint' 	=> "memory/$hostname",
+        "inf_field" => "SGAUsed",
+        "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
+        "default"   => 0,
+        "group_by"  => "$datacenter,memory/$hostname",
+	}; 
+
+	$queries{"6. $hostname hugepages - used"} = { 
+		'info'		=> "defined(answer)", 
+	#	'warn'		=> "answer < $totalUsedSga",
+		'perl' 		=> $usedHugePages, 
+		'format' 	=> "%i MB(s)", 
+		'uiHint' 	=> "memory/$hostname",
+        "inf_field" => "HugePagesUsed",
+        "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
+        "default"   => 0,
+        "group_by"  => "$datacenter,memory/$hostname",
+	};
+
+	$queries{"7. $hostname pga - used"} = { 
+		'info'		=> "defined(answer)", 
+		'perl' 		=> $totalUsedPga, 
+		'format' 	=> "%i MB(s)", 
+		'uiHint' 	=> "memory/$hostname",
+		'recordMaxResults' => 110000,
+        "inf_field" => "totalUsedPGA",
+        "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
+        "default"   => 0,
+        "group_by"  => "$datacenter,memory/$hostname",	
+	};
+
+	$queries{"8. $hostname hugepages - percent used"} = { 
+		'warn'		=> "answer > 90", 
+		'info'		=> "answer", 
+		'perl' 		=> $percentHugePages,
+		'format' 	=> "%.2f%%", 
+		'uiHint' 	=> "memory/$hostname",
+        "inf_field" => "percentHugePages",
+        "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
+        "default"   => 0,
+        "group_by"  => "$datacenter,memory/$hostname",
+	};
+
+	$queries{"# of sids for $hostname"} = {
+		'info'		=> "answer", 
+		'perl'		=> scalar(@processNames), 
+		'note' 		=> $sgaDetails, 
+		'uiHint' 	=> "memory/$hostname/sga details",
+        "inf_field" => "NumberofSids",
+        "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname/sga details\",hostname=\"$hostname\"",
+        "default"   => 0,
+        "group_by"  => "$datacenter,memory/$hostname/sga details",
+	};
+
+    queries{influx_details} = {measurement => "dba"};
+	my $qm = ariba::monitor::QueryManager->newWithDetails(
+		'dba', $tab, $me->service(), $me->customer(), \%queries
+	);
+
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);
+
+__END__

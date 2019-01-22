@@ -1,0 +1,491 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/etc/monitor-query-template#3 $
+
+#NOTE:  VERY IMPORTANT!!  -  This script has 3 independent sections, two activated by using command line options, with the third as the
+#       default with no options.
+#
+#       The script is currently invoked using two distinct crontab entries, so only two of the 3 sections are actually used, for now.
+#       The important point to realize is that doing it this way means the script is acting as two, *independent*, monitoring processes,
+#       which means *each* section's primary query manager object *file* must have a unique name.  The is handled just before the
+#       QueryManager object is created.  Then, *after* the creation, we use setUiManager() to force them all to report under a common
+#       expando name.  This separation of duties MUST BE MAINTAINED, else objects may clobber objects and data will be lost.
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Url;
+
+use XML::Simple;
+use Data::Dumper;
+
+local $| = 1;
+my $debug = 0;
+
+sub usage
+{
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -tenantmap Check tenant-shard mappings
+    -summary   Check summary of shards usage by zones
+    -e         Enables sending of email for monitor query.
+    -p         Enables sending of pages for monitor query.
+    -d         Turns on debug mode.
+    -h         Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit ();
+}
+
+sub main
+{
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $tenantmap;
+    my $shardSummary = 1;
+
+    my $eighteenGigs = 18 * 1024 * 1024;
+    my $fifteenGigs  = 15 * 1024 * 1024;
+    my $fourteenGigs = 14 * 1024 * 1024;
+    my $twelveGigs   = 12 * 1024 * 1024;
+    my $tenGigs      = 10 * 1024 * 1024;    # 10485760
+    my $eightGigs    = 8 * 1024 * 1024;     # 8388608
+    my $sixGigs      = 6 * 1024 * 1024;     # 6291456
+
+    while (my $arg = shift)
+    {
+        if ($arg =~ /^-tenantmap$/o) {$tenantmap    = 1; next;}
+        if ($arg =~ /^-summary$/o)   {$shardSummary = 1; next;}    # For aggregated shards usage by zones
+        if ($arg =~ /^-h$/o) {usage();  next;}
+        if ($arg =~ /^-d$/o) {$debug++; next;}
+        if ($arg =~ /^-e$/o) {$sendEmail = 1; next;}
+        if ($arg =~ /^-p$/o) {$sendPage  = 1; next;}
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled('arches', $me->service()));
+    my $arches = ariba::rc::InstalledProduct->new('arches', $me->service());
+
+    foreach my $cluster ($arches->allClusters())
+    {
+
+        my %queries;
+        my %ss_summary_queries;
+        my %ss_info_queries;
+        my %ss_disk_size_queries;
+        my %ss_total_shard_size;
+
+        if ($shardSummary)
+        {
+            my $url        = $arches->default('VendedUrls.FrontDoorTopLevel');
+            my $summaryUrl = $url . "/Arches/api/shardstatus/summary";
+
+            print "Checking Summary url: $summaryUrl\n" if $debug;
+
+            my $data = gatherData($summaryUrl);
+
+            ## sample XML returned from gatherData:
+            ##<shardStatusSummaries>
+            ##    <shardStatusSummary>
+            ##        <currentSize>932424710</currentSize>
+            ##        <flag>green</flag>
+            ##        <numOfShards>5</numOfShards>
+            ##        <percentFull>2</percentFull>
+            ##        <zone>z1</zone>
+            ##    </shardStatusSummary>
+            ##    <shardStatusSummary>
+            ##        <currentSize>0</currentSize>
+            ##        <flag>green</flag>
+            ##        <numOfShards>5</numOfShards>
+            ##        <percentFull>0</percentFull>
+            ##        <zone>z2</zone>
+            ##    </shardStatusSummary>
+            ##</shardStatusSummaries>
+            ## Gets turned in this data structure by XML::Simple::XMLin
+            ##$VAR1 = {
+            ##'z1' => {
+            ##        'numOfShards' => '5',
+            ##        'percentFull' => '2',
+            ##        'flag' => 'green',
+            ##        'currentSize' => '932454757'
+            ##        },
+            ##'z2' => {
+            ##        'numOfShards' => '5',
+            ##        'percentFull' => '0',
+            ##        'flag' => 'green',
+            ##        'currentSize' => '179264424'
+            ##        }
+            ## };
+
+            my $shardZoneSummary = shardSummaryInfo($data);
+
+            foreach my $zone (keys %{$shardZoneSummary})
+            {
+                # warn/crit flags are shared for 'currentSize' and 'percentFull' fields for the current zone
+                my $warn = ($shardZoneSummary->{$zone}{'flag'} =~ /yellow/) ? 1 : 0;
+                my $crit = ($shardZoneSummary->{$zone}{'flag'} =~ /red/)    ? 1 : 0;
+                $ss_summary_queries{"$zone-warn flag"} = {
+                    perl             => sub { return $warn },
+                    inf_field        => "warn_flag",
+                    inf_tags         => qq(zone="$zone"),
+                    group_by         => $zone,
+                };
+                $ss_summary_queries{"$zone-crit flag"} = {
+                    perl             => sub { return $crit },
+                    inf_field        => "crit_flag",
+                    inf_tags         => qq(zone="$zone"),
+                    group_by         => $zone,
+                };
+
+                foreach my $zoneInfo (keys %{$shardZoneSummary->{$zone}})
+                {
+                    next if ($zoneInfo eq 'flag');
+
+                    if ($zoneInfo =~ /currentSize/)
+                    {
+                        $ss_summary_queries{"$zone-Sum of All Shards Size"} = {
+                                                                               warn             => $warn,
+                                                                               crit             => $crit,
+                                                                               format           => "%d KB\n",
+                                                                               recordMaxResults => 180,
+                                                                               recordDataType   => "gauge",
+                                                                               graphRecorded    => 1,
+                                                                               perl             => sub {return $shardZoneSummary->{$zone}->{$zoneInfo} / 1024;},
+                                                                               uiHint           => "Shard Status Summary/$zone",
+                                                                               inf_field        => "sum_of_all_shards_size",
+                                                                               inf_default      => 0,
+                                                                               inf_tags         => qq(zone="$zone"),
+                                                                               group_by         => $zone,
+                                                                              };
+                    }
+                    elsif ($zoneInfo =~ /percentFull/)
+                    {
+                        $ss_summary_queries{"$zone-Percentage occupied by All Shards "} = {
+                                                                                           warn             => $warn,
+                                                                                           crit             => $crit,
+                                                                                           format           => "%.0f%%\n",
+                                                                                           recordMaxResults => 180,
+                                                                                           recordDataType   => "gauge",
+                                                                                           graphRecorded    => 1,
+                                                                                           perl             => sub {return $shardZoneSummary->{$zone}->{$zoneInfo};},
+                                                                                           uiHint           => "Shard Status Summary/$zone",
+                                                                                           inf_field        => "percent_occupied_by_all_shards",
+                                                                                           inf_default      => 0,
+                                                                                           inf_tags         => qq(zone="$zone"),
+                                                                                           group_by         => $zone,
+                                                                                          };
+                    }
+                    else
+                    {
+                        $ss_summary_queries{"$zone-$zoneInfo "} = {
+                                                                   perl             => sub {return $shardZoneSummary->{$zone}->{$zoneInfo};},
+                                                                   recordMaxResults => 180,
+                                                                   recordDataType   => "gauge",
+                                                                   graphRecorded    => 1,
+                                                                   uiHint           => "Shard Status Summary/$zone",
+                                                                   inf_field        => "$zoneInfo",
+                                                                   inf_tags         => qq(zone="$zone"),
+                                                                   group_by         => $zone,
+                                                                  };
+                    }
+                }
+            }
+        }
+
+        elsif ($tenantmap)
+        {
+            my $url          = $arches->default('VendedUrls.FrontDoorTopLevel');
+            my $tenantmapUrl = $url . "/Arches/search/checktenantshardmap";
+
+            print "Checking tenant map url: $tenantmapUrl\n" if $debug;
+
+            my $result = gatherData($tenantmapUrl);
+            $result = "OK" unless $result;
+
+            $queries{'tenant-shard mapping'} = {
+                warn                         => "defined(answer) && answer ne 'OK'",
+                severity                     => 2,
+                perl                         => sub {return $result;},
+                ticketOnWarnOpenAfterMinutes => 5,
+                ticketDueInDays              => 1,
+                ticketOwner                  => 'unassigned-prodops',
+                description                  => qq`Monitor whether all the shards pointed to by a tenant
+                    have the indexes for that tenant. An 'OK' result means everything is good,
+                    string containing tenant names means those might have stale/corrupted pointers
+                    to shards`,
+                correctiveActions => [
+                    Ops         => qq`Open an S2 CR to assign to Engineering/Platform to investigate the cause.`,
+                    Engineering => qq`Check whether tenant rebuild can be done to solve this immediately.
+                        Check whether wrong shard directories are getting purged.`,
+                ]
+            };
+            #
+            # sample output with stale/corrupt pointers:
+            # Ariba177^test.ariba.indexadapter
+            # Ariba222^test.ariba.indexadapter
+            # Ariba402^test.ariba.indexadapter
+            # Ariba557^test.ariba.indexadapter
+            # Ariba67^test.ariba.indexadapter
+            #
+        }
+
+        my $shardStatusCollected = 0;
+
+        my @instances = $arches->appInstancesInCluster($cluster);
+
+        my $total_shard_size = 0;
+      INST:
+        foreach my $instance (@instances)
+        {
+            unless ($instance->appName() =~ m/searchcore/i)
+            {
+                print "** Skipping role ", $instance->serverRoles(), " **\n" if $debug;
+                next INST;
+            }
+            my $url;
+
+            unless ($shardStatusCollected)
+            {
+                $url = $instance->shardStatusURL();
+
+                print "URL for Shard Status: '$url'\n" if $debug;
+
+                my $data = gatherData($url);
+
+                ## sample XML returned from gatherData:
+                ## <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+                ## <shardStatusDatas>
+                ##     <shardStatusData>
+                ##         <currentSize>9257097539</currentSize>
+                ##         <name>S_SearchCore3140002</name>
+                ##         <percentFull>88</percentFull>
+                ##     </shardStatusData>
+                ##     <shardStatusData>
+                ##         <currentSize>9683752896</currentSize>
+                ##         <name>S_SearchCore3240003</name>
+                ##         <percentFull>92</percentFull>
+                ##     </shardStatusData>
+                ## </shardStatusDatas>
+                ## Gets turned in this data structure by XML::Simple::XMLin:
+                ## $VAR1 = {
+                ##    "shardStatusData" => {
+                ##        "S_SearchCore3240003" => {
+                ##            "percentFull" => 88,
+                ##            "currentSize" => 9257097539
+                ##        },
+                ##        "S_SearchCore3140002" => {
+                ##            "percentFull" => 92,
+                ##            "currentSize" => 9683752896
+                ##        }
+                ##    }
+                ## };
+
+                my $xs = XML::Simple->new();
+                my $xml = eval {$xs->XMLin($data)};
+
+                while (my ($key, $value) = each %{$xml->{'shardStatusData'}})
+                {
+                    $shardStatusCollected = 1;
+
+                    $ss_info_queries{"$key Usage"} = {
+                        recordMaxResults => 36000,
+                        recordDataType   => "gauge",
+                        graphRecorded    => 1,
+                        format           => "%.0f%%\n",
+                        uiHint           => 'ShardInfo Usage',
+                        info             => 'answer < 187',
+                        warn             => 'answer >= 187',     # Setting warn at 105 % 8 GB i.e. 15 GB
+                        crit             => 'answer > 225',      # Setting Crit at 125 % of 8GB i.e. 18 GB
+                        correctiveActions => [
+                                              Ops      => 'Warn: Open S2 CR for engineering, assigned to Platform. Crit: Open S1 CR for engineering, assigned to Platform.',
+                                              Engineer => 'Warn: Investigate the distribution of index and maybe trigger SystemRebuild for load balancing. Crit: Investigate whether SystemRebuild will help. Check with OPS whether disk needs cleanup, or add more space or increase the limits.',
+                                             ],
+                        description => 'Provides information about how much a Shard is Consumed (Percent Disk Space Used)',
+                        perl        => sub {getPctFull($xml, $key);},
+                        inf_field   => "usage",
+                        inf_default => 0,
+                        inf_tags    => qq(key="$key"),
+                        group_by    => $key,
+                                                     };
+
+                    $ss_info_queries{"$key Current Size"} = {
+                        recordMaxResults => 36000,
+                        recordDataType   => "gauge",
+                        graphRecorded    => 1,
+                        format           => "%d KB\n",
+                        uiHint           => 'ShardInfo Size',
+                        info             => "answer < $fifteenGigs",
+                        warn             => "answer > $fifteenGigs",     # Setting warn 15 GB
+                        crit             => "answer > $eighteenGigs",    # Setting Crit at 18 GB
+                        correctiveActions => [
+                                              Ops      => 'Warn: Open S2 CR for engineering, assigned to Platform. Crit: Open S1 CR for engineering, assigned to Platform.',
+                                              Engineer => 'Warn: Investigate the distribution of index and maybe trigger SystemRebuild for load balancing. Crit: Investigate whether SystemRebuild will help. Check with OPS whether disk needs cleanup, or add more space or increase the limits.',
+                                             ],
+                        description => 'Provides information about how much a Shard is Consumed (Disk Space Usage)',
+                        perl        => sub {getSize($xml, $key);},
+                        inf_field   => "current_size",
+                        inf_default => 0,
+                        inf_tags    => qq(key="$key"),
+                        group_by    => $key,
+                                                            };
+                }
+            }
+
+            $url = $instance->shardSizeURL();
+            print "URL for Shard Size: '$url'\n" if $debug;
+
+            $total_shard_size += getResult($url);
+            my $instance_name = $instance->instanceName();
+
+            $ss_disk_size_queries{$instance->instanceName() . " Shard Size"} = {
+                recordMaxResults             => 36000,
+                recordDataType               => "gauge",
+                graphRecorded                => 1,
+                warn                         => "answer > $fifteenGigs",                                                    # Setting warn 15 GB
+                crit                         => "answer > $eighteenGigs",                                                   # Setting Crit at 18 GB
+                perl                         => sub {return getResult($url);},
+                format                       => "%d KB\n",
+                uiHint                       => 'Shard Size on Disk',
+                ticketOnWarnOpenAfterMinutes => 5,
+                ticketDueInDays              => 1,
+                ticketOwner                  => 'unassigned-prodops',
+                severity                     => 1,
+                description                  => 'Monitoring whether size of the physical shard on disk is within limits',
+                correctiveActions            => [
+                    Ops =>
+'Warn: Open an S2 CR to assign to Engineering/Platform to investigate the cause.<BR><BR>Crit: Open an S1 CR to assign to Engineering/Platform. Also, OPS has to check with Engineering whether:<BR> 1. SystemRebuild is required if this is just a problem with load distribution.<BR> 2. Make sure that the Arches scheduled task to purge old shards has been running properly.<BR> 3. There is a need to add more search nodes to the topology, in case we are running short on disk space.<BR>',
+                ],
+                inf_field => "shard_size_on_disk",
+                inf_default => 0,
+                inf_tags  => qq(instance="$instance_name"),
+                group_by  => $instance_name,
+                                                                               };
+        }
+        print "Total summary shard size for all nodes ,$total_shard_size \n" if ($debug);
+
+        $ss_total_shard_size{"Summary Of Shard Size On Disk"} = {
+                                                                  recordMaxResults => 36000,
+                                                                  recordDataType   => "gauge",
+                                                                  graphRecorded    => 1,
+                                                                  perl             => sub {return $total_shard_size;},
+                                                                  format           => "%d KB\n",
+                                                                  description      => 'Summary of Shard Size on Disk',
+                                                                  inf_field        => "total_shard_size",
+                                                                  inf_default      => 0,
+                                                                 };
+
+        my $email = $me->default('notify.email');
+
+        # Note these names are need to be sure the different sections of the script, above, don't step on each other, but they will never be
+        # seen in the web page, only in /var/mon/qm-storage/arches/{primary,secondary}.
+        my $expando;
+        if ($shardSummary)
+        {
+            $expando = "shard-status-summary";
+        }
+        elsif ($tenantmap)
+        {
+            $expando = "shard-status-tenantmap";
+        }
+        else
+        {
+            $expando = "shard-status-others";
+        }
+
+        $ss_summary_queries{'influx_details'}   = {measurement => "arches_shardstatus_summary", tags => qq(cluster=$cluster) };
+        $ss_info_queries{'influx_details'}      = {measurement => "arches_shardstatus_info", tags => qq(cluster=$cluster) };
+        $ss_disk_size_queries{'influx_details'} = {measurement => "arches_shardstatus_disksize", tags => qq(cluster=$cluster) };
+        $ss_total_shard_size{'influx_details'}  = {measurement => "arches_shardstatus_total_shard_size",tags => qq(cluster=$cluster) };
+
+        my $qm = ariba::monitor::QueryManager->newWithDetails($expando, $arches->name(), $arches->service(), $arches->customer(), $cluster, \%ss_summary_queries);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        my $qm2 = ariba::monitor::QueryManager->newWithDetails($expando, $arches->name(), $arches->service(), $arches->customer(), $cluster, \%ss_info_queries);
+        $qm2->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        my $qm3 = ariba::monitor::QueryManager->newWithDetails($expando, $arches->name(), $arches->service(), $arches->customer(), $cluster, \%ss_disk_size_queries);
+        $qm3->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        my $qm4 = ariba::monitor::QueryManager->newWithDetails($expando, $arches->name(), $arches->service(), $arches->customer(), $cluster, \%ss_total_shard_size);
+        $qm4->processQueries($debug, $email, $sendEmail, $sendPage);
+
+    }
+}
+
+sub gatherData
+{
+    my $url = shift;
+
+    my $stat = ariba::monitor::Url->new($url);
+
+    my @results = $stat->request(45);
+
+    my $html = join "", @results;
+
+    return $html;
+}
+
+sub getPctFull
+{
+    my $xml   = shift;
+    my $ident = shift;
+
+    return $xml->{'shardStatusData'}->{$ident}->{'percentFull'};
+}
+
+sub getSize
+{
+    my $xml   = shift;
+    my $ident = shift;
+
+    return ($xml->{'shardStatusData'}->{$ident}->{'currentSize'} / 1024);
+}
+
+## This sub is for the newer shard size request
+## TMID: 131755
+sub getResult
+{
+    my $url  = shift;
+    my $stat = ariba::monitor::Url->new($url);
+
+    my @results = $stat->request(45);
+
+    my $html = join "", @results;
+
+    #    print "** \n$html\n**\n";
+    return ($html / 1024);
+}
+
+sub shardSummaryInfo
+{
+
+    my $statsXml = shift;
+    my $error;
+    my $stats;
+
+    $stats = eval {XMLin($statsXml, KeyAttr => {shardStatusSummary => 'zone'}, forcearray => ['shardStatusSummary']);};
+    $error = "Malformed XML: $@" if $@;
+    print $error, if ($error && $debug);
+
+    while (my ($xml, $zoneSummary) = each %{$stats})
+    {
+        print "DEBUG: ZONE SUMMARY\n" . Dumper($zoneSummary) . "\n", if $debug;
+        return $zoneSummary;
+    }
+}
+
+main(@ARGV);
+
+__END__
+

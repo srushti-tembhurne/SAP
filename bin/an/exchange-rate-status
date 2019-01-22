@@ -1,0 +1,61 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/an/faxcube-status#4 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use Data::Dumper;
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::Ops::ProductAPIExtensions;
+use Time::Local;
+
+my $DAY     = 60 * 60 * 24;
+
+sub main {
+	my $debug = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my @output = ();
+
+	while(my $arg=shift(@ARGV) ){
+		if($arg =~ /^-d/o){ $debug = 1; }
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+	
+	my $me  = ariba::rc::InstalledProduct->new();
+	my $service = $me->service();
+
+	unless (ariba::rc::InstalledProduct->isInstalled('an', $service)) {
+		return 0;
+	}
+
+	my $an  = ariba::rc::InstalledProduct->new('an', $service);
+
+	my $now = time();
+
+	my %queries = (
+		"Last Updated" => {
+			noRowCount => 1,
+			format => "localtime(answer)",
+			info => "(($now - answer) / $DAY) < 2",
+			crit => "(($now - answer) / $DAY) > 2",
+			sql  => "select ((timestamp - to_date('01-01-1970','MM-DD-YYYY')) * 86400) as last_updated from fx_spot where id = 100",
+            inf_field => "last_updated",
+		},
+	);
+
+	my $email = $me->default('notify.email');
+    $queries{influx_details} = { measurement => "exchange_rate_status" };
+
+	my $q = ariba::monitor::QueryManager->newWithDetails("exchange-rate-status", 'an', $service, $me->customer(), \%queries);
+
+	$q->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

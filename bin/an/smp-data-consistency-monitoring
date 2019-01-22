@@ -1,0 +1,661 @@
+#!/usr/local/bin/perl -w
+
+# $Id$
+# $DateTime$
+# $Author$
+
+## See: //ariba/devweb/ASM_Suite/versions/11s/11s3/QSMP-PostGA/DesignSpecs/SMP Monitoring Queries.doc for details on request
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode.
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $service = $me->service();
+    my $an = ariba::rc::InstalledProduct->new('an', $service);
+    
+    my %queries;
+
+    ## Query 1
+    $queries{'Off Cycle Invoices'} = {
+        warn    => 'numrows > 0',
+        #ticketOnWarnOpenAfterMinutes   => 1,
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql => q`
+            SELECT o.anid, o.name, si.created, si.invoice_number, si.total_amount_approx, si.status, ssa.eligible_date
+            FROM smi_invoice si,
+                smi_invoice_item sii,
+                smi_subscription ss,
+                smi_service_account ssa, org o
+            WHERE si.to_org= o.id
+                AND sii.invoice=si.id
+                AND ss.invoice_item=sii.id
+                AND ss.service_account=ssa.id
+                AND ss.service='MEMBERSHIP'
+                AND ss.effective_day >= trunc(sysdate, 'MM')
+                AND ss.status NOT IN ('Canceled', 'Force_Canceled', 'Expired')
+                AND mod(abs(to_number(to_char(ssa.eligible_date,'MM')) - to_number(to_char(ss.expiration_day ,'MM'))),3) <> 0
+        `,
+    };
+
+    ## Query 2
+    $queries{'Double Invoices'} = {
+        warn    => 'numrows > 0',
+        #ticketOnWarnOpenAfterMinutes   => 1,
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql => q`
+            SELECT p.anid, p.name, p.parent, ssa.eligible_Date
+            FROM org p, smi_service_account ssa
+            WHERE p.id in
+              (SELECT id FROM
+            (SELECT COUNT(distinct si.invoice_number), o.id
+              FROM smi_subscription ss, smi_invoice_item sii, smi_invoice si, org o
+              WHERE ss.invoice_item = sii.id
+                        AND sii.invoice = si.id
+                        AND si.created >= trunc(sysdate, 'MM')
+                        AND si.status in ('pre_generated', 'confirmed')
+                        AND ss.service = 'MEMBERSHIP'
+                        AND si.to_org = o.id
+                        --AND si.amount_approx > 0
+                        GROUP BY o.id
+                        HAVING count(distinct si.invoice_number) > 1
+                )
+            )
+            AND ssa.org = p.id
+                  AND ssa.service =
+                      (select id from smi_service where service_name = 'MEMBERSHIP')
+        `,
+    };
+
+    ## Query 3
+    $queries{'Sales Tax'} = {
+        warn    => 'numrows = 0',
+        #ticketOnWarnOpenAfterMinutes   => 1,
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql     => q`
+            SELECT count(si.id)
+            FROM smi_invoice si, org o
+            WHERE si.to_org = o.id
+                AND si.tax > 0
+                AND si.created >= trunc(sysdate, 'MM')
+        `,
+    };
+
+    ## Query 4
+    $queries{'Subscriptions Not Renewed/Expired'} = {
+        warn    => 'numrows > 0',
+        #ticketOnWarnOpenAfterMinutes   => 1,
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql     => q`
+            SELECT o.anid, o.name, o.community, ss.status as Subscriptio_Status, ss.expiration_day
+                from smi_subscription ss, smi_service_account ssa, org o
+            where
+                ss.expiration_day=  trunc(sysdate, 'mm') 
+                    and ss.status in ('Subscribed', 'Pre Activation')
+                    and ss.service_account = ssa.id
+                    and ssa.org = o.id
+                    and o.status not in ('Deleted', 'Expired')
+
+        `,
+    };
+
+    ## Query 5
+    $queries{'Usages in Chargeable Status, but Not Billed'} = {
+        warn    => 'numrows > 0',
+        #ticketOnWarnOpenAfterMinutes    => 1,
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql     => q`
+            SELECT o.anid as Supplier_ANID, o.name as Supplier_NAME, su.relationship
+            FROM smi_usage su,
+                 org o,
+                 relationship r,
+                 relationship_status rs
+            WHERE su.status = 'STATIC'
+            AND not exists (
+                SELECT ss.*
+                       FROM smi_subscription ss, smi_service_account ssa, smi_plan sp
+                        WHERE ssa.id = ss.service_account
+                            AND ssa.org = su.org
+                            AND nvl(su.relationship, 1) = nvl(ss.relationship, 1)
+                            AND sp.id = ss.plan
+                            AND sp.usage_type = 'DOCUMENT'
+                            AND ss.status not in ('Canceled', 'Force_Canceled', 'Expired')
+            )
+            AND su.org = o.id
+            AND su.usage_type = 'DOCUMENT'
+            AND su.relationship = r.id
+            AND r.status not in (101, 102)
+            AND su.end_date = trunc(sysdate, 'MM')
+        `,
+    };
+
+    ## Query 6
+    $queries{'Usages in NON Chargeable Status, but Billed'} = {
+        warn    => 'numrows > 0',
+        #ticketOnWarnOpenAfterMinutes    => 1,
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql     => q`
+            SELECT o.anid as Supplier_ANID, o.name as Supplier_NAME, su.relationship
+            FROM smi_usage su, relationship r, org o
+            WHERE su.status = 'ACTIVE'
+            AND su.usage_type = 'DOCUMENT'
+            AND exists
+            (
+                  SELECT 1 from smi_subscription
+                        WHERE service = 'MEMBERSHIP'
+                        AND relationship = su.relationship
+                        AND status not in ('Canceled', 'Force_Canceled', 'Expired')
+                        AND effective_day <= trunc(sysdate, 'MM')
+                        AND expiration_day >= trunc(sysdate, 'MM')
+            )
+            AND su.org = o.id
+            AND su.relationship = r.id
+            AND r.status not in (101, 102)
+        `,
+    };
+
+    ## Query 7
+    $queries{'Master Anniversary Date is NULL, but Org Has Active Subscription'} = {
+        warn    => 'numrows > 0',
+        #ticketOnWarnOpenAfterMinutes    => 1,
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql     => q`
+            SELECT o.anid, o.name, ss.status, ssa.eligible_date
+            FROM smi_subscription ss, smi_service_account ssa, org o
+            WHERE
+              ss.status not in ('Deleted', 'Enforced', 'Enforced Pre Activation', 'Canceled', 'Force_Canceled', 'Expired', 'Pending Cancelation')
+               AND ss.service_account=ssa.id
+               AND ssa.eligible_date is null
+               AND ss.effective_day <= trunc(sysdate, 'MM')
+               AND ss.expiration_day >= trunc(sysdate, 'MM')
+               AND ss.service='MEMBERSHIP'
+               AND ssa.org = o.id
+        `,
+    };
+
+    ## Query 8
+    $queries{'Master Anniversary Date is NOT NULL, but Org Has NO Active Subscription'} = {
+        warn    => 'numrows > 0',
+        #ticketOnWarnOpenAfterMinutes    => 1,
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql     => q`
+            SELECT o.anid, o.name, ssa.eligible_date
+            from smi_service_account ssa, org o
+            WHERE ssa.service = (select id from smi_service where service_name = 'MEMBERSHIP')
+              AND not exists
+                 ( select 1 from smi_subscription
+                    WHERE service_account = ssa.id
+                                 AND effective_day <= trunc(sysdate, 'MM')
+                                 AND expiration_day >= trunc(sysdate, 'MM')
+               AND status not in ('Canceled', 'Force_Canceled', 'Expired')
+                 )
+              AND ssa.eligible_date is not null
+              AND ssa.org = o.id
+              AND ssa.org in ( select id from org where parent is null)
+              AND not exists (select 1 from org where parent = ssa.org)
+        `,
+    };
+
+    ## Query 9
+    $queries{'Relationship Anniversary is NULL'} = {
+        warn    => 'numrows > 0',
+        #ticketOnWarnOpenAfterMinutes    => 1,
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql     => q`
+            SELECT so.anid as Supplier_ANID, so.name as Supplier_Name, bo.anid as Buyer_ANID, bo.name as Buyer_Name, srbc.relationship
+            FROM smi_rel_billing_cycle srbc, org so, org bo, relationship r
+            WHERE srbc.relationship = r.id
+                AND r.party1 = so.id
+                AND r.party0 = bo.id
+                AND anniversary_date IS NULL
+        `,
+    };
+
+    ## Query 10
+    $queries{'Membership Subscriptions in DORMANT Status'} = {
+        warn    => 'numrows > 0',
+        #ticketOnWarnOpenAfterMinutes    => 1,
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql     => q`
+            SELECT ss.id, o.anid, o.name, si.invoice_number, si.created, si.status
+            FROM smi_invoice si,
+                smi_invoice_item sii,
+                smi_subscription ss,
+                org o,
+                smi_service_account ssa
+            WHERE ss.invoice_item = sii.id
+                AND sii.invoice = si.id
+                AND ss.service = 'MEMBERSHIP'
+                AND ss.status = 'Dormant'
+                AND ssa.id = ss.service_account
+                AND si.created >= trunc(sysdate, 'MM')
+                AND ssa.org = o.id
+            ORDER BY o.anid, o.name, si.invoice_number, si.created, si.status
+        `,
+    };
+
+    ## Query 11
+    $queries{'Any Renewal Invoice Without Billing Address'} = {
+        warn    => 'numrows > 0',
+        #ticketOnWarnOpenAfterMinutes    => 1,
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql     => q`
+            SELECT si.invoice_number, si.created, si.amount, si.billing_address
+            FROM smi_invoice si, smi_invoice_item sii, smi_subscription ss
+            WHERE ss.invoice_item = sii.id
+                AND sii.invoice = si.id
+                AND si.BILLING_ADDRESS is null
+                AND si.created >= trunc(sysdate, 'MM')
+                AND si.is_renewal_invoice = 1
+                AND ss.status = 'Auto Renewal Contingency'
+        `,
+    };
+
+    ## Query 12
+    $queries{'Duplicate SMI Billing Usages'} = {
+        warn    => 'numrows > 0',
+        #ticketOnWarnOpenAfterMinutes    => 1,
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql     => q`
+            SELECT count(sbu.id), o.anid, o.name, sbu.relationship,
+                sbu.start_date, sbu.end_date, sbu.usage_type
+            FROM smi_billing_usage sbu, org o
+            WHERE sbu.org = o.id
+            GROUP BY o.anid, o.name, sbu.relationship,
+                sbu.start_date, sbu.end_date, sbu.usage_type
+                having count(sbu.id) > 1
+        `,
+    };
+
+    ## Query 13
+    $queries{'Duplicate SMI Usage'} = {
+        warn    => 'numrows > 0',
+        #ticketOnWarnOpenAfterMinutes    => 1,
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql     => q`
+            SELECT count(su.id), o.anid, o.name, nvl(su.relationship, 1),
+                su.start_date, su.end_date, su.usage_type
+            FROM smi_billing_usage su, org o
+            WHERE su.org = o.id
+            GROUP BY o.anid, o.name, nvl(su.relationship, 1),
+                su.start_date, su.end_date, su.usage_type
+                having count(su.id) > 1
+        `,
+    };
+
+    ## Query 14 - TMID: 133709
+    $queries{'Negative Invoice'} = {
+        warn    => 'numrows > 0',
+        #ticketOnWarnOpenAfterMinutes    => 1,
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql     => q`
+            SELECT si.invoice_number, ss.relationship, sii.amount
+            FROM smi_invoice si, smi_invoice_item sii, smi_subscription ss
+            WHERE si.id = sii.invoice
+                AND sii.id = ss.invoice_item
+                AND sii.amount < 0
+                AND ss.effective_day = trunc(sysdate, 'mm')
+                AND ss.service = 'MEMBERSHIP'
+        `,
+    };
+
+    ## Query 15 - TMID: 133709
+    $queries{'Relationship Anniversary Date in Future'} = {
+        warn    => 'numrows > 0',
+        #ticketOnWarnOpenAfterMinutes    => 1,
+        ticketSubmitter                 => 'dept_an_ops_prod@ariba.com',
+        sql     => q`
+            SELECT relationship, anniversary_date
+            FROM smi_rel_billing_cycle
+            WHERE anniversary_date > sysdate
+        `,
+    };
+## Query 1 - TMID: 181732
+    $queries{'Annual Subscription not aligned with MAD'} = {
+        warn => 'numrows > 0',
+        sql     => q`
+            SELECT ss.service, ss.id as Subscription_ID, ss.effective_day                   as Effective_Day,ss.status,mssa.eligible_date as MAD,o.ANID as Supplier_ANID FROM smi_subscription ss, smi_service_account ssa, smi_plan sp, org o, smi_service_account mssa WHERE ss.service_account = ssa.id 
+            AND ss.plan = sp.id
+            AND o.id = ssa.org
+            AND sp.duration = 12
+            AND ss.effective_day <= sysdate
+            AND ss.expiration_day >= sysdate
+            AND ss.status NOT IN('Deleted', 'Canceled', 'Force_Canceled', 'Expired', 'Pending Cancelation')
+            AND abs(to_number(to_char(mssa.eligible_date,'MM')) - to_number(to_char(ss.effective_day ,'MM')))<>0
+            AND mssa.service=(select id from smi_service where service_name = 'MEMBERSHIP') 
+            AND ssa.org = mssa.org 
+            AND ((ss.is_offer = 1  and ss.is_for_package = 0) OR (ss.service = 'MEMBERSHIP'))
+            order by mssa.eligible_date
+            `,
+    };
+## Query 2 - TMID: 181732
+    $queries{'RAD misaligned with MAD'} = {
+        warn    => 'numrows > 0',
+        sql     => q`
+            SELECT ss.id as Subscription_ID, ss.effective_day as Effective_Day,
+            srbc.anniversary_date RAD, ss.relationship Relationship,
+            ssa.eligible_date as MAD, o.ANID as Supplier_ANID
+            FROM smi_subscription ss, smi_service_account ssa,
+            smi_plan sp, org o, smi_rel_billing_cycle srbc
+            WHERE ss.service_account = ssa.id 
+            AND ss.plan = sp.id
+            AND o.id = ssa.org
+            AND srbc.relationship = ss.relationship
+            AND ss.service = 'MEMBERSHIP'
+            AND sp.duration = 12
+            AND ss.effective_day <= sysdate
+            AND ss.expiration_day >= sysdate
+            AND ss.status NOT IN('Deleted', 'Canceled', 'Force_Canceled', 'Expired', 'Pending Cancelation')
+            AND mod(abs(to_number(to_char(ssa.eligible_date,'MM')) - to_number(to_char(srbc.anniversary_date ,'MM'))),3) <> 0
+        `,
+    };
+## Query 3 - TMID: 181732
+    $queries{'Multi org with Single Org invoice'} = {
+        warn    => 'numrows > 0',
+        sql     => q`
+        select smoh.org as Child_Org, ss.id as Subscription_Id
+        from smi_subscription ss, smi_service_account ssa,
+        smi_multi_org_hierarchy smoh where ss.service_account = ssa.id
+        AND ssa.org = smoh.org
+        AND smoh.org <> smoh.to_org
+        AND smoh.status = 'ENABLED'
+        AND ss.effective_day <= sysdate
+        AND ss.expiration_day >= sysdate
+        AND ss.status NOT IN('Deleted', 'Canceled', 'Force_Canceled', 'Expired', 'Pending Cancelation') and not exists ( Select 1 from smi_subscription_pref 
+                        where subscription = ss.id
+                        and name = 'parent.org.anid'
+                        and value = (Select anid from org where id = smoh.to_org                        )
+                        )
+        `,
+    };
+
+## Query 4 - TMID: 181732
+    $queries{'Non chargeable relationship charged and not moved to SMPIV'} = {
+        warn    => 'numrows > 0',
+        sql     => q`
+		SELECT su.Supplier_ANID, su.Supplier_NAME, su.relationship, su.country_isoa3, su.unit2, su.unit3, su.unit4 
+		FROM
+		(SELECT o.anid as Supplier_ANID, o.name as Supplier_NAME, su.relationship,
+  		su.country_isoa3, su.unit2, su.unit3, su.unit4 
+  		FROM smi_usage su, relationship r, org o, smi_service_account ssa
+   		WHERE su.usage_type = 'DOCUMENT' 
+        	AND exists (
+                	SELECT 1 FROM smi_subscription 
+                	WHERE service = 'MEMBERSHIP' 
+                	AND relationship = su.relationship 
+                	AND status not in ('Canceled', 'Force_Canceled', 'Expired') 
+                	AND effective_day <= trunc(sysdate, 'MM') 
+                	AND expiration_day >= trunc(sysdate, 'MM')) 
+         		AND su.org = o.id 
+         		AND su.relationship = r.id 
+         		AND r.status = 100 
+         		AND ( su.unit1 < 5  OR su.unit4 < 50000 )
+         		AND to_char(su.end_date, 'MM') = to_char((select anniversary_date from smi_rel_billing_cycle where relationship= su.relationship), 'MM') 
+         		AND ssa.org = o.id 
+         		AND ssa.service = (select id from smi_service where service_name = 'MEMBERSHIP')
+         		AND ((CASE WHEN ssa.eligible_date > sysdate THEN add_months(ssa.eligible_date, -12) ELSE ssa.eligible_date END) 
+                  < (select value_date from configuration where name='SMP4ReleaseDate'))
+		)su, smi_plan sp
+			WHERE                   
+  			sp.usage_type='DOCUMENT' 
+  			AND sp.valid_from < sysdate 
+  			AND (sp.valid_to is null or sp.valid_to > sysdate) 
+  			AND sp.is_default=1 
+  			AND sp.plan_type='SYSTEM' 
+  			AND (sp.region = su.country_isoa3  OR 
+          		sp.region = (select r.name from country c, region r where su.country_isoa3 = c.isoa3 and c.region = r.id)
+      			)
+  			AND (su.unit2 < nvl(sp.threshold2_min, 1) AND su.unit3 < nvl(sp.threshold3_min, 1) AND  su.unit4 < nvl(sp.threshold4_min,		 1)) 
+		`,
+    };
+
+    ## Query 5 - TMID: 181732
+    $queries{'Any org not getting the NPF Package on MAD '} = {
+        warn    => 'numrows > 0',
+        sql     => q`
+		SELECT o.anid as Supplier_ANID, o.name as Supplier_NAME 
+		FROM org o, smi_service_account mssa
+   		WHERE not exists 
+            		( SELECT 1 from smi_subscription ss, smi_service_account ssa 
+                	WHERE  ss.status not in ('Canceled', 'Force_Canceled', 'Expired') 
+                    	AND ss.effective_day <= trunc(sysdate, 'MM') 
+                    	AND ss.expiration_day >= trunc(sysdate, 'MM') 
+                    	AND ss.service in ('NPF_SELECT_PACKAGE', 'NPF_PREMIER_PACKAGE', 'NPF_ENTERPRISE_PACKAGE', 'NPF_ENTERPRISE_PLUS_PACKAGE')
+                    	AND ss.service_account = ssa.id
+                    	AND ssa.org=mssa.org )
+         		AND exists ( SELECT 1 from smi_subscription ss, smi_service_account ssa 
+                		WHERE  ss.status not in ('Canceled', 'Force_Canceled', 'Expired') 
+                    		AND ss.effective_day <= trunc(sysdate, 'MM') 
+                    		AND ss.expiration_day >= trunc(sysdate, 'MM') 
+                    		AND ss.service_account = ssa.id
+                    		AND ssa.org=mssa.org )
+         			AND mssa.org = o.id 
+         			AND mssa.service = (select id from smi_service where service_name = 'MEMBERSHIP')
+         			AND ((CASE WHEN mssa.eligible_date > sysdate THEN add_months(mssa.eligible_date, -12) ELSE mssa.eligible_date END) 
+                  		>= (select value_date from configuration where name='SMP4ReleaseDate'))
+        `,
+    };
+
+    ## Query 6 - TMID: 181732
+    $queries{'Any org got NPF Package on Non MAD '} = {
+        warn    => 'numrows > 0',
+        sql     => q`
+		SELECT o.id, o.anid as Supplier_ANID, o.name as Supplier_NAME 
+		FROM org o, smi_service_account mssa
+   		WHERE exists ( 
+               		SELECT 1 FROM smi_subscription ss, smi_service_account ssa
+                  	WHERE ss.status not in ('Canceled', 'Force_Canceled', 'Expired') 
+                    	AND ss.effective_day <= trunc(sysdate, 'MM') 
+                    	AND ss.expiration_day >= trunc(sysdate, 'MM') 
+                    	AND ss.service in ('NPF_SELECT_PACKAGE', 'NPF_PREMIER_PACKAGE', 'NPF_ENTERPRISE_PACKAGE', 'NPF_ENTERPRISE_PLUS_PACKAGE')
+                    	AND ss.is_offer = 1  and ss.is_for_package = 0
+                    	AND ss.service_account = ssa.id
+                    	AND ssa.org = mssa.org
+                    	AND to_char(ss.expiration_day ,'MM') <> to_char(mssa.eligible_date ,'MM')
+               		)
+         		AND mssa.org = o.id 
+         		AND mssa.service = (select id from smi_service where service_name = 'MEMBERSHIP')
+         		AND ((CASE WHEN mssa.eligible_date > sysdate THEN add_months(mssa.eligible_date, -12) ELSE mssa.eligible_date END) 
+                  	>= (select value_date from configuration where name='SMP4ReleaseDate'))
+        	`,
+    };
+
+    ## Query 7 - TMID: 181732
+    $queries{'All relationships in hierarchy got charged'} = {
+        warn    => 'numrows > 0',
+        sql     => q`
+		SELECT distinct o.anid as Supplier_ANID, o.name as Supplier_NAME, su.relationship, p.anid as Parent_ANID, ssa.eligible_date 
+		FROM smi_usage su, relationship r, org o, smi_service_account ssa, org p, smi_multi_org_hierarchy smoh, smi_subscription cSub
+	   	WHERE su.usage_type = 'DOCUMENT' 
+	        AND not exists ( 
+	            SELECT 1 from smi_subscription 
+	            WHERE service = 'MEMBERSHIP' 
+	            AND relationship = su.relationship 
+	            AND status not in ('Canceled', 'Force_Canceled', 'Expired') 
+	            AND effective_day <= trunc(sysdate, 'MM') 
+	            AND expiration_day >= trunc(sysdate, 'MM') ) 
+	            AND su.org = o.id 
+	            AND su.relationship = r.id 
+	            AND r.status not in (101, 102) 
+	            AND r.created < cSub.effective_day
+	            AND smoh.org = su.org 
+                    AND smoh.to_org=p.id 
+                    AND smoh.status='ENABLED'
+	            AND cSub.service = 'MEMBERSHIP' 
+	            AND cSub.status not in ('Canceled', 'Force_Canceled', 'Expired') 
+		    AND cSub.effective_day <= trunc(sysdate, 'MM') 
+		    AND cSub.expiration_day >= trunc(sysdate, 'MM') 
+                    AND cSub.service_account in (select id from smi_service_account where org in (select org from smi_multi_org_hierarchy where to_org=p.id and status='ENABLED'))
+	            AND ssa.org = o.id 
+	            AND ssa.service = (select id from smi_service where service_name = 'MEMBERSHIP')
+                    AND not exists ( 
+                        SELECT 1 
+          		FROM membership_exemption_rule 
+          		WHERE 
+          		(supplier = r.party1 and buyer = r.party0 ) 
+           		OR (supplier is null and buyer = r.party0 ) 
+           		OR (supplier = r.party1 and buyer is null)
+        		)
+        		AND ssa.org = o.id 
+        		AND ssa.service = (select id from smi_service where service_name = 'MEMBERSHIP')
+	        	AND ((CASE WHEN ssa.eligible_date > sysdate THEN add_months(ssa.eligible_date, -12) ELSE ssa.eligible_date END) 
+              		>= (select value_date from configuration where name='SMP4ReleaseDate'))
+        	`,
+    };
+
+     ## Query 8 - TMID: 181732
+    $queries{'Any org that did not get premier while using cXML/EDI'} = {
+        warn    => 'numrows > 0',
+        sql     => q`
+		SELECT o.anid as Supplier_ANID, o.name as Supplier_NAME, su.status, su.unit1, su.unit2, su.unit3, su.unit4 
+		FROM org o, smi_service_account mssa, smi_usage su
+   		WHERE not exists 
+            	   ( SELECT 1 from smi_subscription ss, smi_service_account ssa 
+                   WHERE  ss.status not in ('Canceled', 'Force_Canceled', 'Expired') 
+                   AND ss.effective_day <= trunc(sysdate, 'MM') 
+                   AND ss.expiration_day >= trunc(sysdate, 'MM') 
+                   AND ss.service in ('NPF_PREMIER_PACKAGE')
+                   AND ss.service_account = ssa.id
+                   AND ssa.org=mssa.org
+		   )
+         	   AND mssa.org = o.id 
+                   AND mssa.service = (select id from smi_service where service_name = 'MEMBERSHIP')
+                   AND su.org = o.id
+                   AND su.usage_type='TECHNICAL_SUPPORT'
+                   AND su.status = 'STATIC'
+                   AND su.unit2 in (4,8,12)
+                   AND ((CASE WHEN mssa.eligible_date > sysdate THEN add_months(mssa.eligible_date, -12) ELSE mssa.eligible_date END) 
+                   >= (select value_date from configuration where name='SMP4ReleaseDate'))
+        `,
+    };
+
+    ## Query 9 - TMID: 181732
+    $queries{'Invoice subscriptions created after SMP-IV release not aligned with MAD'} = {
+        warn    => 'numrows > 0',
+        sql     => q`
+		SELECT o.anid as Supplier_ANID, o.name as Supplier_NAME, mssa.eligible_date 
+		FROM org o, smi_service_account mssa
+   		WHERE exists 
+            	    ( SELECT 1 from smi_subscription ss, smi_service_account ssa 
+                    WHERE  ss.status not in ('Canceled', 'Force_Canceled', 'Expired') 
+                    AND ss.effective_day <= trunc(sysdate, 'MM') 
+                    AND ss.expiration_day >= trunc(sysdate, 'MM') 
+                    AND ss.service in ('NPF_SELECT_PACKAGE', 'NPF_PREMIER_PACKAGE', 'NPF_ENTERPRISE_PACKAGE', 'NPF_ENTERPRISE_PLUS_PACKAGE')
+                    AND ss.service_account = ssa.id
+                    AND ssa.org=mssa.org
+                    AND to_char(ss.expiration_day, 'MM')  <> to_char(mssa.eligible_date, 'MM') and ss.effective_day >= (CASE WHEN mssa.eligible_date > sysdate THEN add_months(mssa.eligible_date, -12) ELSE mssa.eligible_date END)
+		    )
+         	    AND mssa.org = o.id 
+                    AND mssa.service = (select id from smi_service where service_name = 'MEMBERSHIP')
+         	    AND ((CASE WHEN mssa.eligible_date > sysdate THEN add_months(mssa.eligible_date, -12) ELSE mssa.eligible_date END) 
+                    >= (select value_date from configuration where name='SMP4ReleaseDate'))
+        `,
+    };
+
+   ## Query 10 - Jira-Id: HOA-1619
+    $queries{'SMP IV subscriptions getting renewed on correct plan and duration'} = {
+        warn    => 'numrows > 0',
+        sql     => q`   
+        select act_sub.*, exp_sub.* from
+                  (select ss.*, sp.duration, sp.plan_method from smi_subscription ss, smi_plan sp 
+                    where ss.effective_day = trunc(sysdate, 'mm') 
+                    AND ss.service='MEMBERSHIP' 
+                    AND ss.status in ('Subscribed', 'Pre Activation', 'Auto Renewal Contingency', 'Enforced', 'Enforced Pre Activation')
+                    AND ss.plan = sp.id 
+                  ) act_sub,
+                  (select sub.*, sp.duration, sp.plan_method from smi_subscription sub, smi_plan sp
+                     where sub.expiration_day = trunc(sysdate, 'mm')
+                     AND sub.service='MEMBERSHIP' 
+                     AND sub.status in ( 'Expired', 'Enforced Expired') 
+                     AND sub.plan = sp.id 
+                  ) exp_sub 
+                  where act_sub.relationship = exp_sub.relationship (+)
+                  AND (act_sub.duration != exp_sub.duration
+                         or nvl(act_sub.plan_method, 'AGGREGATE') != nvl(exp_sub.plan_method, 'AGGREGATE')
+                      )       
+                  AND exists ( 
+                      select 1 from smi_usage 
+                      where (relationship = exp_sub.relationship OR relationship = act_sub.relationship ) 
+                      and status='STATIC' and end_date = trunc(sysdate, 'mm')
+                  )       
+                  order by act_sub.relationship
+          `,      
+      };  
+
+       ## Query 11 - jira-ID : HOA-25428
+      $queries{'QN Billing Invoices with no Statement'} = {
+          description => 'This is to identify if there are any QN invoices where there is no QN billing statement received',
+          warn    => 'numrows > 0',
+          sql     => q` SELECT to_org, invoice_number, invoice_created, invoice_total_amount
+                        from smi_external_invoice where nvl(is_parked_invoice, 0) = 1 and
+                        invoice_created >= add_months(trunc(sysdate, 'MM'), -12) and
+                        nvl(status, 'x') <> 'cancelled'`,
+      };
+
+      ## Query 12 - jira-ID : HOA-25428
+      $queries{'QN Billing Statement with no invoice'} = {
+          description   =>  'This is to identify if there are any QN statements with no invoices',
+          warn    => 'numrows > 0',
+          sql     => q` SELECT to_org, STATEMENT_NUMBER, STATEMENT_CREATED, STATEMENT_AMOUNT from
+                        smi_external_invoice where nvl(is_parked_invoice, 0) = 0
+                        and STATEMENT_CREATED >= add_months(trunc(sysdate, 'MM'), -12)
+                        and INVOICE_NUMBER is null`,
+      };
+
+      ## Query 13 - jira-ID : HOA-25428
+      $queries{'Check if there exists STATIC usage for a QN migrated supplier'} = {
+           description   =>  'This is to identify if there exists STATIC usage for a QN migrated supplier',
+           warn    => 'numrows > 0',
+           sql     => q` SELECT org, end_date from smi_usage su where su.status='STATIC' and
+                         su.usage_type='DOCUMENT' and su.end_date= trunc(sysdate, 'MM') and exists (select 1
+                         from smi_external_invoice where to_org=su.org)`,
+      };
+
+    my $email = $me->default('notify.email');
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('smp-data-consistency', 'an', $service, undef, \%queries);
+    $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);
+
+__END__

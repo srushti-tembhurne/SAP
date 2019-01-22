@@ -1,0 +1,219 @@
+#!/usr/local/bin/perl -w
+
+# $Id: $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use ariba::SNMP::Session;
+
+my $debug = 0;
+
+# We will start with a list of all images currently running in production
+# and narrow this list down later.
+my @KNOW_GOOD_VERSIONS = ( '6.3(3)', '7.0(7)',              # PIX OS
+            '7.0(3)I2(2a)', # Cisco NX-OS
+            '8.0(4)', '8.2(4), 8.2(5), 9.0(1)',              # ASA/PIX OS
+            '12.2(18)SXF14, 12.2(33)SXH8a, 12.2(50)SY2',         # 6500 series IOS
+            '12.2(44)SE3, 12.2(44)SE2, 12.2(58)SE2',    # 3750 series IOS
+            '12.2(17a)',                    # 3600 series IOS
+            '12.4(4)T8, 12.2(17a)',             # 7200 series IOS
+            '12.0(5)WC7, 12.0(5)WC17',          # 2900 XL series IOS
+            '12.2(46)SE, 15.0(02)SE5' ,         # 2960 series IOS
+            '12.4(22)T',                    # 2800 series IOS
+            '12.2(8)T', '12.2(46a)',            # opslab only 2600 series IOS
+            '08.10.1.06',                   # CSS OS
+            '10.0.1.10',                    # NetGear M7100
+            '4.12.7.1', '4.18.0F',          # Arista Switches 7050t and 7060 series EOS
+            '15.0(1)S, 15.1(3)S, 15.2(2)S, 15.4(3)S2'   # asr1000 series IOS
+    );
+
+sub main {
+
+    my $send_email = 0;
+    my $send_page  = 0;
+
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-e/o) { $send_email = 1; };
+        if ($arg =~ /^-p/o) { $send_page  = 1; };
+        if ($arg =~ /^-d/o) { $debug     = 1; };
+    }
+
+    my $me    = ariba::rc::InstalledProduct->new();
+    my $email = $me->default('notify.email');
+
+    for my $datacenter ( ariba::Ops::ProductAPIExtensions::datacentersForProducts($me) ) {
+
+
+        my %match_datacenter = (
+            'datacenter' => $datacenter,
+            'os' => 'nxos, ios, ios-xe, IOS-XE, css, pix, netgear, eos',
+            'status'       => 'inservice',
+            'monitoringDatacenter' => '',
+        );
+
+        my %match_monitoring_datacenter = (
+            'status'           => 'inservice',
+            'os' => 'nxos, ios, ios-xe, IOS-XE, css, pix, netgear, eos',
+            'monitoringDatacenter' => $datacenter,
+        );
+
+
+        my @network_devices = ariba::Ops::Machine->machinesWithProperties(%match_datacenter);
+        @network_devices = (@network_devices , ariba::Ops::Machine->machinesWithProperties(%match_monitoring_datacenter));
+
+        my %queries  = ();
+
+        for my $network_device (@network_devices) {
+
+            my $device_name    = $network_device->hostname();
+            my $device_OS     = $network_device->os();
+            my $mdb_OS_version  = $network_device->osVersion();
+            my $snmp          = ariba::SNMP::Session->newFromMachine($network_device);
+
+            print "$device_name: is running $device_OS\n" if $debug;
+
+            # SNMP get system description
+            my $sysDescr = 'sysDescr.0';
+            if ( $device_OS eq 'netapp' ){ $sysDescr = 'enterprises.4526.10.1.1.1.13.0'; }
+            my $output = $snmp->valueForOidExpr($sysDescr);
+            if (! defined($output)){
+                print "unable to get sysDescr from $device_name\n";
+                next;
+            }
+
+            my @output = split (/\n/, $output);
+
+
+            for my $line (@output) {
+
+                # Only care about line with OS information
+                next unless $line =~ m/nxos|pix|ios|content switch|adaptive security appliance|ProSafe|eos/i;
+
+                # Find the currently running version
+                my $version = findVersion($line, $device_OS);
+
+                # Check if MDB is correct
+                my $is_OS_version_correct = checkMDBOSVersion($version, $mdb_OS_version);
+
+                print "line is $line\n" if $debug;
+                print "version is $version\n" if $debug;
+    
+                my $info = 1;
+                my $warn = 0;
+                my $osversion_status = 1; # good
+
+                if (!$is_OS_version_correct){
+                    $info = 0;
+                    $osversion_status = 2; # waring
+                    $warn = "OS Version in MDB is $mdb_OS_version but the device is actually running $version\n";
+                    $line = $line . "\nOS Version in MDB is $mdb_OS_version but the device is actually running $version.";
+                }
+
+                my $version_to_compare = quotemeta($version);
+                if (! grep (/$version_to_compare/, @KNOW_GOOD_VERSIONS)) {
+                    $info = 0;
+                    $osversion_status = 2; #warning
+                    if ($warn ne 0) {
+                        $warn = $warn . "\n$version is not a know good os";
+                    } else {
+                        $warn = "$version is not a know good os";
+                    }
+                    $line = $line . "\n$version is not a know good os."
+                }
+
+                $queries{"$device_name is running"} = {
+                    info => "'$info'",
+                    warn => "'$warn'",
+                    perl => "return qq($osversion_status)",
+                    inf_field => "osversion_status",
+                    inf_tags => qq|datacenter="$datacenter",device="$device_name",device_os="$device_OS",osversion_msg="$version"|,
+                    inf_default => 0,
+                    group_by => "$datacenter,$device_name",
+                };
+            }
+        }
+   
+        $queries{influx_details} = {measurement => "network_os"};
+        my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+        my $qm = ariba::monitor::QueryManager->newWithDetails(
+            'Network OS', $pn, $me->service(), $me->customer(), \%queries
+        );
+        $qm->processQueries($debug, $email, $send_email, $send_page);
+    }
+}
+
+sub findVersion {
+
+    my $line = shift;
+    my $device_OS = shift;
+    my $version = "unknow version";
+
+    if ($device_OS eq 'ios' || $device_OS eq 'ios-xe' || $device_OS eq 'IOS-XE') {
+        if ($line =~ m/Version (.*?),/){
+            $version = $1;
+        }
+    } elsif ($device_OS eq 'pix') {
+        if ($line =~ m/Version (.*)/){
+            $version = $1;
+        }
+    } elsif ($device_OS eq 'css' ) {
+        if ($line =~ m/Version (.*) with/){
+            $version = $1;
+        }
+    } elsif ($device_OS eq 'netgear' ){
+        $version = $line;
+    } elsif ($device_OS eq 'nxos') {
+        if ($line =~ m/Version (.*?),/){
+            $version = $1;
+        }
+    } elsif ( $device_OS =~ /^eos$/i ){
+        if ( $line =~ m/version (.*?) running/i ){
+            $version = $1;
+        }
+    }
+
+    return $version
+} 
+
+sub checkMDBOSVersion {
+    
+    my $version = shift;
+    my $mdb_OS_version = shift;
+    my $isMDBCorrect = 0;
+
+    if ($version eq $mdb_OS_version){
+        $isMDBCorrect = 1
+    }
+
+    return $isMDBCorrect;
+}
+
+main();
+
+__END__
+
+Notes for NetGear:
+[monlab@mon11 ~]
+ $ snmpwalk M7100-db-n3-2.opslab.ariba.com 1.3.6.1.4.1.4526.10.1.1 -c public
+ SNMPv2-SMI::enterprises.4526.10.1.1.1.1.0 = STRING: "M7100-24X - ProSafe 24-port 10G L2+ Managed Switch, 10.0.1.10, B1.0.0.2"
+ SNMPv2-SMI::enterprises.4526.10.1.1.1.2.0 = STRING: "M7100-24X - ProSafe 24-port 10G L2+ Managed Switch"
+ SNMPv2-SMI::enterprises.4526.10.1.1.1.3.0 = STRING: "M7100-24X"
+ SNMPv2-SMI::enterprises.4526.10.1.1.1.4.0 = STRING: "3711375XF0024"
+ SNMPv2-SMI::enterprises.4526.10.1.1.1.5.0 = ""
+ SNMPv2-SMI::enterprises.4526.10.1.1.1.6.0 = STRING: "A"
+ SNMPv2-SMI::enterprises.4526.10.1.1.1.7.0 = STRING: "BCM56820"
+ SNMPv2-SMI::enterprises.4526.10.1.1.1.8.0 = STRING: "0xbc00"
+ SNMPv2-SMI::enterprises.4526.10.1.1.1.9.0 = Hex-STRING: 44 94 FC 91 2B 5A
+ SNMPv2-SMI::enterprises.4526.10.1.1.1.10.0 = STRING: "Linux 2.6.34.6"
+ SNMPv2-SMI::enterprises.4526.10.1.1.1.11.0 = STRING: "BCM56820_B0"
+ SNMPv2-SMI::enterprises.4526.10.1.1.1.12.0 = STRING: " QOS"
+ SNMPv2-SMI::enterprises.4526.10.1.1.1.13.0 = STRING: "10.0.1.10"
+

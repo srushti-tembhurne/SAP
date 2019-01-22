@@ -1,0 +1,267 @@
+#!/usr/local/bin/perl -w
+
+use lib qw(/home/monprod/lib);
+use POSIX;
+use File::Basename;
+use ariba::monitor::CircularDB;
+
+# 
+
+use vars qw(@sla @all @unplanned @invoices @fax @html @cXML @email @edi @edifact @EDIGateway
+	@spendinvoices @spendfax @spendhtml @spendcXML @spendemail @spendedi @spendedifact @spendEDIGateway);
+
+@sla = qw (
+	100 99.57 100 100 99.96 99.86 99.83 99.96 99.86 99.5 99.93 99.85 100 99.44 99.93 99.81 100
+	100 100 100 100 100 99.71 100 100 100 99.87 99.95 100 100 100 100 100 100 100 100 100 100 100
+	100 100 100 100 100 100
+);
+
+@all = qw (
+	99.5 98.39 99.81 99.14 99.84 98.93 99.63 99.65 98.04 98.58 99.53 99.41 99.32 99.31 99.16 98.96
+	97.58 98.93 99.99 99.72 99.93 99.88 99.52 99.98 99.78 98.84 99.83 99.93 99.36 100 97.97 99.98
+	99.25 100 97.61 100 99.47 98.37 100 99.91 99.91 98.77 97.47 98.92 99.99
+);
+
+@unplanned = qw (
+	100 99.56 99.99 99.81 99.93 99.83 99.7 99.8 99.8 99.48 99.91 99.84 99.95 99.31 99.88 99.49
+	99.95 100 99.99 99.85 99.96 99.88 99.52 99.98 100 100 99.83 99.93 100 100 99.99 99.98 100 100
+	100 100 100 100 100 99.99 100 99.98 99.99 99.79 99.99
+);
+
+# Documents/Invoice/Production/Successful/Monthly
+
+@invoices = qw (
+	96 222 577 697 837 779 1672 2423 3805 4916 7427 10465 10650 11406 9462 11712 13518 19792 24170
+	28769 39149 43762 57655 50232 54928 57178 94124 136177 144137 134320 133126
+);
+
+@spendinvoices = qw (
+	4282040619.31 718380255.16
+);
+	
+
+@cXML = qw (
+	179572 164459 190079 218204 238042 235698 264558 290052 302960 360823 309831 287976 394599 337062
+	378976 402746 403496 409972 426443 427683 484359 541915 458562 469788 590673 564118 663127 596389 566090 602035
+);
+
+@spendcXML = qw (
+	87787402.93 80526526.94 118057780.11 107679237.97 191992541.40 262165549.53 701017041.07 466916833.63
+	448854506.93 396649389.91 334205880.73 517789728.50 534040334.62 419575635.43 1292587199.25 560737177.12
+	695212649.98 604557629.11 635779598.66 585276238.44 631957552.42 699692944.96 666355143.24 816511632.75
+	780533100.91 634311893.79 865211448.36 770571331.43 721123943.32 907713863.16
+);
+
+@email = qw (
+	83716 85429 89699 100472 104598 106753 137142 133539 147916 172070 156446 139850 187418 182947
+	208697 215859 226826 229657 250263 220563 233450 258398 233490 215685 256327 260494 302860 279900 271339 297242
+);
+
+@spendemail = qw (
+	188642848.39 193857238.27 337924228.68 460423954.10 501644905.23 576840480.26 1844477589.44 521000088.77
+	860587491.57 776639678.08 704341256.08 976864097.46 1258868546.62 1830372826.32 1517253554.03 1194577418.27
+	1231180376.78 1411876762.07 4141618334.37 1685159158.90 1535660360.77 1451968758.14 1916960616.32
+	1696726364.2 3189327602.43 2448257894.23 3103284171.75 3353429591.88 2298335075.81 2370499782.69
+);
+
+# bad order by kishore in aug 2003 worth 2704253662.82, also double counted
+# so reduce total number from 7093666484.54 to 1685159158.90
+# bad data from exxon in jun 2004 reduce fax by 13550895627
+#
+@fax = qw (
+	23424 20874 25128 29142 32771 31836 38934 42658 44340 50190 44521 42964 56212 52663 55479 51352
+	57764 61512 64493 59340 58988 69529 63943 59705 92613 85786 117143 124807 122025 136749
+);
+
+@spendfax = qw (
+	38246380.47 36930820.98 49697252.87 240155210.48 95647031.67 102828253.48 156020206.91 103671046.11
+	166602557.74 163617711.46 378816222.03 203379884.24 522268931.93 316611735.82 338204136.39 262110321.37
+	212503751.97 337215175.98 725890824.17 346602685.17 365245603.75 349195056.64 276669157.23 324159301.53
+	1419577939.44 460156327.68 934585877.7 1326392554.8 1910657955.19 1318279192.11
+);
+
+@html = qw (
+	10641 9684 9879 11646 14619 22244 24389 23367 33829 27184 19611 17195 22905 23015 25229 29479 28672
+	26556 27136 24463 25188 26360 23099 21621 25511 26665 48848 52904 49535 64209
+);
+
+@spendhtml = qw (
+	200521973.76 180314913.94 90352887.40 177205755.17 293124427.26 952159423.36 1660358314.89 3524852444.26
+	2951261830.50 1258228163.81 650228075.93 535948555.93 1186338808.53 1152340697.08 2150123412.99
+	1004615264.66 1093449214.79 1408907183.03 1241812646.53 536078243.1 1461959737.21 481343924.45 564411698.95
+	883399350.05 910510452.40 646357703.57 915220313.97 682882839.22 633387969.84 451826222.11
+);
+
+@edi = qw (
+	64348 55401 56372 61170 63263 59340 68342 76876 74738 87315 63814 60465 83613 75839 81434 81288 82322
+	89363 72856 101670 92331 83500 69295 68377 71333 44600 2781 0 0 0 0
+	0
+);
+
+@spendedi = qw (
+	24001561.79 18269935.63 23890852.33 28559759.70 32620339.93 33218459.80 40038199.28 43717364.03 85934923.70
+	96515622.10 75398594.75 50252683.56 60867881.29 57783307.09 141342578.43 88240060.31 111144542.81 132834729.99
+	100200400.02 135397956.66 152061846.35 99118605.75 129666061.59
+	122863844.85 193449312.02 91902754.34 3344923.61 0 0 0 0 0
+);
+
+@edifact = qw (
+	120 100 89 164 206 137 199 146 179 557 687 448 732 660 717 623 553
+	698 871 322 359 322 565 456 297 261 136 0 0 0 0 0
+);
+
+@spendedifact = qw (
+	119411.04 66476.61 28115.49 149890.94 289031.85 81634.31 176742.51 107382.60 96839.65 543298.70 453239.01
+	458293.71 504847.97 608729.74 529604.07 10179456.51 343340.95 486830.93 611903.26 72872.46 116588.55
+	141016.98 383396.96 331920.10 142888.69 68113.66 34756.08 0 0 0 0 0
+);
+
+@EDIGateway = qw (
+	10 1 0 6 9 26987 32650 40293 67176 59083 58783 73745 86029 149650
+	137911 133012 140299
+);
+
+@spendEDIGateway = qw (
+	558.60 55.86 0 335.16 50907.03 4109043.77 5064178.14 10078994.54 20836200.11 20979745.37 20561584.39
+	31475882.43 34375229.25 130428044 168242753.42 156394629.58 115614005.63
+);
+
+sub writeData {
+	my $cdb = shift;
+	my $startMonth = shift;; # october
+	my $startYear = shift;
+
+	my @data = @_;
+
+	my @records = ();
+
+	print "  will write ", scalar(@data), " rows of data\n";
+
+	for ( my $i = 0; $i < @data; $i++) {
+
+		my $month = ($startMonth + $i) % 12;
+		my $year = $startYear + int(($startMonth + $i) / 12);
+
+		my $time = (POSIX::mktime(0, 0, 0, 1, $month, $year) + 86400);
+
+		$records[$i][0] = $time;
+		$records[$i][1] = $data[$i];
+	}
+
+	return $cdb->writeRecords(@records);
+}
+
+sub initCdbWithName {
+	my $name = shift;
+	my $startMonth = shift || 0; #jan
+	my $startYear = shift  || 102; # 2002
+	my $shortName = shift || basename($name);
+	my $dataName = shift || $shortName;
+
+	if ($name =~ /\bspend\b/ || $shortName =~ /\bspend\b/) {
+		$dataName = "spend$dataName";
+	}
+
+	my $description = $name;
+	$description =~ s|/| |g;
+
+	print "writing cdb = $name, name = $shortName, data = $dataName, des = [$description]\n";
+
+	my $cdb = ariba::monitor::CircularDB->new($name, $shortName, 1000, "gauge", "percent", $description);
+
+	writeData($cdb, $startMonth, $startYear, @$dataName);
+}
+
+sub initSla {
+	initCdbWithName("an/business-metrics/uptime/sla", 9, 100);
+}
+
+sub initAll {
+	initCdbWithName("an/business-metrics/uptime/all", 9, 100);
+}
+
+sub initUnplanned {
+	initCdbWithName("an/business-metrics/uptime/unplanned", 9, 100);
+}
+
+sub initEdi {
+	initCdbWithName("an/business-metrics/documents/pos/volume/edi");
+	initCdbWithName("an/business-metrics/documents/pos/spend/edi", 0, 102);
+
+	initCdbWithName("an/business-metrics/documents/pos/volume/edifact");
+	initCdbWithName("an/business-metrics/documents/pos/spend/edifact", 0, 102);
+
+	#initCdbWithName("an/business-metrics/documents/pos/volume/EDIGateway", 1, 103);
+	#initCdbWithName("an/business-metrics/documents/pos/spend/EDIGateway", 1, 103);
+}
+
+sub initFax {
+	initCdbWithName("an/business-metrics/documents/pos/volume/fax");
+	initCdbWithName("an/business-metrics/documents/pos/spend/fax", 0, 102);
+}
+
+sub initHtml {
+	initCdbWithName("an/business-metrics/documents/pos/volume/html");
+	initCdbWithName("an/business-metrics/documents/pos/spend/html", 0, 102);
+}
+
+sub initCXML {
+	initCdbWithName("an/business-metrics/documents/pos/volume/cXML");
+	initCdbWithName("an/business-metrics/documents/pos/spend/cXML", 0, 102);
+}
+
+sub initEmail {
+	initCdbWithName("an/business-metrics/documents/pos/volume/email");
+	initCdbWithName("an/business-metrics/documents/pos/spend/email", 0, 102);
+}
+
+sub initInvoice {
+	initCdbWithName("an/business-metrics/documents/invoices/volume", 11, 101, "volume", "invoices");
+	initCdbWithName("an/business-metrics/documents/invoices/spend", 4, 104, "spend", "invoices");
+}
+
+sub printdata {
+	my $cdb1 = ariba::monitor::CircularDB->new("docvolume/edi");
+	my $cdb2 = ariba::monitor::CircularDB->new("docvolume/cXML");
+	my $cdb3 = ariba::monitor::CircularDB->new("docvolume/invoices");
+
+	my @records  = ();
+	my @records1 = ();
+	my @records2 = ();
+	my @records3 = ();
+
+	$cdb1->readRecords(undef, undef, undef, \@records1);
+	$cdb2->readRecords(undef, undef, undef, \@records2);
+	$cdb3->readRecords(undef, undef, undef, \@records3);
+
+	my $dateFormat = '%b-%y';
+
+	for (my $i = 0; $i < @records1; $i++) {
+		my $time = POSIX::strftime($dateFormat, localtime($records1[$i][0]+86400));
+		my $val1 = $records1[$i][1];
+		my $val2 = $records2[$i][1];
+		my $val3 = $records3[$i][1];
+
+		print "$time\t$val1\t$val2\t$val3\n";
+		push(@records, [($time, $val1, $val2, $val3)]);
+	}
+
+	return \@records;
+}
+
+sub main {
+	#initSla();
+	#initAll();
+	#initUnplanned();
+
+	initEdi();
+	#initFax();
+	#initHtml();
+	#initCXML();
+	#initEmail();
+
+	#initInvoice();
+	#my $records = printdata();
+}
+
+main();

@@ -1,0 +1,159 @@
+#!/usr/local/bin/perl -w
+
+# $Id$
+# $DateTime$
+# $Author$
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+
+my $debug = 0;
+
+my $s4MigrationDoc = "http://ops.ariba.com/documentation/prodops/common/an-to-s4-migration-errors.txt";
+
+## Helper for later:
+my $oneHourInSeconds = 60 * 60;
+my $fifteenMinutes   = 15 * 60;
+
+sub usage
+{
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit ();
+}
+
+sub main
+{
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while (my $arg = shift)
+    {
+        if ($arg =~ /^-h$/o) {usage();  next;}
+        if ($arg =~ /^-d$/o) {$debug++; next;}
+        if ($arg =~ /^-e$/o) {$sendEmail = 1; next;}
+        if ($arg =~ /^-p$/o) {$sendPage  = 1; next;}
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me      = ariba::rc::InstalledProduct->new();
+    my $service = $me->service();
+    my $an      = ariba::rc::InstalledProduct->new('an', $service);
+
+    my %queries;
+
+    ## Query 1
+    $queries{'Datalink Queue Length'} = {
+        crit             => 'answer > 500',
+        recordMaxResults => 35040,
+        sql              => q`
+            select /*+ INDEX(data_link_queue IND_EB809A47_20EB57A7) */ count(id) as queue_length_cnt
+            from data_link_queue
+            where status = 1
+        `,
+        description       => "Datalink queue length:  monitor the length of data link queue to make sure the data link task can keep up with the linking jobs.",
+        correctiveActions => [
+                              Ops => "Escalate to AN development based on CIRS criteria",
+                             ],
+        inf_default => 0,
+                                        };
+
+    ## Query 2
+    $queries{'Datalink Queue Items Stuck More Than 2 Hours'} = {
+        crit => 'numrows > 200',
+        sql  => q`
+            select /*+ INDEX(data_link_queue IND_EB809A47_20EB57A7) */
+                id as id,ROOT_ID as root_id ,status as status,(sysdate-CREATED)*24 as stuck_time 
+            from data_link_queue
+            where status = 1
+                and (sysdate-CREATED)*24 > 2
+        `,
+        description       => "Datalink queue items stuck more than 2 hrs: make sure data link task is running so no job is stuck for more than 2 hrs.",
+        correctiveActions => [
+                              Ops => "Escalate to AN development based on CIRS criteria",
+                             ],
+    };
+
+    ## Query 3
+    $queries{'Change Log Stuck'} = {
+        warn             => 'answer > 5000',
+        recordMaxResults => 35040,
+        sql              => q`
+            select count(*) as change_log_stuck_cnt from change_log
+        `,
+        description =>
+"Change Log stuck: The count of change_log is equivalent to the queue length. If it keeps growing, that means we are not processing it. This query warns when the count is greater than 5000 and turns critical if it stays that way for an hour.  This delay is to avoid alerting for a valid (temporary) spike in data processing.",
+        correctiveActions => [
+                              Ops => "Escalate to AN development based on CIRS criteria",
+                             ],
+        inf_default => 0,
+                                   };
+
+    $queries{'DataSync GetChangeList failures'} = {
+        warn                         => 'answer > 3',
+        ticketOnWarnOpenAfterMinutes => 30,
+        recordMaxResults             => 8640,
+        description                  => "Number of DataSync GetChangeList failures in the past hour",
+        sql                          => q`SELECT
+            count(*) as datasync_getcl_failures
+        FROM
+            event_log
+        WHERE
+            event_name = 'EventDSGetChangeList'
+            AND status = -1
+            AND (sysdate - start_time < 60/1440);
+        `,
+        correctiveActions => [
+                              Ops => "Escalate to AN Engineering",
+                             ],
+        inf_default => 0,
+                                                  };
+
+    $queries{'S4 Migration failures'} = {
+        description => "List of S4 Migration failures in the past day",
+        sql         => q`SELECT
+            user_id as user_id, info as info
+        FROM
+            event_log
+        WHERE
+            status = -1
+            AND event_name='EventS4Migration'
+            AND start_time > SYSDATE - 1
+        `,
+        correctiveActions => [
+                              Ops => "See note",
+                             ],
+        note => "<html>See <a href=\"$s4MigrationDoc\">$s4MigrationDoc</a></html>",
+                                        };
+
+    my $email = $an->default('notify');
+
+    $queries{influx_details} = {measurement => "an_datalink_status"};
+    my $qm = ariba::monitor::QueryManager->newWithDetails('datalink-status', 'an', $service, undef, \%queries);
+    $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);
+
+__END__
+

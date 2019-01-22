@@ -1,0 +1,160 @@
+#!/usr/local/bin/perl -w
+#
+# Tab for miscellenous queries
+#
+# $Id: //ariba/services/monitor/bin/an/misc-status#21 $
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+
+sub main {
+	my $debug = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $queries = {};
+    $queries->{"influx_details"} = { 'measurement' => "an_misc_status"};
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ m/^-d/o) { $debug = 1; }
+		if ($arg =~ m/^-e/o) { $sendEmail = 1; }
+		if ($arg =~ m/^-p/o) { $sendPage = 1; }
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $service = $me->service();
+	my $customer = $me->customer();
+	my $an = ariba::rc::InstalledProduct->new('an', $service);
+
+	$queries->{'Walkup Catalog Enabled'} = {
+		noRowCount	=> 1,
+		info		=> "answer eq 'Yes'",
+		crit		=> "answer ne 'Yes'",
+		sql		=> "select value as value from configuration where name = 'WalkupCatalogEnabled'",
+	};
+
+	$queries->{'Walkup Suppliers registered in past hour'} = {
+		info            => "numrows >= 0",
+		timeout         => 30,
+		format          => "%s: org %s, user %s\n",
+		recordMaxResults => 20000,
+		recordDatatype	=>	"gauge",
+		recordItem		=>	"numrows",
+		sql             => qq`
+			SELECT /*+ ORDERED use_nl(p o pr r) */ as ordered
+			        to_char(p.created_on, 'YYYY-MM-DD HH24:MI:SS') as create_on
+			        o.name as name,
+			        p.user_id as user_id
+			FROM
+			        person p,
+			        org o,
+			        person_role pr,
+			        role r
+			WHERE   
+			        r.name = 'SUPPLIER_MASTERACCOUNT' AND
+			        r.owningorg = 99 AND
+			        pr.role = r.id AND
+			        pr.person = p.id AND
+			        p.org = o.id AND
+			        p.status = 'LimitedAccess' AND
+			        p.created_on > sysdate - 1/24
+		`
+	};
+
+
+
+
+	my @levels = ('Dir', 'Comm');
+
+	for my $level (@levels) {
+
+		my $communitiesList;
+
+		if ($level eq 'Dir') {
+			$communitiesList = "0";
+		} else {
+			my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+			$communitiesList = join(", ", @communityIds);
+		}
+
+
+		$queries->{"$level Schema statistics analyze errors"} = {
+			info            => "answer > -1",
+			crit            => "answer > previousAnswer",
+			runForCommunities => $communitiesList,
+			sql             => qq`
+				SELECT count(*) as count FROM idl_ana_log WHERE
+				sqlerror != 0
+			`
+		};
+
+		$queries->{"$level Schema statistics incomplete or stuck jobs"} = {
+			info            => "answer > -1",
+			crit            => "answer > previousAnswer",
+			runForCommunities => $communitiesList,
+			sql             => qq`
+				SELECT count(*) as idl_ana_log_cnt FROM idl_ana_log WHERE
+				end_time is null and start_time < sysdate-1
+			`
+		};
+
+		my $maxInt = 60; # same num as in analyze_all_an_schemas
+
+		$queries->{"$level Schema table statistics null for 2 days or older than $maxInt days"} = {
+			info            => "answer > -1",
+			crit            => "answer > 0",
+			runForCommunities => $communitiesList,
+			sql             => qq`
+				select count(*) as table_stats_cnt_$level from 
+				user_objects o, user_tables t 
+				where o.object_type = 'TABLE' and 
+				o.status = 'VALID' and 
+				o.temporary = 'N' and 
+				o.last_ddl_time < sysdate-2 and 
+				t.table_name = o.object_name and 
+				t.table_name not like 'DR\$%' and 
+				(t.last_analyzed is null or
+				t.last_analyzed < sysdate-$maxInt) 
+			`
+		};
+
+		$queries->{"$level Schema index statistics null for 2 days or older than $maxInt days"} = {
+			info            => "answer > -1",
+			crit            => "answer > 0",
+			runForCommunities => $communitiesList,
+			sql             => qq`
+				select count(*) index_stats_cnt_$level
+				from user_objects o, user_indexes t 
+				where 
+				o.object_type = 'INDEX' and
+				o.status = 'VALID' and 
+				o.temporary = 'N' and 
+				o.last_ddl_time < sysdate-2 and 
+				t.index_name = o.object_name and 
+				t.index_type != 'DOMAIN' and 
+				t.table_name not like 'DR\$%' and 
+				(t.last_analyzed is null or
+				t.last_analyzed < sysdate-$maxInt)
+			`
+		};
+
+	}
+
+	my $email = $me->default('notify.email');
+
+	my $q = ariba::monitor::QueryManager->newWithDetails('misc-status', 'an', $service, $customer, $queries);
+
+	$q->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+        ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $q);
+
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();
+

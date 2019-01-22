@@ -1,0 +1,174 @@
+#!/usr/local/bin/perl
+
+use strict;
+use Data::Dumper;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use ariba::Ops::Startup::Common;
+use ariba::Ops::Startup::Apache;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::Passwords;
+use ariba::rc::Utils;
+use ariba::rc::CipherStore;
+use ariba::Ops::Machine;
+use ariba::monitor::CircularDB;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::monitor::misc;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 -product [ssws|ws]
+
+        -e    Enables sending of email for monitor query.
+        -p    Enables sending of pages for monitor query.
+        -d    Turns on debug mode.
+        -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $product;
+
+    while ( my $arg = shift(@ARGV) ) {
+        if ( $arg =~ /^-h$/o ) { usage();  next; }
+        if ( $arg =~ /^-d$/o ) { $debug++; next; }
+        if ( $arg =~ /^-e$/o )      { $sendEmail = 1;            next; }
+        if ( $arg =~ /^-p$/o )      { $sendPage  = 1;            next; }
+        if ( $arg =~ /^-product/o ) { $product   = shift(@ARGV); next; }
+        usage("Invalid argument: $arg");
+    }
+
+    usage() unless ( $product && ($product eq 'ssws' || $product eq 'ws' ) );
+
+    my $me      = ariba::rc::InstalledProduct->new('mon');
+    my $service = $me->service;
+
+    print "service is $service\n" if $debug;
+
+    my $ws = ariba::rc::InstalledProduct->new( $product, $service );
+    my $webserverRole = $ws->webserverRole();
+
+    my $httpPort      = $ws->default('WebServerHTTPPort');
+    my $httpsPort     = $ws->default('WebServerHTTPSPort');
+    my $certHttpsPort = $ws->default('CertServerHTTPSPort');
+
+    my $cluster = $ws->currentCluster();
+
+    my @webMachines;
+
+    my $datacenter;
+
+    for my $webmachine ( $ws->hostsForRoleInCluster( $webserverRole, $cluster ) ) {
+        my ( $shortname, $dc ) = $webmachine =~ /([^\.]+)?\.([^\.]+)?/;
+        push( @webMachines, $shortname );
+        if (!$datacenter) {$datacenter = $dc};
+    }
+
+   print "machines to monitor are @webMachines for $product in $service\n" if $debug;
+
+    my @portsToMonitor;
+
+    push( @portsToMonitor, $httpPort ) if ( $httpPort && $httpPort =~ /\d+/ );
+    push( @portsToMonitor, $httpsPort ) if ( $httpsPort && $httpsPort =~ /\d+/ );
+    push( @portsToMonitor, $certHttpsPort ) if ( $certHttpsPort && $certHttpsPort =~ /\d+/ );
+
+    print "ports to monitor are @portsToMonitor\n" if $debug;
+
+    my @lbs;
+
+    my %matchDatacenter = (
+        status           => 'inservice',
+        datacenter       => $datacenter,
+        providesServices => 'loadbalancer',
+    );
+
+    for my $machine (
+        ariba::Ops::Machine->machinesWithProperties(%matchDatacenter) )	{
+        push( @lbs, $machine->hostname() );
+    }
+
+    my %queries = ();
+
+    my ( $maxConnectionsCrit, $maxConnectionsWarn ) = (0,0);
+
+    my $maxConnections = $ws->default('workermaxclients') || $ws->default('preforkmaxclients');
+    if ($maxConnections) {
+        $maxConnectionsCrit = $maxConnections * .90;
+        $maxConnectionsWarn = $maxConnections * .75;
+    }
+
+    for my $webMachine (@webMachines) {
+
+        my $connections = 0;
+        for my $port (@portsToMonitor) {
+
+            for my $lb (@lbs) {
+
+		# This will only work with Cisco loadbalancers for now
+		# When we add monitoring for F5 loadbalancers then 
+		# Those CDBs will need to be added here
+	
+                my $webConnectionsQueryName =
+                  "snmp/$lb/Current_connections_to_$webMachine" . "\.$port";
+
+                if ( ariba::monitor::Query->objectWithNameExists($webConnectionsQueryName)) {
+                    my $query = ariba::monitor::Query->new($webConnectionsQueryName);
+                    my $connectionsCdb = $query->cdb();
+                    $connections += int(
+                        $connectionsCdb->aggregateUsingFunctionForRecords('average', '+2'));
+                }
+            }
+
+        }
+
+        print "$webMachine has $connections connections\n" if $debug;
+
+        my $qname = "Current connections to $webMachine";
+        $queries{$qname} = {
+            recordMaxResults => 106000,
+            recordDataType   => 'gauge',
+            info             => "answer ne '' and answer > -1",
+            warn             => "answer ne '' and answer > $maxConnectionsWarn",
+            crit             => "answer > $maxConnectionsCrit",
+            perl             => "return qq($connections)",
+            inf_field        => "connections",
+            inf_tags         => "webserver=\"$webMachine\"",
+            group_by         => $webMachine,
+            inf_default      => "none",
+        };
+        $queries{"$qname warn threshold"} = {
+            perl      => sub { $maxConnectionsWarn },
+            inf_field => "connections_warn_threshold",
+            inf_tags  => "webserver=\"$webMachine\"",
+            group_by  => $webMachine,
+        };
+        $queries{"$qname crit threshold"} = {
+            perl      => sub { $maxConnectionsCrit },
+            inf_field => "connections_crit_threshold",
+            inf_tags  => "webserver=\"$webMachine\"",
+            group_by  => $webMachine,
+        };
+
+    }
+
+    my $email = $me->default('notify.email');
+    $queries{'influx_details'} = { measurement => 'ssws_httpd_connection_status' };
+    my $q = ariba::monitor::QueryManager->newWithDetails( "Per webserver http connections", $product, $me->service(), $me->customer(), \%queries );
+    $q->processQueries( $debug, $email, $sendEmail, $sendPage );
+}
+
+main(@ARGV);

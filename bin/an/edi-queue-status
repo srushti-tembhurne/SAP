@@ -1,0 +1,388 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/an/edi-queue-status#19 $
+
+use strict;
+use Time::Local;
+use Data::Dumper;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+use ariba::Ops::DBConnection;
+use ariba::Ops::ServiceController;
+use dmail::LockLib;
+
+my %queries  = ();
+my %queries_count  = ();
+my $LOCKFILE = "/tmp/stratus-an-edi-queue-status";
+
+sub main
+{
+    my $debug     = 0;
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while (my $arg = shift (@ARGV))
+    {
+        if ($arg =~ /^-d/o) {$debug     = 1;}
+        if ($arg =~ /^-e/o) {$sendEmail = 1;}
+        if ($arg =~ /^-p/o) {$sendPage  = 1;}
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $edi = ariba::rc::InstalledProduct->new("an", $me->service());
+
+    my %rateQueues;
+
+    my @queues = ("edi_interchange_queue", "edi_out_queue", "edi_outdisp_queue", "edi_status_update_queue", "edi_translation_queue", "edi_trans_queue", "edi_fa_queue", "edi_break_queue",);
+
+    my $tm = time ();
+    my ($month, $year, $day) = (localtime ($tm - 259200))[4, 5, 3];
+    my $newCut = timelocal(0, 0, 0, $day, $month, $year);
+    $newCut .= "000";    # status_changed is 1/1000th seconds.
+    $month++;
+    $year += 1900;
+    my $cut = sprintf ("%4d-%02d-%02d", $year, $month, $day);
+    for my $queue (@queues)
+    {
+        my $hours = 2;
+        if ($queue eq 'edi_status_update_queue')
+        {
+            $hours = 0.333;
+        }
+        my $longHours         = 6;
+        my $note              = undef;
+        my $critRows          = 10;
+        my $skipNotifications = 0;
+        my $openTicket        = undef;
+        my $stuckCrit         = undef;
+
+        my $warn              = 30;
+        my $crit              = 100;
+        my $stuckSql          = "select id,item ,status,round((sysdate-status_changed)*24) stuck_time from $queue where status in ('Queued','Processing') and (sysdate-status_changed)*24 > $hours";
+        my $stuckSqlCount     = "select count(*) as stuck_count from $queue where status in ('Queued','Processing') and (sysdate-status_changed)*24 > $hours";
+        my $stuckSql6h        = "select id as id,item as item,status as status,round((sysdate-status_changed)*24) stuck_time from $queue where status in ('Queued','Processing') and (sysdate-status_changed)*24 > $longHours";
+        my $stuckSql6hCount   = "select count(*) as stuck_count from $queue where status in ('Queued','Processing') and (sysdate-status_changed)*24 > $longHours";
+        my $countSql          = "select count(id) as count from $queue where status in ('Queued','Processing')";
+        my $queuename         = $queue;
+        my $totalCountSql     = "select count(id) as total_count from $queue where status_changed > to_date('$cut', 'YYYY-MM-DD')";
+        my $completedCountSql = "select count(id) as completed_count from $queue where status_changed > to_date('$cut', 'YYYY-MM-DD') AND status not in ('Queued', 'Processing')";
+
+        if ($queue eq 'edi_fa_queue')
+        {
+            $warn = 1000;
+            $crit = 4000;
+        }
+        elsif ($queue eq 'edi_out_queue')
+        {
+            $warn = 100;
+            $crit = 150;
+        }
+        elsif ($queue eq 'edi_outdisp_queue')
+        {
+            $warn     = 100;
+            $crit     = 150;
+            $stuckSqlCount = "select /*+ INDEX(edi_outdisp_queue IND_B3B26EEF_B1A4A7A0) */ count(*) as stuck_count from $queue where status in (1, 2) and $tm - (status_changed/1000) > $hours * 3600";
+            $stuckSql = "select /*+ INDEX(edi_outdisp_queue IND_B3B26EEF_B1A4A7A0) */ id, item, decode(status, 1, 'Queued', 2, 'Processing', 'Unknown' ||  status),round(($tm - (status_changed/1000))/3600) stuck_time from $queue where status in (1, 2) and $tm - (status_changed/1000) > $hours * 3600";
+            $countSql = "select /*+ INDEX(edi_outdisp_queue IND_B3B26EEF_B1A4A7A0) */ count(id) as count from $queue where status in (1,2)";
+        }
+        elsif ($queue eq 'edi_break_queue')
+        {
+            $warn       = undef;
+            $crit       = undef;
+            $critRows   = undef;
+            $openTicket = 1;
+            $note       = 'see http://ops.ariba.com/documentation/prodops/common/query_notes/edi_queues.txt';
+        }
+        elsif ($queue eq 'edi_interchange_queue')
+        {
+            $warn = 40;
+        }
+        elsif ($queue eq 'edi_status_update_queue')
+        {
+            $warn     = undef;
+            $crit     = undef;
+            $critRows = undef;
+        }
+        elsif ($queue eq 'edi_translation_queue')
+        {
+            $warn = 300;
+            $crit = 3000;
+        }
+        elsif ($queue eq 'edi_trans_queue')
+        {
+            $warn     = 4000;
+            $crit     = 8000;
+            $stuckSqlCount = "select /*+ INDEX(edi_trans_queue IND_AB537CA5_D5BE9811) */ count(*) as stuck_count from $queue where status in (1, 2) and $tm - (status_changed/1000) > $hours * 3600";
+            $stuckSql = "select /*+ INDEX(edi_trans_queue IND_AB537CA5_D5BE9811) */ id, item, decode(status, 1, 'Queued', 2, 'Processing', 'Unknown' || status),round(($tm - (status_changed/1000))/3600) stuck_time from $queue where status in (1, 2) and $tm - (status_changed/1000) > $hours * 3600";
+            $countSql = "select /*+ INDEX(edi_trans_queue IND_AB537CA5_D5BE9811) */ count(id) as count from $queue where status in (1,2)";
+        }
+
+        if ($queue eq 'edi_trans_queue' || $queue eq 'edi_outdisp_queue')
+        {
+            #
+            # new style queues have slightly different table layout
+            #
+            $totalCountSql     = "select count(id) as total_count from $queue WHERE (status_changed) > $newCut";
+            $completedCountSql = "select count(id) as completed_count from $queue WHERE (status_changed) > $newCut and status not in (1,2)";
+        }
+
+        $rateQueues{$queuename} = 1;
+
+        if ($queue eq 'edi_break_queue')
+        {
+            $queries{"$queuename: items stuck more than $longHours hrs"} = {
+                                                                            recordMaxResults => 20000,
+                                                                            recordDataType   => "gauge",
+                                                                            recordItem       => "numrows",
+                                                                            info             => "numrows > -1",
+                                                                            crit             => "numrows > 1",
+                                                                            timeout          => 300,
+                                                                            format           => "$queue.id %d $queue.item %d  %s %d hours\n",
+                                                                            note             => $note,
+                                                                            sql              => $stuckSql6h,
+                                                                            inf_tags         => qq(type="$queuename",duration="$longHours hrs"),
+                                                                            group_by         => qq($queuename,$longHours),
+                                                                           };
+             $queries_count{"$queuename: item count stuck more than $longHours hrs"} = {
+                                                                             sql              => $stuckSql6hCount,
+                                                                             inf_tags         => qq(queue="$queuename",duration="$longHours hrs"),
+                                                                             group_by         => qq($queuename,$longHours),
+                                                                            };
+        }
+
+        my $stuck_crit_threshold = (defined $critRows) ? $critRows : 0;
+        $stuckCrit = "numrows > $critRows" if defined ($critRows);
+
+        $queries{"$queuename: items stuck more than $hours hrs"} = {
+            recordMaxResults             => 20000,
+            recordDataType               => "gauge",
+            recordItem                   => "numrows",
+            info                         => "numrows > -1",
+            warn                         => "numrows > 0",
+            timeout                      => 300,
+            crit                         => $stuckCrit,
+            format                       => "$queue.id %d $queue.item %d  %s %d hours\n",
+            ticketOnWarnOpenAfterMinutes => $openTicket,
+            note                         => $note,
+            sql      => $stuckSql,
+            inf_tags => qq(type="$queuename",duration="$hours hrs"),
+            group_by => qq($queuename,$hours),
+        };
+
+        $queries_count{"$queuename: item count stuck more than $hours hrs"} = {
+            sql              => $stuckSqlCount,
+            inf_tags         => qq(queue="$queuename",duration="$hours hrs"),
+            group_by         => qq($queuename,$hours),
+        };
+        $queries_count{"$queuename: item count stuck more than $hours hrs crit threshold"} = {
+            perl             => sub { return $stuck_crit_threshold },
+            inf_tags         => qq(queue="$queuename",duration="$hours hrs"),
+            group_by         => qq($queuename,$hours),
+            inf_field        => 'stuck_count_crit_threshold',
+        };
+
+        my $warn_threshold = (defined $warn) ? $warn : 0;
+        my $crit_threshold = (defined $crit) ? $crit : 0;
+        $warn = "answer > $warn" if defined ($warn);
+        $crit = "answer > $crit && previousAnswer > $crit" if defined ($crit);
+
+        $queries{"$queuename: queue length (Queued, Processing)"} = {
+            recordMaxResults  => 20000,
+            recordDataType    => "gauge",
+            info              => "answer > -1",
+            warn              => $warn,
+            crit              => $crit,
+            timeout           => 300,
+            skipNotifications => $skipNotifications,
+            sql      => $countSql,
+            inf_tags => qq(type="$queuename"),
+            group_by => qq($queuename),
+        };
+        $queries{"$queuename: queue length (Queued, Processing) warn threshold"} = {
+            perl      => sub { return $warn_threshold },
+            inf_field => 'count_warn_threshold',
+            inf_tags  => qq(type="$queuename"),
+            group_by  => qq($queuename),
+        };
+        $queries{"$queuename: queue length (Queued, Processing) crit threshold"} = {
+            perl      => sub { return $crit_threshold },
+            inf_field => 'count_crit_threshold',
+            inf_tags  => qq(type="$queuename"),
+            group_by  => qq($queuename),
+        };
+
+        $queries{"$queuename: total length"} = {
+                                                info             => 1,
+                                                recordMaxResults => 20000,
+                                                recordDataType   => "gauge",
+                                                uiHint           => "ignore",
+                                                sql              => $totalCountSql,
+                                                timeout          => 300,
+                                                inf_tags         => qq(type="$queuename"),
+                                                group_by         => qq($queuename),
+                                               };
+
+        $queries{"$queuename: completed length"} = {
+                                                    info             => 1,
+                                                    recordMaxResults => 20000,
+                                                    recordDataType   => "gauge",
+                                                    uiHint           => "ignore",
+                                                    sql              => $completedCountSql,
+                                                    timeout          => 300,
+                                                    inf_tags         => qq(type="$queuename"),
+                                                    group_by         => qq($queuename),
+                                                   };
+    }
+
+    my $email = $me->default('notify.email');
+    unless (dmail::LockLib::requestlock($LOCKFILE, 5))
+    {
+        die "can't grab lock\n";
+    }
+    my $ediDbc      = ariba::Ops::DBConnection->connectionsForProductOfDBType($edi, ariba::Ops::DBConnection::typeMainEdi());
+    # for stratus/influx we have count and data measurement queries.
+    $queries_count{influx_details} = {measurement => "an_edi_queue_status_count"};
+    my $qCount = ariba::monitor::QueryManager->newWithDetails("edi-queue-status-count", "an", $me->service, $me->customer(), \%queries_count);
+    $qCount->setSQLConnectInfoFromDBConnection($ediDbc);
+    $qCount->processQueries($debug, $email, $sendEmail, $sendPage);
+
+    $queries{influx_details} = {measurement => "an_edi_queue_status"};
+    my $q = ariba::monitor::QueryManager->newWithDetails("edi-queue-status", "an", $me->service, $me->customer(), \%queries);
+
+
+    $q->setSQLConnectInfoFromDBConnection($ediDbc);
+
+    $q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+    #
+    # XXXX -- this is a temporary high priority query for Sysco to
+    # detect a bug in AN49... it breaks some rules, so we should
+    # fix it eventually.
+    #
+    my %syscoQCount;
+    $syscoQCount{"Failed Interchanges at Break State"} = {
+        sql  => "select count(*) as failed_count FROM
+                edi_break_queue break, edi_interchange_document inter,
+                edi_base_document base, edi_profile prof
+                WHERE break.status = 'Failed' and  break.item = inter.id and
+                inter.basedocument = base.id and
+                base.document_type = 'Interchange' and base.direction=0 and
+                base.profile = prof.id and prof.anid = 'AN01002330463' and
+                break.STATUS_CHANGED > sysdate - 1
+                order by base.created",
+    };
+    $syscoQCount{'influx_details'} = {'measurement' => "an_edi_queue_status_failed_inter_count"};
+    my %syscoQ;
+    $syscoQ{"Failed Interchanges at Break State"} = {
+        info => "numrows == 0",
+        crit => "numrows > 0",
+        timeout => 300,
+        sql  => "select inter.id,
+                inter.control_number, base.created, break.status FROM
+                edi_break_queue break, edi_interchange_document inter,
+                edi_base_document base, edi_profile prof
+                WHERE break.status = 'Failed' and  break.item = inter.id and
+                inter.basedocument = base.id and
+                base.document_type = 'Interchange' and base.direction=0 and
+                base.profile = prof.id and prof.anid = 'AN01002330463' and
+                break.STATUS_CHANGED > sysdate - 1
+                order by base.created",
+    };
+    $syscoQ{'influx_details'} = {'measurement' => "an_edi_queue_status_failed_inter"};
+
+    my $emailCS = 0;
+    $emailCS = 1 if (ariba::Ops::ServiceController::isProductionServicesOnly($me->service()));
+    # stratus/influx requires a count and data measurments so when no rows we still get count of zero
+    my $syscoQMCount = ariba::monitor::QueryManager->newWithDetails("edi-queue-status-failed-inter-count", "an", $me->service, $me->customer(), \%syscoQCount);
+    $syscoQMCount->setSQLConnectInfoFromDBConnection($ediDbc);
+    $syscoQMCount->processQueries($debug, "dept_support_ants\@ariba.com", $emailCS, 0);
+
+    my $syscoQM = ariba::monitor::QueryManager->newWithDetails("edi-queue-status", "an", $me->service, $me->customer(), \%syscoQ);
+    $syscoQM->setSQLConnectInfoFromDBConnection($ediDbc);
+    $syscoQM->processQueries($debug, "dept_support_ants\@ariba.com", $emailCS, 0);
+
+    my %qq;
+    foreach my $queue (keys %rateQueues)
+    {
+        my ($egress, $ingress, $delta) = (undef, undef, undef);
+
+        my $qname          = "$queue: total length";
+        my $instance       = ariba::monitor::Query->generateInstanceName($qname, "an", $me->customer(), undef);
+        my $completedQuery = ariba::monitor::Query->new($instance);
+
+        $qname = "$queue: completed length";
+        $instance = ariba::monitor::Query->generateInstanceName($qname, "an", $me->customer(), undef);
+        my $totalQuery = ariba::monitor::Query->new($instance);
+
+        #
+        # at midnight, when seven days ago changes, our result counters
+        # will shrink.  We'll just skip this pass.
+        #
+        if (   $totalQuery->hasAttribute('previousResults')
+            && $totalQuery->results() >= $totalQuery->previousResults())
+        {
+            my $interval = $totalQuery->checkTime() - $totalQuery->previousCheckTime();
+            $interval /= 3600;
+            $egress  = ($completedQuery->results() - $completedQuery->previousResults()) / $interval;
+            $egress  = (int ($egress * 100)) / 100;
+            $ingress = ($totalQuery->results() - $totalQuery->previousResults()) / $interval;
+            $ingress = (int ($ingress * 100)) / 100;
+
+            $delta = $ingress - $egress;
+            $delta = (int ($delta * 100)) / 100;
+        }
+
+        $qq{"$queue egress rate (items/hour)"} = {
+                                                  info             => 1,
+                                                  perl             => $egress,
+                                                  recordMaxResults => 20000,
+                                                  recordDataType   => "gauge",
+                                                  recordDataUnits  => "items/hour",
+                                                  recordItem       => "answer",
+                                                  inf_field        => "value",
+                                                  inf_tags         => qq(queue_name="$queue",type="egress_rate"),
+                                                  inf_default      => 0,
+                                                  group_by         => qq($queue,"egress_rate"),
+                                                 };
+
+        $qq{"$queue ingress rate (items/hour)"} = {
+                                                   info             => 1,
+                                                   perl             => $ingress,
+                                                   recordMaxResults => 20000,
+                                                   recordDataType   => "gauge",
+                                                   recordDataUnits  => "items/hour",
+                                                   recordItem       => "answer",
+                                                   inf_field        => "value",
+                                                   inf_default      => 0,
+                                                   inf_tags         => qq(queue_name="$queue",type="ingress_rate"),
+                                                   group_by         => qq($queue,"ingress_rate"),
+                                                  };
+
+        $qq{"$queue size change rate (items/hour)"} = {
+                                                       info             => 1,
+                                                       perl             => $delta,
+                                                       recordMaxResults => 20000,
+                                                       recordDataType   => "gauge",
+                                                       recordDataUnits  => "items/hour",
+                                                       recordItem       => "answer",
+                                                       inf_field        => "value",
+                                                       inf_default      => 0,
+                                                       inf_tags         => qq(queue_name="$queue",type="change_rate"),
+                                                       group_by         => qq($queue,"change_rate"),
+                                                      };
+    }
+    $qq{'influx_details'} = {'measurement' => "an_edi_queue_egress_ingress"};
+
+    my $qqm = ariba::monitor::QueryManager->newWithDetails("edi-queue-egress-and-ingress", "an", $me->service(), $me->customer(), \%qq);
+
+    $qqm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+    dmail::LockLib::releaselock($LOCKFILE);
+}
+
+main();

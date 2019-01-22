@@ -1,0 +1,164 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/an/daily-order-status#4 $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::ServiceController;
+
+use dmail::LockLib;
+
+my $LOCKFILE = '/tmp/an-stratus-daily-order-status';
+
+my $adminAppURL;
+my $debug = 0;
+my $sendEmails = 0;
+
+sub main {
+
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; }
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $an = ariba::rc::InstalledProduct->new("an", $me->service());
+
+	if (ariba::Ops::ServiceController::isProductionServicesOnly($me->service())) {
+		$sendEmails = 1;
+	}
+
+	my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+	my $communitiesList = join(", ", @communityIds);
+
+	$adminAppURL = $an->default('acadminurlprefix');
+
+	my %queries = (
+		"failed documents sent to providers over last 5 days" =>
+			{
+				recordMaxResults   => 36000,
+				recordDataType     => "gauge",
+				recordItem         => "numrows",
+				graphRecorded      => 1,
+				recordDataUnits    => 'absolute',
+
+				runForCommunities => $communitiesList,
+				aggregationMethod => "rows",
+				info => "numrows > -1",
+				warn => "numrows > 0",
+				timeout => 15 * 60,
+
+				processAnswer => sub { main::addAdminAppLinksToFailedDocsToProvidersResults() },
+				sql => q`
+					SELECT  /*+ index(cd IND_B398011A_2B45162B) use_nl(cd cds sj f t) */
+					cd.id Id,  
+				nvl(cd.document_type, 'Unknown') DocType,
+				nvl(cd.operation_type,  'Unavailable') OpType,
+				sj.service_id ServiceId,
+				schema_community as community,
+				to_char(cd.created,'YYYY-MM-DD HH24:MI:SS') Created,
+				nvl(f.name,  'Name unavailable') fromOrg,
+				nvl(t.name, 'Name unavailable') Provider
+					FROM cxml_document cd, cxml_document_service cds, service_join sj, org_join f, org_join t
+					WHERE cd.id = cds.document
+					AND cd.document_type != 'CopyRequest'
+					AND cd.status =  'Failed'
+					AND cd.created >  sysdate  -  5
+					AND cds.service = sj.id                    
+					AND cd.source_partition = schema_community 
+					AND cd.from_org = f.id and nvl(f.deployment,  'Production')  ='Production'
+					AND cd.to_org = t.id and nvl(t.deployment,  'Production')  ='Production'
+					UNION ALL
+       	         SELECT  /*+ index(cd IND_B398011A_2B45162B) use_nl(cd cds sj f t ori) */
+       	         cd.id Id,
+       	     nvl(cd.document_type, 'Unknown') DocType,
+       	     nvl(cd.operation_type,  'Unavailable') OpType,
+       	     sj.service_id ServiceId,
+       	     schema_community as community,
+       	     to_char(cd.created,'YYYY-MM-DD HH24:MI:SS') Created,
+       	     nvl(f.name,  'Name unavailable') fromOrg,
+       	     nvl(t.name, 'Name unavailable') Provider
+       	         FROM cxml_document cd, cxml_document_service cds, service_join sj, org_join f, org_join t, cxml_document ori
+       	         WHERE cd.id = cds.document
+       	         AND cd.document_type = 'CopyRequest'
+       	         AND cd.status =  'Failed'
+       	         AND cd.created >  sysdate  -  5
+       	         AND cds.service = sj.id
+       	         AND cd.source_partition = schema_community
+       	         AND ori.from_org = f.id and nvl(f.deployment,  'Production')  ='Production'
+       	         AND cd.to_org = t.id and nvl(t.deployment,  'Production')  ='Production'
+       	         AND ori.id = cd.related_document
+				ORDER BY Provider, Id asc, OpType
+					`,
+
+			},
+		);
+
+
+	my $email = $me->default('notify.email');
+    $queries{influx_details} = { measurement => "an_daily_order_status" };
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails(
+		"order-status", "an", $me->service(), $me->customer(), \%queries
+	);
+
+	unless (dmail::LockLib::requestlock($LOCKFILE,5)) {
+                die "can't grab lock\n";
+        }
+
+	$qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+	ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
+
+	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+	dmail::LockLib::releaselock($LOCKFILE);
+}
+
+# Add links to the admin app for each result line
+sub addAdminAppLinksToFailedDocsToProvidersResults {
+
+	my $query   = $ariba::monitor::Query::_ourGlobalQuerySelf;
+	my @results = ();
+
+	my $shouldCrit = 0;
+
+	for my $result ($query->results()) {
+
+		my ($id, $type, $opType, $serviceID, $community, $created, $from, $to) = split(/\t/, $result);
+
+		my $format = 'cxml_document.id %s %s community %s created %s %18.18s -> %18.18s with serviceID %s OperationType %s';
+
+		$result = sprintf($format, $id, $type, $community, $created, $from, $to, $serviceID, $opType);
+
+		# The daily last 5 days query doesn't need to crit, because the frequently run
+		# single day query will pick up the problem
+#		$shouldCrit = 1 if ($opType eq "SignUp" || $opType eq "InvoiceUpload");
+
+		push @results, sprintf("<html>%s</html>", _insertAdminAppURLs($result, $community));
+	}
+
+	$query->setCrit($shouldCrit);
+
+	return join("\n", @results);
+}
+
+sub _insertAdminAppURLs {
+	my ($line, $community) = @_;
+
+	$line =~ s|(po\.id)\s+(\d+)|$1 <a target=admin href=$adminAppURL/po?id=$2&community=$community>$2</a>|o;
+	$line =~ s|(cxml_document\.id)\s+(\d+)|$1 <a target=admin href=$adminAppURL/doc?id=$2&community=$community>$2</a>|o;
+
+	return $line;
+}
+
+main();

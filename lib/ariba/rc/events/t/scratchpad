@@ -1,0 +1,36 @@
+#!/usr/local/bin/perl
+#
+# Scratchpad for testing RC Events
+#
+
+use strict;
+use warnings;
+use Carp;
+use Data::Dumper;
+use ariba::rc::events::EventRegistry;
+use ariba::rc::events::client::Event;
+
+
+my $config = new ariba::rc::events::EventConfig ("../../../../../../../tools/rc/etc/events.xml");
+my $hashref = $config->parse_events();
+print Dumper ($hashref);
+
+my $event = new ariba::rc::events::client::Event
+(
+    {
+        channel => 'robot57',
+        title => "Test Event $$",
+        description => "HGLAHULAGLAHLAG",
+        url => "https://rc.ariba.com/?$$",
+    }
+);
+
+my $reg = new ariba::rc::events::EventRegistry ("../../../../../../../tools/rc/etc/events.xml");
+my $generator = $reg->get_feeder ($event, "robot57");
+print Dumper ($generator);
+# $generator->publish();
+
+my $config_manager = $reg->get_config_manager();
+print Dumper ($config_manager->get_order());
+
+print Dumper ($reg->get_feeds());

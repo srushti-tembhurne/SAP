@@ -1,0 +1,537 @@
+#!/usr/local/bin/perl
+#
+# Monitor total down nodes per type and community.
+# This script is a variation if node-health, it
+# will insert one row per down node and a single row
+# with a node down count (by product).  This will serve
+# for better reporting.
+#
+# $Id: //ariba/services/monitor/bin/common/node-health#15 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Url;
+use Data::Dumper;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-cluster <name>] [-e|-p|-d|-h]
+Monitors number of nodes down for each community
+
+    -cluster    Specifies the cluster to run the monitoring against
+
+    -e          Enable email
+    -p          Enable paging
+    -d          Enable debug
+    -type       (e.g critical or normal)
+    -prod       <product>
+    <url files> file(s) that contain urls to monitor
+                      defaults to \$URLFILE
+                      or $FindBin::Bin/../../etc/http-watcher-urls
+    -h          Show this help.
+
+USAGE
+
+    print "(error) $error\n" if ( $error );
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $cluster;
+    my $type;
+    my $productNameParam;
+    my @urlFiles                = ();
+    my $defaultUrlFile = $ENV{'URLFILE'} || "$FindBin::Bin/../../etc/http-watcher-urls";
+
+    while( my $arg = shift(@ARGV) ) {
+        if ( $arg =~ m/^-h$/o ) { usage(); next; }
+        if ( $arg =~ m/^-d$/o ) { $debug++; next; }
+        if ($arg =~ /^-t/o) {$type = shift (@ARGV); next;}
+        if ( $arg =~ m/^-e$/o ) { $sendEmail = 1; next; }
+        if ( $arg =~ m/^-p$/o ) { $sendPage = 1; next; }
+        if ( $arg =~ m/^-cluster$/o ) { $cluster = shift(@ARGV); next; }
+        if ($arg =~ /^-prod/o) {$productNameParam = shift (@ARGV); next;}
+        if ($arg !~ /^-/o) {push (@urlFiles, $arg); next;}
+        usage("Unknown arg: $arg");
+    }
+    exit (1) unless ($productNameParam);
+    unless (@urlFiles)
+    {
+        push (@urlFiles, $defaultUrlFile);
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $service = $mon->service();
+    my $email = $mon->default('notify.email');
+    my %includes  = ();
+    $cluster = $mon->currentCluster() unless ( $cluster );
+
+    for my $URLFILE (@urlFiles)
+    {
+        next unless -f $URLFILE;
+        readConfigFile($URLFILE, \%includes);
+    }
+
+    # dynamically load urls that live in ariba::HTTPWatcherPlugin::*
+    my $urlsRef = evalURLsAndLoadIncludes($service, \%includes, $type, $cluster, $productNameParam);
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList($service);
+
+    my %inspector_urls = ();
+    my %log_urls = ();
+
+    for my $url (@{$urlsRef->{$productNameParam}}) {
+      $inspector_urls{$url->instanceName()} = $url->inspectorURL();
+      $log_urls{$url->instanceName()} = $url->logURL();
+    }
+
+    foreach my $product (@products) {
+        next unless ( $product->name() eq $productNameParam );
+        next unless ( $product->currentCluster() eq $cluster );
+
+        my %queries = ();
+        my %queriesCount = ();
+        my %total = ();
+        my %down = ();
+        my %sick = ();
+        my %up = ();
+
+        my $productName = $product->name();
+        my $customer = $product->customer();
+        my $cluster = $product->currentCluster();
+
+        my @instances = $product->appInstancesInCluster($cluster);
+        my %instance_hash = map {$_->instanceName() => $_ } @instances;
+        # lets also get up/down status for cluster group API the SREs want to see if that Status
+        # is more acurate
+        my %logicalNameToStatus = _fetchCGroupsStatus(\@instances);
+
+        my $qmName = ariba::monitor::QueryManager->generateInstanceName("http-urls-status-normal", $productName, $customer, $cluster);
+        next unless ariba::monitor::QueryManager->objectWithNameExists($qmName);
+
+        my $qm = ariba::monitor::QueryManager->new($qmName);
+
+        foreach my $query ($qm->queries()) {
+            my ($community, $appName);
+            next unless ($query->instance() =~ m/([a-zA-Z]+)-?\d+_?([^_]+|connection_to_DB)?/ ||
+                         $query->instance() =~ m/C\d+-([a-zA-Z]+)\d+/);
+            $appName = $1;
+            my $uiHint = $query->uiHint();
+            # Skip if the community "name" is General, it has no nodes to check (or so I've been told).
+            next if $uiHint =~ /^[Gg]eneral/;
+            if($uiHint) {
+                ($community, $appName) = split('/', $uiHint);
+            } else {
+                $community = "default";
+            }
+            ($community = $community) =~ s/\s?community\s?//g;
+
+            $total{$community} = {} unless $total{$community};
+            $total{$community}->{$appName} = 0 unless $total{$community}->{$appName};
+            $total{$community}->{$appName}++;
+            $up{$community} = {} unless $up{$community};
+            $up{$community}->{$appName} = [] unless $up{$community}->{$appName};
+            $down{$community} = {} unless $down{$community};
+            $down{$community}->{$appName} = [] unless $down{$community}->{$appName};
+            $sick{$community} = {} unless $sick{$community};
+            $sick{$community}->{$appName} = [] unless $sick{$community}->{$appName};
+            if($query->status eq "crit") {
+                my $prettyName = $query->queryName() || $query->instance();
+                push(@{$down{$community}->{$appName}}, $prettyName);
+            } elsif($query->status eq "warn") {
+                my $prettyName = $query->queryName() || $query->instance();
+                push(@{$sick{$community}->{$appName}}, $prettyName);
+            } elsif($query->status eq "info")  {
+               my $prettyName = $query->queryName() || $query->instance();
+               push(@{$up{$community}->{$appName}}, $prettyName);
+            }
+        }
+
+        next unless(keys(%total));
+        foreach my $community (keys %total) {
+            my $community_nbr_tag = $community ne 'default' ? $community : 0;
+            foreach my $appName (keys %{$total{$community}}) {
+                my $instances_down_cnt = scalar(@{$down{$community}->{$appName}});
+                my $instances_sick_cnt = scalar(@{$sick{$community}->{$appName}});
+                my $instances_up_cnt = scalar(@{$up{$community}->{$appName}});
+                my $downNodeArray = $down{$community}->{$appName};
+                my $row = 0;
+                foreach my $nodeName (@$downNodeArray) {
+                  # we need the 'node app instance name' which is to right of ,
+                   (my $nodeAppInstanceName  = $nodeName) =~ s/^.*\,//;
+                   $nodeAppInstanceName =~ s/^\s+//;
+                   $nodeAppInstanceName =~ s/\s+$//;
+                   # we only want the nodeName which will be to the left of a ,
+                   $nodeName =~ s/\,.*$//;
+                   $nodeName =~ s/^\s+//;
+	                 $nodeName =~ s/\s+$//;
+
+                   my $cgroupNodeStatus = $logicalNameToStatus{$nodeAppInstanceName};
+
+                   $queries{"$appName app instance $nodeName cgroup down on $community"} = {
+                                           'description' => "Checks the number of app instances that are cgroup down in $community",
+                                           'uiHint' => "$community",
+                                           'perl' => sub { return lc($cgroupNodeStatus); },
+                                           inf_field   => "cgroup_status_str",
+                                           inf_default => "none",
+                                           inf_tags    => qq(type="$appName",community="$community",community_nbr_tag="$community_nbr_tag",nodename="$nodeName",nodeappinstancename="$nodeAppInstanceName",health_str=down),
+                                           group_by    => qq($community,$community_nbr_tag,$appName,$nodeName),
+                                   };
+
+                   $queries{"$appName app instance $nodeName down on $community"} = {
+                                           'description' => "Checks the number of app instances that are down in $community",
+                                           'uiHint' => "$community",
+                                           'perl' => sub { return 2; },
+                                           inf_field   => "health",
+                                           inf_default => "none",
+                                           inf_tags    => qq(type="$appName",community="$community",community_nbr_tag="$community_nbr_tag",nodename="$nodeName",nodeappinstancename="$nodeAppInstanceName",health_str=down),
+                                           group_by    => qq($community,$community_nbr_tag,$appName,$nodeName),
+                                   };
+                    $queries{"$appName app instance $nodeName inspector url down on $community"} = {
+                                           'description' => "Checks the number of app instances that are down in $community",
+                                           'uiHint' => "$community",
+                                           'perl' => sub { $inspector_urls{$nodeName} },
+                                           inf_field   => "inspector_url",
+                                           inf_default => "none",
+                                           inf_tags    => qq(type="$appName",community="$community",community_nbr_tag="$community_nbr_tag",nodename="$nodeName",nodeappinstancename="$nodeAppInstanceName",health_str=down),
+                                           group_by    => qq($community,$community_nbr_tag,$appName,$nodeName),
+                                   };
+                    $queries{"$appName app instance $nodeName log url down on $community"} = {
+                                          'description' => "Checks the number of app instances that are down in $community",
+                                          'uiHint' => "$community",
+                                          'perl' => sub { $log_urls{$nodeName } },
+                                          inf_field   => "log_url",
+                                          inf_default => "none",
+                                          inf_tags    => qq(type="$appName",community="$community",community_nbr_tag="$community_nbr_tag",nodename="$nodeName",nodeappinstancename="$nodeAppInstanceName",health_str=down),
+                                          group_by    => qq($community,$community_nbr_tag,$appName,$nodeName),
+                                  };
+                   $row += 1;
+                }
+                my $sickNodeArray = $sick{$community}->{$appName};
+                $row = 0;
+                foreach my $nodeName (@$sickNodeArray) {
+                  (my $nodeAppInstanceName  = $nodeName) =~ s/^.*\,//;
+                  $nodeAppInstanceName =~ s/^\s+//;
+                  $nodeAppInstanceName =~ s/\s+$//;
+                  my $cgroupNodeStatus = $logicalNameToStatus{$nodeAppInstanceName};
+                  # we only want the nodeName which will be to the left of a ,
+                  $nodeName =~ s/\,.*$//;
+                  $nodeName =~ s/^\s+//;
+                  $nodeName =~ s/\s+$//;
+                  my $nodeInstance = %instance_hash{$nodeName};
+                  my $monitorStats = ariba::monitor::AppInstanceStats->newFromAppInstance($nodeInstance);
+                  my $vm_heap_usage;
+                  if ( defined $monitorStats ) {
+                      $monitorStats->fetch() if defined $monitorStats;
+                      $vm_heap_usage = main::vmMemUsage($monitorStats);
+                  }
+                  $queries{"$appName app instance $nodeName cgroup sick on $community"} = {
+                           'description' => "Checks the number of app instances that are cgroup sick in $community",
+                           'uiHint' => "$community",
+                           'perl' => sub { return lc($cgroupNodeStatus); },
+                           inf_field   => "cgroup_status_str",
+                           inf_default => "none",
+                           inf_tags    => qq(type="$appName",community="$community",community_nbr_tag="$community_nbr_tag",nodename="$nodeName",nodeappinstancename="$nodeAppInstanceName",health_str=sick),
+                           group_by    => qq($appName,$community,$nodeName),
+                   };
+                  $queries{"$appName app instance $nodeName sick on $community"} = {
+                           'description' => "Checks the number of app instances that are sick in $community",
+                           'uiHint' => "$community",
+                           'perl' => sub { return 1; },
+                           inf_field   => "health",
+                           inf_default => "none",
+                           inf_tags    => qq(type="$appName",community="$community",community_nbr_tag="$community_nbr_tag",nodename="$nodeName",nodeappinstancename="$nodeAppInstanceName",health_str=sick),
+                           group_by    => qq($appName,$community,$nodeName),
+                   };
+                   $queries{"$appName app instance $nodeName inspector url sick on $community"} = {
+                            'description' => "Checks the number of app instances that are sick in $community",
+                            'uiHint' => "$community",
+                            'perl' => sub { $inspector_urls{$nodeName} },
+                            inf_field   => "inspector_url",
+                            inf_tags    => qq(type="$appName",community="$community",community_nbr_tag="$community_nbr_tag",nodename="$nodeName",nodeappinstancename="$nodeAppInstanceName",health_str=sick),
+                            group_by    => qq($appName,$community,$nodeName),
+                    };
+                    $queries{"$appName app instance $nodeName log url sick on $community"} = {
+                             'description' => "Checks the number of app instances that are sick in $community",
+                             'uiHint' => "$community",
+                             'perl' => sub { $log_urls{$nodeName} },
+                             inf_field   => "log_url",
+                             inf_tags    => qq(type="$appName",community="$community",community_nbr_tag="$community_nbr_tag",nodename="$nodeName",nodeappinstancename="$nodeAppInstanceName",health_str=sick),
+                             group_by    => qq($appName,$community,$nodeName),
+                     };
+                   if ( defined $vm_heap_usage && $vm_heap_usage != "" ) {
+                     $queries{"$appName app instance $nodeName heap usage sick on $community"} = {
+                              'description' => "Checks the number of app instances that are sick in $community",
+                              'uiHint' => "$community",
+                              'perl' => sub { return $vm_heap_usage; },
+                              inf_field   => "heap_usage",
+                              inf_tags    => qq(type="$appName",community="$community",community_nbr_tag="$community_nbr_tag",nodename="$nodeName",nodeappinstancename="$nodeAppInstanceName",health_str=sick),
+                              group_by    => qq($appName,$community,$nodeName),
+                      };
+                   }
+                   $row += 1;
+                }
+                my $upNodeArray = $up{$community}->{$appName};
+                $row = 0;
+                foreach my $nodeName (@$upNodeArray) {
+                  (my $nodeAppInstanceName  = $nodeName) =~ s/^.*\,//;
+                  $nodeAppInstanceName =~ s/^\s+//;
+                  $nodeAppInstanceName =~ s/\s+$//;
+                  my $cgroupNodeStatus = $logicalNameToStatus{$nodeAppInstanceName};
+                  # we only want the nodeName which will be to the left of a ,
+                  $nodeName =~ s/\,.*$//;
+                  $nodeName =~ s/^\s+//;
+                  $nodeName =~ s/\s+$//;
+                  my $nodeInstance = %instance_hash{$nodeName};
+                  my $monitorStats = ariba::monitor::AppInstanceStats->newFromAppInstance($nodeInstance);
+                  my $vm_heap_usage;
+                  if ( defined $monitorStats ) {
+                      $monitorStats->fetch() if defined $monitorStats;
+                      $vm_heap_usage = main::vmMemUsage($monitorStats);
+                  }
+                  $queries{"$appName app instance $nodeName cgroup up on $community"} = {
+                           'description' => "Checks the number of app instances that are cgroup up in $community",
+                           'uiHint' => "$community",
+                           'perl' => sub { return lc($cgroupNodeStatus); },
+                           inf_field   => "cgroup_status_str",
+                           inf_default => "0",
+                           inf_tags    => qq(type="$appName",community="$community",community_nbr_tag="$community_nbr_tag",nodename="$nodeName",nodeappinstancename="$nodeAppInstanceName",health_str=up),
+                           group_by    => qq($appName,$community,$nodeName),
+                   };
+                  $queries{"$appName app instance $nodeName up on $community"} = {
+                           'description' => "Checks the number of app instances that are up in $community",
+                           'uiHint' => "$community",
+                           'perl' => sub { return 0; },
+                           inf_field   => "health",
+                           inf_default => "0",
+                           inf_tags    => qq(type="$appName",community="$community",community_nbr_tag="$community_nbr_tag",nodename="$nodeName",nodeappinstancename="$nodeAppInstanceName",health_str=up),
+                           group_by    => qq($appName,$community,$nodeName),
+                   };
+                   $queries{"$appName app instance $nodeName inspector url up on $community"} = {
+                            'description' => "Checks the number of app instances that are up in $community",
+                            'uiHint' => "$community",
+                            'perl' => sub { $inspector_urls{$nodeName} },
+                            inf_field   => "inspector_url",
+                            inf_tags    => qq(type="$appName",community="$community",community_nbr_tag="$community_nbr_tag",nodename="$nodeName",nodeappinstancename="$nodeAppInstanceName",health_str=up),
+                            group_by    => qq($appName,$community,$nodeName),
+                    };
+                    $queries{"$appName app instance $nodeName log url up on $community"} = {
+                             'description' => "Checks the number of app instances that are up in $community",
+                             'uiHint' => "$community",
+                             'perl' => sub { $log_urls{$nodeName} },
+                             inf_field   => "log_url",
+                             inf_tags    => qq(type="$appName",community="$community",community_nbr_tag="$community_nbr_tag",nodename="$nodeName",nodeappinstancename="$nodeAppInstanceName",health_str=up),
+                             group_by    => qq($appName,$community,$nodeName),
+                     };
+                   if ( defined $vm_heap_usage && $vm_heap_usage != "" ) {
+                     $queries{"$appName app instance $nodeName heap usage up on $community"} = {
+                              'description' => "Checks the number of app instances that are up in $community",
+                              'uiHint' => "$community",
+                              'perl' => sub { return $vm_heap_usage; },
+                              inf_field   => "heap_usage",
+                              inf_tags    => qq(type="$appName",community="$community",community_nbr_tag="$community_nbr_tag",nodename="$nodeName",nodeappinstancename="$nodeAppInstanceName",health_str=up),
+                              group_by    => qq($appName,$community,$nodeName),
+                      };
+                   }
+                   $row += 1;
+                }
+                # counts
+            $queriesCount{"$appName app instance down count $community"} = {
+                     'uiHint' => "$community",
+                     'perl' => sub { return $instances_down_cnt; },
+                     inf_field   => "down_count",
+                     inf_default => "0",
+                     inf_tags    => qq(type="$appName",community="$community"),
+                     group_by    => qq($appName,$community),
+             };
+             $queriesCount{"$appName app instance sick count $community"} = {
+                      'uiHint' => "$community",
+                      'perl' => sub { return $instances_sick_cnt; },
+                      inf_field   => "sick_count",
+                      inf_default => "0",
+                      inf_tags    => qq(type="$appName",community="$community"),
+                      group_by    => qq($appName,$community),
+              };
+              $queriesCount{"$appName app instance ok count $community"} = {
+                       'uiHint' => "$community",
+                       'perl' => sub { return $instances_up_cnt; },
+                       inf_field   => "up_count",
+                       inf_default => "0",
+                       inf_tags    => qq(type="$appName",community="$community"),
+                       group_by    => qq($appName,$community),
+               };
+
+            }
+        }
+        next unless(keys(%queries));
+        $queries{influx_details} = { measurement => "node_health_detail" };
+#
+        $qm = ariba::monitor::QueryManager->newWithDetails("node-health-detail", $productName, $service, $customer, $cluster, \%queries);
+#
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+        $queriesCount{influx_details} = { measurement => "node_health_detail_count" };
+#
+        my $qmcount = ariba::monitor::QueryManager->newWithDetails("node-health-detail-count", $productName, $service, $customer, $cluster, \%queriesCount);
+#
+        $qmcount->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub vmMemUsage {
+    my $monitorStats = shift;
+
+    my $memUsage = "";
+
+    my $totalMem = $monitorStats->totalMemory();
+    my $freeMem = $monitorStats->freeMemory();
+
+    if (defined($totalMem) && defined($freeMem) ) {
+        $memUsage = $totalMem - $freeMem; # in KB
+    }
+
+    return $memUsage;
+}
+
+sub evalURLsAndLoadIncludes
+{
+    my $service       = shift;
+    my $includes = shift;
+    my $type     = shift;
+    my $cluster  = shift;
+    my $pname    = shift;
+
+    # trace("evalURLs()");
+
+    my %urls    = ();
+
+    for my $include (keys %{$includes})
+    {
+
+        next unless $include =~ /include\s+(\S+)\s+(.*)$/o;
+
+        my $package = $1;
+        my $parms   = $2;
+
+        $parms =~ s/\s+$//o;
+        my @initparams = split (/\s+/o, $parms);
+
+        unshift (@initparams, $cluster);
+        unshift (@initparams, $service);
+
+        print "   package = $package\n" if $debug;
+        print "   initparms = ", join (" ", @initparams), "\n" if $debug;
+
+        eval ("require $package");
+        die "require $package failed ($@)" if $@;
+
+        my @monitoredProducts = eval "${package}::init(\@initparams)";
+        die "${package}::init(", join (", ", @initparams), ") failed ($@)" if $@;
+
+        # the urls() method allocs ariba::monitor::Urls() and they
+        # live on in the shared cache
+        for my $product (@monitoredProducts)
+        {
+            next unless defined ($product);
+
+            my $productName = $product->name();
+
+            next if ($productName ne $pname);
+
+            push (@{$urls{$productName}}, eval "${package}::urls(\$product)");
+            die "${package}::urls() failed ($@)" if $@;
+
+            if ($type && $type eq 'critical')
+            {
+                @{$urls{$productName}} = grep {$_->recordStatus() && $_->recordStatus() eq 'yes'} @{$urls{$productName}};
+            }
+            elsif ($type && $type eq 'normal')
+            {
+                @{$urls{$productName}} = grep {!($_->recordStatus()) || $_->recordStatus() ne 'yes'} @{$urls{$productName}};
+            }
+            else
+            {
+                usage("Please specify a -t option\n");
+            }
+        }
+    }
+
+    return \%urls;
+}
+
+sub readConfigFile
+{
+    my $file     = shift;
+    my $includes = shift;
+
+    # trace("readConfigFile($file)");
+
+    open (CONFIG, $file) || return;
+
+    while (my $line = <CONFIG>)
+    {
+        next if $line =~ /^#/o;
+        next if $line =~ /^;/o;
+        chomp ($line);
+        next if $line =~ /^\s*$/o;
+
+        if ($line =~ /^include\s+/o)
+        {
+            $includes->{$line} = $line;
+            print "will include ", $includes->{$line}, "\n" if $debug;
+        }
+    }
+
+    close (CONFIG);
+}
+
+sub _fetchCGroupsStatus {
+    my $appInstances     = shift;
+
+    my %communityToInstance = ();
+    my %logicalNameToStatus = ();
+
+    # we only need cluster group status from one node!! Each node
+    # contains the up/down status of all the other nodes so we only need
+    # this info from one good node
+
+    # create a hash where key is logicalName and val is undef, we will need it later
+    for my $instance (@$appInstances) {
+      $logicalNameToStatus{$instance->logicalName()} = undef;
+    }
+
+    # get the cluster status from the first node that works
+    my $timeout = 6;
+    my $xmlStringRef;
+    for my $instance (@$appInstances) {
+      my $clusterGroupStatusURL = ariba::Ops::Url->new( $instance->clusterGroupStatusURL() );
+      $xmlStringRef = $clusterGroupStatusURL->request($timeout);
+      ( $clusterGroupStatusURL->error() ) ?  next : last;
+    }
+
+    my $xmlParser = XML::Simple->new(
+            ForceArray     => [ 'Metric', 'Singleton' ],
+            KeyAttr        => { Metric => 'Name', Singleton => 'Name' },
+            NormaliseSpace => 1
+        );
+    my $xmlResult = $xmlParser->XMLin($xmlStringRef);
+    while(my($k, $v) = each $xmlResult->{'Status'}) {
+      $logicalNameToStatus{$k} = $v->{'Status'};
+    }
+
+    return %logicalNameToStatus;
+}
+
+main();

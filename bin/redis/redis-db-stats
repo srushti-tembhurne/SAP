@@ -1,0 +1,296 @@
+#!/usr/local/bin/perl -w
+# $Id: //ariba/services/monitor/bin/redis/redis-db-stats#5 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use JSON;
+use Net::SSH::Perl;
+use Net::Telnet;
+use Data::Dumper;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::PageUtils;
+use Net::Ping;
+use DateTime;
+use  ariba::rc::InstalledProduct;
+
+
+my $debug = 0;
+my $urlTimeout = 20;
+my $me = ariba::rc::InstalledProduct->new( 'mon' );
+my $user = $me->default("DBAInfo.REDIS.RLEC.userName");#if the value is not there error out
+my $pass = $me->default("DBAInfo.REDIS.RLEC.password"); 
+my $muser = $me->default("DBAInfo.REDIS.ADMIN.userName");
+my $mpass = $me->default("DBAInfo.REDIS.ADMIN.password"); 
+my $auth_pass;
+if(!$user or !$pass or !$muser or !$mpass){
+		die "\n Redis configs not present in mon.. exiting... ";
+}
+
+my $service = $me->service();
+my $monserver = ariba::Ops::PageUtils::monitorServer();
+my @split = split /\./, $monserver;
+my $dc = $split[1];
+
+my $rhost = 'redis'.$service.'.'.$dc.'.ariba.com';
+
+main();
+#https://redisdev.lab1.ariba.com:9443/v1/bdbs/stats/last/1
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $product = 'redis';
+	my %queries;
+	my $url = 'https://'.$rhost.':9443';	
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; }
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+	my $surl = $url.'/v1/bdbs';
+	my $cmd = "curl -s -u $user:$pass ". '--insecure '.$surl;
+	my $results = `$cmd`;#exceptio handling
+	my $warn ;
+	my $crit ;
+	my @output;
+	my @errors;
+	my $redis_hash;
+	my $ref;# =  decode_json( $results);
+	print "\n $cmd | $results " if($debug);
+	my $ref;
+	eval { $ref = decode_json($results);};
+	if($@) { die "\n Error $@"; }
+	my %slow;
+	foreach my $db(@$ref){
+		my $name= $db->{name};
+		my $uid = $db->{uid};
+		#my $endp = $db->{dns_address_master};
+		my $endp =  $db->{endpoints}->[0]->{dns_name};
+		my $dport = $db->{port};
+		$auth_pass = $db->{authentication_redis_pass};
+		$slow{$name} = &get_slowlog($name,$endp,$dport);
+		$redis_hash->{$uid}->{name} = $name;
+	 }
+	 $surl = $url.'/v1/license';
+	 $cmd = "curl -s -u $user:$pass ". '--insecure '.$surl;
+	 $results = `$cmd`;
+	 print "\n $cmd | $results " if($debug);
+	 my $ref;
+	 eval { $ref = decode_json($results);};
+	 if($@) { die "\n Error $@"; }
+	 my @temp = split /\n/, $ref->{license};
+	 my $lic_exp = $temp[3];
+	 $lic_exp =~ s/.*z\-//ig;
+	 $lic_exp =~ s/T.*//ig;
+	 my @ldate = split /\-/, $lic_exp;
+	 my $ldt = DateTime->new(
+			  year	   => $ldate[0],
+			  month	  => $ldate[1],
+			  day		=> $ldate[2],
+			  hour	   => 0,
+			  minute	 => 0,
+			  second	 => 0,
+
+		  );
+	
+
+	my %shard_map;
+	$surl = $url.'/v1/bdbs/';
+	foreach my $id(keys %$redis_hash){
+	$cmd = "curl -s -u $user:$pass ". '--insecure '.$surl.$id;
+	$results = `$cmd`;
+	print "\n $cmd | $results " if($debug);
+	my $ref;
+	eval { $ref = decode_json($results);};
+	if($@) { die "\n Error $@"; }
+
+	#my $epip = $ref->{endpoint_ip}->[0];
+	my $epip = $ref->{endpoints}->[0]->{addr}->[0];
+	$epip .= "|" . $ref->{endpoints}->[0]->{port};
+	$redis_hash->{$id}->{endpoint} = $epip;
+
+	my $ma = $ref->{shard_list};
+	foreach  my $mad(@$ma){
+		$shard_map{$mad} = $id;		
+	}
+	my $stat_url = $url . '/v1/bdbs/stats/last/'.$id;
+	$cmd = "curl -s -u $user:$pass ". '--insecure '.$stat_url;
+	print "\n $id => $cmd" if($debug);
+	$results = `$cmd`;
+	print "\n $cmd | $results" if($debug);
+	my $ref;
+	eval {
+		$ref = decode_json($results);
+	};
+	if($@) { die "\n Error.. $@";}
+		my $nocon = $ref->{'bdb:'.$id}->{total_connections_received};	#concatenation needs to be outside
+		$redis_hash->{$id}->{conn_recvd} = $nocon;
+	}
+	my ($second, $minute, $hour, $dayOfMonth, $month, $yearOffset, $dayOfWeek, $dayOfYear, $daylightSavings) = localtime();
+	my $year = 1900 + $yearOffset;
+	$month++;
+	#my $etime = "$year-$month-$dayOfMonth"."T"."$hour:$minute:$second"."Z";
+	my $dt = DateTime->new(
+		  year	   => $year,
+		  month	  => $month,
+	  	  day		=> $dayOfMonth,
+		  hour	   => $hour,
+		  minute	 => $minute,
+		  second	 => $second,
+	);
+	my $etime = $dt->date()."T".$dt->hour().":".$dt->minute().":".$dt->second().'Z';
+	$dt->subtract(minutes => 5);
+	my $licexpire = $ldt->subtract_datetime_absolute($dt)->delta_seconds / (24*60*60);
+	$queries{"License Validity in days "} = {
+				crit	=> 'answer < 50',
+				perl	=> sub { int($licexpire); },
+				description => "RLEC License Expiry in days ",
+				uiHint => "License",
+				inf_field => "RLEC_license_expire_in_days",
+				inf_tags => "uihint=License",
+				inf_default => 0,
+		};
+
+
+
+	my $stime = $dt->date()."T".$dt->hour().":".$dt->minute().":".$dt->second().'Z';
+	my $turl = $url.'/v1/shards/stats?';
+	$cmd = "curl -s -u $user:$pass ". '--insecure '.$turl.'interval=5min&stime='.$stime;#.'&etime='.$etime;
+	print "\n$cmd";
+	$results = `$cmd`;
+	print "\n $cmd | $results" if($debug);
+	my $ref;
+	eval { $ref = decode_json($results);};
+	if($@) { die "\n Error $@";}
+	foreach my $shard(@$ref){
+		my $sh;
+		$sh->{sid} = $shard->{uid};
+		$sh->{role} = $shard->{role};
+		my $node = $shard->{node_uid};
+		$sh->{'Assigned Slots'} = $shard->{assigned_slots};
+		my $inte = $shard->{intervals}->[0];
+		$sh->{'Ops Per Second'} = $inte->{total_req};
+		$sh->{'Mem Size'} = $inte->{mem_size_actual};
+		$sh->{'Mem Size'} = $sh->{'Mem Size'}/1048576;
+		$sh->{'Number Of Keys'} = $inte->{no_of_keys};
+		$sh->{'Read Misses'} = $inte->{read_misses};
+		$sh->{'Write Misses'} = $inte->{write_misses};
+		my $rdb = $shard_map{$sh->{sid}};
+		if( defined ($redis_hash->{$rdb}->{shards})){
+			push @{$redis_hash->{$rdb}->{shards}}, $sh;
+		}
+		else { $redis_hash->{$rdb}->{shards} = [$sh];}
+			
+		
+	}
+	my $crits;
+	foreach my $bdb(keys%$redis_hash){
+		my $endpo = $redis_hash->{$bdb}->{endpoint};
+		my $db = $redis_hash->{$bdb}->{name};
+		my $endstat = &get_ep_status($endpo);
+		$queries{"Endpoint Status $endpo"} = {
+				crit => 'answer =~ /down/i',
+				perl	=> sub { return $endstat; },
+				description => "Redis Endpoint Ping Status $db",
+				uiHint => "Database",
+				inf_field => "Redis_endpoint_status",
+				inf_tags => "uihint=Database,db=$db",
+   				inf_default => "none", 
+		};
+		$queries{"Total Connections Received $db"} = {
+				crit => 'answer > 12000',
+				warn => 'answer > 10000',
+				perl	=> sub { return $redis_hash->{$bdb}->{conn_recvd}; },
+				description => "Redis rate of new client connections to DB (connections/sec)",
+				uiHint => "Database/$db",
+				inf_field => "Total_connection_received",
+				inf_tags => "type=\"Database/$db\",db=$db",
+   				inf_default => 0, 
+		};
+
+		foreach my $shard(@{$redis_hash->{$bdb}->{shards}}){
+			my $sid = $shard->{sid};
+			my $db = $redis_hash->{$bdb}->{name};
+			foreach my $k(keys %$shard){
+				next if(($k eq 'sid') or ($k eq 'role'));
+						(my $inf_field = $k) =~ s/\W//g;
+				my $role = $shard->{role};
+				$queries{"$db-shard-".$sid."-".$k } = {
+						perl	=> sub { return $shard->{$k}; },
+				   		description => "Redis $db Shard $sid $k",
+				  		uiHint => "Database/$db/Shards/".$role."/Shard-$sid/",
+						inf_field => "$inf_field",
+						inf_tags => qq|db="$db",role="$role",sid="$sid"|,
+						group_by => "$db,$role,$sid",
+   						inf_default => 0, 
+				};
+				if($k !~ /slot/i){
+						$queries{"$db-shard-".$sid."-".$k }->{recordMaxResults} = 5000;
+						$queries{"$db-shard-".$sid."-".$k }->{recordDataType} =  'counter';
+						$queries{"$db-shard-".$sid."-".$k }->{recordOnError} = 1;
+				}
+				if($k =~ /Mem Size/){
+		 				$queries{"$db-shard-".$sid."-".$k }->{format} = '%4.2fMB';
+				}
+			}
+		}
+	}
+	foreach my $db(keys %slow){
+		#Add if there is info or warn or crit
+		$queries{"Number of Slowlog Entries $db"} = {
+				perl	=> sub { return $slow{$db}; },
+				description => "Redis slowlog count",
+				uiHint => "SlowLog Counts",
+				inf_field => "slowlog_count",
+				inf_tags => "uihint=\"SlowLog Counts\",db=$db",
+   				inf_default => 0, 
+		};
+	}
+
+	$queries{influx_details} = {measurement => "Redis_cluster_details"};
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails('Redis Cluster Details', 'mon', $service, "", '', \%queries);
+	my $email = $me->default('notify.email') || $me->default('notify');
+
+	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+}
+
+
+sub get_slowlog {
+	my $db = shift;
+	my $endp = shift;
+	my $port = shift;
+	$endp =~ s/\:.*//;
+	my $cmd = 'redis-cli -h '.$endp.' -p '.$port.' -a '.$auth_pass .' SLOWLOG LEN';
+	my $urlTimeout = 20;
+   	my $product = 'redis';
+   	my %queries;
+
+	my $ssh	 = ariba::rc::Utils::sshCmd();
+
+	my $command = sprintf('%s %s@%s %s/%s', $ssh, $muser, $rhost, '/opt/redislabs/bin/', $cmd);
+	my @output ;
+	print "Executing command: $command\n\n" if $debug;
+	ariba::rc::Utils::sshCover($command, $mpass, undef, undef, \@output);
+
+	my $result = join "\n", @output;
+	$result =~ s/\(integer\) //;
+   	return $result; 
+}
+
+sub get_ep_status {
+	my $hp = shift;
+	chomp($hp);
+	my($ep,$port) = split /\|/, $hp;
+	$ep =~ s/\:.*//;
+	my $cmd = "nc -zv $ep $port";
+	my $op = `$cmd`;
+	if($op =~ /succeeded/i) {
+		return 'UP';
+	}
+	else { return 'Down';}
+}

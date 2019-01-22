@@ -1,0 +1,214 @@
+#!/usr/local/bin/perl
+# $Id: //ariba/services/monitor/bin/arches/index-manager#21 $
+
+use strict;
+use FindBin;
+use XML::Simple;
+use Data::Dumper;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Url;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-daily] [-e|-p|-d|-h] [-prod prodname]
+
+    -daily    Run daily type of queries
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode. 
+    -h        Shows this help.
+    -prod     product name
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub debug {
+    print "(debug) @_\n" if ($debug);
+}
+
+$| = 1;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $runDailyQueries = 0;
+    my $prodname = 'arches'
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-daily$/o) { $runDailyQueries = 1;   next; }
+        if ($arg =~ /^-prod$/o) { $prodname = shift;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled($prodname, $me->service()));
+    my $arches = ariba::rc::InstalledProduct->new($prodname, $me->service());
+    my %queries;
+    my %dailyQueries;
+    my $jobsStatusCollected = 0;
+
+    foreach my $cluster ( $arches->allClusters() ) {
+
+        my @indexMgrApps = grep { $_->appName() eq 'IndexMgr' } $arches->appInstancesInCluster($cluster); 
+        exit unless (@indexMgrApps);
+        my $jobFlag = 0;
+
+        my %thresholds = ( 
+           NotStartedCount      => { crit => 1000,
+                                     warn => 100,
+                                     name => 'Jobs Not Yet Started',
+                                     desc => 'Checks IndexMgr for the number of jobs not yet started',
+                                     maxresults => '',
+                                     datatype => '' },
+           AvgProcessingTime    => { crit => 7200,
+                                     warn => 900, 
+                                     name => 'Average Publishing Job Processing Time(sec)',
+                                     desc =>  'Checks IndexMgr average publishing time',
+                                     maxresults => 36000,
+                                     datatype => 'gauge' },
+        );
+
+        for my $app (@indexMgrApps) {
+            my $instanceName = $app->instanceName();
+            my $statusUrl = $app->indexManagerMonitoringURL();
+            debug("Checking index manager url: $statusUrl");
+
+            my $url = ariba::monitor::Url->new($statusUrl);
+            my $response = eval{ $url->request(30); }; # This method can die() with empty message.  The implication of this is staggering.
+            my $error = $url->error() || $@;
+            debug("Error: $error") if ($error);
+
+            unless ($jobFlag) {
+                for my $metric ( keys %thresholds ) {
+                    my $value;
+                    if ( $response ) {
+                        ( $value ) = $response =~ m|<$metric>(\d+)</$metric>|;
+                    }
+
+                    $queries{"$thresholds{ $metric }->{ name }"} = {
+                        recordMaxResults => "$thresholds{ $metric }->{ maxresults }",
+                        recordDataType  => "$thresholds{ $metric }->{ datatype }",
+                        crit            => "answer && answer > $thresholds{ $metric }->{ crit }",
+                        warn            => "answer && answer > $thresholds{ $metric }->{ warn }",
+                        perl            => sub { return $value || $error; },
+                        error           => $error,
+                        noCritOnError   => 1, 
+                        description     => "$thresholds{ $metric }->{ desc }",
+                        correctiveActions   => [
+                            Ops => 'For warn, please file CR for engineering.  For crit, please escalate to engineering.',
+                        ],
+                        inf_field   => $metric,
+                        inf_default => "none",
+                    };
+                    $jobFlag = 1;
+                }
+            }
+
+            if ( $response && !$jobsStatusCollected ) { 
+                $jobsStatusCollected = 1;
+
+                $queries{'Long running jobs'} = {
+                    warn            => "numrows >= 30",
+                    crit            => "numrows >= 100 || answer =~ /Error:/",
+                    perl            => sub { main::jobsForAppAndType($app, 'longrunning'); },
+                    severity        => 2,
+                    format          => 'jobId %s',
+                    recordMaxResults    => 20000,
+                    recordItem          => 'numrows',
+                    ticketOnWarnOpenAfterMinutes    => 60,
+                    ticketDueInDays                 => 'today',
+                    description     => 'Monitor long running jobs for all tenants in the system. This monitoring should be 
+                        page filtered during migration as it is expected to have long running jobs.',
+                    correctiveActions   => [
+                        Ops => 'File a CR for Engineering based on the current severity - default is s2, but use s1 if more than 100 jobs. If there is an error, fix based on the error message.',
+                    ],
+                    inf_field => "long_running_jobs",
+                    inf_default => "none",
+                };
+
+                $dailyQueries{'Jobs that had error when processing'} = {
+                    warn            => "answer >= 25 || answer =~ /Error:/",
+                    perl            => sub { main::jobsForAppAndType($app, 'errorjobs', 'returnRawResponse'); },
+                    severity        => 2,
+                    recordMaxResults    => 20000,
+                    ticketOnWarnOpenAfterMinutes    => 15,
+                    ticketDueInDays                 => 'today',
+                    description     => 'Some error has occurred while processing the job.',
+                    correctiveActions   => [
+                        Ops => 'Open a CR to assign to Engineering/Platform to investigate the cause. If error, fix based on the error message.',
+                    ],
+                    inf_field => "processing_error_jobs",
+                    inf_default => "none",
+                };
+            }
+        }
+
+
+        my $email = $me->default('notify.email');
+        $dailyQueries{'influx_details'} = {measurement => 'arches_index_mgr', tags => qq(cluster="$cluster")};
+        $queries{'influx_details'} = {measurement => 'arches_index_mgr', tags => qq(cluster="$cluster")};
+        %queries = %dailyQueries if ( $runDailyQueries );
+
+        my $qm = ariba::monitor::QueryManager->newWithDetails('index-manager', $arches->name(), $arches->service(), undef, $cluster, \%queries);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+    }
+}
+
+sub jobsForAppAndType {
+    my $app = shift;
+    my $type = shift;
+    my $returnRawResponse = shift || 0;
+
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+    my $jobsUrl = $app->jobsUrlForType($type);
+    debug("Checking $jobsUrl for $type jobs");
+
+    my $url = ariba::monitor::Url->new($jobsUrl);
+    my $response = eval { $url->request() };
+
+    return "Error: Request to $jobsUrl resulted with $@" if ($@);
+    return "Error: Strange, no response from $jobsUrl." unless defined $response;
+
+    return $response if ( $returnRawResponse );
+
+    unless ($response =~ /job/i) {
+        $response =~ s/</&lt;/g; # Server might return html error
+        return "Error: No '*job' element in response: $response";
+    }
+
+    my @jobs;
+    while ($response =~ /<job>([^<]+)<\/job>/g) {
+        my $job = $1; 
+        push(@jobs, $job);
+    }
+    
+    $query->setSeverity(1) if (scalar(@jobs) >= 100);
+    
+    #return join(";", @jobs);
+    return scalar(@jobs);
+}
+
+main(@ARGV);
+
+__END__
+
+

@@ -1,0 +1,242 @@
+#!/usr/local/bin/perl -w
+#
+# A monitoring script to monitor and graph size of vm as reported
+# by app instances.
+#
+# $Id: //ariba/services/monitor/bin/common/instance-heap-usage#29 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::misc;
+use ariba::monitor::QueryManager;
+use JSON;
+
+require "geturl";
+
+my $debug = 0;
+
+sub main {
+
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $cluster;
+
+    while (my $arg = shift(@ARGV)) {
+        if( $arg =~ /^-e/o ){ $sendEmail = 1; };
+        if( $arg =~ /^-p/o ){ $sendPage = 1; };
+        if( $arg =~ /^-c/o ){ $cluster = shift(@ARGV); next };
+        if( $arg =~ /^-d/o ){ $debug = 1; };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    $cluster = $me->currentCluster() unless ($cluster);
+    my @products = ariba::rc::InstalledProduct->installedProductsListInCluster( $me->service(), undef, undef, $cluster );
+
+    my $email = $me->default('notify.email');
+
+    my $cycledWofProducts = ariba::monitor::misc::cycledWofProducts();
+    # Loop over all products.
+    for my $product (@products) {
+
+        my $name = $product->name();
+
+        next unless (defined($product->woVersion()) || $product->name() =~ /^arches/ || $product->name() =~ /^dms/);
+
+        my $service = $product->service();
+        my $customer    = $product->customer();
+        my $cluster = $product->currentCluster();
+
+        my %queries;
+        my %instancesDown;
+        my %totalInstances;
+        my $warn;
+        my $crit;
+		my $critValue = 48;
+
+        unless($service eq 'sp') {
+            $warn = "!defined(answer) || answer eq ''";
+            $crit = "defined(answer) && answer ne '' && answer > $critValue";
+        }
+
+        for my $instance ($product->appInstancesInCluster($cluster)) {
+
+            my $instanceName = $instance->instanceName();
+            my $url;
+            if ($instance->productName eq 'dms') {
+                $url = $instance->metricsURL();
+            }
+            else {
+                $url = $instance->monitorStatsURL();
+            }
+
+            next unless ($url); # Skip internal apps without a monitorStatsURL/metricsURL (ex: Selenium)
+
+            my $community = $instance->community();
+            if ($community) {
+                $community = "community $community";
+            } else {
+                $community = "default community";
+            }
+
+            my $uiHint = "$community/" . $instance->appName();
+
+            my $results;
+
+            $results = fetchMonitorUrl($url);
+
+            my $nodeType = $instanceName;
+            $nodeType =~ s/\-.*$//;
+            $instancesDown{$nodeType} = 0 unless($instancesDown{$nodeType});
+            $totalInstances{$nodeType}++;
+            #
+            # A correct response should have a value here.
+            #
+            if(main::vmMemUsage($results) eq "") {
+                $instancesDown{$nodeType}++;
+            }
+           
+            $queries{"$instanceName vm heap usage in KBytes"} = {
+                'recordMaxResults' => 110000,
+                'recordDataType' => "gauge",
+
+                'info' => "answer eq '' || answer >= 0",
+                'uiHint' => $uiHint,
+                'format' => "%d\n",
+
+                'perl' => sub { main::vmMemUsage($results) },
+                inf_field => "vm_heap_usage",
+                inf_default => 0,
+                inf_tags  => qq(node="$uiHint",instance_id="$instanceName"),
+                group_by  => "$uiHint,$instanceName",
+            };
+        
+            # dms requires heap usage to be mentioned in percentage          
+            if($name eq 'dms') {
+              delete $queries{"$instanceName vm heap usage in KBytes"};
+                 $queries{"$instanceName vm heap usage in percentage"} = {
+                     'crit' => "answer >= 100",
+                     'warn' => "answer >= 95",
+                     'info' => "answer eq '' || answer >= 0",
+                      'uiHint' => $uiHint,
+                     'format' => "%d\n",
+                      'perl' => sub { main::vmMemUsage($results,$name) },
+                      'recordMaxResults' => 103680,
+                     'correctiveActions' => [
+                        Engr => 'Ask for heap dump if needed to evaluate what is using the heap and take appropriate action
+                        based on the result',
+                      ],
+                     inf_field => "vm_heap_usage",
+                     inf_default => 0,
+                     inf_tags  => qq(node="$uiHint",instance_id="$instanceName"),
+                     group_by  => "$uiHint,$instanceName",
+                 };
+            }
+
+            # only check instances that are restarted every 24h
+            # by cycle-wof-apps
+            next unless exists($cycledWofProducts->{$product->name()});
+
+            # dispatchers restart due to count of requests served
+            next if $instance->isDispatcher();
+
+            # Ignoring dms until we get the exact way to monitor time since last restart
+            next if ($name eq 'dms');
+
+
+            $queries{"$instanceName time since last restart"} = {
+                'info' => "defined(answer)",
+                'warn' => $warn,
+                'crit' => $crit,
+                'uiHint' => $uiHint,
+                'format' => "%d hours\n",
+				'note' => "If this generates a ticket it is likely because \$results (the xml returned to the query) does not contain the search string to indicate success.",
+                'perl' => sub { main::upTime($results) },
+                inf_field => "time_since_last_restart",
+                inf_default => 0,
+                inf_tags  => qq(node="$uiHint",instance_id="$instanceName"),
+                group_by  => "$uiHint,$instanceName",
+                 };
+        }
+
+        next unless(keys(%queries));
+
+        $queries{"influx_details"} = { 'measurement' => "front_door_heap_instance" };
+        my $q = ariba::monitor::QueryManager->newWithDetails(
+            "http-urls-status", $name, $service, $customer, $cluster, \%queries
+        );
+
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub fetchMonitorUrl
+{
+    my $url = shift;
+    my @results;
+
+    my $timeout = 15;
+
+    eval { geturl("-e","-q","-timeout",$timeout,"-results",\@results,$url) };
+
+    return \@results;
+}
+
+sub upTime
+{
+    my $results = shift;
+    my $upTime = undef;
+	my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+    for my $line (@$results) {
+        if ( $line =~ m|<UpTimeSeconds>(\d+)</UpTimeSeconds>| ) {
+            $upTime = $1 / 3600;
+            last;
+        }
+    }
+	unless (defined($upTime)) {
+		$query->setTicketOnWarnOpenAfterMinutes(30);
+	}
+
+    # normalize to a number (we can't mix data types in influxdb)
+    return ( defined $upTime ) ? $upTime : -1;
+}
+
+sub vmMemUsage
+{
+    my $results = shift;
+    my $productName = shift || '';
+    my $memUsage = "";
+
+    if ($productName eq 'dms') {
+      my $json = qq(@$results);
+      my $decoded_json = JSON::decode_json($json);
+      my $totalHeap = $decoded_json->{'heap'};
+      my $usedHeap = $decoded_json->{'heap.used'};
+         $memUsage = ($usedHeap/$totalHeap)*100;
+    } else {
+    my $totalMem;
+    my $freeMem;
+    for my $line (@$results) {
+        if ($line =~ m|<CurrentTotalMemory>(\d+)</CurrentTotalMemory>|o) {
+            $totalMem = $1;
+        }
+        if ($line =~ m|<CurrentFreeMemory>(\d+)</CurrentFreeMemory>|o) {
+            $freeMem = $1;
+        }
+
+        if (defined($totalMem) && defined($freeMem)) {
+            $memUsage = ($totalMem - $freeMem)/1024; # in KB
+            last;
+        }
+    }
+    }
+    return $memUsage;
+}
+
+main();
+
+__END__

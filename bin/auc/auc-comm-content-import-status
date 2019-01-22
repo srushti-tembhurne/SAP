@@ -1,0 +1,160 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/auc/auc-comm-content-import-status#2 $
+
+###############################################################################
+# $Id: //ariba/services/monitor/bin/auc/auc-comm-content-import-status#2 $
+# $HeadURL:$
+#
+# Copyright (c) 2014 Ariba
+#
+# auc-comm-content-import-status - Monitor AUC Content Import Status
+#
+###############################################################################
+
+=head1 NAME
+
+auc-comm-content-import-status - Monitor AUC content import status
+
+=head1 SYNOPSIS
+
+auc-comm-content-import-status [Options]
+
+=head1 OPTIONS
+
+=over
+
+=item B<-help|-h>
+
+Print this usage information and exit.
+
+=item B<-debug|-d>
+
+Enable debugging output / dryrun
+
+=item B<-e>
+
+Enable sending of emails
+
+=item B<-p>
+
+Enable sending of pages
+
+=back
+
+=head1 DESCRIPTION
+
+C<auc-comm-content-import-status> - Monitor AUC content import status
+
+=cut
+
+=author
+
+Saran thiyagarajan<< <saran.thyagrajan@sap.com> >>
+
+=head1 LICENSE
+
+Copyright 2015 Ariba
+
+=cut
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::Url;
+use Data::Dumper;
+use XML::Simple;
+my $debug = 0;
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ( $error );
+
+    exit ();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while ( my $arg = shift ) {
+        if ( $arg =~ /^-h$/o ) { usage();  next; }
+        if ( $arg =~ /^-d$/o ) { $debug++; next; }
+        if ( $arg =~ /^-e$/o ) { $sendEmail = 1; next; }
+        if ( $arg =~ /^-p$/o ) { $sendPage  = 1; next; }
+
+        usage( "Invalid argument: $arg" );
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $me = ariba::rc::InstalledProduct->new('community', $mon->service());
+    my %queries;
+
+
+	my $content_import_monitoring_url;	
+	my $service =lc( $mon->service() );
+	if($service  =~ /prod/si ) {
+		$content_import_monitoring_url = q(https://uex.ariba.com/internal/content_import_monitoring.php);
+	}
+	else {
+		$content_import_monitoring_url = 'https://svc'.$service.'auc.lab1.ariba.com/internal/content_import_monitoring.php';
+	}		
+
+	print "Content import monitoring url for service $service --> $content_import_monitoring_url\n" if ($debug);
+	#$content_import_monitoring_url = q(https://svcitgauc.lab1.ariba.com/internal/content_import_monitoring.php);#This url is used for testing
+
+	my $contentImport = ariba::monitor::Url->new($content_import_monitoring_url);	
+	my $contentImportStats = $contentImport->request(45);
+
+	#$contentImportStats = 80;#just for testing
+	print "content Import stats from $content_import_monitoring_url: $contentImportStats \n".Dumper($contentImportStats) if($debug);
+
+	   
+	    $queries{"AUC Community Content Import Status"} = {
+
+                    crit   => "answer > 72",
+                    warn   => "answer > 40",
+					perl => sub { return $contentImportStats; },
+		    		severity => 2,
+		    		description => 'To verify Community Content Import Status',
+                    format => "%d\n",
+                    uiHint => 'General/Community Content Import Status',
+		    		correctiveActions => [
+						ops => "Please Send email to AUC Community alias DL ARB AUC_Content_Import",
+		    		],
+                    inf_field => "content_import_status",
+                    inf_default => 0,
+	    };
+
+
+
+	my $email = $me->default('notify.email');
+    $queries{'influx_details'} = { measurement => 'community_front_door'};
+    my $qm = ariba::monitor::QueryManager->newWithDetails('http-urls-status', $me->name(), $me->service(), $me->customer(), \%queries);
+    $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($me));
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+}
+
+
+
+
+main( @ARGV );
+
+__END__

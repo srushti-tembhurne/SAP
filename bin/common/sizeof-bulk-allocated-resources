@@ -1,0 +1,339 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/common/sizeof-bulk-allocated-resources#25 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::OracleClient;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ServiceController;
+use Data::Dumper;
+
+my $maxResults = 17520; # 1 year at twice an hour data
+
+sub main {
+	my $debug = 0;
+	my $quiet = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $productName;
+
+	my $oracle_type = ariba::Ops::DBConnection::oracleDBServerType;
+    my $hana_type = ariba::Ops::DBConnection::hanaDBServerType;
+
+	while(my $arg=shift(@ARGV)){
+			print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+			if($arg =~ /^-d/o){ $debug=1; }
+			if($arg =~ /^-e/o){ $sendEmail=1; };
+			if($arg =~ /^-p$/o){ $sendPage=1; };
+			if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $cluster = $me->currentCluster();
+	my $service = $me->service();
+
+	my $product;
+	unless (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
+		exit(0);
+	}
+	$product = ariba::rc::InstalledProduct->new($productName, $service);
+
+	my $skip = 0;
+
+	my %queries  = ();
+
+	# buyer has realms of different variant types:
+	my @variants = ();
+	my @dbTypes = ();
+	my $success = allDbVariants($product, \@variants, \@dbTypes);
+	my $oracleRealmsRemainingSql = "select count(*) as count_unallocated from realmtab where state='unassigned' and (dbtype = '$oracle_type' or dbtype is null)";
+	my $hanaRealmsRemainingSql = "select count(*) as count_unallocated from realmtab where state='unassigned' and dbtype = '$hana_type'";
+    my $realmsRemainingOfTypeSql;
+	my $realmsRemainingOfVariant;
+	my $totalRealms;
+	#
+	# on failure to fetch variants (e.g. due to oracle being down)
+	# don't create dummy queries that will go stale later and cause
+	# confusion
+	#
+
+	if ($success) {
+		for my $dbTypeHash(@dbTypes){
+			my $dbType = $dbTypeHash->{DBTYPE};
+			if(lc($dbType) eq lc($oracle_type)){
+				$realmsRemainingOfTypeSql = $oracleRealmsRemainingSql;
+				$totalRealms = "select count(*) as count_realms from realmtab where dbtype = '$oracle_type' or dbtype is null";
+			}
+			elsif(lc($dbType) eq lc($hana_type)){
+				$realmsRemainingOfTypeSql = $hanaRealmsRemainingSql;
+				$totalRealms = "select count(*) as count_realms from realmtab where dbtype = '$hana_type'";
+			}
+			else{
+
+				next;
+			}
+			if (@variants) {
+				for my $variantHash (@variants) {
+				    my $variant = $variantHash->{'BASEDOMAINVARIANT'};
+				    $realmsRemainingOfVariant = "$realmsRemainingOfTypeSql and basedomainvariant=\'$variant\'";
+					my $warn = 60;
+					my $crit = 30;
+                	if ( ariba::Ops::ServiceController::isProductionServicesOnly( $service ) &&
+                    	 !ariba::Ops::ServiceController::isProductionUSServiceOnly( $service )) {
+						$warn = 20;
+						$crit = 10;
+					}
+					if ($variant eq "vpsoft84ora") {
+						$warn = 15;
+						$crit = 10;
+                    	if ( ariba::Ops::ServiceController::isProductionServicesOnly( $service ) &&
+                         	!ariba::Ops::ServiceController::isProductionUSServiceOnly( $service )) {
+							$warn = 10;
+							$crit = 5;
+						}
+                    	if ( ariba::Ops::ServiceController::isProductionServicesOnly( $service ) && $productName =~/buyer/si ) {
+                        	if ( ariba::Ops::ServiceController::isProductionUSServiceOnly( $service )) {
+                            	$warn = 20;
+                            	$crit = 10;
+                        	}
+                        	elsif ( ariba::Ops::ServiceController::isProductionEUServiceOnly( $service )) {
+                            	$warn = 10;
+                            	$crit = 3;
+                        	}
+                        	if ( ariba::Ops::ServiceController::isProductionRUServiceOnly( $service )) {
+                            	$warn = 10;
+                            	$crit = 3;
+                        	}
+                    	}
+					}
+					if ($variant eq "vsap") {
+						$warn = 25;
+						$crit = 15;
+                    	if ( ariba::Ops::ServiceController::isProductionServicesOnly( $service ) &&
+                        	 !ariba::Ops::ServiceController::isProductionUSServiceOnly( $service )) {
+							$warn = 20;
+							$crit = 10;
+						}
+                    	if ( ariba::Ops::ServiceController::isProductionServicesOnly( $service ) && $productName =~/buyer/si ) {
+                        	if ( ariba::Ops::ServiceController::isProductionUSServiceOnly( $service )) {
+                            	$warn = 50;
+                            	$crit = 20;
+                        	}
+                        	elsif ( ariba::Ops::ServiceController::isProductionEUServiceOnly( $service )) {
+                            	$warn = 20;
+                            	$crit = 5;
+                        	}
+                        	if ( ariba::Ops::ServiceController::isProductionRUServiceOnly( $service )) {
+                           		$warn = 20;
+                            	$crit = 5;
+                        	}
+				    	}
+                	}
+                	if ($variant eq "vgeneric") {
+                    	if ( ariba::Ops::ServiceController::isProductionServicesOnly( $service ) && $productName =~/buyer/si ) {
+                        	if ( ariba::Ops::ServiceController::isProductionUSServiceOnly( $service )) {
+                            	$warn = 30;
+                            	$crit = 10;
+                        	}
+                       		elsif ( ariba::Ops::ServiceController::isProductionEUServiceOnly( $service )) {
+                            	$warn = 10;
+                            	$crit = 3;
+                        	}
+                        	if ( ariba::Ops::ServiceController::isProductionRUServiceOnly( $service )) {
+                            	$warn = 10;
+                            	$crit = 3;
+                        	}
+                    	}
+                	}
+
+					if ($service eq 'sales') {
+						$crit = 5;
+					}
+
+					$queries{"Number of $dbType realms for variant $variant (unallocated)"} = {
+						info => "answer",
+						warn => "answer && answer < $warn",
+						crit => "!answer || answer <= $crit",
+						sql => $realmsRemainingOfVariant,
+						recordMaxResults => $maxResults,
+						recordDataType => 'gauge',
+						recordItem => 'answer',
+						ticketOnWarnOpenAfterMinutes => 1,
+						inf_field => "count_unallocated",
+						inf_tags  => qq(type="$variant",dbType="$dbType"),
+						inf_default => 0,
+						group_by  => qq($variant,$dbType),
+					};
+					$queries{"Number of $dbType realms for variant $variant (unallocated) warn threshold"} = {
+						perl      => sub { $warn },
+						inf_field => "cu_warn_threshold",
+						inf_tags  => qq(type="$variant",dbType="$dbType"),
+						group_by  => qq($variant,$dbType),
+					};
+					$queries{"Number of $dbType realms for variant $variant (unallocated) crit threshold"} = {
+						perl      => sub { $crit },
+						inf_field => "cu_crit_threshold",
+						inf_tags  => qq(type="$variant",dbType="$dbType"),
+						group_by  => qq($variant,$dbType),
+					};
+				}
+			} else {
+			  	my $crit = 50;
+				my $warn = 100;
+            	if ( ariba::Ops::ServiceController::isProductionServicesOnly( $service ) &&
+                 	!ariba::Ops::ServiceController::isProductionUSServiceOnly( $service )) {
+					$warn = 20;
+					$crit = 10;
+				}
+                if( ( $productName =~ /s4/si ) && ariba::Ops::ServiceController::isProductionServicesOnly( $service ) ) {
+                    if(ariba::Ops::ServiceController::isProductionUSServiceOnly( $service ) ) {
+                        $warn = 75;
+                        $crit = 40;
+                    }
+                    elsif(ariba::Ops::ServiceController::isProductionEUServiceOnly( $service ) ) {
+                        $warn = 50;
+                        $crit = 30;
+                    }
+                    elsif(ariba::Ops::ServiceController::isProductionRUServiceOnly( $service ) ) {
+                        $warn = 30;
+                        $crit = 10;
+                    }
+               	}
+
+				$crit  = 5 if $service eq 'sales';
+				$queries{"Number of $dbType realms (unallocated)"} = {
+					info => "answer",
+					warn => "answer && answer < $warn",
+					crit => "!answer || answer <= $crit",
+					sql => $realmsRemainingOfTypeSql,
+					recordMaxResults => $maxResults,
+					recordDataType => 'gauge',
+					recordItem => 'answer',
+					ticketOnWarnOpenAfterMinutes => 1,
+					inf_field  => "count_unallocated",
+					inf_tags   => qq(dbType="$dbType"),
+					inf_default => 0,
+					group_by  => qq($dbType),
+				};
+				$queries{"Number of $dbType realms (unallocated) warn threshold"} = {
+					perl      => sub { $warn },
+					inf_field => "cu_warn_threshold",
+					inf_tags  => qq(dbType="$dbType"),
+					group_by  => qq($dbType),
+				};
+				$queries{"Number of $dbType realms (unallocated) crit threshold"} = {
+					perl      => sub { $crit },
+					inf_field => "cu_crit_threshold",
+					inf_tags  => qq(dbType="$dbType"),
+					group_by  => qq($dbType),
+				};
+			}
+
+			$queries{"Number of $dbType realms (total)"} = {
+				info => 1,
+				sql => $totalRealms,
+				recordMaxResults => $maxResults,
+				recordDataType => 'gauge',
+				recordItem => 'answer',
+				inf_field  => "count_realms",
+				inf_tags   => qq(dbType="$dbType"),
+				inf_default => 0,
+				group_by  => qq($dbType),
+			};
+
+		}
+	}
+
+	$queries{"Density of instance field mapping"} = {
+		format => "%30s %s %d",
+		info => 1,
+		#warn => "answer && answer < 10",
+		#crit => "!answer || answer <= 4",
+		noRowCount => 1,
+		sql => q`
+			select distinct storagefieldname, storageclassname,
+			count(storagefieldname) as count_storagefieldname from dynamicfieldmaptab
+			where rowNumber != -1
+			group by storagefieldname, storageclassname, storagevariantname
+			having count(storagefieldname) >= 3
+			order by count(storagefieldname) desc
+			`,
+	};
+#
+		my $sqlWithoutWhereClause = q`
+			select overall.cname class, overall.ftype fieldtype, mapped.vname variant,
+				mapped.cstar/overall.cstar ratio, mapped.cstar mapped_count, overall.cstar overall_count
+			from
+				(select m.classname cname, m.fieldtype ftype, count(*) cstar
+				from metalayouttab m
+				where m.fieldname like 'UF%'
+	 			group by m.classname, m.fieldtype) overall
+			inner join
+				(select distinct m.classname cname, m.fieldtype ftype, d.storagevariantname vname, count(*) cstar
+				from metalayouttab m inner join dynamicfieldmaptab d
+				on m.fieldname = d.storagefieldname and m.classname = d.storageclassname
+				where m.fieldname like 'UF%'
+				group by m.classname, m.fieldtype, d.storagevariantname) mapped
+				on overall.cname = mapped.cname and overall.ftype = mapped.ftype`;
+	$queries{"Flex Field that are 60% used"} = {
+		#format => "%30s %s %d",
+		info => 1,
+		skip => 1,
+		warn => "numrows > 5",
+		sql => "$sqlWithoutWhereClause where mapped.cstar/overall.cstar > 0.6 order by ratio desc",
+	};
+
+	$queries{"Flex Field that are 85% used"} = {
+		#format => "%30s %s %d",
+		info => 1,
+		skip => 1,
+		crit => "numrows >= 1",
+		sql => "$sqlWithoutWhereClause where mapped.cstar/overall.cstar > 0.85 order by ratio desc",
+	};
+
+	my $email = $me->default('notify.email');
+	$queries{influx_details} = { measurement => 'sizeof_bulk_allocated_resources'};
+
+	my $q = ariba::monitor::QueryManager->newWithDetails(
+		"sizeof-bulk-allocated-resources", $product->name(), $service, $product->customer(), \%queries
+	);
+
+	$q->setSQLConnectInfo($product->connectInfoForOracleClient());
+
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+
+sub allDbVariants {
+	my $product = shift;
+	my $variantsRef = shift;
+	my $dbTypeRef = shift;
+	my $productName = $product->name();
+	my $oc = ariba::Ops::OracleClient->new($product->connectInfoForOracleClient());
+	if ($oc->connect()){
+		my $dbTypesSql = 'select distinct(DBTYPE) from realmtab';
+		if ($productName eq "buyer"){
+			my $variantsSql = 'select distinct(basedomainvariant) from realmtab';
+			unless($oc->executeSqlWithTimeout($variantsSql, undef, $variantsRef)) {
+				print STDERR "ERROR: Timedout running sql $variantsSql\n";
+				return 0;
+			}
+		}
+		unless($oc->executeSqlWithTimeout($dbTypesSql, undef, $dbTypeRef)) {
+			print STDERR "ERROR: Timedout running sql $dbTypesSql\n";
+			return 0;
+		}
+	} else {
+		print STDERR "ERROR: connect failed: ", $oc->error(), "\n";
+		return 0;
+	}
+	return 1;
+}
+
+main();

@@ -1,0 +1,24 @@
+<html>
+	<b>test</b>
+	<OWVar id=foo value=bar />
+	<OWHtmlString>
+		blah
+	</OWHtmlString>
+
+	There are following colors in the list:
+
+	<OWRepetition list=*("red","yellow","green")*>
+			color=*$currentItem*
+	</OWRepetition>
+
+	<OWRepetition list = *ariba::Ops::Machine->machinesWithProperties(
+								('os','sunos',
+								'providesServices','mon')
+								)*
+								>
+
+			name=*$currentItem->hostname()*     osVersion=*$currentItem->osVersion()*
+	</OWRepetition>
+
+	hello
+</html>

@@ -1,0 +1,243 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/dba/listener-status#24 $
+#
+# This script checks to see if the listener process is running 
+# on the system. If not found, the scripts attempts to start it
+# once. If after this attempt it is still not running, this script
+# sends out a page.
+#
+# This script has to be run as 'oracle' unix user
+# It does not need to know any passwords.
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+use ariba::rc::Globals;
+use ariba::rc::CipherStore;
+use ariba::util::OraInfo;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::DBConnection;
+use ariba::Ops::ProcessTable;
+use ariba::Ops::DatacenterController;
+
+my $debug = 0;
+
+my $RUNNING = "running";
+my $STARTED = "started";
+my $NOTRUNNING = "not running";
+
+my ($user, $pass);
+
+$main::quiet = 1;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+	my $restart   = 1;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; };
+		if ($arg =~ /^-d/o) { $debug = 1; };
+		if ($arg =~ /^-x/o) { $restart = 0; };
+	}
+
+	my $me          = ariba::rc::InstalledProduct->new();
+	my $email       = $me->default('notify.email');
+	my $cluster     = $me->currentCluster();
+
+	my $hostname    = ariba::Ops::NetworkUtils::hostname();
+	my $machine     = ariba::Ops::Machine->new($hostname);
+	my $datacenter  = $machine->datacenter();
+	my $tab         = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+	my $cipherStore = ariba::rc::CipherStore->new($me->service());
+	$user        = ariba::rc::Globals::deploymentUser($me->name(), $me->service());
+	$pass        = $cipherStore->valueForName($user) || return;
+
+	my @products    = ariba::rc::InstalledProduct->installedProductsList($me->service());
+	my @instances   = ();
+
+	my @connections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+
+	my @sidsForMainListener;
+	my @sidsForDataGuardListeners;
+
+	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections)) {
+
+		my $type        = $dbc->type();
+		my $virtualHost = $dbc->host();
+		my $instance    = uc($dbc->sid());
+
+		my $product     = $dbc->product();
+
+		my @hosts = $product->hostsForVirtualHostInCluster($virtualHost, $cluster);
+		push(@hosts, $virtualHost) unless @hosts;
+
+		push(@instances, $instance) if (grep { /^$hostname$/ } @hosts);
+	}
+
+	return unless(@instances);
+
+	my %queries = ();
+
+	for my $sid (@instances) {
+
+		my $oraHome = ariba::util::OraInfo::latestOracleHome() || next;
+
+		$queries{"Listener process on $hostname"} = {
+			'crit'   => "answer eq '$NOTRUNNING'",
+			'warn'   => "answer eq '$STARTED'",
+			'info'   => "answer eq '$RUNNING'",
+			'perl'   => "main::checkRestartListener(\"$oraHome\", \"$restart\");",
+			'note'   => "run $oraHome/bin/lsnrctl start on $hostname immediately, if this is crit!",
+			'uiHint' => 'listener-status',
+            'inf_field' => "listernerStatus",
+            'inf_tags' => "datacenter=\"$datacenter\",hostname=\"$hostname\",uihint=\"listener-status\"",
+            'inf_default' => 0,
+            'group_by' => "listener-status",
+		};
+        if ( ariba::Ops::DatacenterController::isProductionAllMSDatacenters($datacenter) ) {
+            $queries{"Listener_dr process on $hostname"} = {
+                'crit'   => "answer eq '$NOTRUNNING'",
+                'warn'   => "answer eq '$STARTED'",
+                'info'   => "answer eq '$RUNNING'",
+                'perl'   => "main::checkRestartListenerDR(\"$oraHome\", \"$restart\");",
+                'note'   => "run $oraHome/bin/lsnrctl start LISTENER_DR on $hostname immediately, if this is crit!",
+                'uiHint' => 'listener-status',
+                'inf_field' => "listernerStatus",
+                'inf_tags' => "datacenter=\"$datacenter\",hostname=\"$hostname\",uihint=\"listener-status\"",
+                'inf_default' => 0,
+                'group_by' => "DR-listener-status",
+            };
+        }
+
+
+		last; #XXX do we need to run this for each sid?
+	}
+
+    queries{'influx_details'} = {measurement => "dba"};
+	my $qm = ariba::monitor::QueryManager->newWithDetails(
+		'dba', $tab, $me->service(), $me->customer(), \%queries
+	);
+
+	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+sub checkListener {
+	my $sid = shift;
+
+	my $process = "tnslsnr LISTENER";
+
+	if ($sid) {
+		$process .= "_$sid";
+	} else {
+		$process .= " ";
+	}
+
+	my $processTable  = ariba::Ops::ProcessTable->new();
+	if ($processTable->processWithNameExists($process, insensitive => 1)) {
+		return $RUNNING;
+	}
+	return $NOTRUNNING;
+}
+
+sub checkListenerDR {
+    my $process = "tnslsnr LISTENER_DR";
+
+    my $processTable  = ariba::Ops::ProcessTable->new();
+    if ($processTable->processWithNameExists($process, insensitive => 1)) {
+        return $RUNNING;
+    }
+    return $NOTRUNNING;
+}   
+
+sub checkRestartListener {
+	my $oraHome = shift;
+	my $restart = shift;
+
+	my $status = checkListener();
+
+	#
+	# if the listener is not running, attempt to start it once
+	#
+	if ($status eq $NOTRUNNING) {
+	
+		print "ERROR: listener down, restarting $oraHome/tnslsnr...\n";
+
+		$ENV{'ORACLE_HOME'} = $oraHome;
+		$ENV{'PATH'} = "$oraHome/bin:$ENV{'PATH'}";
+		$ENV{'NLS_LANG'} = "American_America.UTF8";
+		my $sudo = sudoCmd();
+		my @output;
+
+		if ($restart) {
+			my $cmd = "$sudo -u oracle $oraHome/bin/lsnrctl start > /dev/null";
+			unless ( ariba::rc::Utils::executeLocalCommand($cmd, undef, \@output, undef, 1, undef, $pass) ) {
+				print "Starting Oracle listener failed:\n", join("\n", @output), "\n";
+				exit(1);
+			}
+		}
+
+		$status = checkListener();
+
+		if ($status eq $RUNNING) {
+			$status = $STARTED;
+			print "listener restarted.\n";
+		}
+	}
+
+	return $status;
+}
+
+sub checkRestartListenerDR {
+    my $oraHome = shift;
+    my $restart = shift;
+
+    my $status = checkListenerDR();
+
+    #
+    # if the listener is not running, attempt to start it once
+    #   
+    if ($status eq $NOTRUNNING) {
+
+        print "ERROR: listener down, restarting $oraHome/tnslsnr...\n";
+
+        $ENV{'ORACLE_HOME'} = $oraHome;
+        $ENV{'PATH'} = "$oraHome/bin:$ENV{'PATH'}";
+        $ENV{'NLS_LANG'} = "American_America.UTF8";
+        my $sudo = sudoCmd();
+        my @output;
+
+        if ($restart) {
+            my $cmd = "$sudo -u oracle $oraHome/bin/lsnrctl start LISTENER_DR > /dev/null";
+            unless ( ariba::rc::Utils::executeLocalCommand($cmd, undef, \@output, undef, 1, undef, $pass) ) {
+                print "Starting Oracle listener failed:\n", join("\n", @output), "\n";
+                exit(1);
+            }
+        }
+
+        $status = checkListenerDR();
+
+        if ($status eq $RUNNING) {
+            $status = $STARTED;
+            print "LISTENER_DR restarted.\n";
+        }
+    }
+
+    return $status;
+}
+
+main();
+
+__END__

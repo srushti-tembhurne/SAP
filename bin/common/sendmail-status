@@ -1,0 +1,102 @@
+#!/usr/local/bin/perl -w
+#
+# $
+#
+
+use strict;
+
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::LogParser::SendmailLogParser;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::monitor::StatusPage;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::PageUtils;
+use dmail::LockLib;
+
+my $debug = 0;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+	my $lockFile = "/tmp/sendmail-status-lock";
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; };
+		if ($arg =~ /^-d/o) { $debug = 1; };
+	}
+
+	my $me          = ariba::rc::InstalledProduct->new();
+	my $service     = $me->service();
+	my $hostname    = ariba::Ops::NetworkUtils::hostname();
+	my $machine     = ariba::Ops::Machine->new($hostname);
+	my $datacenter  = $machine->datacenter();
+	my $tab         = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+    my $monserver  = ariba::Ops::PageUtils::monitorServerForDatacenterByProduct( $me );
+
+	my %properties = (
+			'providesServices' => 'smtp',
+			'os'               => 'redhat',
+			'status'           => 'inservice',
+			);
+
+	return unless ( $machine->hasProperties(%properties) );
+
+	exit(0) unless (dmail::LockLib::requestlock($lockFile));
+
+	my $sendmailLogParser = ariba::Ops::LogParser::SendmailLogParser->new();
+	$sendmailLogParser->setDebug($debug);
+	$sendmailLogParser->parseLog();
+
+	my %queries;
+
+    my @results = $sendmailLogParser->errors();
+    @results = $sendmailLogParser->warnings() unless @results;
+    my $data = join("\n", @results) if @results;
+
+    my $perlcode = "return";
+    $perlcode = "return '$data'" if $data;
+
+	$queries{"$hostname maillog errors"} = {
+		uiHint  => 'Maillog Errors',
+		info    => "numrows > -1",
+		crit    => $sendmailLogParser->errorCount() > 0,
+		warn    => $sendmailLogParser->warningCount() > 0,
+		perl    => "return $sendmailLogParser->errorCount()",
+        inf_field => "errorCount",
+        inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
+        inf_default => 0,
+        group_by => "$datacenter,$hostname",
+	};
+    $queries{"$hostname maillog warnings"} = {
+        uiHint  => 'Maillog Errors',
+        info    => "numrows > -1",
+        crit    => $sendmailLogParser->errorCount() > 0,
+        warn    => $sendmailLogParser->warningCount() > 0,
+        perl    => "return $sendmailLogParser->warningCount()",
+        inf_field => "warningCount",
+        inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
+        inf_default => 0,
+        group_by => "$datacenter,$hostname",
+    };
+
+	my $email = $me->default('notify') || $me->default('notify.email');
+
+    $queries{influx_details} = {measurement => "Sendmail-Status"};
+	my $qm = ariba::monitor::QueryManager->newWithDetails(
+		'Sendmail Status', $tab, $service, undef, \%queries
+	);
+
+	$qm->processQueries($debug, $email, $sendEmail, $sendPage, $monserver);
+
+	dmail::LockLib::releaselock($lockFile);
+}
+
+main();
+
+__END__

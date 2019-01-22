@@ -1,0 +1,449 @@
+<html xmlns:v="urn:schemas-microsoft-com:vml"
+xmlns:o="urn:schemas-microsoft-com:office:office"
+xmlns:x="urn:schemas-microsoft-com:office:excel"
+xmlns:dt="uuid:C2F41010-65B3-11d1-A29F-00AA00C14882"
+xmlns="http://www.w3.org/TR/REC-html40">
+
+<head>
+<meta http-equiv=Content-Type content="text/html; charset=windows-1252">
+<meta name=ProgId content=Excel.Sheet>
+<meta name=Generator content="Microsoft Excel 9">
+<!--[if !mso]>
+<style>
+v\:* {behavior:url(#default#VML);}
+o\:* {behavior:url(#default#VML);}
+x\:* {behavior:url(#default#VML);}
+.shape {behavior:url(#default#VML);}
+</style>
+<![endif]--><!--[if gte mso 9]><xml>
+ <o:DocumentProperties>
+  <o:Author>AN Ops</o:Author>
+  <o:LastAuthor>Employee of</o:LastAuthor>
+  <o:LastPrinted>2003-04-08T01:11:30Z</o:LastPrinted>
+  <o:Created>2001-01-23T06:35:27Z</o:Created>
+  <o:LastSaved>2003-07-02T01:57:11Z</o:LastSaved>
+  <o:Version>9.4402</o:Version>
+ </o:DocumentProperties>
+ <o:CustomDocumentProperties>
+  <o:_AdHocReviewCycleID dt:dt="float">-439820206</o:_AdHocReviewCycleID>
+  <o:_EmailSubject dt:dt="string">ASN Monthly Stats</o:_EmailSubject>
+  <o:_AuthorEmail dt:dt="string">an_ops@ariba.com</o:_AuthorEmail>
+  <o:_AuthorEmailDisplayName dt:dt="string">AN Ops</o:_AuthorEmailDisplayName>
+  <o:_ReviewingToolsShownOnce dt:dt="string"></o:_ReviewingToolsShownOnce>
+ </o:CustomDocumentProperties>
+ <o:OfficeDocumentSettings>
+  <o:DownloadComponents/>
+  <o:LocationOfComponents HRef="file:E:\msowc.cab"/>
+ </o:OfficeDocumentSettings>
+</xml><![endif]-->
+<style>
+<!--table
+	{mso-displayed-decimal-separator:"\.";
+	mso-displayed-thousand-separator:"\,";}
+@page
+	{margin:1.0in .75in 1.0in .75in;
+	mso-header-margin:.5in;
+	mso-footer-margin:.5in;}
+tr
+	{mso-height-source:auto;}
+col
+	{mso-width-source:auto;}
+br
+	{mso-data-placement:same-cell;}
+.style0
+	{mso-number-format:General;
+	text-align:general;
+	vertical-align:bottom;
+	white-space:nowrap;
+	mso-rotate:0;
+	mso-background-source:auto;
+	mso-pattern:auto;
+	color:windowtext;
+	font-size:10.0pt;
+	font-weight:400;
+	font-style:normal;
+	text-decoration:none;
+	font-family:Arial;
+	mso-generic-font-family:auto;
+	mso-font-charset:0;
+	border:none;
+	mso-protection:locked visible;
+	mso-style-name:Normal;
+	mso-style-id:0;}
+td
+	{mso-style-parent:style0;
+	padding:0px;
+	mso-ignore:padding;
+	color:windowtext;
+	font-size:10.0pt;
+	font-weight:400;
+	font-style:normal;
+	text-decoration:none;
+	font-family:Arial;
+	mso-generic-font-family:auto;
+	mso-font-charset:0;
+	mso-number-format:General;
+	text-align:general;
+	vertical-align:bottom;
+	border:none;
+	mso-background-source:auto;
+	mso-pattern:auto;
+	mso-protection:locked visible;
+	white-space:nowrap;
+	mso-rotate:0;}
+.xl24
+	{mso-style-parent:style0;
+	mso-number-format:"Medium Date";}
+.xl25
+	{mso-style-parent:style0;
+	font-weight:700;
+	font-family:Arial, sans-serif;
+	mso-font-charset:0;}
+-->
+</style>
+
+<OWVar 
+	id=title
+	value=Invoice Volume
+	nodisplay=1 
+/>
+
+<OWVar 
+	id=num-records
+	value=*scalar(ariba::monitor::CircularDB->new("an/business-metrics/documents/invoices/volume")->readRecords())*
+	nodisplay=1 
+/>
+
+<OWVar 
+	id=first-row
+	value=30
+	nodisplay=1 
+/>
+
+<OWVar 
+	id=last-row
+	value=*ariba::Ops::OW::Var->new("first-row")->value()+ariba::Ops::OW::Var->new("num-records")->value()-1*
+	nodisplay=1 
+/>
+
+<!--[if gte mso 9]><xml>
+ <x:ExcelWorkbook>
+  <x:ExcelWorksheets>
+   <x:ExcelWorksheet>
+    <x:Name>*ariba::Ops::OW::Var->new("title")->value()*</x:Name>
+    <x:WorksheetOptions>
+     <x:Print>
+      <x:ValidPrinterInfo/>
+      <x:HorizontalResolution>600</x:HorizontalResolution>
+      <x:VerticalResolution>600</x:VerticalResolution>
+     </x:Print>
+     <x:Selected/>
+     <x:Panes>
+      <x:Pane>
+       <x:Number>3</x:Number>
+       <x:ActiveRow>26</x:ActiveRow>
+      </x:Pane>
+     </x:Panes>
+     <x:ProtectContents>False</x:ProtectContents>
+     <x:ProtectObjects>False</x:ProtectObjects>
+     <x:ProtectScenarios>False</x:ProtectScenarios>
+    </x:WorksheetOptions>
+   </x:ExcelWorksheet>
+  </x:ExcelWorksheets>
+  <x:WindowHeight>8730</x:WindowHeight>
+  <x:WindowWidth>13035</x:WindowWidth>
+  <x:WindowTopX>1575</x:WindowTopX>
+  <x:WindowTopY>60</x:WindowTopY>
+  <x:TabRatio>757</x:TabRatio>
+  <x:ProtectStructure>False</x:ProtectStructure>
+  <x:ProtectWindows>False</x:ProtectWindows>
+ </x:ExcelWorkbook>
+</xml><![endif]--><!--[if gte mso 9]><xml>
+ <o:shapedefaults v:ext="edit" spidmax="21505"/>
+</xml><![endif]--><!--[if gte mso 9]><xml>
+ <o:shapelayout v:ext="edit">
+  <o:idmap v:ext="edit" data="14,15"/>
+ </o:shapelayout></xml><![endif]-->
+</head>
+
+<body link=blue vlink=purple>
+
+<table x:str border=0 cellpadding=0 cellspacing=0 width=681 style='border-collapse:
+ collapse;table-layout:fixed;width:512pt'>
+ <col width=64 span=4 style='width:48pt'>
+ <col width=69 style='mso-width-source:userset;mso-width-alt:2523;width:52pt'>
+ <col width=114 style='mso-width-source:userset;mso-width-alt:4169;width:86pt'>
+ <col width=50 style='mso-width-source:userset;mso-width-alt:1828;width:38pt'>
+ <col width=64 span=3 style='width:48pt'>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 width=64 style='height:12.75pt;width:48pt' align=left
+  valign=top><!--[if gte vml 1]><v:shapetype id="_x0000_t201" coordsize="21600,21600"
+   o:spt="201" path="m0,0l0,21600,21600,21600,21600,0xe">
+   <v:stroke joinstyle="miter"/>
+   <v:path shadowok="f" o:extrusionok="f" strokeok="f" fillok="f"
+    o:connecttype="rect"/>
+   <o:lock v:ext="edit" shapetype="t"/>
+  </v:shapetype><v:shape id="_x0000_s15361" type="#_x0000_t201" style='position:absolute;
+   margin-left:47.25pt;margin-top:12pt;width:416.25pt;height:243pt;z-index:1'
+   fillcolor="window [78]" strokecolor="windowText [77]" o:insetmode="auto">
+   <v:fill color2="windowText [77]"/>
+   <o:lock v:ext="edit" rotation="t" text="t"/>
+   <x:ClientData ObjectType="Chart">
+    <x:WebChart>
+     <x:Scaling>
+      <x:ScaleID>0</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>1</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Chart>
+      <x:Name>Chart 1025</x:Name>
+      <x:Title>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>11.5</x:Size>
+        <x:B/>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Border>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Interior>
+      </x:Title>
+      <x:Options>
+       <x:SizeWithWindow/>
+      </x:Options>
+      <x:PageSetup>
+       <x:ChartSize>FullPage</x:ChartSize>
+      </x:PageSetup>
+      <x:Font>
+       <x:FontName>Arial</x:FontName>
+       <x:Size>9.5</x:Size>
+       <x:AutoScale/>
+      </x:Font>
+      <x:Left>0</x:Left>
+      <x:Top>0</x:Top>
+      <x:Width>8339.9853515625</x:Width>
+      <x:Height>4874.9853515625</x:Height>
+      <x:ChartGrowth>
+       <x:HorzGrowth>1</x:HorzGrowth>
+       <x:VertGrowth>1</x:VertGrowth>
+      </x:ChartGrowth>
+      <x:PlotArea>
+       <x:Border>
+        <x:ColorIndex>15</x:ColorIndex>
+        <x:LineStyle>Solid</x:LineStyle>
+        <x:Weight>Narrow</x:Weight>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Interior>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>9.5</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>0</x:ScaleID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:Series>
+         <x:Index>0</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>&quot;<x:B>Invoices By Month</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Name>Invoices</x:Name>
+         <x:Line>
+          <x:ColorIndex>24</x:ColorIndex>
+          <x:LineStyle>Solid</x:LineStyle>
+          <x:Weight>Wide</x:Weight>
+         </x:Line>
+         <x:Category>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$A$*ariba::Ops::OW::Var->new("first-row")->value()*:$A$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Category>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$B$*ariba::Ops::OW::Var->new("first-row")->value()*:$B$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Axis>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>0</x:AxisID>
+        <x:ScaleID>0</x:ScaleID>
+        <x:CrossingAxis>1</x:CrossingAxis>
+        <x:Alignment>
+         <x:Rotation>90</x:Rotation>
+        </x:Alignment>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>9.5</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:FormatString>d\-mmm\-yy</x:FormatString>
+        </x:Number>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>1</x:AxisID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:MajorGridlines/>
+        <x:CrossingAxis>0</x:CrossingAxis>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>9.5</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:BuiltInFormat>3</x:BuiltInFormat>
+        </x:Number>
+        <x:Type>Value</x:Type>
+       </x:Axis>
+      </x:PlotArea>
+      <x:Legend>
+       <x:Delete/>
+      </x:Legend>
+     </x:Chart>
+    </x:WebChart>
+   </x:ClientData>
+  </v:shape><![endif]--><![if !vml]><span style='mso-ignore:vglayout;
+  position:absolute;z-index:0;margin-left:63px;margin-top:16px;width:557px;
+  height:326px'><![endif]><![if !excel]><img width=557 height=326
+  src="./invoices_files/image001.gif" v:shapes="_x0000_s15361" class=shape
+  v:dpi="96"><![endif]><![if !vml]></span><![endif]><span style='mso-ignore:
+  vglayout2'>
+  <table cellpadding=0 cellspacing=0>
+   <tr>
+    <td height=17 width=64 style='height:12.75pt;width:48pt'></td>
+   </tr>
+  </table>
+  </span></td>
+  <td width=64 style='width:48pt'></td>
+  <td width=64 style='width:48pt'></td>
+  <td width=64 style='width:48pt'></td>
+  <td width=69 style='width:52pt'></td>
+  <td width=114 style='width:86pt'></td>
+  <td width=50 style='width:38pt'></td>
+  <td width=64 style='width:48pt'></td>
+  <td width=64 style='width:48pt'></td>
+  <td width=64 style='width:48pt'></td>
+ </tr>
+ <tr height=34 style='height:25.5pt;mso-xlrowspan:2'>
+  <td height=34 colspan=10 style='height:25.5pt;mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=9 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=153 style='height:114.75pt;mso-xlrowspan:9'>
+  <td height=153 colspan=10 style='height:114.75pt;mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl25 style='height:12.75pt'>Date</td>
+  <td class=xl25>Invoices</td>
+  <td colspan=8 style='mso-ignore:colspan'></td>
+ </tr>
+
+
+ <OWRepetition list=*ariba::monitor::CircularDB->new("an/business-metrics/documents/invoices/volume")->readRecords()*>
+
+	<tr height=17 style='height:12.75pt'>
+		<td x:str>*POSIX::strftime('%b-%y',localtime($$currentItem[0]-2332800))*</td>
+		<td x:num>*$$currentItem[1]*</td>
+		<td colspan=8 style='mso-ignore:colspan'></td>
+	</tr>
+
+ </OWRepetition>
+
+ <![if supportMisalignedColumns]>
+ <tr height=0 style='display:none'>
+  <td width=64 style='width:48pt'></td>
+  <td width=64 style='width:48pt'></td>
+  <td width=64 style='width:48pt'></td>
+  <td width=64 style='width:48pt'></td>
+  <td width=69 style='width:52pt'></td>
+  <td width=114 style='width:86pt'></td>
+  <td width=50 style='width:38pt'></td>
+  <td width=64 style='width:48pt'></td>
+  <td width=64 style='width:48pt'></td>
+  <td width=64 style='width:48pt'></td>
+ </tr>
+ <![endif]>
+</table>
+
+</body>
+
+</html>

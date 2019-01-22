@@ -1,0 +1,500 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/buyer/queue-status#27 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::monitor::ProductStatus;
+use ariba::monitor::OutageSchedule;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::OracleClient;
+use ariba::Ops::ProductAPIExtensions;
+
+sub main {
+    my $debug = 0;
+    my $quiet = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $productName;
+
+    # tmid:166098
+    my $invDetailReqFailedDoc = "https://wiki.ariba.com:8443/display/ENGDPTS/How+to+handle+Buyer+CC%3AInvoiceDetailRequest+in+Failed+state";
+
+    while(my $arg=shift(@ARGV)){
+            print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+            if($arg =~ /^-d/o){ $debug=1; }
+            if($arg =~ /^-e/o){ $sendEmail=1; };
+            if($arg =~ /^-p$/o){ $sendPage=1; };
+            if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+    my $email = $me->default('notify.email');
+
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+    unless (@products) {
+        exit(0);
+    }
+
+    for my $product (@products) {
+
+        my $skip = 0;
+        my %queries  = ();
+        my %communitySeen = ();
+
+        my %badPos = ();
+        my %missingPos = ();
+        my $numMissing = 0;
+        my $numBad = 0;
+        my $badPosOracleError;
+        my $missingPosOracleError;
+        my $badPosOutage;
+        if (grep { $productName eq $_ } ariba::rc::Globals::sharedServiceBuyerProducts() ) {
+            my $oc = ariba::Ops::OracleClient->new($product->connectInfoForOracleClient());
+            # PO's for which we don't even have a response recorded
+            # likely never even got to the ASN
+            getPos(\$oc, \%badPos, \$numBad, 0, \$badPosOracleError);
+
+            # PO's which are still sending, but which are probably
+            # on the ASN
+            getPos(\$oc, \%missingPos, \$numMissing, 1, $missingPosOracleError);
+
+
+            my $anProductStatus = ariba::monitor::ProductStatus->newWithDetails("an", $product->service(), $product->customer());
+
+            if ($anProductStatus->inPlannedDownTime()) {
+                #my $now = DateTime->now( time_zone => 'local' );
+                #my ($startHour, $startMinute) = ($now->hour(), $now->minute());
+                #my $later = $today->add( minutes => 5 ); 
+                #my ($endHour, $endMinute
+
+                $badPosOutage = ariba::monitor::OutageSchedule->new("daily 00:00-23:59");
+            }
+                    
+            $queries{"Orders not sent to the ASN in the last 10 days"} = {
+                'recordMaxResults' => 60000,
+                'recordDataType' => "gauge",
+                'info' => 1,
+                'warn' => "answer > 20",
+                'crit' => "answer > 100 && previousAnswer > 100",
+                'error' => $badPosOracleError,
+                'outageSchedule' => $badPosOutage,
+                'perl' => sub { return $numBad; },
+                'inf_field' => "value",
+                'inf_default' => 0,
+                'inf_tags' => qq(community="none",description="Orders not sent to the ASN in the last 10 days"),
+                'group_by' => '1',
+            } ;
+            $queries{"Orders in sending state with non-4xx responses in the last 10 days"} = {
+                'recordMaxResults' => 60000,
+                'recordDataType' => "gauge",
+                'info' => 1,
+                'warn' => "answer > 100",
+                'crit' => "answer > 200",
+                'error' => $missingPosOracleError,
+                'outageSchedule' => $badPosOutage,
+                'perl' => sub { return $numMissing; },
+                'inf_field' => "value",
+                'inf_tags' => qq(community="none",description="Orders in sending state with non-4xx responses in the last 10 days"),
+                'inf_default' => 0,
+                'group_by' => '2',
+            } ;
+        }
+
+        for my $instance ($product->appInstancesInCluster($cluster)) {
+
+            my $communityString = "";
+            my $community = 0;
+            my $uiHint;
+
+            if ($product->isASPProduct()) {
+                $uiHint = $instance->appName();
+            } else {
+                $community = $instance->community();
+                if ($community) {
+                    $communityString = " in community $community";
+                    $uiHint = "Community $community";
+                } else {
+                    next;
+                }
+            }
+
+            next if ($communitySeen{$community});
+            $communitySeen{$community} = 1;
+
+            my $results;
+            my $exceptionsUrl = $instance->backgroundExceptionsMonitorURL();
+            my $queueSizeUrl = $instance->documentQueueSizeMonitorURL();
+                        my $cxmlInvoiceUrl = $instance->unprocessedCXMLInvoiceActionMonitorURL();
+
+            my $exceptions = ariba::monitor::Url->new($exceptionsUrl);
+
+            #
+            #16,WARN,realm_1 
+            #2,ERROR,realm_1 
+            #
+            #This is a sliding window query (default 4 hours, use
+                    #a parameter window to change) that returns the number
+            #of warnings and errors that are logged. There should
+            #be a threshold on errors of 0. A warning could happen
+            #if the  #of warnings becomes high (its usually related
+                    #to cXML failures). Right now, there is no resolution.
+            #Errors are exceptions that are unexpected
+            #and would most generally indicate a bug. 
+            #
+            my @exceptionsResults = $exceptions->request(45);
+            $queries{"Errors logged for realms" . $communityString} = {
+                'uiHint' => $uiHint,
+                'info' => 1,
+                'crit' => "numrows > 0",
+                'perl' => sub { main::typeOfExceptionsLogged(\@exceptionsResults, "Error"); },
+                inf_field   => 'string_value',
+                inf_default => "none",
+                inf_tags    => qq(community="$community",description="Errors logged for realms"),
+                group_by    => qq(community $community,description="Errors logged for realms"),
+            };
+            $queries{"Warnings logged for realms" . $communityString} = {
+                'uiHint' => $uiHint,
+                'info' => 1,
+                'warn' => "numrows > 5",
+                'crit' => "numrows > 20",
+                'perl' => sub { main::typeOfExceptionsLogged(\@exceptionsResults, "Warn"); },
+                inf_field   => 'string_value',
+                inf_default => "none",
+                inf_tags    => qq(community="$community",description="Warnings logged for realms"),
+                group_by    => qq(community $community,description="Warnings logged for realms"),
+            };
+
+            $queries{"Orders not sent to the ASN in the last 10 days" .  $communityString} = {
+                'recordMaxResults' => 60000,
+                'recordDataType' => "gauge",
+                'recordItem' => 'numrows',
+                'uiHint' => $uiHint,
+                'info' => 1,
+                'warn' => "numrows > 2",
+                'crit' => "numrows > 10",
+                'error' => $badPosOracleError,
+                'outageSchedule' => $badPosOutage,
+                'perl' => sub { 
+                    return $badPos{$community};
+                },
+                inf_field   => 'value',
+                inf_default => 0,
+                inf_tags    => qq(community="$community",description="Orders not sent to the ASN in the last 10 days"),
+                group_by    => qq(community $community,description="Orders not sent to the ASN in the last 10 days"),
+            };
+
+            $queries{"Orders in sending state with non-4xx responses in the last 10 days" .  $communityString} = {
+                'recordMaxResults' => 60000,
+                'recordDataType' => "gauge",
+                'recordItem' => 'numrows',
+                'uiHint' => $uiHint,
+                'info' => 1,
+                'error' => $missingPosOracleError,
+                'outageSchedule' => $badPosOutage,
+                'perl' => sub { 
+                    return $missingPos{$community};
+                },
+                inf_field   => 'value',
+                inf_default => 0,
+                inf_tags    => qq(community="$community",description="Orders in sending state with non-4xx responses in the last 10 days"),
+                group_by    => qq(community $community,description="Orders in sending state with non-4xx responses in the last 10 days"),
+            };
+
+            my $queueSize = ariba::monitor::Url->new($queueSizeUrl);
+                        my $cxmlInvoice = ariba::monitor::Url->new($cxmlInvoiceUrl);
+
+            #
+            #realm_1,Queued,InvoiceStatusUpdateRequest,10 
+            #realm_1,Failed,InvoiceStatusUpdateRequest,1 
+            #
+            #Threshold should be on the Failed docs (duno what
+                    #number) and Queued (dunnoeither) When this happens,
+            #the process is the following: 
+            #When queued threshold exceeded, investigate why
+            #the system is slow (possibly nodes unresponsive).
+            #Remedy the problem. It could be high load.  
+            #
+
+            my @queueSizeResults = $queueSize->request(45);
+            my @cxmlInvoiceResults = $cxmlInvoice->request(45);
+
+            foreach my $i (@cxmlInvoiceResults) {
+                 my ($realm, $count) = split(',', $cxmlInvoiceResults[$i]);
+                 my $connection_time_out_message = $count;
+                 if ($realm =~ /timed out/){
+                     $realm = "connection_timed_out";
+                     $count = -1;
+                     $queries{"Connection Timed out error$communityString"} = {
+                         perl => sub {return "$realm,$connection_time_out_message"},
+                         inf_field => "message",
+                         inf_tags => "community=$community",
+                         inf_default => "none",
+                         group_by => "community=$community",
+                     };
+                 }
+                 $queries{"cXMLDocuments without invoices created for realm ${realm}$communityString"} = {
+                    'uiHint' => $uiHint,
+                    'severity' => 1,
+                    'recordMaxResults' => 34560,
+                    'warn'   => "answer != 0",
+                    'perl' => sub { return $count },
+                    correctiveActions => [
+                            Ops => "File S2 CR for invoicing team if problem is in production realm (ignore test realms)",
+                    ],
+                    inf_field   => 'value',
+                    inf_default => 0,
+                    inf_tags    => qq(community="$community",description="cXMLDocuments without invoices created for realm ${realm}"),
+                    group_by    => qq(community $community,description="cXMLDocuments without invoices created for realm ${realm}"),
+                 };
+            }
+
+
+            # tmid 190047
+            my $surCount = ariba::monitor::Url->new( $instance->contractSURCountURL() );
+
+            # tmid 190047
+            my @surCountResults = $surCount->request(45);
+
+            # tmid 190047
+            # Tally all Sourcing Update Requests for the current community. Sample data:
+            #<xml>
+            #  <realm id="accAcwSg">
+            #    <SourcingUpdateRequest>4</SourcingUpdateRequest>
+            #  </realm>
+            #  <realm id="xxxAcwSg">
+            #    <SourcingUpdateRequest>5</SourcingUpdateRequest>
+            #  </realm>
+            #</xml>
+            my $surCountTotal = 0;
+            for my $line (@surCountResults) {
+                if ($line =~ /<SourcingUpdateRequest>/i) {
+                    my $value = $line;
+                    $value =~ s/^.*<SourcingUpdateRequest>//;
+                    $value=~ s/<\/SourcingUpdateRequest>.*$//;
+                    $surCountTotal =+ $value;
+                }
+            }
+
+            # tmid 190047
+            my $surWarn = 100;
+            my $surCrit = 150;
+            $queries{"Contract Sourcing Update Requests in sending status more than 1 hour" . $communityString} = {
+                'uiHint' => $uiHint,
+                'info' => "answer < $surWarn",
+                'warn' => "answer >= $surWarn",
+                'crit' => "answer >= $surCrit",
+                'perl' => sub { 
+                    return $surCountTotal;
+                },
+                inf_field   => 'value',
+                inf_default => 0,
+                inf_tags    => qq(community="$community",description="Contract Sourcing Update Requests in sending status more than 1 hour"),
+                group_by    => qq(community $community,description="Contract Sourcing Update Requests in sending status more than 1 hour"),
+            };
+
+
+            my ($queueSizeSummaryHashRef, $queuesArrayRef, $statusArrayRef) = collateQueueSizes(\@queueSizeResults);
+
+            for my $queue (sort(@$queuesArrayRef)) {
+                for my $status (sort(@$statusArrayRef)) {
+                    my $crit = 0;
+                    my $warn = 0;
+                    my $note;
+
+                    if ($status =~ m|failed|i) {
+                        $crit = 150;
+                        $warn = 50;
+                        # tmid:166098
+                        if ($queue =~ m|CC:InvoiceDetailRequest|i) {
+                            $note = "\n<html>See <a href=\"$invDetailReqFailedDoc\">$invDetailReqFailedDoc</a></html>";
+                        }
+                    } elsif ($status =~ m|queued|i) {
+                        $crit = 1000;
+                        $warn = 500;
+                        if ($queue =~ m|InvoiceStatusUpdateRequest|i) {
+                            $crit = 3000;
+                            $warn = 1000;
+                            $note = 'http://ops.ariba.com/documentation/SRE/processes/operational/InvoiceStatusUpdateRequest-queues.txt';
+                        }
+                    }
+                    $queries{"Documents in $queue in $status state" . $communityString} = {
+                        'recordMaxResults' => 60000,
+                        'recordDataType' => "gauge",
+                        'uiHint' => $uiHint,
+                        'info' => 1,
+                        'warn' => "defined(answer) && answer >= $warn",
+                        'crit' => "defined(answer) && answer >= $crit",
+                        'note' => $note,
+                        'perl' => sub { return $queueSizeSummaryHashRef->{$queue}{$status}; },
+                        inf_field   => "value",
+                        inf_default => 0,
+                        inf_tags    => qq(community="$community",description="Documents in $queue in $status state"),
+                        group_by    => qq(community $community,description="Documents in $queue in $status state"),
+                    };
+                    $queries{"Documents in $queue in $status state warn threshold" . $communityString} = {
+                        perl      => sub { $warn },
+                        inf_field => "qs_warn_threshold",
+                        inf_tags  => qq(community="$community",description="Documents in $queue in $status state"),
+                        group_by  => qq(community $community,description="Documents in $queue in $status state"),
+                    };
+                    $queries{"Documents in $queue in $status state crit threshold" . $communityString} = {
+                        perl      => sub { $crit },
+                        inf_field => "qs_crit_threshold",
+                        inf_tags  => qq(community="$community",description="Documents in $queue in $status state"),
+                        group_by  => qq(community $community,description="Documents in $queue in $status state"),
+                    };
+                }
+            }
+        }
+        my %exception_queries;
+        my %time_out_queries;
+        foreach my $key (keys %queries)
+        {
+            if ($queries{$key}->{inf_field} eq 'message')
+            {
+                $time_out_queries{$key} = $queries{$key};
+                delete $queries{$key};
+            }
+            elsif ($queries{$key}->{inf_field} eq 'string_value')
+            {
+                $exception_queries{$key} = $queries{$key};
+                delete $queries{$key};
+            }
+        }
+        $exception_queries{influx_details} = {measurement => "buyer_queue_status_exception"};
+        my $e_q = ariba::monitor::QueryManager->newWithDetails(
+                "queue-and-exceptions-status", $product->name(), $service, $product->customer(), \%exception_queries
+                );
+        $e_q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        $time_out_queries{influx_details} = {measurement => "buyer_queue_status_timeout"};
+        my $to_q = ariba::monitor::QueryManager->newWithDetails(
+                "queue-and-exceptions-status", $product->name(), $service, $product->customer(),\%time_out_queries
+                );
+        $to_q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        $queries{influx_details} = {measurement => "buyer_queue_status_v2"};
+        my $q = ariba::monitor::QueryManager->newWithDetails(
+                "queue-and-exceptions-status", $product->name(), $service, $product->customer(), \%queries
+                );
+
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+    }
+}
+
+sub typeOfExceptionsLogged {
+    my $exceptionsArrayRef = shift;
+    my $matchType = shift;
+
+    my $numExceptions = 0;
+    my @exceptions = ();
+
+    for my $line (@$exceptionsArrayRef) {
+        #
+        #16,WARN,realm_1 
+        #2,ERROR,realm_1 
+        #
+        my ($num, $type, $realm) = split(/,/, $line);
+        if ($num && $type =~ m|$matchType|i) {
+            $numExceptions += $num;
+            push(@exceptions, "$realm: $num");
+        }
+    }
+
+    if ($numExceptions) {
+        unshift(@exceptions, "Total $matchType: $numExceptions");
+    }
+
+    return(join(";", @exceptions));
+}
+
+sub collateQueueSizes {
+    my $queueSizesResultArrayRef = shift;
+
+    my %collatedQueueSizes;
+    my %queues;
+    my %statuses;
+
+    for my $line (@$queueSizesResultArrayRef) {
+        #
+        #realm_1,Queued,InvoiceStatusUpdateRequest,10 
+        #realm_1,Failed,InvoiceStatusUpdateRequest,1 
+        #
+        my ($realm, $status, $queue, $size) = split(/,/, $line);
+
+        unless($collatedQueueSizes{$queue}{$status}) {
+            $collatedQueueSizes{$queue}{$status} = 0;
+        }
+        $collatedQueueSizes{$queue}{$status} += $size;
+        $queues{$queue} = 1;
+        $statuses{$status} = 1;
+    }
+
+    my @queuesArray = keys(%queues);
+    my @statusArray = keys(%statuses);
+
+    return (\%collatedQueueSizes,\@queuesArray,\@statusArray) ;
+}
+
+sub getPos {
+    my $oc = shift;
+    my $pos = shift;
+    my $num = shift;
+    my $hasResponse = shift;
+    my $oracleError = shift;
+
+    my @res = ();
+
+    my $badPoSql = "SELECT c.communityid, Ord1.or_PartitionNumber, r.name, Ord1.or_FailureReason, Ord1.or_PurchaseOrder, to_char(Ord1.or_TimeUpdated+(SUBSTR(tz_offset(sessiontimezone),1,1)||'1')*to_dsinterval('0 '||SUBSTR(tz_offset(sessiontimezone),2,5)||':00'),'Dy DD-Mon-YYYY HH24:MI:SS'), Pur2.po_orderid, Pur2.po_payloadid
+        FROM OrderRecipientTab Ord1, PurchaseOrderTab Pur2, ApprovableTab App3, CXMLDocumentTab CXM4, realmtab r, communitytab c 
+        WHERE App3.rootId = Pur2.rootId 
+        AND r.id = Ord1.or_PartitionNumber/10 
+        AND c.realmid = r.id 
+        AND Ord1.or_PurchaseOrder = Pur2.rootId 
+        AND Ord1.or_State = 1 
+        AND Ord1.or_OrderingMethod = 'URL' 
+        AND App3.ap_StatusString = 'Ordering' 
+        AND LOWER(Ord1.or_FailureReason) NOT LIKE LOWER('%[4%') 
+        AND CXM4.cdt_EntityReference = Ord1.or_PurchaseOrder 
+        AND CXM4.cdt_DocumentAssociation IS " . 
+        ($hasResponse ? "NOT" : "") . " NULL 
+        AND CAST(SYS_EXTRACT_UTC(systimestamp) AS DATE) - Ord1.or_TimeUpdated < 10
+        AND CAST(SYS_EXTRACT_UTC(systimestamp) AS DATE) - Ord1.or_TimeUpdated > 30/(24.0*60.0)
+        AND (Ord1.or_Active = 1) 
+        AND (Ord1.or_PurgeState = 0) 
+        AND (CXM4.cdt_Active = 1) 
+        AND (CXM4.cdt_PurgeState = 0) 
+        AND (App3.ap_Active = 1) 
+        AND (App3.ap_PurgeState = 0) 
+        AND ROWNUM < 5000 ORDER BY 1,2,3,4";
+    if ($$oc->connect()) {
+        unless($$oc->executeSqlWithTimeout($badPoSql, 240, \@res)) {
+            $$oracleError = $$oc->error();
+        }
+    } else {
+        $$oracleError = $$oc->error();
+    }
+    for my $row (@res) {
+        my ($cid, $part, $name, $failure, $order, $dt, $poid, $payloadid) = split(ariba::Ops::OracleClient->colsep(),$row);
+        my $poStr = "$name $poid since $dt falilure '$failure' (realmid=$part baseid=$order payload=$payloadid)\n";
+        if ($$pos{$cid}) {
+            $$pos{$cid} .= $poStr;
+        } else {
+            $$pos{$cid} = $poStr;
+        }
+        $$num++;
+    }
+}
+
+main()

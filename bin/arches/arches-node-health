@@ -1,0 +1,123 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/arches/arches-node-health#5 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Url;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::OutageSchedule;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub usage
+{
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode. 
+    -h        Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit ();
+}
+
+sub debug
+{
+    print "(debug) @_\n" if ($debug);
+}
+
+sub main
+{
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $prodname = "arches";
+
+    while (my $arg = shift)
+    {
+        if ($arg =~ /^-h$/o) {usage();  next;}
+        if ($arg =~ /^-d$/o) {$debug++; next;}
+        if ($arg =~ /^-e$/o) {$sendEmail = 1; next;}
+        if ($arg =~ /^-p$/o) {$sendPage  = 1; next;}
+        if ($arg =~ /^-prod$/o) {$prodname  = shift; next;}
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled($prodname, $me->service()));
+    my $arches = ariba::rc::InstalledProduct->new($prodname, $me->service());
+
+    #
+    # set arches scheduled outage for nightly recycle
+    #
+    my $outage = ariba::monitor::OutageSchedule->new('daily 23:05-23:30');
+
+    foreach my $cluster ($arches->allClusters())
+    {
+
+        my %queries;
+        my @instances = grep {$_->appName() ne 'ZooKeeper'} $arches->appInstancesInCluster($cluster);
+        exit unless (@instances);
+
+        foreach my $app (@instances)
+        {
+            my $instance_name = $app->instanceName();
+            $queries{$app->instanceName() . ' ruok status'} = {
+                crit           => 'answer !~ /iamok/ && previousAnswer !~ /iamok/',
+                warn           => 'answer !~ /iamok/',
+                uiHint         => 'ruok status',
+                perl           => sub {return ruokNodeStatus($app);},
+                outageSchedule => $outage,
+                description    => 'Checks the node for issues.  iamok means "I am ok" and the node is healthy and fully initialized, otherwise it is not.',
+                correctiveActions => [
+                                      Ops  => 'Check kr log for details of the corruption and escalate to Engineering',
+                                      Engr => 'Look at kr logs for details of the corruption.',
+                                     ],
+                inf_field       => "status",
+                inf_default     => "none",
+                inf_tags        => qq(instance_name="$instance_name",type="ruok_status"),
+                group_by        => $instance_name
+            };
+        }
+
+        my $email = $me->default('notify.email');
+        $queries{'influx_details'} = { measurement => 'arches_node_health'};
+        my $qm = ariba::monitor::QueryManager->newWithDetails('node-health', $arches->name(), $arches->service(), undef, $cluster, \%queries);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub ruokNodeStatus
+{
+    my $app   = shift;
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+    my $statusUrl = $app->archesNodeRuokUrl();
+    debug("Checking $statusUrl");
+
+    my $url = ariba::monitor::Url->new($statusUrl);
+
+    my $response = $url->request();
+    debug("Response: $response");
+    debug("Error: " . $url->error()) if ($url->error());
+
+    $query->setError($url->error()) if ($url->error());
+
+    return $response || $url->error();
+}
+
+main(@ARGV);
+
+__END__

@@ -1,0 +1,112 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/auc/learning-center-status#1 $
+
+use warnings;
+use strict;
+
+use Data::Dumper;
+use JSON;
+use FindBin;
+
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Utils;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ServiceController;
+
+sub main {
+    my $monProd    = ariba::rc::InstalledProduct->new('mon');
+    my $installDir = $monProd->installDir();
+    my $product    = qw(community);
+
+    my $service = $monProd->service();
+    my $communityProd = ariba::rc::InstalledProduct->new($product, $service);
+    chomp (my $secureSiteURL = $communityProd->default('SiteURLSecure'));
+    return unless $secureSiteURL;
+
+    my $duration = qw(3600);
+    my $startTime = time () - $duration;
+    my $dev_url  = qq(/internal/learning_center_build_monitoring.php?start_ts=$startTime&duration_sec=$duration);
+    my $prod_url = qq(/internal/community_creation_monitoring.php?start_ts=$startTime&duration_sec=$duration);
+
+    my $full_url= (ariba::Ops::ServiceController::isProductionServices($service)) ? "$secureSiteURL$prod_url" : "$secureSiteURL$dev_url";
+
+    eval {
+        my $data_hash = ariba::Ops::Utils::generateJsonOutput($full_url);
+        print encode_json($data_hash) if ( scalar(keys %{$data_hash}) );
+    };
+}
+
+main(@ARGV);
+
+__END__
+
+From Casey's document:
+
+The output is a JSON string like so:
+{"lc_sidebar_memory_consumption":0,"lc_sidebar_memcache_size":0,
+"lc_sidebar_timed_out":"0"
+,"lc_sidebar_failed":"0","lc_sidebar_succeeded":"0","lc_sidebar_total":"0"
+,"lc_memory_consumption":0,"lc_memcache_size":0,"lc_timed_out":"0","lc_failed":"0"
+,"lc_succeeded":"0","lc_total":"0"}
+
+Or, pretty printed:
+
+{
+   "lc_sidebar_total" : "0",
+   "lc_sidebar_memory_consumption" : 0,
+   "lc_memcache_size" : 0,
+   "lc_memory_consumption" : 0,
+   "lc_total" : "0",
+   "lc_succeeded" : "0",
+   "lc_sidebar_timed_out" : "0",
+   "lc_sidebar_succeeded" : "0",
+   "lc_sidebar_failed" : "0",
+   "lc_failed" : "0",
+   "lc_sidebar_memcache_size" : 0,
+   "lc_timed_out" : "0"
+}
+
+Most of the following metadata is stored in the file <Mon Home>/etc/query/learning-center.conf configuration file:
+
+    The expando "Learning Center" will exist under the Community tab.
+
+    All queries will be under this expando.
+
+    Data collection will be once an hour with an expected run time of under 5 seconds for data collection.  The actual
+    data collection requires a time range spec, so the request URL must specifify the UNIX time as:
+        start time:  current - 3600
+        time range:  +3600
+    This will collect the last one hour's worth of data.  The host system actually uses this to calculate the individual
+    values actually returned.
+
+    Data is to be collected and graphed, with a retention policy of 3 months.  This needs to be interpolated into the
+    number of rows to be retained, which depends on the collection frequency of 60 minutes:
+        1 row per hour * 24 hours per day * 30 days per month * 3 months.
+
+    Two areas need additional interpretation, as the document defines values as strings that need to be numeric:
+
+        due : immediately --> Since this represents the begin work time for the ticket, it needs a date/time value;
+        create ticket : after 1 occurrence --> taken to mean if previous was warn/crit and current is also, then create
+                                               the ticket.  This would translate to 60 minutes, given the current measurement
+                                               duration of 3600 seconds.
+
+The file <Mon Home>/startup-hooks/monserver holds the when to execute time, which it could also read from the configuration file.
+
+The URLs provided are:
+
+    Devlab ITG:
+    https://svcitgauc.lab1.ariba.com/internal/learning_center_build_monitoring.php?start_ts="now_minus_3600"&duration_sec="3600"
+
+    Production:
+    http://uex.ariba.com/internal/community_creation_monitoring.php?start_ts= "1496688257"&duration_sec="3600"
+
+For LWP, need to ignore the certificate, since it is self-signed:
+
+my $ua = LWP::UserAgent->new(
+        ssl_opts => {
+            SSL_verify_mode => 0,
+            verify_hostname => 0,
+            ...});
+

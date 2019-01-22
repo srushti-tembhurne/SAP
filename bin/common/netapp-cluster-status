@@ -1,0 +1,275 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/netapp-cluster-status#8 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::StatusPage;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DatacenterController;
+
+use ariba::SNMP::Session;
+use ariba::SNMP::ConfigManager;
+
+use Data::Dumper;
+
+my $debug = 0;
+
+my %resultmap; #0-99 or 100-199 warn 200-299 crit
+$resultmap{"settings"}{"enabled"} = 0;
+$resultmap{"settings"}{"notfound"} = 100;
+$resultmap{"settings"}{"none"} = 101;
+$resultmap{"settings"}{"thisnodedead"} = 200;
+
+$resultmap{"state"}{"cantakeover"} = 0;
+$resultmap{"state"}{"none"} = 1;
+$resultmap{"state"}{"notfound"} = 100;
+$resultmap{"state"}{"takeover"} = 101;
+$resultmap{"state"}{"cannottakeover"} = 102;
+$resultmap{"state"}{"unknown"} = 199;
+$resultmap{"state"}{"dead"} = 200;
+
+$resultmap{"cannottakeover"}{"ok"} = 0;
+$resultmap{"cannottakeover"}{"none"} = 1;
+$resultmap{"cannottakeover"}{"notfound"} = 100;
+$resultmap{"cannottakeover"}{"disabledbyoperator"} = 101;
+$resultmap{"cannottakeover"}{"interconnectoffline"} = 102;
+$resultmap{"cannottakeover"}{"disabledbypartner"} = 103;
+$resultmap{"cannottakeover"}{"unknown"} = 199;
+$resultmap{"cannottakeover"}{"takeoverfailed"} = 200;
+
+$resultmap{"partnerstatus"}{"ok"} = 0;
+$resultmap{"partnerstatus"}{"none"} = 1;
+$resultmap{"partnerstatus"}{"notfound"} = 100;
+$resultmap{"partnerstatus"}{"maybedown"} = 101;
+$resultmap{"partnerstatus"}{"unknown"} = 199;
+$resultmap{"partnerstatus"}{"dead"} = 200;
+
+$resultmap{"partnername"}{"notfound"} = 0;
+$resultmap{"partnername"}{"none"} = 1;
+$resultmap{"partnername"}{"unknown"} = 200;
+
+$resultmap{"interconnectstatus"}{"up"} = 0;
+$resultmap{"interconnectstatus"}{"none"} = 1;
+$resultmap{"interconnectstatus"}{"notfound"} = 100;
+$resultmap{"interconnectstatus"}{"partialfailure"} = 101;
+$resultmap{"interconnectstatus"}{"notpresent"} = 102;
+$resultmap{"interconnectstatus"}{"unknown"} = 199;
+$resultmap{"interconnectstatus"}{"down"} = 200;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-e/o) { $sendEmail = 1; };
+        if ($arg =~ /^-p/o) { $sendPage  = 1; };
+        if ($arg =~ /^-d/o) { $debug     = 1; };
+    }
+
+    my $me    = ariba::rc::InstalledProduct->new();
+    my $email = $me->default('notify.email');
+
+    for my $dataCenter ( ariba::Ops::ProductAPIExtensions::datacentersForProducts($me) ) {
+
+        next if ( ariba::Ops::DatacenterController::isProductionAllMSDatacenters($dataCenter) );
+
+        my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($dataCenter);
+
+        # only monitor primary data center
+        next unless $tab eq ariba::monitor::StatusPage::commonProduct();
+
+        my %match = (
+                status         => 'inservice',
+                datacenter     => $dataCenter,
+                hardwareVendor => 'netapp',
+                );
+
+        my @machines = ariba::Ops::Machine->machinesWithProperties(%match);
+        my %queries  = ();
+
+        for my $machine (@machines) {
+
+            my $host = $machine->hostname();
+      #      next if ($host !~/snvntap/);
+            my $result = runSnmp($host, "cfSettings.0");
+            $result = "none" if !($result);
+            my $resultCode = resultCode("settings", $result);
+            my $stat = "clusterSettings";
+            $queries{"$host cluster settings result"} = {
+                info => "answer eq 'enabled'",
+                warn => "answer ne 'enabled' && answer ne 'thisNodeDead'",
+                crit => "answer eq 'thisNodeDead'",
+                perl => sub { return $result; },
+                inf_field => "result",
+                inf_tags => qq|datacenter="$dataCenter",hostname="$host",stat="$stat"|,
+                group_by => "$dataCenter,$host,$stat",
+            };
+            $queries{"$host cluster settings code"} = {
+                perl => sub { return $resultCode; },
+                inf_field => "code",
+                inf_default => 0,
+                inf_tags => qq|datacenter="$dataCenter",hostname="$host",stat="$stat"|,
+                group_by => "$dataCenter,$host,$stat",
+            };
+#
+            $stat = "clusterState";
+            my $result1 = runSnmp($host, "cfState.0");
+            $result1 = "none" if !($result1);
+            my $resultCode1 = resultCode("state", $result1);
+            $queries{"$host cluster state result"} = {
+                info => "answer eq 'canTakeover'",
+                warn => "answer eq 'takeover' || answer eq 'cannotTakeover' || answer eq 'unknown'",
+                crit => "answer eq 'dead'",
+                perl => sub { return $result1; },
+                inf_field => "result",
+                inf_tags => qq|datacenter="$dataCenter",hostname="$host",stat="$stat"|,
+                group_by => "$dataCenter,$host,$stat",
+            };
+            $queries{"$host cluster state code"} = {
+                perl => sub { return $resultCode1; },
+                inf_field => "code",
+                inf_default => 0,
+                inf_tags => qq|datacenter="$dataCenter",hostname="$host",stat="$stat"|,
+                group_by => "$dataCenter,$host,$stat",
+            };
+#
+            $stat = "clusterCannotTakeoverCause";
+            my $result2 = runSnmp($host, "cfCannotTakeoverCause.0");
+            $result2 = "none" if !($result2);
+            my $resultCode2 = resultCode("cannottakeover", $result2);
+            $queries{"$host cluster cannot takeover cause result"} = {
+                info => "answer eq 'ok'",
+                warn => "answer eq 'disabledByOperator' || answer eq 'interconnectOffline' ||
+                    answer eq 'disabledByPartner' || answer eq 'unknown'",
+                crit => "answer eq 'takeoverFailed'",
+                perl => sub { return $result2; },
+                inf_field => "result",
+                inf_tags => qq|datacenter="$dataCenter",hostname="$host",stat="$stat"|,
+                group_by => "$dataCenter,$host,$stat",
+            };
+            $queries{"$host cluster cannot takeover cause code"} = {
+                perl => sub { $resultCode2; },
+                inf_field => "code",
+                inf_default => 0,
+                inf_tags => qq|datacenter="$dataCenter",hostname="$host",stat="$stat"|,
+                group_by => "$dataCenter,$host,$stat",
+            };
+#
+            $stat = "clusterPartnerStatus";
+            my $result3 = runSnmp($host, "cfPartnerStatus.0");
+            $result3 = "none" if !($result3);
+            my $resultCode3 = resultCode("partnerstatus", $result3);
+            $queries{"$host cluster partner status result"} = {
+                info => "answer eq 'ok'",
+                warn => "answer eq 'maybeDown' || answer eq 'unknown'",
+                crit => "answer eq 'dead'",
+                perl => sub { return $result3; },
+                inf_field => "result",
+                inf_tags => qq|datacenter="$dataCenter",hostname="$host",stat="$stat"|,
+                inf_default => 0,
+                group_by => "$dataCenter,$host,$stat",
+            };
+            $queries{"$host cluster partner status code"} = {
+                perl => sub { $resultCode3; },
+                inf_field => "code",
+                inf_default => 0,
+                inf_tags => qq|datacenter="$dataCenter",hostname="$host",stat="$stat"|,
+                group_by => "$dataCenter,$host,$stat",
+            };
+#
+             $stat = "clusterPartnerName";
+             my $result4 = runSnmp($host, "cfPartnerName.0");
+             $result4 = "none" if !($result4);
+             my $resultCode4 = resultCode("partnername", $result4);
+             $queries{"$host cluster partner name result"} = {
+                 info => "answer ne 'unknown'",
+                 crit => "answer eq 'unknown'",
+                 perl => sub { return $result4; },
+                 inf_field => "result",
+                 inf_tags => qq|datacenter="$dataCenter",hostname="$host",stat="$stat"|,
+                 inf_default => 0,
+                 group_by => "$dataCenter,$host,$stat",
+             };
+             $queries{"$host cluster partner name code"} = {
+                 perl => sub { $resultCode4; },
+                 inf_field => "code",
+                 inf_default => 0,
+                 inf_tags => qq|datacenter="$dataCenter",hostname="$host",stat="$stat"|,
+                 group_by => "$dataCenter,$host,$stat",
+             };
+#
+             $stat = "clusterInterconnectStatus";
+             my $result5 = runSnmp($host, "cfInterconnectStatus.0");
+             $result5 = "none" if !($result5);
+             my $resultCode5 = resultCode("interconnectstatus", $result5);
+             $queries{"$host cluster interconnect status result"} = {
+                 info => "answer eq 'up'",
+                 warn => "answer eq 'partialFailure' || answer eq 'notPresent' || answer eq 'unknown'",
+                 crit => "answer eq 'down'",
+                 perl => sub { return $result5; },
+                 inf_field => "result",
+                 inf_tags => qq|datacenter="$dataCenter",hostname="$host",stat="$stat"|,
+                 inf_default => 0,
+                 group_by => "$dataCenter,$host,$stat",
+             };
+             $queries{"$host cluster interconnect status code"} = {
+                 perl => sub { $resultCode5; },
+                 inf_field => "code",
+                 inf_default => 0,
+                 inf_tags => qq|datacenter="$dataCenter",hostname="$host",stat="$stat"|,
+                 group_by => "$dataCenter,$host,$stat",
+             };
+        }
+
+        $queries{influx_details} = {measurement => "netapp_cluster_status"};
+        my $qm = ariba::monitor::QueryManager->newWithDetails(
+                'netapp-cluster-status', $tab, $me->service(), $me->customer(), \%queries
+                );
+
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub runSnmp {
+    my $hostname = shift;
+    my $oidString = shift;
+    my $retry = shift || 5;
+    my ($result, $hostIsDown);
+#
+    my $machine = ariba::Ops::Machine->new($hostname);
+    my $snmp    = ariba::SNMP::Session->newFromMachine($machine);
+#
+    unless($snmp->hostIsDown()) {
+#
+        $oidString = ariba::SNMP::ConfigManager::_cleanupOidExpr($oidString, $machine);
+        $result = $snmp->valueForOidExpr($oidString);
+        if ($snmp->hostIsDown()) {
+            $result = "down";
+        }
+    }
+
+    return $result;
+}
+
+sub resultCode {
+  # lookup result code
+  my $stat   = shift;
+  my $res = shift;
+  $stat = lc($stat);
+  $res = lc($res);
+  # if we don't have this stat, return crit 299
+  return 299 if !exists $resultmap{$stat};
+  # if we don't have a string result for this stat, return code for notfound
+  return ( !exists $resultmap{$stat}{$res} ) ? $resultmap{$stat}{"notfound"}
+                                             : $resultmap{$stat}{$res};
+}
+
+main();
+
+__END__

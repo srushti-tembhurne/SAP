@@ -1,0 +1,143 @@
+#!/usr/local/bin/perl -w
+
+###############################################################################
+# $Id: //ariba/services/monitor/bin/an/payments-an#1 $
+# $HeadURL:$
+#
+# Copyright (c) 2013 Ariba
+#
+# payments-an - Monitor AN Payments/Open API
+#
+###############################################################################
+
+=head1 NAME
+
+payments-an - Monitor AN Payments/Open API
+
+=head1 SYNOPSIS
+
+payments-an [options]
+
+=head1 OPTIONS
+
+=over
+
+=item B<-help|-h>
+
+Print this usage information and exit.
+
+=item B<-debug|-d>
+
+Enable debugging output / dryrun
+
+=item B<-e>
+
+Enable sending of emails
+
+=item B<-p>
+
+Enable sending of pages
+
+=back
+
+=head1 DESCRIPTION
+
+C<payments-an> - Monitor AN Payments/Open API
+
+=cut
+
+=author
+
+Chaitanya Valaparla C<< <chaitanya.valaparla@sap.com> >>
+
+=head1 LICENSE
+
+Copyright 2013 Ariba
+
+=cut
+
+use strict;
+use FindBin;
+use  lib "$FindBin::Bin/../../lib";
+
+use Pod::Usage;
+use Getopt::Long;
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    GetOptions(
+        "help|h" => sub { pod2usage(1); },
+        "debug|d+" => \$debug,
+        "e" => \$sendEmail,
+        "p" => \$sendPage,
+    );
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $an = ariba::rc::InstalledProduct->new("an", $mon->service());
+    my $cluster = $mon->currentCluster();
+    my $email = $mon->default('notify.email');
+    my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+    my $CommunitiesList = join(", ", @communityIds);
+    my $buyerCommunitiesList = join(", ", ( grep { ( $_ % 2 ) == 0 } @communityIds ) );
+    my $supplierCommunitiesList = join(", ", ( grep { ( $_ % 2 ) == 1 } @communityIds ) );
+
+    my %queries = ();
+
+    $queries{"No PPR SUR more than 12 hours"} = {
+       warn => "count > 0",
+       description => "Can't receive SCF PPR SUR after 12 hours",
+       severity => 1,
+       runForCommunities => $CommunitiesList,
+       recordMaxResults => 8928,
+       sql => q`Select p.payment_proposal_id, o.anid as buyer_anid, o1.anid as supplier_anid, p.status as payment_status
+                from payment_remittance_item p inner join org_join o on p.from_org=o.id inner join org_join o1 on p.to_org=o1.id 
+                inner join cxml_document cd on p.payment_doc = cd.id inner join payment_method_join pm on pm.id=p.payment_method
+                where pm.name='scf' and p.pay_me_now_status=15 and o.deployment='Production' and o.visibility='Public' and cd.created < (sysdate - 0.5) and cd.created > (sysdate - 7) and p.rvstatus=1`,
+    };
+
+    $queries{"Supplier remittance not received more than 24 hours after trade request received(in Scheduled status)"} = {
+       warn => "count > 0",
+       description => "Can't receive Supplier remittance more than 24 hours after trade request received (in Scheduled status)",
+       severity => 1,
+       runForCommunities => $supplierCommunitiesList,
+       recordMaxResults => 8928,
+       sql => q`Select p.payment_proposal_id, o.anid as buyer_anid, o1.anid as supplier_anid, p.status as payment_status
+                from payment_remittance_item p inner join org_join o on p.from_org=o.id inner join org_join o1 on p.to_org=o1.id inner join cxml_document cd on p.payment_doc = cd.id 
+                inner join payment_method_join pm on pm.id=p.payment_method where pm.name='scf' and o.deployment='Production' and o.visibility='Public' and cd.created < (sysdate -1) 
+                and cd.created > (sysdate -7) and p.status='Scheduled' and p.rvstatus=1`,
+    };
+
+    $queries{"Buyer remittance is not received by maturity date"} = {
+       warn => "count > 0",
+       description => 'Buyer remittance is not received by maturity date',
+       severity => 1,
+       runForCommunities => $buyerCommunitiesList,
+       recordMaxResults => 8928,
+       sql => q`Select p.payment_proposal_id, o.anid as buyer_anid, o1.anid as supplier_anid, p.status as payment_status
+                from payment_remittance_item p inner join org_join o on p.from_org=o.id inner join org_join o1 on p.to_org=o1.id inner join cxml_document cd on 
+                p.payment_doc = cd.id inner join payment_method_join pm on pm.id=p.payment_method left join payment_remittance pr on p.remittance=pr.id
+                where pm.name='scf' and o.deployment='Production' and o.visibility='Public' and p.scheduled_payment_date<sysdate and p.scheduled_payment_date>(sysdate-7) and p.status!='Rejected' 
+                and (p.remittance is null or pr.scf_type!='TradedBuyerRemittance') and p.rvstatus=1`,
+    };
+
+    $queries{"influx_details"} = { 'measurement' => "payments_an" };
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('SCF', $an->name(), $mon->service(), undef, \%queries);
+    $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);
+
+__END__

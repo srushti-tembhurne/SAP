@@ -1,0 +1,579 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/an/order-status#82 $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Math;
+use ariba::monitor::QueryManager;
+use ariba::monitor::VendorOutageList;
+use ariba::monitor::FaxInfo;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::ServiceController;
+use ariba::Oncall::Schedule;
+use ariba::Oncall::Person;
+
+use dmail::LockLib;
+
+my $LOCKFILE = '/tmp/an-order-status';
+
+# These numbers represent how many times we need to see the same fax ID
+# missing before we go crit.  E.g. if N=4, on the 4th time we page.
+# To get the number of minutes it will take to go crit, multiply
+# the threshold by the run interval of this script.
+my %FAX_PAGE_THRESHOLDS = (
+	'xpedite'    , 13,
+	'visionlab'  , 13,
+);
+
+my $MAX_MISSING_FAXES = 10;
+
+my $adminAppURL;
+my $debug = 0;
+my $sendEmails = 0;
+
+sub main {
+
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; }
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $an = ariba::rc::InstalledProduct->new("an", $me->service());
+
+	if (ariba::Ops::ServiceController::isProductionServicesOnly($me->service())) {
+		$sendEmails = 1;
+	}
+
+	my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+	my $communitiesList = join(", ", @communityIds);
+
+	$adminAppURL = $an->default('acadminurlprefix');
+
+	my %queries = (
+		"catalogs stuck in validating state" =>
+		{
+		  info => "numrows > -1",
+		  warn => "numrows > 0",
+		  crit => "numrows > 20",
+		  format => "catalog_content.id %d \t %d hours \t %s \t %s \t %s\n",
+		  sql => q`
+			Select /*+INDEX (cv IND_AF4F1CD4_2B45162B)*/ cv.id, 
+			(sysdate-cv.created)*24, p.user_id, cv.remote_file_name, cv.file_name
+				FROM catalog_version cv, person p 
+				WHERE p.id = cv.creator AND   
+				created > sysdate-1/24 AND  
+					(
+						(cv.status='Validating') 
+						OR 
+						(cv.status IS NULL AND NOT EXISTS (SELECT 1 FROM catalog_version_qual WHERE catalog=cv.id))
+					) 
+			`,
+		},
+	
+		"documents stuck in queued status (status unchanged for more than day)" =>
+		{
+		  runForCommunities => $communitiesList,
+		  aggregationMethod => "rows",
+		  info => "numrows > -1",
+		  warn => "numrows > 0",
+		  crit => "numrows > 20",
+		  processAnswer => sub { main::addAdminAppLinksToStuckResults() },
+		  sql => q`
+			select /*+ INDEX(cxml_document IND_B398011A_2B45162B) */ id,document_type,source_partition,routing_method,(sysdate-status_changed)*24
+                from cxml_document where status='Queued' and(sysdate-status_changed)>1 and (document_type != 'ParkedInvoiceDocument'
+                and document_type != 'OrganizationChangeMessage' and document_type != 'SubscriptionChangeMessage') and created > sysdate - 5;
+		`,
+		},
+
+		"failed documents from production sender to production receiver in last 5 days" =>
+		{
+		  recordMaxResults   => 36000,
+		  recordDataType     => "gauge",
+		  recordItem         => "numrows",
+		  graphRecorded      => 1,
+		  recordDataUnits    => 'absolute',
+
+		  runForCommunities => $communitiesList,
+		  aggregationMethod => "rows",
+		  timeout => 3 * 60,
+		  info => "numrows > -1",
+		  warn => "numrows > 5500",
+		  processAnswer => sub { main::addAdminAppLinksToFailedResults() },
+		  sql => q`
+			select /*+ index(doc IND_B398011A_2B45162B) use_nl(doc p f t) */ 
+			doc.id, doc.document_type, 
+			nvl(p.id, 0) poid, schema_community,
+			to_char(doc.created,'YYYY-MM-DD HH24:MI:SS'),
+			nvl(f.name, 'Name unavailable'), 
+			nvl(t.name, 'Name unavailable'), doc.routing_method, doc.receiving_method
+				from org_join f, org_join t, cxml_document doc, po p
+				where doc.status='Failed'
+				and doc.created > sysdate - 5
+				and doc.from_org = f.id(+)
+				and nvl(f.deployment, 'Production') ='Production'
+				and doc.to_org = t.id(+)
+				and nvl(t.deployment, 'Production') ='Production'
+				and doc.id = p.generic_document(+)
+				and doc.source_partition = schema_community
+				order by doc.id asc
+		  `,
+		},
+
+		"failed document summary for production sender over last 5 days" =>
+		{
+		  runForCommunities => $communitiesList,
+		  aggregationMethod => "uniqueCounts",
+		  timeout => 3 * 60,
+		  info => "numrows > -1",
+		  noRowCount => 1,
+  		  processAnswer => sub { main::fixupOrderStatusForSummaries() },
+		  sql => q`
+			select /*+ index(doc IND_B398011A_2B45162B) use_nl(doc p f t) */
+				count(doc.id),
+				nvl(doc.document_type, 'Unknown'),
+				nvl(f.name, 'Name unavailable'),
+				nvl(doc.routing_method, 'Unknown'),
+				nvl(doc.receiving_method, 'Unknown')
+			from org_join f,
+				org_join t,
+				cxml_document doc,
+				po p
+			where doc.status='Failed'
+				and doc.created > sysdate - 5
+				and doc.from_org = f.id(+)
+				and nvl(f.deployment, 'Production') ='Production'
+				and doc.to_org = t.id(+)
+				and nvl(t.deployment, 'Production') ='Production'
+				and doc.id = p.generic_document(+)
+				and doc.source_partition = schema_community
+			group by f.name, doc.document_type, doc.routing_method, doc.receiving_method
+			having count(doc.id) >= 10
+			order by count(doc.id) desc;
+		  `,
+		},
+
+
+		"failed document summary for production receiver over last 5 days" =>
+		{
+		  runForCommunities => $communitiesList,
+		  aggregationMethod => "uniqueCounts",
+		  info => "numrows > -1",
+		  timeout => 3 * 60,
+		  noRowCount => 1,
+  		  processAnswer => sub { main::fixupOrderStatusForSummaries() },
+		  sql => q`
+			select /*+ index(doc IND_B398011A_2B45162B) use_nl(doc p f t) */
+				count(doc.id),
+				nvl(doc.document_type, 'Unknown'),
+				nvl(t.name, 'Name unavailable'),
+				nvl(doc.routing_method, 'Unknown'),
+				nvl(doc.receiving_method, 'Unknown')
+			from org_join f,
+				org_join t,
+				cxml_document doc,
+				po p
+			where doc.status='Failed'
+				and doc.created > sysdate - 5
+				and doc.from_org = f.id(+)
+				and nvl(f.deployment, 'Production') ='Production'
+				and doc.to_org = t.id(+)
+				and nvl(t.deployment, 'Production') ='Production'
+				and doc.id = p.generic_document(+)
+				and doc.source_partition = schema_community
+			group by t.name, doc.document_type, doc.routing_method, doc.receiving_method
+			having count(doc.id) >= 10
+			order by count(doc.id) desc;
+		  `,
+		},
+
+		"Faxes missing delivery status after 2 hrs (problem with provider?)" =>
+		{
+		  runForCommunities => $communitiesList,
+		  aggregationMethod => "rows",
+		  recordMaxResults => 5000,
+		  recordDataType => "counter",
+		  recordItem => "numrows",
+		  info => "numrows > -1",
+		  warn => "numrows > 0",
+		  timeout => 5 * 60,
+		  ticketDueInDays => "today",
+		  ticketOnWarnOpenAfterMinutes => 0, #place holder - same as for crit
+		  crit => 0, # placeholder, processAnswer will set the true value for this
+			processAnswer => sub { main::computeFaxIDsAndSendEmails() },
+
+		  sql => q`
+			select /*+ ORDERED USE_NL(doc p a) INDEX(doc IND_B398011A_677C9D8B) */ distinct 
+				doc.routing_method_subtype, to_char(a.timestamp,'YYYY-MM-DD HH24:MI:SS'),
+				p.id, schema_community, doc.document_number, 'Sent', a.description, ( select retry_count from po_doc_disp_queue where item = doc.id )
+			  from cxml_document doc, po p, app_log a where
+			      p.source_partition = schema_community
+			      and doc.status='Sent'
+			      and doc.routing_method= 'Ariba.fax'
+			      and (sysdate - a.timestamp) > 2/24
+			      and p.generic_document = doc.id
+			      and a.id = (
+				select /*+ no_unnest */ max(id) from app_log b where
+				  b.item = p.id and (
+				    b.description like 'Fax Order sent to%' or
+				    (b.facility_name='PO' and b.message_code= 66)
+				  ) and b.item_type = 'ANPurchaseOrder'
+			      )
+			order by doc.routing_method_subtype asc, p.id asc
+		    `,
+		},
+
+		"failed documents sent to providers over last day" =>
+		{
+			recordMaxResults   => 36000,
+			recordDataType     => "gauge",
+			recordItem         => "numrows",
+			graphRecorded      => 1,
+			recordDataUnits    => 'absolute',
+
+			runForCommunities => $communitiesList,
+			aggregationMethod => "rows",
+			info => "numrows > -1",
+			warn => "numrows > 0",
+			timeout => 5 * 60,
+
+			processAnswer => sub { main::addAdminAppLinksToFailedDocsToProvidersResults() },
+			sql => q`
+				SELECT  /*+ index(cd IND_B398011A_2B45162B) use_nl(cd cds sj f t) */
+				cd.id Id,  
+			nvl(cd.document_type, 'Unknown') DocType,
+			nvl(cd.operation_type,  'Unavailable') OpType,
+			sj.service_id ServiceId,
+			schema_community, 
+			to_char(cd.created,'YYYY-MM-DD HH24:MI:SS') Created,
+			nvl(f.name,  'Name unavailable') fromOrg,
+			nvl(t.name, 'Name unavailable') Provider
+				FROM cxml_document cd, cxml_document_service cds, service_join sj, org_join f, org_join t
+				WHERE cd.id = cds.document
+				AND cd.document_type != 'CopyRequest'
+				AND cd.status =  'Failed'
+				AND cd.created >  sysdate  -  1
+				AND cds.service = sj.id                    
+				AND cd.source_partition = schema_community 
+				AND cd.from_org = f.id and nvl(f.deployment,  'Production')  ='Production'
+				AND cd.to_org = t.id and nvl(t.deployment,  'Production')  ='Production'
+				UNION ALL
+                SELECT  /*+ index(cd IND_B398011A_2B45162B) use_nl(cd cds sj f t ori) */
+                cd.id Id,
+            nvl(cd.document_type, 'Unknown') DocType,
+            nvl(cd.operation_type,  'Unavailable') OpType,
+            sj.service_id ServiceId,
+            schema_community,
+            to_char(cd.created,'YYYY-MM-DD HH24:MI:SS') Created,
+            nvl(f.name,  'Name unavailable') fromOrg,
+            nvl(t.name, 'Name unavailable') Provider
+                FROM cxml_document cd, cxml_document_service cds, service_join sj, org_join f, org_join t, cxml_document ori
+                WHERE cd.id = cds.document
+                AND cd.document_type = 'CopyRequest'
+                AND cd.status =  'Failed'
+                AND cd.created >  sysdate  -  1
+                AND cds.service = sj.id
+                AND cd.source_partition = schema_community
+                AND ori.from_org = f.id and nvl(f.deployment,  'Production')  ='Production'
+                AND cd.to_org = t.id and nvl(t.deployment,  'Production')  ='Production'
+                AND ori.id = cd.related_document
+			ORDER BY Provider, Id asc, OpType
+				`,
+
+		},
+	);
+
+
+    $queries{influx_details} = { measurement => 'an_order_status'};
+	my $email = $me->default('notify.email');
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails(
+		"order-status", "an", $me->service(), $me->customer(), \%queries
+	);
+
+	unless (dmail::LockLib::requestlock($LOCKFILE,5)) {
+                die "can't grab lock\n";
+        }
+
+	$qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+	ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
+
+	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+	dmail::LockLib::releaselock($LOCKFILE);
+}
+
+# Generate a fax ID from the PO, and stuff it back into the results.
+sub computeFaxIDsAndSendEmails {
+
+	my $query     = $ariba::monitor::Query::_ourGlobalQuerySelf;
+	my @results   = ();
+	my $community = $query->communityId();
+	my $regularFormat     = '<html>provider %s faxid %s created %s po.id %s community %s po.order_number %s status %s %s</html>';
+	my $unrespondedFormat = 
+		'<html><b>Unresponsive</b> provider %s faxid %s created %s po.id %s community %s po.order_number %s status %s %s</html>';
+	
+	return if ($query->error());
+
+	my $faxInfo = ariba::monitor::FaxInfo->newFromQuery($query);
+
+	# counts of previously seen faxes, hashed by fax ID
+	my %previousFaxIdsCount = $faxInfo->faxIDs();
+
+	# counts of current outstanding faxes, hashed by fax ID
+	my %currentFaxIdsCount = ();
+
+	my @faxIdsToPageFor = ();
+	my %newFaxIds = ();
+
+
+	my %outageSchedules = ();
+
+	for my $line ($query->results()) {
+
+		next unless $line;
+
+		my @items = split(/\t/, $line);
+
+		my $faxId = ariba::monitor::Math::base10toBase36($items[2]);
+
+		#
+		# if we have a retry count, append that to the faxId
+		#
+		my $retry = $items[7]; # get the retry count
+		if( $retry > 0 ) {
+			$faxId .= "-$retry";
+		}
+
+		# This is lame - we only add :2: to community 2, not 1.
+		if ($community && $community == 2) {
+
+			$faxId = sprintf('%s:%d:', $faxId, $community);
+		}
+
+		my $providerName = lc((split(/\s+/,$items[0]))[0]);
+		# also lame, but a workaround for venali's poor search software
+		if ( $providerName =~ /Visionlab/i ) {
+			$faxId = "AN-ORD-EID:" . $query->service() . ":" . $faxId;
+			if($community && $community == 1) {
+				$faxId .= ":$community:";
+			}
+		}
+
+		$outageSchedules{$providerName} = ariba::monitor::VendorOutageList->outageForVendor($providerName);
+
+		# Make the provider name less harsh, and add in the faxId 
+		splice(@items, 0, 1, ucfirst($providerName));
+		splice(@items, 1, undef, $faxId);
+
+		# update the number of times we've seen this faxId
+		if ( exists($previousFaxIdsCount{$faxId}) ) {
+			$currentFaxIdsCount{$faxId} = $previousFaxIdsCount{$faxId} + 1;
+		} else {
+			$currentFaxIdsCount{$faxId} = 1;
+		}
+
+		# only send mail the first time we see a fax ID
+		if ($currentFaxIdsCount{$faxId} == 1) {
+			push @{$newFaxIds{$providerName}}, $faxId;
+		}
+
+		my $format = $regularFormat;
+
+		# set status to crit if we have a fax that is outstanding 
+		# for ($FAX_PAGE_THRESHOLDS * [run interval]) minutes
+		if ($currentFaxIdsCount{$faxId} >= $FAX_PAGE_THRESHOLDS{$providerName}) {
+			$format = $unrespondedFormat;
+			next if $outageSchedules{$providerName}->isInScheduledOutage();
+			if ($query->rowCount() >= $MAX_MISSING_FAXES) {
+				$query->setCrit(1);
+			} else {
+			  	$query->setTicketOnWarnOpenAfterMinutes(1);
+			}
+		}
+		push(@results, (_insertAdminAppURLs(sprintf($format, @items), $community)));
+	}
+
+
+	# send mail to each provider regarding the missing delivery statuses
+	for my $provider (keys %newFaxIds) {
+		# don't send missing-faxes emails if we are in scheduled outage
+		next if $outageSchedules{$provider}->isInScheduledOutage();
+		_sendEmailToProviders($provider, $newFaxIds{$provider}, $query);
+	}
+
+	$faxInfo->setFaxIDs(%currentFaxIdsCount);
+	$faxInfo->save();
+
+	return join(",\n", @results);
+}
+
+sub _sendEmailToProviders {
+	my $provider = shift;
+	my $faxIdsRef = shift;
+	my $query = shift;
+
+	return unless ($sendEmails);
+
+	my $subject = "Missing fax delivery status for $provider";
+	my $schedule = ariba::Oncall::Schedule->new();
+	my $primary = ariba::Oncall::Schedule->primaryForUnixTime(time());
+
+	my $product = ariba::rc::InstalledProduct->new($query->productName(), $query->service());
+	my $to = $product->default("fax.$provider.SupportEmail");
+
+	my $prodOpsEmail = ariba::Ops::Constants::productionOperationsEmailAddress();
+
+	my $from = my $replyto = 
+		($primary ? ariba::Oncall::Person->new($primary)->emailAddress() : $prodOpsEmail);
+
+	my $cc = $prodOpsEmail;
+
+	# temporary until an DD.xml in prod gets updated
+	if (!$to) {
+		my $mon = ariba::rc::InstalledProduct->new();
+		$to = $mon->default("fax.$provider.SupportEmail");
+	}
+
+	my $body_template=<<BODY;
+
+%s Support,
+We have not recieved delivery confirmation for the following customer reference number%s:
+
+%s
+
+%s job%s %s over 2 hours old, please check on %s and resend the delivery confirmation%s if necessary.
+
+Thank you,
+Ariba Production Operations
+BODY
+
+	my $plural = scalar(@$faxIdsRef) > 1 ? 's':'';
+	my ($these, $are, $them) = ($plural ? ("These", "are", "them") : ("This", "is", "it"));
+	my $body = sprintf($body_template, ucfirst($provider), $plural, scalar(join("\n", @$faxIdsRef)), $these, $plural, $are, $them, $plural);
+
+	my $idstring = join("\n", @$faxIdsRef);
+	if ($debug) {
+		print "Sending email to $to about $subject with body:$idstring:\n" if $debug;
+	} else {
+		ariba::Ops::Utils::email($to, $subject, $body, $cc, $from, $replyto);
+	}
+}
+
+sub fixupOrderStatusForSummaries {
+
+	my $query   = $ariba::monitor::Query::_ourGlobalQuerySelf;
+	my @results = ();
+	my $format  = "%s %s for %s via %s";
+
+	for my $result ($query->results()) {
+
+		my ($id, $type, $name, $routing, $receiving) = split(/\t/, $result);
+
+		# stick receiving_method in for IDR's, it doesn't have a routing_method.
+		my $method = $type eq 'InvoiceDetailRequest' ? $receiving : $routing;
+
+		push(@results, sprintf($format, $id, $type, $name, $method));
+	}
+
+	return join("\n", @results);
+}
+
+# Add links to the admin app for each result line
+sub addAdminAppLinksToFailedDocsToProvidersResults {
+
+	my $query   = $ariba::monitor::Query::_ourGlobalQuerySelf;
+	my @results = ();
+
+	my $shouldCrit = 0;
+
+	for my $result ($query->results()) {
+
+		my ($id, $type, $opType, $serviceID, $community, $created, $from, $to) = split(/\t/, $result);
+
+		my $format = 'cxml_document.id %s %s community %s created %s %18.18s -> %18.18s with serviceID %s OperationType %s';
+
+		$result = sprintf($format, $id, $type, $community, $created, $from, $to, $serviceID, $opType);
+
+		# for TRE failed documents it will be good if we can show in RED the                                                   
+        # failed documents with cd.operation_type = `SignUp' or `InvoiceUpload'.                                                    
+		$shouldCrit = 1 if ($opType eq "SignUp" || $opType eq "InvoiceUpload");
+
+		push @results, sprintf("<html>%s</html>", _insertAdminAppURLs($result, $community));
+	}
+
+	$query->setCrit($shouldCrit);
+
+	return join("\n", @results);
+}
+
+# Add links to the admin app for each result line, and rearrange depending on
+# if we are an InvoiceDetailRequest or not.
+sub addAdminAppLinksToFailedResults {
+
+	my $query   = $ariba::monitor::Query::_ourGlobalQuerySelf;
+	my @results = ();
+
+	for my $result ($query->results()) {
+
+		my ($id, $type, $poid, $community, $created, $from, $to, $routing, $receieving) = split(/\t/, $result);
+
+		# Only PO has a po.id
+		if ($type eq 'PurchaseOrder') {
+
+			my $format = 'cxml_document.id %s %s po.id %s community %s created %s %18.18s -> %18.18s via %s';
+
+			$result = sprintf($format, $id, $type, $poid, $community, $created, $from, $to, $routing);
+
+		} else {
+
+			my $format = 'cxml_document.id %s %s community %s created %s %18.18s -> %18.18s via %s';
+			my $method = $type eq 'InvoiceDetailRequest' ? $receieving : $routing;
+
+			$result = sprintf($format, $id, $type, $community, $created, $from, $to, $method);
+		}
+
+		push @results, sprintf("<html>%s</html>", _insertAdminAppURLs($result, $community));
+	}
+
+	return join("\n", @results);
+}
+
+# This handles just the stuck document query.
+sub addAdminAppLinksToStuckResults {
+
+	my $query   = $ariba::monitor::Query::_ourGlobalQuerySelf;
+	my @results = ();
+	my $format  = 'cxml_document.id %s %s community %s via %s %d hours';
+
+	my $community = $query->communityId();
+
+	for my $result ($query->results()) {
+
+		$result = sprintf($format, split(/\t/, $result));
+
+		push @results, sprintf("<html>%s</html>", _insertAdminAppURLs($result, $community));
+	}
+
+	return join("\n", @results);
+}
+
+sub _insertAdminAppURLs {
+	my ($line, $community) = @_;
+
+	$line =~ s|(po\.id)\s+(\d+)|$1 <a target=admin href=$adminAppURL/po?id=$2&community=$community>$2</a>|o;
+	$line =~ s|(cxml_document\.id)\s+(\d+)|$1 <a target=admin href=$adminAppURL/doc?id=$2&community=$community>$2</a>|o;
+
+	return $line;
+}
+
+main();

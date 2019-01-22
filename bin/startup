@@ -1,0 +1,234 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin";
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../lib/perl";
+
+use vars qw($INSTALLDIR $debug $testing $quiet);
+
+use Cwd;
+use File::Basename;
+use File::Path;
+use File::Slurp;
+
+use ariba::rc::Globals;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Passwords;
+use ariba::rc::Utils;
+
+use ariba::Ops::Startup::Common;
+use ariba::Ops::Startup::Monitoring;
+
+use ariba::Ops::ProductConfig::Utils;
+
+$SIG{PIPE} = sub { print "startup encountered SIGPIPE. Ignored.\n"; };
+$ENV{'INSTR_MODE'} = 0;
+
+main();
+
+sub main
+{
+    my (@launchApps, @launchRoles, @appArgs);
+    my ($startShell, $masterPassword, $communityName, $specifiedClusterName);
+    my ($startSpecificApps, $startSpecificRoles, $genWoConf, $alreadyDoneCleanTemp);
+
+    my $readMasterPassword = 1;
+    my $rollingStart = 0;
+    my $fullStart = 0;
+    my $maxTimeToWaitForStart = 0;
+    my $cipherStoreInit = 0;
+
+    while(my $arg = shift(@ARGV)) {
+
+        print STDERR "parsing arg $arg\n" if $debug;
+
+        if($arg =~ /^-h/o) { usage(); next;}
+        if($arg =~ /^-d/o) { $debug=1; next;}
+        if($arg =~ /^-q/o) { $quiet=1; next;}
+        if($arg =~ /^-test/o) { $testing=1; next;}
+        if($arg =~ /^-rolling/o) { $rollingStart=1; next;}
+        if($arg =~ /^-full/o) { $fullStart=1; next;}
+        if($arg =~ /^-cluster/o) { $specifiedClusterName=shift(@ARGV); next;}
+        if($arg =~ /^-community/o) { $communityName=shift(@ARGV); next;}
+        if($arg =~ /^-woconf/o) { $genWoConf=1; next;}
+        if($arg =~ /^-readMasterPassword/o) { $readMasterPassword=1; next;}
+        if($arg =~ /^-role/o) { $startSpecificRoles=1; push(@launchRoles, shift(@ARGV)); next;}
+        if($arg =~ /^-shell/o) { $startShell=1; $startSpecificApps=1; next;}
+        if($arg =~ /^--$/o) { push(@appArgs, @ARGV); last;}
+        if($arg !~ /^-/o) { $startSpecificApps = 1; push(@launchApps,$arg); next;}
+    }
+
+
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my $shortHost = $hostname;
+    $shortHost =~ s/\.ariba\.com//;
+
+    my $me = ariba::Ops::Startup::Common::initializeProductAndBasicEnvironment($hostname, $specifiedClusterName, undef, 1);
+    exit (ariba::Ops::Startup::Common::EXIT_CODE_ERROR()) unless ($me);
+
+    $INSTALLDIR = $me->installDir();
+    my $service  = $me->service();
+    my $prodname = $me->name();
+    my $customer = $me->customer();
+    my $clusterName = $me->currentCluster();
+    my $buildName = $me->buildName();
+
+    print "INSTALLDIR is $INSTALLDIR for service $service and prod $prodname for customer $customer on cluster $clusterName for build $buildName\n";
+
+    print "Hello, Stratus!\n";
+    createSymlinks({ clusterName => $clusterName });
+
+    # Load in the roles of this host
+    my @roles = $me->rolesForHostInCluster($hostname, $clusterName);
+
+    # launch all roles served by this host, or only the ones requested
+    my @rolesToLaunch = $startSpecificRoles ? @launchRoles : @roles;
+
+    print "roles is @roles\n";
+    print "rolesToLaunch is  @rolesToLaunch\n";
+    ariba::Ops::Startup::Common::setAsInstalled($buildName);
+
+    # setAsInstalled() sets default symlinks only... add etc/ for stratus
+    ariba::Ops::Startup::Common::createSymLinks($buildName, {"etc" => "etc"});
+
+    my %rolesLaunched = ();
+    for my $role (@rolesToLaunch) {
+        next if $rolesLaunched{$role};
+
+        if ($role eq "monserver" || $role eq "backup-monserver") {
+
+            # force decryption of mon product passwords while blowfish is
+            # still initialized with masterpassword.  This is a
+            # work-around until ariba::util::Encryption is a full-fledged
+            # class and can handle multiple Blowfish keys.
+            my $throwawayDecryptedValue = $me->default('dbainfo.system.password');
+            my @products = ariba::Ops::Startup::Common::loadInstalledProducts($service);
+            unless($cipherStoreInit) {
+                ariba::Ops::Startup::Monitoring::initializeCipherStore($me, @products);
+                $cipherStoreInit = 1;
+            }
+
+            $rolesLaunched{"monserver"} = 1;
+            $rolesLaunched{"backup-monserver"} = 1;
+        }
+    }
+}
+
+sub createSymlinks() {
+
+    my $args = shift;
+
+    my $clusterName = $args->{clusterName};
+
+    # set sym links for cluster specifc configs.  If replace-tokens is not found then simply move along.
+    # eg DeploymentDefaults.xml -> DeploymentDefaults.xml.primary
+    my $configFiles = "$ENV{'ARIBA_CONFIG_ROOT'}/replace-tokens.cfg";
+    my $deployRoot = $ENV{'ARIBA_DEPLOY_ROOT'};
+
+    # Comment above says if replace-tokens.cfg is not found then move along, but this test needs it to
+    # exist, else the script aborts.  So test for it first and if readable, do so, else move on.
+    if ( -r $configFiles && (my @files = read_file( $configFiles ))) {
+        # replace-tokens.cfg: each row has two file names used by configure-deployment.
+        # The first is the input file, unsubstituted.  The second is the output file
+        # written post substitution.  We leverage the second file of each pair as it's
+        # possible one of the files could end with '.primary' or '.secondary'.  If so
+        # we set a soft link to the appropriate file based on the cluster.
+
+        # Parameters.table is created from scratch via java, not throuth replace-tokens.cfg.
+        # Add P.t.primary and P.t.secondary to the array so we can look for them in the install dir.
+# this code is here for when we get P.table.primary and P.table.secondary.  This will require additional testing.
+#        if ( my $pTable = $me->parametersTable() ) {
+#            push ( @files, "foo $pTable.primary" ) if -e "$pTable.primary";
+#            push ( @files, "foo $pTable.secondary" ) if -e "$pTable.secondary";
+#        }
+
+        foreach my $line ( @files ) {
+            chomp ($line);
+
+            # skip comments
+            next if ( $line =~ m/^#/ );
+
+            # Check for a new line char at end of file and strip it if found (Damn you Bill Gates)
+            chop $line if $line =~ /\r$/;
+
+            # Grab the second file name on each line (see file construct assumptions above).
+            my $fileCandidate = (split /\s+/, $line)[1];
+
+            # next unless it end with a .primary or .secondary suffix
+            next unless ( $fileCandidate =~ /(.+)\.(primary|secondary)$/ );
+            my $softLinkFileName = "$deployRoot/$1";
+            my $suffix = $2;
+
+            # next unless the suffix matches the cluster in which we're running
+            next unless ( $suffix eq $clusterName );
+
+            # The file candidate has a suffix matching the cluster in which we're running.
+            # Create the soft link.
+            # eg DeploymentDefaults.xml -> DeploymentDefaults.xml.primary
+            my $actualFileName = "$deployRoot/$fileCandidate";
+            ariba::Ops::Startup::Common::makeSymlink( $actualFileName, $softLinkFileName );
+        }
+    }
+
+}
+
+##################################################################################
+# This method is responsible for generating L2P Mapping file during server startup
+###################################################################################
+sub writeL2PMappingFile
+{
+    my $currentSSWS = shift;
+    my $productRef  = shift;
+    my @products    = @$productRef;
+
+    for my $product (@products) {
+        my $productName = $product->name();
+        if( ($productName eq "buyer") || ($productName eq "s4") ){
+                my @newInstances = $product->appInstances();
+                my $l2pContentSource  = getL2PContentSource($product);
+                ariba::Ops::L2PMap::generateL2PMapFile($currentSSWS,$productName,\@newInstances,$l2pContentSource);
+        }
+    }
+}
+
+sub getL2PContentSource
+{
+    my $product   = shift;
+    my $buildName = $product->buildName();
+    my $l2pContentSource  = "startup|$buildName:0|$buildName:1";
+    return($l2pContentSource);  
+}
+
+sub usage
+{
+    my $ver = '$Id: //ariba/services/tools/bin/startup#656 $';
+
+
+    print "usage: $0 (version $ver)\n";
+    print "    [wofapp-pattern|wofapp-name]\n";
+    print "    -h : this help\n";
+    print "    -d : run with debug\n";
+    print "    -q : do not print anything, work silently\n";
+    print "    -test : run as test\n";
+    print "    -rolling: will cause startup to wait for initialization to complete\n";
+    print "    -full: will cause full start code to be executed for product (if any)\n";
+    print "    -shell : start a shell with right environment\n";
+    print "    -role : specific role to launch\n";
+    print "    -woconf : just regenerate WebObjects.conf file\n";
+    print "    -readMasterPassword : read password from stdin\n";
+    print "    -cluster <clustername>: which cluster to make active\n";
+    print "    -community <id>: specific community to launch\n";
+    print "    -- args ...: args to pass to the apps\n";
+    print "    wofapp-pattern: pattern like ANCXMLDispatcher\n";
+    print "    wofapp-name: pattern like ANCXMLDispatcher-501\n";
+    print "                 if wofapp* is specified only that piece\n"; 
+    print "                 of service will be started.\n";
+    exit(ariba::Ops::Startup::Common::EXIT_CODE_ERROR());
+}
+
+
+main();
+

@@ -1,0 +1,253 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/network/redundancy-check#15 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::NetworkDeviceManager;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+my $BIGIP_ACTIVE_STATE = 'active';
+my $BIGIP_STANDBY_STATE = 'standby';
+
+sub main {
+
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-e/o) { $sendEmail = 1; };
+        if ($arg =~ /^-p/o) { $sendPage  = 1; };
+        if ($arg =~ /^-d/o) { $debug     = 1; };
+    }
+
+    my $me    = ariba::rc::InstalledProduct->new();
+    my $email = $me->default('notify.email');
+
+    for my $datacenter ( ariba::Ops::ProductAPIExtensions::datacentersForProducts($me) ) {
+
+        my %queries  = ();
+
+        # Per device method
+        checkFirewallRedundancy (\%queries, $datacenter);
+        checkActiveSupervisorModule (\%queries, $datacenter);
+        checkBigIpFailoverState (\%queries, $datacenter);
+
+        if (%queries) {
+            $queries{influx_details} = {measurement => "Network-Redundancy"};
+            my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+            my $qm = ariba::monitor::QueryManager->newWithDetails(
+                'Network Redundancy', $pn, $me->service(), $me->customer(), \%queries
+            );
+            $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+        }
+    }
+}
+
+sub checkFirewallRedundancy {
+
+    my $queriesRef = shift;
+    my $datacenter = shift;
+
+    my %matchDatacenter = (
+        'datacenter' => $datacenter,
+        'os' => 'pix',
+        #Ignoring osVersion to allow mutiple OS version host HOA-30294
+        #'osVersion' => '8.+',
+        'status'           => 'inservice',
+        'monitoringDatacenter' => '',
+    );
+
+    my %matchMonitoringDatacenter = (
+        'os' => 'pix',
+        #Ignoring osVersion to allow mutiple OS version host HOA-30294
+        #'osVersion' => '8.+',
+        'status'           => 'inservice',
+        'monitoringDatacenter' => $datacenter,
+    );
+
+    my @networkDevices = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+    @networkDevices = (@networkDevices , ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+
+    for my $networkDevice (@networkDevices) {
+        # Unit will either be Primary or Secondary
+        my $primaryStatus;
+        my $secondaryStatus;
+        my $deviceName   = $networkDevice->hostname();
+
+        # Can't login to the failover device.
+        next if $deviceName =~ /(?:pix|asa)\S+-2\./;
+
+        # Create a networkDevice, and get failover details
+        my $networkDevice = ariba::Ops::NetworkDeviceManager->newFromMachine($networkDevice);
+
+        # Active or Standby
+        ($primaryStatus, $secondaryStatus) = $networkDevice->getSystemStatus();
+
+        # Some firewalls are not part of a failover pair, so ignore them TMID: 45504
+
+        $queriesRef->{"$deviceName Primary Status is"} = {
+        uiHint => 'firewall',
+        crit => "answer ne 'Active unit' && answer ne 'Failover Off'",
+        perl => "return qq($primaryStatus)",
+        inf_field => "primaryStatus",
+        inf_tags => qq|datacenter="$datacenter",deviceName="$deviceName",uiHint="firewall"|,
+        inf_default => 0,
+        group_by => "$datacenter,$deviceName,firewall",
+        };
+
+        $queriesRef->{"$deviceName Secondary Status is"} = {
+        uiHint => 'firewall',
+        crit => "answer ne 'Standby unit' && answer ne 'Failover Off'",
+        perl => "return qq($secondaryStatus)",
+        inf_field => "secondaryStatus",
+        inf_tags => qq|datacenter="$datacenter",deviceName="$deviceName",uiHint="firewall"|,
+        inf_default => 0,
+        group_by => "$datacenter,$deviceName,firewall",
+        };
+    }
+}
+
+sub checkActiveSupervisorModule {
+
+    my $queriesRef = shift;
+    my $datacenter = shift;
+
+    my %matchDatacenter = (
+        'datacenter' => $datacenter,
+        'status'       => 'inservice',
+        'monitoringDatacenter' => '',
+    );
+
+    my %matchMonitoringDatacenter = (
+        'status'           => 'inservice',
+        'monitoringDatacenter' => $datacenter,
+    );
+
+    my @networkDevices = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+    @networkDevices = (@networkDevices , ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+
+    for my $networkDevice (@networkDevices) {
+
+        my $deviceName   = $networkDevice->hostname();
+
+        # MDB is the source of truth, check for consoleHostNameSup2 field.
+        next unless defined ($networkDevice->consoleHostNameSup2());
+
+        # Create a networkDevice, and get failover details
+        my $networkDeviceManager = ariba::Ops::NetworkDeviceManager->newFromMachine($networkDevice);
+
+        # Find Active / Standby details
+        my ($activeUnitModule, $peerUnitState) = $networkDeviceManager->getActiveSupervisorModule();
+
+        # We currently only have redundant supervisors on 6506 and 6509 switches
+        # Both these device can only run their supervisor blades on modules 5 and 6
+        # Network team has decided that we will rely on module 6 being our primary.
+
+        # Adding 6504 switches to the network
+        # For 6504 switches we will rely on module 2 being our primary
+
+        my $crit;
+        my $info;
+
+        if(grep (/6504/, $networkDevice->hardwareType())) {
+            $crit = "answer ne '2'"
+        } else {
+            $crit = "answer ne '6'"
+        }
+
+        if(grep (/6504/, $networkDevice->hardwareType())) {
+            $info = "answer eq '2'"
+        } else {
+            $info = "answer eq '6'"
+        }
+
+        $queriesRef->{"$deviceName Active Supervisor module is"} = {
+            uiHint => 'Switch',
+            info => $info,
+            crit => $crit,
+            perl => "return qq($activeUnitModule)",
+            inf_field => "activeSupervisorStatus",
+            inf_tags => qq|datacenter="$datacenter",deviceName="$deviceName",uiHint="Switch"|,
+            inf_default => 0,
+            group_by => "$datacenter,$deviceName,Switch",
+        };
+
+        $queriesRef->{"$deviceName Standby module state is"} = {
+            uiHint => 'Switch',
+            info => "answer eq 'standbyHot'",
+            crit => "answer ne 'standbyHot'",
+            perl => "return qq($peerUnitState)",
+            inf_field => "standbySupervisorStatus",
+            inf_tags => qq|datacenter="$datacenter",deviceName="$deviceName",uiHint="Switch"|,
+            inf_default => 0,
+            group_by => "$datacenter,$deviceName,Switch",
+        };
+    }
+}
+
+# This code works for F5 devices only.  It does not work for cisco/css
+sub checkBigIpFailoverState {
+    my $queriesRef = shift;
+    my $datacenter = shift;
+
+    # Any hosts with 'os = bigip' is an F5 host.
+    my %bigIpProperties = (
+        'datacenter'    => $datacenter,
+        'status'        => 'inservice',
+        'os'            => 'bigip',
+    );
+    my @machines = ariba::Ops::Machine->machinesWithProperties(%bigIpProperties);
+
+    for my $machine (@machines) {
+        my $hostname = $machine->hostname();
+
+        # $activeBigIpHostname was hard coded and thus would not work for multiple services
+        # If we detect an F5 device with '-1' in it's name string then we assume this is the
+        # expected active device.  All other F5 devices for the service are viewed as stand by
+        my $activeBigIpHostname = 'dummy';
+        $activeBigIpHostname = $hostname if $hostname =~ /\-1\./;
+        my $activeUnit = $hostname eq $activeBigIpHostname;
+
+        # SNMP queries against an F5 device using an oid 'word' do not work.
+        # Instead, we need to use the iod 'number'.
+        # When doing an snmp->get we need to specify and 'index' indicating which value we want returned.
+        # In our case we want the value of the first index so the index number is '0'
+        # Structure wise we contatenate the index to the end of the number separated by a '.'
+        # This will get properly parsed in the snmp module.
+        # Our find result is this: '.1.3.6.1.4.1.3375.2.1.14.3.1' . '.' . '0'
+        $queriesRef->{"$hostname failover state"} = {
+            info    => 1,
+            crit    => $activeUnit ? "answer ne '$BIGIP_ACTIVE_STATE'" : "answer ne '$BIGIP_STANDBY_STATE'",
+            snmp    => "$hostname, .1.3.6.1.4.1.3375.2.1.14.3.1.0",
+            processAnswer => sub { main::translateFailoverAnswer() },
+            uiHint  => 'bigip',
+            inf_field => "failoverState",
+            inf_tags => qq|datacenter="$datacenter",deviceName="$hostname",uiHint="bigip"|,
+            inf_default => 0,
+            group_by => "$datacenter,$hostname,bigip",
+        };
+    }
+}
+
+sub translateFailoverAnswer {
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+    if ($query->results() eq '4') {
+        return $BIGIP_ACTIVE_STATE;
+    } elsif ($query->results() eq '3') {
+        return $BIGIP_STANDBY_STATE;
+    } else {
+        return $query->results() ? $query->results() : 'unknown';
+    }
+}
+
+main();

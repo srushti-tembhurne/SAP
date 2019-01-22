@@ -1,0 +1,251 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/everywhere/diskstats-watcher#9 $
+#
+# Get the number of blocks read and written for each veritas volume
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::Veritas::Mapping;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::SNMP::Session;
+
+use Tie::RefHash;
+
+
+my $debug = 0;
+
+# Stats the scripts wants to retrieve
+my $statsToGet = {
+	
+	'name'          => 2,
+	'block read'    => 5,
+	'block written' => 9,
+};
+
+my $DISKSTATS = "/proc/diskstats";
+
+
+# Return the largest index of $statsToGet
+sub maxStatIndex {
+	my $statsToGetRef = shift;
+
+	my $maxIndex = -1;
+	foreach my $stat (keys(%$statsToGetRef)) {
+	
+		my $index = $statsToGetRef->{$stat};
+
+		$maxIndex = $index if ($index > $maxIndex);
+	
+	}
+
+	return $maxIndex;
+}
+
+sub processDiskStats {
+
+	my $stats = {};
+	
+	open( DISKSTATS, $DISKSTATS);
+
+	foreach my $line (<DISKSTATS>) {
+
+		my @deviceStats = split(/\s+/, $line);
+	
+		@deviceStats = grep {defined($_) && ($_ ne "")} @deviceStats;
+
+		# Does the line contain enough information ?
+		next unless (scalar(@deviceStats) > maxStatIndex($statsToGet)  );
+
+		my $deviceName = $deviceStats[2];
+		next unless ($deviceName =~ m/^\w+$/);
+
+
+		my $device = {};
+		foreach my $stat (keys(%$statsToGet)) {
+		
+			my $index = $statsToGet->{$stat};
+	
+			$device->{$stat} = $deviceStats[$index];
+	
+		}
+
+		$stats->{$deviceName} = $device;
+	}
+
+	close(DISKSTATS);
+
+
+	return $stats
+}
+
+sub matchVeritas {
+
+	my $diskStatsRef = processDiskStats();
+
+
+	#
+	# clear the object cache before we create a new vxMap
+	#
+	ariba::Veritas::Mapping->clearCache();
+	my $vxMap = ariba::Veritas::Mapping->new();
+
+
+	my %plexes;
+	tie %plexes, "Tie::RefHash";
+
+	my %blocksReadFromPlex;
+	tie %blocksReadFromPlex, "Tie::RefHash";
+
+	my %blocksWrittenFromPlex;
+	tie %blocksWrittenFromPlex, "Tie::RefHash";
+
+
+	# We are going to link each disk to the plex it belongs to
+	foreach my $osDisk (keys(%$diskStatsRef)) {
+
+		my $vDisk = $vxMap->diskFromOsName($osDisk);
+
+		# Is it part of VCS ?
+		next unless ($vDisk);
+	
+		# Retrieve the stats (blocks written, blocks read...)
+		my $diskInfoRef = $diskStatsRef->{$osDisk};
+
+		# Update each plex the disk belongs to
+		# N.B. : A disk cannot belong to more than one plex
+		foreach my $plex ($vDisk->plexes()){
+
+			# Add the plex to the hash of known plexes
+			$plexes{$plex}++;
+
+			$blocksReadFromPlex{$plex} = 0 unless (defined($blocksReadFromPlex{$plex}));
+			$blocksReadFromPlex{$plex} += $diskInfoRef->{'block read'};
+
+			$blocksWrittenFromPlex{$plex} = 0 unless (defined($blocksWrittenFromPlex{$plex}));
+			$blocksWrittenFromPlex{$plex} += $diskInfoRef->{'block written'};
+		}
+	}
+
+	my %blocksReadFromVolume;
+	tie %blocksReadFromVolume, "Tie::RefHash";
+
+	my %blocksWrittenFromVolume;
+	tie %blocksWrittenFromVolume, "Tie::RefHash";
+
+	# Organize data per volume
+	# N.B. : There is only one plex per volume
+	foreach my $plex (keys(%plexes)) {
+		my $volume = $plex->volume();
+
+		$blocksReadFromVolume{$volume} = $blocksReadFromPlex{$plex} if (defined($blocksReadFromPlex{$plex}));
+
+		$blocksWrittenFromVolume{$volume} = $blocksWrittenFromPlex{$plex} if (defined($blocksReadFromPlex{$plex}));
+	}
+
+
+	
+	my %blocksWritten = map {$_->instance() => $blocksWrittenFromVolume{$_}} keys(%blocksWrittenFromVolume);
+	my %blocksRead = map {$_->instance() => $blocksReadFromVolume{$_}} keys(%blocksReadFromVolume);
+	return (\%blocksRead, \%blocksWritten);
+}
+
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+	my $service;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; };
+		if ($arg =~ /^-d/o) { $debug = 1; };
+	}
+
+	my $me       = ariba::rc::InstalledProduct->new();
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+
+
+	my ($blocksReadRef, $blocksWrittenRef) = matchVeritas();
+	my @datacenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+
+
+	foreach my $datacenter (@datacenters) {
+
+		my %queries;
+
+		foreach my $volume (keys(%$blocksReadRef)) {
+
+			my $blocksRead = $blocksReadRef->{$volume};
+
+			my $volumeShort = $volume;
+			$volumeShort =~ s/^\S+\/(\S+)$/$1/;
+	
+			if (defined($blocksReadRef->{$volume})) {
+				$queries{"MB read for $hostname:$volumeShort"} = {
+						'recordMaxResults' => 20000,
+						'recordDataType' => 'counter',
+						'recordDataUnits' => 'per sec',
+						'info' => "1",
+						'format' => "%d MB\n",
+						'uiHint' => "$hostname/$volumeShort",
+						'perl' => sub { return $blocksRead / 1024 * 512 / 1024; },
+                        "inf_field" => "MBRead",
+                        "inf_tags" => qq|datacenter="$datacenter",hostname="$hostname",volume="$volumeShort"|,
+                        "inf_default" => 0,
+                        "group_by" => "$datacenter,$hostname,$volumeShort",
+				};
+			}
+		}
+
+		foreach my $volume (keys(%$blocksWrittenRef)) {
+
+			my $blocksWritten = $blocksWrittenRef->{$volume};
+
+			my $volumeShort = $volume;
+			$volumeShort =~ s/^\S+\/(\S+)$/$1/;
+
+			if (defined($blocksWrittenRef->{$volume})) {
+				$queries{"MB written for $hostname:$volumeShort"} = {
+						'recordMaxResults' => 20000,
+						'recordDataType' => 'counter',
+						'recordDataUnits' => 'per sec',
+						'info' => "1",
+						'format' => "%d MB\n",
+						'uiHint' => "$hostname/$volumeShort",
+						'perl' => sub { return $blocksWritten / 1024 * 512 / 1024; },
+                        "inf_field" => "MBWritten",
+                        "inf_tags" => qq|datacenter="$datacenter",hostname="$hostname",volume="$volumeShort"|,
+                        "inf_default" => 0,
+                        "group_by" => "$datacenter,$hostname,$volumeShort",
+				};
+			}
+		}
+
+
+		my $email = $me->default('notify.email');
+		my $pager = $me->default('notify.pagers');
+		my $tab   = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+        $queries{influx_details} = {measurement => "diskstats-watcher"};
+		my $qm = ariba::monitor::QueryManager->newWithDetails("diskstats-watcher", $tab, $me->service(), $me->customer(), \%queries);
+
+		$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+	}
+
+}
+
+
+main();
+
+__END__

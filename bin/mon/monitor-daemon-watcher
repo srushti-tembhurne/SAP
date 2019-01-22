@@ -1,0 +1,112 @@
+#!/usr/local/bin/perl -w
+
+# $Id$
+#
+# Watch the monitoring daemons
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProcessTable;
+use ariba::Ops::ServiceController;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+
+my $debug = 0;
+
+sub main {
+	my $sendEmail = 0;
+        my $sendPage  = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if( $arg =~ /^-e/o ){ $sendEmail = 1; };
+		if( $arg =~ /^-p/o ){ $sendPage = 1; };
+		if( $arg =~ /^-d/o ){ $debug = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my @products = ariba::rc::InstalledProduct->installedProductsList($me->service());
+
+	my %queries   = ();
+
+	my @primaryProcesses = (
+		"queryd",
+		"status-checkerd",
+		"stale-markerd",
+		"paged",
+		"outaged",
+	);
+
+	if (ariba::Ops::ServiceController::checkFunctionForService($me->service(), 'primary-procs')) {
+		push (@primaryProcesses, "logwatcher" ) 
+	}
+
+	push (@primaryProcesses, "copy-to-shared-fs mon" ) if $me->service() ne "pd";
+
+	my @secondaryProccesses = (
+		"copy-from-shared-fs mon",
+		"proxy-queryd",
+	);
+	push (@secondaryProccesses, "copy-from-shared-fs an") if (grep /^an$/, @products);
+	
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $cluster = $me->currentCluster();
+
+	my @processes;
+	my $tab;
+
+	if ($me->servesRoleInCluster($hostname, 'monserver', $cluster)) {
+		@processes = @primaryProcesses;
+		$tab = $me->name();
+	} elsif ($me->servesRoleInCluster($hostname, 'backup-monserver', $cluster)) {
+		@processes = @secondaryProccesses;
+		$tab = ariba::monitor::StatusPage::disasterRecoveryProduct();
+	} else {
+		exit(0);
+	}
+
+	# Walk the process table.
+	my $processTable = ariba::Ops::ProcessTable->new();
+
+	for my $process (sort @processes) {
+                my $process_name= $process;
+                $process_name=~ s/ /_/g;
+		my $status = $processTable->processWithNameExists($process) ? 0 : 1;
+		my $openTicket;
+		my $openTicketService;
+	
+		unless (ariba::Ops::ServiceController::isProductionServicesOnly($me->service())) {
+			$openTicket = 15;
+			$openTicketService = "all";
+		}
+
+		$queries{$process} = {
+			info => "answer eq 0",
+			crit => "answer eq 1",
+			perl => "return '$status'",
+			ticketOnWarnOpenAfterMinutes => $openTicket,
+			openTicketInServices => $openTicketService,
+                        inf_field => "$process_name",
+                        inf_default => 0,
+		};
+	}
+	$queries{"influx_details"} = { 'measurement' => "monitor_daemon_watcher" };
+	my $email = $me->default('notify.email');
+
+	my $q = ariba::monitor::QueryManager->newWithDetails(
+			"monitor-daemon-watcher", 
+		 	$tab, 
+			$me->service(), 
+			$me->customer(),
+			\%queries
+	);
+        #$queries{"influx_details"} = { 'measurement' => "monitor_daemon_watcher" };
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();
+
+__END__

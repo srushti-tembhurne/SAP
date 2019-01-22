@@ -1,0 +1,89 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/common/realm-reclaim-status#2 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DateTime;
+
+sub main {
+	my $debug = 0;
+	my $quiet = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $productName;
+
+	while(my $arg=shift(@ARGV)){
+			print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+			if($arg =~ /^-d/o){ $debug=1; }
+			if($arg =~ /^-e/o){ $sendEmail=1; };
+			if($arg =~ /^-p$/o){ $sendPage=1; };
+			if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $cluster = $me->currentCluster();
+	my $service = $me->service();
+
+	my $product;
+	unless (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
+		exit(0);
+	}
+	$product = ariba::rc::InstalledProduct->new($productName, $service);
+
+	my %queries  = ();
+
+	$queries{"Realm delete candidates (ID, Name, Time State Changed)"} = {
+		'info' => 1,
+		'crit' => 'numrows >= 1',
+		'ticketOnWarnOpenAfterMinutes' => 1,
+		'sql' => "select ID, NAME, LABEL, to_char(TIMESTATECHANGED, 'MM/DD/YY, HH:MI:SS AM')
+			from realmtab where sysdate - TIMESTATECHANGED > 180
+			and state = 'assigned'
+			order by ID",
+	};
+
+	$queries{"Freemium realm delete candidates (ID, Name, State)"} = {
+		'info' => 1,
+		'crit' => 'numrows >= 1',
+		'ticketOnWarnOpenAfterMinutes' => 1,
+		'sql' => q`select Rea1.rp_Id, rt.NAME, rt.label, rt.State
+			from RealmProfileTab Rea1, BaseIdTab Bas2, us_FeatureTab us_3, RealmTab rt
+			where Rea1.rp_Id=rt.Id
+			and Rea1.rp_Features = Bas2.lvId
+			and Rea1.rootId = Bas2.rootId
+			and Bas2.val = us_3.rootId
+			and (Bas2.val LIKE 'AAAAACU%')
+			and (Bas2.rootId LIKE 'AAAAAAd%')
+			and (us_3.ph_UniqueName IN ('Ariba Start Sourcing', 'Ariba Start Contracts'))
+			and (Rea1.rp_Active = 1)
+			and (Rea1.rp_PurgeState = 0)
+			and (Rea1.rp_PartitionNumber = 0)
+			and (us_3.ph_Active = 1)
+			and (us_3.ph_PurgeState = 0)
+			and (us_3.ph_PartitionNumber = 0)
+			and rt.state = 'assigned'
+			and sysdate - TIMESTATECHANGED > 10
+			order by 1 ASC`,
+	};
+
+	my $email = $me->default('notify.email');
+
+	my $q = ariba::monitor::QueryManager->newWithDetails(
+		"realm-delete-status", $product->name(), $service, $product->customer(), \%queries
+	);
+
+	$q->setSQLConnectInfo($product->connectInfoForOracleClient());
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+}
+
+main();

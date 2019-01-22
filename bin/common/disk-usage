@@ -1,0 +1,393 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/common/disk-usage#126 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::MachineProductInfo;
+use ariba::Ops::DatacenterController;
+use ariba::monitor::CircularDB;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::DatacenterController;
+use ariba::Ops::ServiceController;
+use ariba::Ops::Constants;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $debug = 0;
+
+    while(my $arg=shift(@ARGV)){
+        if($arg =~ /^-d/o){ $debug = 1; };
+        if($arg =~ /^-e/o){ $sendEmail = 1; };
+        if($arg =~ /^-p/o){ $sendPage = 1; };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $service = $me->service();
+    my $cluster = $me->currentCluster();
+    my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+
+    for my $datacenter ( @dataCenters ) {
+
+                my %matchDatacenter = (
+                        status => 'inservice',
+                        datacenter => $datacenter,
+                        os => 'sunos,linux,redhat,hp-ux,ontap,windows2003,suse,cdot',
+                        monitoringDatacenter => '',
+                );
+
+                my %matchMonitoringDatacenter = (
+                        status => 'inservice',
+                        monitoringDatacenter => $datacenter,
+                        os => 'sunos,linux,redhat,hp-ux,ontap,suse,cdot',
+                );
+
+                # VMs are marked as outofservice because they do not want cfengine to update them
+                my %matchVirtualMachinesInDatacenter = (
+                        status      => 'outofservice',
+                        datacenter  => $datacenter,
+                        os      => 'redhat',
+                        hardwareType    => 'VM',
+                );
+
+                my @machines = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+                push(@machines, ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+                push(@machines, ariba::Ops::Machine->machinesWithProperties(%matchVirtualMachinesInDatacenter));
+
+                my %queries = ();
+
+        for my $machine (@machines) {
+
+            my $hostname = $machine->hostname();
+            my $cdbs     = ariba::monitor::CircularDB->listDBs("snmp/$hostname",'Disk');
+
+            for my $cdb (@$cdbs) {
+
+                my $file = $cdb->name();
+
+                my @path = split /\//, $file;
+                my $name = pop @path;
+                   $file =~ s/\s/_/g;
+
+                ## TMID: 122093 - Adding check for inode usage
+                next unless $name =~ /(?:Disk Usage|Inode)/;
+
+                my $filesystem = '';
+
+                if ($machine->os() =~ /windows/) {
+                    ($filesystem) = ($name =~ m| (\w\:)|);
+                } else {
+                    $name =~ s|:|/|;
+                    ($filesystem) = ($name =~ m! ((?:/|aggr)\S*)$!);
+                }
+
+                next unless defined $filesystem and $filesystem !~ /^\s*$/;
+                next if $filesystem =~ m!^/(?:proc|dev|dev:odm|cdrom[0-9]*|bcv.*|etc:mnttab)$!;
+
+                # NetApp returns values for "aggregate snapshot
+                # usage", which is bogus, because aggregates are
+                # not real filesystems, and cannot have any
+                # snapshots.  Ignore any such reported value.
+                next if $filesystem =~ m|aggr\d/\.snapshot|;
+
+                my $warn = 75;
+                my $crit = 85;
+                my $openTicket;
+                my $pageInServices;
+                my $openTicketInServices;
+
+                if ( (grep (/^fs$/, $machine->providesServices()) ) && ($name =~ m|Percent Disk Usage for |i) && ($filesystem =~ m|aggr0|)) {
+                    $crit = 97;
+                }
+                if ($datacenter eq 'snv') {
+                    $openTicket = 30;
+                }
+
+                # jira-id: HOA-4161, adding paging for sales
+                if ($datacenter eq 'sales') {
+                    $openTicket = 30;
+                    $pageInServices = 'sales';
+                    $openTicketInServices = 'sales';
+                }
+
+                # tmid:168669
+                if ( (grep (/^hadoop$/, $machine->providesServices()) ) && (ariba::Ops::DatacenterController::isProductionDatacenters($datacenter)) && ($name =~ m|Percent Disk Usage for /$|i) ) {
+                    $warn = 80;
+                    $crit = 90;
+                    # tmid:173038
+                    undef $openTicket;
+                }
+
+                # Prod thresholds
+                if (!(ariba::Ops::DatacenterController::isDevlabDatacenters($datacenter))) {
+                    if ($filesystem =~ m|^/ora|) {
+                        # Want to crit on min of 95% or 250G left
+                        # tmid: 153238
+                        
+                        $warn = 88;
+                        $crit = 95;
+                        
+                        my $critSpace = 250;
+
+                        # get the absolute and percent usage for the volume
+                        my @path = split /:/, $file;
+                        my $volName = pop @path;
+                        
+                        my ($diskUsagePercent, $diskUsageInGB);
+                        
+                        my $diskUsageQueryName = "snmp/$hostname/Percent_Disk_Usage_for_:$volName";
+                        if (ariba::monitor::Query->objectWithNameExists($diskUsageQueryName)) {
+                            my $query = ariba::monitor::Query->new($diskUsageQueryName);
+                            my $diskCdb = $query->cdb();
+                            $diskUsagePercent = int($diskCdb->aggregateUsingFunctionForRecords('average', '+1'));
+                        }
+
+                        $diskUsageQueryName = "snmp/$hostname/Disk_Usage_in_GByte_for_:$volName";
+                        if (ariba::monitor::Query->objectWithNameExists($diskUsageQueryName)) {
+                            my $query = ariba::monitor::Query->new($diskUsageQueryName);
+                            my $diskCdb = $query->cdb();
+                            $diskUsageInGB = int($diskCdb->aggregateUsingFunctionForRecords('average', '+1'));
+                        }
+                        
+                        if ($diskUsagePercent && $diskUsageInGB) {
+                            my $diskTotalSize = $diskUsageInGB * 100 / $diskUsagePercent;
+                            # if 5 percent of the volume is more than our space threshold
+                            # we want to adjust the crit to match it
+                            if (($diskTotalSize * 5 / 100) > $critSpace) {
+                                $crit = ($diskTotalSize - $critSpace) / $diskTotalSize * 100;
+                            }
+                        }
+                    }
+
+                    # lower the warn for filesystems with logs on them
+                    # to give more time to DBAs to catch growing logs
+                    if ($filesystem =~ m|^/ora.*\d+log\d+|) {
+                        $warn = 80;
+                        $crit = 85;
+                    }
+
+                    #
+                    # lower thresholds on s4/SSSPRO2 logs to give DBAs time
+                    # to catch and correct issues
+                    # Also lowered for anl/ALPRO1
+                    if ($filesystem =~ m!^/ora(02|11)log0[12]!) {
+                        $warn = 60;
+                        $crit = 70;
+                    }
+
+                    # TMID 50546
+                    if ($filesystem =~ m|^/vol:vol1|) {
+                        $warn = 90;
+                        $crit = 94;
+                    }
+
+                    # TMID 53854
+                    if ($filesystem =~ m|^/vol:vol3|) {
+                        $warn = 90;
+                        $crit = 94;
+                    }
+
+                    # TMID 100248
+                    if ($filesystem =~ m|^/fpc|) {
+                        $warn = 98;
+                        $crit = 99;
+                    }
+                    # TMID 145764
+                    if ($filesystem =~ m|^/vol:s4prod|) {
+                        $warn = 85;
+                        $crit = 95;
+                        }
+                    #TMID 145764
+                    if ($filesystem =~ m|^/vol:buyerprod|) {
+                        $warn = 85;
+                        $crit = 95;
+                        }
+                    #TMID 142188
+                    if ($filesystem =~ m|^/vol:anprod|) {
+                        $warn = 85;
+                        $crit = 98;
+                        }
+					#HOA-18483
+					if ($filesystem =~ m|^/hana:log|){
+						$warn = 65;
+						$crit = 70;
+					}
+
+                    # HOA-59347
+                    # Allow higher threshold for crit level for aggregate types.
+                    if ($filesystem =~ /aggr\d/ && $hostname =~ /^nfs/) {
+                        $crit = 95;
+                    }
+
+                    # HOA-79741
+                    if ( $filesystem =~ /vol:hdbbackup:$/ && $hostname =~ 'nfs61.snv.ariba.com' ) {
+                        $crit = 90;
+                    }
+
+                } # end of Prod thresholds
+
+                # sysadm threshold tweaks
+                if ($filesystem =~ m!^/opt!) {
+                    $warn = 90;
+                    $crit = 95;
+                }
+                if ($filesystem =~ m|snapshot|) {
+                    $warn = 90;
+                    $crit = undef;
+                }
+
+                if ($name =~ m/Percent Disk Usage/) {
+                    my $note;
+                    my $path = "http://ops.ariba.com/documentation/prodops/common/umount_mount_DB_volume.txt";
+                    if ($machine->provides('db')) {
+                        $note = "For initial debugging refer to $path";
+                    }
+                    
+                    $queries{"$hostname $filesystem used"} = {
+                        format => "%.0f%%\n",
+                        uiHint => $hostname,
+                        info => "answer eq '' or answer > -1",
+                        extractRecorded => "average(snmp/$file, +2)",
+                        ticketOnWarnOpenAfterMinutes => $openTicket,
+                        pageInServices => $pageInServices,
+                        openTicketInServices => $openTicketInServices,
+                        note => $note,
+                        details => {
+                            "$hostname product roles" => {
+                                noRowCount => 1,
+                                perl => sub { 
+                                    return ariba::Ops::MachineProductInfo->topProductRolesForServiceAndHost($me->service(), $hostname);
+                                }, 
+                            },
+                        },
+                        inf_field => "disk_usage_pct",
+                        inf_tags => qq|cluster=$cluster,service=$service,hostname=$hostname,filesystem=$filesystem|,
+                        inf_default => 0,
+                        group_by => "$datacenter,$hostname"
+                    };
+
+                    $queries{"$hostname $filesystem used"}->{"warn"} = "answer eq '' or answer > $warn" if defined($warn);
+                    $queries{"$hostname $filesystem used"}->{"crit"} = "answer ne '' and answer > $crit" if defined($crit);
+		    if($filesystem =~m|piwik|i) {
+				 $queries{"$hostname $filesystem used"}->{"correctiveActions"} = [
+                    			Ops => 'Please refer the wiki --> https://wiki.ariba.com/pages/viewpage.action?title=Monitoring+piwik+for+pending+data+loads+and+disk+space+usage&spaceKey=ENGDPTS'
+                		];
+                $queries{"$hostname $filesystem used"}->{"note"} = 'Please refer the wiki --> https://wiki.ariba.com/pages/viewpage.action?title=Monitoring+piwik+for+pending+data+loads+and+disk+space+usage&spaceKey=ENGDPTS';
+			}
+    
+                    if ( $hostname =~ /^adm/ && ($datacenter eq "bou" || $datacenter eq "us1" )) {
+                        my $filesystem = "/fs";
+                        $queries{"$hostname:$filesystem used"} = {
+                            info => 1,
+                            perl => "return \"$filesystem not mounted with snapmirror live\"",
+                        };
+                    }
+                
+                    $queries{"$hostname $filesystem used crit threshold"} = {
+                        perl        => sub { return $crit },
+                        inf_field   => "disk_usage_pct_crit_threshold",
+                        inf_tags    => qq|cluster=$cluster,service=$service,hostname=$hostname,filesystem=$filesystem|,
+                        inf_default => 95,
+                        group_by    => "$datacenter,$hostname"
+                    }; 
+
+                    $queries{"$hostname $filesystem used warn threshold"} = {
+                        perl        => sub { return $warn },
+                        inf_field   => "disk_usage_pct_warn_threshold",
+                        inf_tags    => qq|cluster=$cluster,service=$service,hostname=$hostname,filesystem=$filesystem|,
+                        inf_default => 85,
+                        group_by    => "$datacenter,$hostname"
+                    }; 
+                } elsif ( $name =~ m/Inode/ ){
+                    
+                    $queries{"$hostname $filesystem percent inodes used"} = {
+                        format                        => "%.0f%%\n",
+                        uiHint                        => $hostname,
+                        info                          => "answer <= 70",
+                        warn                          => "answer > 70",
+                        crit                          => "answer > 85",
+                        extractRecorded               => "average(snmp/$file, +2)",
+                        ticketOnWarnOpenAfterMinutes  => $openTicket,
+                        pageInServices => $pageInServices,
+                        openTicketInServices => $openTicketInServices,
+                        details => {
+                            "$hostname product roles" => {
+                                noRowCount => 1,
+                                perl => sub {
+                                    return ariba::Ops::MachineProductInfo->topProductRolesForServiceAndHost($me->service(), $hostname);
+                                },
+                            },
+                        },
+                        inf_field => "inode_used_pct",
+                        inf_tags => qq|cluster=$cluster,service=$service,hostname=$hostname,filesystem=$filesystem|,
+                        inf_default => 0,
+                        group_by => "$datacenter,$hostname"
+                    };
+                
+                } else {
+
+                    $queries{"$hostname $filesystem used (Absolute)"} = {
+                        format => "%4.2fGB\n",
+                        uiHint => $hostname,
+                        info => "1",
+                        extractRecorded => "average(snmp/$file, +2)",
+                        inf_field => "disk_used_absolute_gb",
+                        inf_tags => qq|cluster=$cluster,service=$service,hostname=$hostname,filesystem=$filesystem|,
+                        inf_default => 0,
+                        group_by => "$datacenter,$hostname"
+                    };
+
+                    # growth rates, tmid: 153238
+                    $queries{"$hostname $filesystem growth rate (Absolute)"} = {
+                        format => "%4.2fGB\n",
+                        uiHint => $hostname,
+                        info => "1",
+                        extractRecorded => "change(snmp/$file, +2)",
+                        recordMaxResults => 110000,
+                        recordDataType => "gauge",
+                        inf_field => "growth_rate_gb",
+                        inf_tags => qq|cluster=$cluster,service=$service,hostname=$hostname,filesystem=$filesystem|,
+                        inf_default => 0,
+                        group_by => "$datacenter,$hostname"
+                    };
+                }
+            }
+        }
+
+        my $email = $me->default('notify.email');
+
+        #Adding service owners as per HOA-24627
+        if($email) {
+           $email .= ",".ariba::Ops::Constants->serviceOwnersEmailNotificationAddress();
+        }   
+        # this is to help monitor devlab disk usage
+        if (!(ariba::Ops::ServiceController::isProductionServicesOnly($me->service()))) {
+
+            # for every non-production service, send out this notification
+            # only once for all devlab services.
+            if (ariba::Ops::ServiceController::isDevServiceOnly($me->service()) && 
+                ariba::Ops::DatacenterController::isDevlabDatacenters($datacenter)) {
+                $email = $me->default('notify.dba');
+            }
+
+            print "Notice: sending notification mail to $email\n" if ($debug);
+        }
+
+        $queries{influx_details} = {measurement => "dc_disk_usage"};
+        my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+        my $q = ariba::monitor::QueryManager->newWithDetails("disk-usage", $pn, $me->service(), $me->customer(), \%queries);
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+main();
+
+__END__

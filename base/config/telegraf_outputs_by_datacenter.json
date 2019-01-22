@@ -1,0 +1,50 @@
+{
+    "lab1": {
+        "primary": [
+            {
+                "output_type": "influxdb",
+                "parameters": [
+                    "urls = [\"http://influxdb.lab1.ariba.com:8086\"]",
+                    "database = \"stratus\"",
+                    "retention_policy = \"30d\"",
+                    "write_consistency = \"any\"",
+                    "timeout = \"5s\"",
+                    "username = \"admin\"",
+                    "password = \"admin\"",
+                    "# user_agent = \"telegraf\"",
+                    "# udp_payload = 512",
+                    "## Optional SSL Config",
+                    "# ssl_ca = \"/etc/telegraf/ca.pem\"",
+                    "# ssl_cert = \"/etc/telegraf/cert.pem\"",
+                    "# ssl_key = \"/etc/telegraf/key.pem\"",
+                    "## Use SSL but skip chain & host verification",
+                    "# insecure_skip_verify = false"
+                ]
+            }
+        ]
+    },
+    "snv": {
+        "primary": [
+            {
+                "output_type": "influxdb",
+                "parameters": [
+                    "urls = [\"http://app713.snv.ariba.com:8086\"]",
+                    "database = \"stratus\"",
+                    "retention_policy = \"30d\"",
+                    "write_consistency = \"any\"",
+                    "timeout = \"5s\"",
+                    "username = \"admin\"",
+                    "password = \"admin\"",
+                    "# user_agent = \"telegraf\"",
+                    "# udp_payload = 512",
+                    "## Optional SSL Config",
+                    "# ssl_ca = \"/etc/telegraf/ca.pem\"",
+                    "# ssl_cert = \"/etc/telegraf/cert.pem\"",
+                    "# ssl_key = \"/etc/telegraf/key.pem\"",
+                    "## Use SSL but skip chain & host verification",
+                    "# insecure_skip_verify = false"
+                ]
+            }
+        ]
+    }
+}

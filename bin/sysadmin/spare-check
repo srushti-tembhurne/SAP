@@ -1,0 +1,153 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/sysadmin/spare-check#16 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::CircularDB;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::monitor::misc;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $debug = 0;
+
+	#
+	# hash of datacenters/machine types that need even/odd queries
+	# see TMID: 46663
+	#
+	my %evenOddCheck = (
+		'snv' => 1,
+				'poweredgec6105,x4140' => 1,
+				'x4100m2' => 1,
+	);
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; };
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+
+	my $cluster = $me->currentCluster();
+
+
+		my @typesToMonitor = ( 'poweredgec6105,x4140', 'x4100m2' );
+
+	for my $datacenter ( @dataCenters ) {
+		my %queries = ();
+		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+		for my $types (@typesToMonitor) {
+
+			my $evenOdd = 0;
+
+			if($evenOddCheck{$datacenter} && $evenOddCheck{$types}) {
+				$evenOdd = 1;
+			}
+
+			my %match = (
+				status	 => 'spare',
+				datacenter => $datacenter,
+				hardwareType => $types,
+			);
+	
+			my @machines = ariba::Ops::Machine->machinesWithProperties(%match);
+			
+			if($evenOdd) {
+				my $warn = 5;
+				my $crit = 1;
+
+				unless($datacenter eq 'snv') {
+					$warn = 1;
+					$crit = 0;
+				}
+
+
+				# We need to look at the machines and count even/odd
+				my $even = 0;
+				my $odd = 0;
+
+				foreach my $m (@machines) {
+					my $hostname = $m->hostname();
+					if($hostname =~ m/^[^\d]+(\d+)\./) {
+						my $n = $1;
+						if($n % 2) {
+							$odd++;
+						} else {
+							$even++;
+						}
+					}
+				}
+
+				$queries{"Odd spare $types"} = {
+					info => "1",
+					warn => "answer eq '' or answer < $warn",
+					crit => "answer ne '' and answer <= $crit",
+					perl => sub {return $odd;},
+					inf_field => "oddSpareNumber",
+					inf_tags => qq|datacenter="$datacenter",types=>"$types"|,
+					inf_default => 0,
+					group_by => "$datacenter,$types",
+				};
+
+				$queries{"Even spare $types"} = {
+					info => "1",
+					warn => "answer eq '' or answer < $warn",
+					crit => "answer ne '' and answer <= $crit",
+					perl => sub {return $even;},
+					inf_field => "evenSpareNumber",
+					inf_tags => qq|datacenter="$datacenter",types=>"$types"|,
+					inf_default => 0,
+					group_by => "$datacenter,$types",
+				};
+
+				$queries{"Odd-Even spare warn threshold $types"} = {
+					perl      => sub { $warn },
+					inf_field => "oesn_warn_threshold",
+					inf_tags  => qq|datacenter="$datacenter",types=>"$types"|,
+					group_by  => "$datacenter,$types",
+				};
+
+				$queries{"Odd-Even spare crit threshold $types"} = {
+					perl      => sub { $crit },
+					inf_field => "oesn_crit_threshold",
+					inf_tags  => qq|datacenter="$datacenter",types=>"$types"|,
+					group_by  => "$datacenter,$types",
+				};
+
+			} else {
+				my $warn = 1;
+				my $doWarn = grep { $pn eq $_ } qw(snv pridc); 
+				$queries{"Spare $types"} = {
+					info => "1",
+					warn => $doWarn ? "answer eq '' or answer < $warn" : undef,
+					# crit => "answer ne '' and answer <= $crit",
+					perl => sub {return scalar(@machines);},
+					inf_field => "SpareNumber",
+					inf_tags => qq|datacenter="$datacenter",types=>"$types"|,
+					inf_default => 0,
+					group_by => "$datacenter,$types",
+				};
+			}
+		}
+		my $email = $me->default('notify.email');
+		
+		$queries{influx_details} = {measurement => "Spare-machines"};
+		my $q = ariba::monitor::QueryManager->newWithDetails("Spare machines", $pn, $me->service(), $me->customer(), \%queries);
+		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+main();
+
+__END__

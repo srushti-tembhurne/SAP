@@ -1,0 +1,60 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::DateTime;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use Data::Dumper;
+
+sub main
+{
+    my $me = ariba::rc::InstalledProduct->new();
+
+    foreach my $product (ariba::rc::InstalledProduct->installedProductsList($me->service()))
+    {
+        my $product_name = $product->name();
+        my $deployment   = $product->buildName();
+        my $release_name = $product->releaseName() . " ";  ### Convert the data to a string i.e 42.0 will become "42.0 "
+        my $deployed_on  = ariba::Ops::DateTime::prettyTime($product->deployedOn());
+        my $service      = $product->service();
+        my @clusters     = $product->allClusters();
+        my $clusters     = join (",", @clusters);
+
+        my %queries;
+        $queries{'clusters'} = {
+                                perl      => sub {return $clusters},
+                                inf_field => "clusters",
+                                group_by  => qq(product_name="$product_name"),
+                               };
+        $queries{'deployed_on'} = {
+                                   perl      => sub {return $deployed_on},
+                                   inf_field => "deployed_on",
+                                   group_by  => qq(product_name="$product_name"),
+                                  };
+        $queries{'deployment'} = {
+                                  perl      => sub {return $deployment},
+                                  inf_field => "deployment",
+                                  group_by  => qq(product_name="$product_name"),
+                                 };
+        $queries{'release'} = {
+                               perl      => sub {return $release_name},
+                               inf_field => "release",
+                               inf_field_type => "string",
+                               group_by  => qq(product_name="$product_name"),
+                              };
+
+        $queries{influx_details} = {measurement => "product_info"};
+        my $qm = ariba::monitor::QueryManager->newWithDetails("product_info", $product_name, $service, undef, undef, \%queries);
+        $qm->processQueries();
+
+    }
+}
+
+main(@ARGV);
+
+__END__
+
+

@@ -1,0 +1,72 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <artifactId>mon</artifactId>
+    <name>mon</name>
+    <version>0.01</version>
+    <packaging>jar</packaging>
+
+    <parent>
+        <groupId>ariba.devtools</groupId>
+        <artifactId>ariba-parent</artifactId>
+        <version>1.0.33</version>
+        <relativePath/>
+    </parent>
+
+    <description>
+    $Id: //ariba/services/release/tools/3.0.0+/pom.xml#16 $
+    ops tools overlay
+    </description>
+
+
+    <scm>
+        <url> https://github.wdf.sap.corp/Ariba-Ops</url>
+        <connection>scm:git:git://github.wdf.sap.corp/Ariba-Ops/mon.git</connection>
+        <developerConnection>scm:git:git@github.wdf.sap.corp:Ariba-Ops/mon.git</developerConnection>
+    
+    </scm>
+
+
+    <properties>
+        <overlay.dest>assemblyroot</overlay.dest>
+    </properties>
+
+    <build>
+        <plugins>
+            <plugin>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <executions>
+                   <execution>
+                        <id>move-resources</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
+                        <configuration>
+                            <target>
+                                <mkdir dir="${overlay.dest}"/>
+                                <copy todir="${overlay.dest}" overwrite="true" verbose="true">
+                                    <fileset dir="${project.basedir}">
+                                        <exclude name="target/**"/>
+                                        <exclude name="pom.xml"/>
+                                        <exclude name="component.bdf"/>
+                                    </fileset>
+                                </copy>
+                            </target>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <artifactId>maven-jar-plugin</artifactId>
+
+                        <configuration>
+                            <classifier>assembly-resources</classifier>
+                            <classesDirectory>
+                               ${project.build.directory}/assemblyroot
+                            </classesDirectory>
+                        </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

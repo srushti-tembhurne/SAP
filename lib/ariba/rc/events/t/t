@@ -1,0 +1,344 @@
+#!/usr/local/bin/perl
+#
+# Uncomment calls to functions at bottom of file to enable tests.
+#
+# t0: Write event to unknown channel
+# t1: Write event to critical channel
+# t2: Write event to debug channel
+# t3: Write event to robot18 channel, should call 
+#     ariba::Automation::RobotEventTrigger class and write to 
+#     10s2qual mainline channel
+# t4: Write large amount of HTML data to robot18, similar to t3.
+# t6: Test event-to-mail gateway
+# t7: Write events to 2 channels
+# t8: Test path where client specifies channel name
+# t9: Test tt/pre tags in description field
+
+$|++;
+use strict;
+use warnings;
+use Carp;
+use Data::Dumper;
+use ariba::rc::events::client::Event;
+use ariba::rc::events::Constants;
+use ariba::rc::events::DB;
+use ariba::rc::events::EventFilter::StripPerlWarnings;
+
+sub t11
+{
+	my $details = <<FIN;
+Test Event $$ please ignore<br>
+Too late to run INIT block at<br>
+derp derp derp<br>
+Too late to run INIT block at<br>
+derp derp<br>
+Too late to run INIT block at<br>
+derp<br>
+FIN
+
+    my $event = new ariba::rc::events::client::Event
+    (
+        {
+			channel_name => 'Builds: Test',
+            channel => 'builds_test',
+            title => "Test Event $$",
+            description => $details,
+        }
+    );
+
+	# my $filter = new ariba::rc::events::EventFilter::StripPerlWarnings();
+	# $filter->execute ($event);
+	# print $event->dump();
+	# exit();
+
+    my $ok = $event->publish();
+
+    if (! $ok)
+    {
+        carp "Failed to publish event\n";
+    }
+    else
+    {
+        print "ok\n";
+    }
+    print $event->dump();
+}
+
+sub t10
+{
+    my $event = new ariba::rc::events::client::Event
+    (
+        {
+			channel_name => "Deploy Request: s4",
+            channel => 'deploy_request_product_s4',
+            title => "Test Event $$",
+            description => "Test Event " . localtime (time()),
+        }
+    );
+
+    my $ok = $event->publish();
+
+    if (! $ok)
+    {
+        carp "Failed to publish event\n";
+    }
+    else
+    {
+        print "ok\n";
+    }
+    print $event->dump();
+}
+
+sub t9
+{
+	my $out = `df -h`;
+	$out = $out; # join "<br>", (split /\n/, $out);
+    my $event = new ariba::rc::events::client::Event
+    (
+        {
+            channel => 'debug',
+            title => "test test",
+            description => 
+				"The text below should be surrounded with tt/pre tags: " . 
+				"<div style='background-color: #FFFF00;'>" . 
+				"<tt><pre>$out</pre></tt>" . 
+				"</div>" .
+				"HLAGHLAGHLAGHGALGHUALUG", 
+        }
+    );
+
+    my $ok = $event->publish();
+
+    if (! $ok)
+    {
+        carp "Failed to publish event\n";
+        print $event->dump();
+    }
+    else
+    {
+        print "ok\n";
+    }
+}
+
+sub t8
+{
+    my $event = new ariba::rc::events::client::Event
+    (
+        {
+			channel_name => 'Builds: Test',
+            channel => 'debug,builds_test',
+            title => "test test",
+            description => "$$ This is a test. Nothing more and nothing less, this will always be a test",
+        }
+    );
+
+    my $ok = $event->publish();
+
+    if (! $ok)
+    {
+        carp "Failed to publish event\n";
+        print $event->dump();
+    }
+    else
+    {
+        print "ok\n";
+    }
+}
+
+sub t7
+{
+    my $event = new ariba::rc::events::client::Event 
+    (
+        {
+            channel => 'critical,robot57',
+            # channel => 'critical',
+            title => "VOOTIE Event $$",
+            description => "VOOTIE " . localtime (time()),
+        }
+    );
+    
+    my $ok = $event->publish();
+    
+    if (! $ok)
+    {
+        carp "Failed to publish event\n";
+        print $event->dump();
+    }
+    else
+    {
+        print "ok\n";
+    }
+}
+
+sub t6
+{
+    my $event = new ariba::rc::events::client::Event
+    (
+        {
+            channel => 'hpage@ariba.com',
+            title => "E-mail test from RC Event Server",
+            description => "This is a test. Nothing more and nothing less, this will always be a test.",
+        }
+    );
+
+    my $ok = $event->publish();
+
+    if (! $ok)
+    {
+        carp "Failed to publish event\n";
+        print $event->dump();
+    }
+    else
+    {
+        print "ok\n";
+    }
+}
+
+sub t4
+{
+    my $buf = "";
+    open FILE, "data" || die $!;
+    while (<FILE>)
+    {
+        $buf .= $_;
+    }
+    close FILE;
+
+    print "Posting " . length ($buf) . " bytes...";
+
+    my $event = new ariba::rc::events::client::Event
+    (
+        {
+            channel => 'robot18',
+            title => "Test Event $$",
+            description => $buf,
+        }
+    );
+
+    my $ok = $event->publish();
+
+    if (! $ok)
+    {
+        print "FAIL\n";
+        print $event->dump();
+    }
+    else
+    {
+        print "ok\n";
+    }
+}
+
+sub t3
+{
+    my $event = new ariba::rc::events::client::Event 
+    (
+        {
+            channel => 'robot18',
+            title => "Test Event $$",
+            description => "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Etiam sit amet sem elit, nec tempus lectus. Ut vel lacinia metus. Cum sociis natoque penatibus et magnis dis parturient montes, nascetur ridiculus mus. Nulla a accumsan nunc. Maecenas tincidunt velit et ante dictum luctus. Vivamus gravida neque a purus pretium in eleifend purus aliquet. Donec consequat consequat nisi, in commodo nisi pharetra eu.", 
+        }
+    );
+    
+    my $ok = $event->publish();
+    
+    if (! $ok)
+    {
+        carp "Failed to publish event\n";
+        print $event->dump();
+    }
+    else
+    {
+        print "ok\n";
+    }
+}
+
+sub t0
+{
+    my $event = new ariba::rc::events::client::Event 
+    (
+        {
+            channel => 'trololo',
+            title => "Test Event $$",
+            description => "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Etiam sit amet sem elit, nec tempus lectus. Ut vel lacinia metus. Cum sociis natoque penatibus et magnis dis parturient montes, nascetur ridiculus mus. Nulla a accumsan nunc. Maecenas tincidunt velit et ante dictum luctus. Vivamus gravida neque a purus pretium in eleifend purus aliquet. Donec consequat consequat nisi, in commodo nisi pharetra eu.", 
+        }
+    );
+    
+    my $ok = $event->publish();
+    
+    if (! $ok)
+    {
+        carp "Failed to publish event\n";
+        print $event->dump();
+    }
+    else
+    {
+        print "ok\n";
+    }
+    
+}
+
+sub t1
+{
+
+    my $event = new ariba::rc::events::client::Event 
+    (
+        {
+            # debug => 1,
+            # verbose => 1,
+            channel => 'critical',
+            title => "Build: FAILED SSP10s2-$$ (buyer-10s2)",
+            description => "robot18 is currently failing. We'll not initiate the build now.",
+        }
+    );
+
+    my $ok = $event->publish();
+
+    if (! $ok)
+    {
+        carp "Failed to publish event\n";
+        print $event->dump();
+    }
+    else
+    {
+        print "ok\n";
+    }
+    
+}
+
+sub t2
+{
+
+    my $event = new ariba::rc::events::client::Event
+    (
+        {
+            channel => ariba::rc::events::Constants::channel_debug(),
+            title => "DEBUG debug DEBUG debug $$",
+            description => "This is a test. Nothing more and nothing less, this will always be a test.",
+        }
+    );
+
+    my $ok = $event->publish();
+
+    if (! $ok)
+    {
+        carp "Failed to publish event\n";
+        print $event->dump();
+    }
+    else
+    {
+        print "ok\n";
+    }
+
+}
+
+t11();
+# t10();
+# t9();
+# t8();
+# t7();
+# t6();
+# t4();
+# t3();
+# t0();
+# t1();
+# t2();

@@ -1,0 +1,139 @@
+#!/usr/local/bin/perl
+
+#
+# $Id: //ariba/services/monitor/bin/piwik/piwik-status#4 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+require "geturl";
+
+use ariba::monitor::QueryManager;
+
+#use WWW::Mechanize;
+use LWP::Simple;
+use HTML::TreeBuilder;
+use HTML::Element;
+use Data::Dumper;
+# Some Data::Dumper settings:
+local $Data::Dumper::Useqq  = 1;
+local $Data::Dumper::Indent = 1;
+
+local $| = 1;
+
+sub main {
+    my $debug = 0;
+    my $quiet = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    ## TODO un-hard-code this stuff
+    my $service;
+
+    while(my $arg=shift){
+        if($arg =~ /^-d/o){ $debug=1; }
+        if($arg =~ /^-e/o){ $sendEmail=1; };
+        if($arg =~ /^-p$/o){ $sendPage=1; };
+        ## TODO: Remove this ...
+        if($arg =~ /^(?:-s|-service)/o){ $service=shift; }
+    }
+
+    die "service is a required argument!!\n" unless $service;
+
+    my $auc = ariba::rc::InstalledProduct->new('community', $service);
+    my $email = $auc->default('notify.email');
+    my $siteUrl = $auc->default('SiteURLSecure') or die "Error reading 'SiteURLSecure' for '$service' service!\n";
+    my $url = "$siteUrl/balancer-manager";
+
+#    $ENV{'PERL_LWP_SSL_VERIFY_HOSTNAME'} = 0;
+#    my $page = LWP::Simple::get( $url );
+    my @results;
+    eval { geturl("-e","-q","-timeout", '15', "-results",\@results,$url) };
+    die $@ if $@;
+
+    my $page = join '', @results;
+
+    my $p = HTML::TreeBuilder->new();
+
+    $p->parse( $page );
+    $p->eof();
+    $p->elementify();
+    my @content = $p->descendents();
+
+    my %results;
+    my $section;
+
+    foreach my $item ( @content ){
+        next unless defined $item;
+
+        my $text = $item->as_text();
+
+        next unless $text =~ /^(?:Init|balancer:)/ && $text !~ /cloudanalytics/i;
+
+        if ( $text =~ /^balancer/ ){ ## We're starting a new section
+            if ( $text =~ m/aucsolr(\S+)-communityappcluster/ ){
+                $section = $1; ## We're either search, indexer or we're the app itself
+                print "Found a new section: '$section'\n" if $debug;
+            } else {
+                $section = 'application';
+            }
+        } else {            ## We're already in a section
+            push @{ $results{ $section } }, $text;
+            print "Added '$text' to '$section'\n" if $debug;
+        }
+    }
+
+    my %q;
+
+    foreach my $role ( keys %results ){
+        print "Role: '$role'\n" if $debug;
+        $q{ "Balancer Status for '$role'" } = {
+            info => 'answer eq "ok"',
+            crit => 'answer eq "error"',
+            ticketOwner => 'unassigned-sre',
+            severity    => 1,
+            description => 'Check the status of the AUC SOLR Indexer node(s)',
+            correctiveActions => [
+                Ops => 'Try restarting CWS, if that fails raise CR and assign to AUC support team',
+            ],
+            perl => sub { return main::checkStatus( $results{ $role } ); },
+            inf_field => "$role"."_status",
+            inf_default => "none",
+        };
+    }
+
+    $q{'influx_details'} = { measurement => 'cws_balancer_status'};
+    my $qm = ariba::monitor::QueryManager->newWithDetails('balancer-status', 'cws', $service, undef, \%q);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+        
+}
+
+sub checkStatus {
+    my $info = shift or die "Status info required!!\n";
+    ## These are arrayrefs
+
+    my $result = 'ok';
+# $VAR1 = {
+#   "search" => [
+#     "Init Ok "
+#   ],
+#   "application" => [
+#     "Init Ok "
+#   ],
+#   "indexer" => [
+#     "Init Ok "
+#   ]
+# };
+    foreach my $item ( @{ $info } ){
+        next if $item =~ /Ok/; ## Good status is 'Init Ok'
+        $result = 'error';
+    }
+
+    return $result;
+}
+
+main(@ARGV);
+
+__END__
+

@@ -1,0 +1,316 @@
+#!/usr/local/bin/perl -w
+
+# $Id: $
+ 
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::NetworkDeviceManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-e/o) { $sendEmail = 1; };
+        if ($arg =~ /^-p/o) { $sendPage  = 1; };
+        if ($arg =~ /^-d/o) { $debug     = 1; };
+    }
+
+    my $me    = ariba::rc::InstalledProduct->new();
+    my $email = $me->default('notify.email');
+
+    for my $datacenter ( ariba::Ops::ProductAPIExtensions::datacentersForProducts($me) ) {
+
+        my %match = (
+            'datacenter'       => $datacenter,
+            'os'           => 'ios,ios-xe,IOS-XE, nxos',
+            'providesServices' => 'switch',
+            'status'       => 'inservice',
+        );
+
+        my @machines = ariba::Ops::Machine->machinesWithProperties(%match);
+        my %queries  = ();
+
+        return unless scalar @machines > 0;
+
+        # handle nxos separately
+        my @nexusmachines = grep { $_->os() eq "nxos" } @machines;
+        my @othermachines = grep { $_->os() ne "nxos" } @machines;
+
+        createQueriesForNexusDevices($datacenter, \@nexusmachines, \%queries);
+
+        for my $machine (@othermachines) {
+
+            my $hostname      = $machine->hostname();
+            print "checking host $hostname\n" if $debug;
+
+            # Currently we only have a maximum of 3 etherChannels per switch.
+            my $MDBEtherChannel1Ports = $machine->etherChannel1Ports();
+            my $MDBEtherChannel2Ports = $machine->etherChannel2Ports();
+            my $MDBEtherChannel3Ports = $machine->etherChannel3Ports();
+            my $MDBEtherChannel4Ports = $machine->etherChannel4Ports();
+            my $MDBEtherChannel5Ports = $machine->etherChannel5Ports();
+            my $MDBEtherChannel6Ports = $machine->etherChannel6Ports();
+
+            my @MDBEtherChannel1Ports = sort (split( ', ' , $MDBEtherChannel1Ports)) if $MDBEtherChannel1Ports;
+            my @MDBEtherChannel2Ports = sort (split( ', ' , $MDBEtherChannel2Ports)) if $MDBEtherChannel2Ports;
+            my @MDBEtherChannel3Ports = sort (split( ', ' , $MDBEtherChannel3Ports)) if $MDBEtherChannel3Ports;
+            my @MDBEtherChannel4Ports = sort (split( ', ' , $MDBEtherChannel4Ports)) if $MDBEtherChannel4Ports;
+            my @MDBEtherChannel5Ports = sort (split( ', ' , $MDBEtherChannel5Ports)) if $MDBEtherChannel5Ports;
+            my @MDBEtherChannel6Ports = sort (split( ', ' , $MDBEtherChannel6Ports)) if $MDBEtherChannel6Ports;
+
+            my %MDBEtherChannelHash = (
+                '1' =>  \@MDBEtherChannel1Ports,
+                '2' =>  \@MDBEtherChannel2Ports,
+                '3' =>  \@MDBEtherChannel3Ports,
+                '4' =>  \@MDBEtherChannel4Ports,
+                '5' =>  \@MDBEtherChannel5Ports,
+                '6' =>  \@MDBEtherChannel6Ports,
+            );
+ 
+            my $networkDevice = ariba::Ops::NetworkDeviceManager->newFromMachine($machine);
+            unless($networkDevice) {
+                print "[DEBUG] driver init failed for $hostname: '$@', skipping...\n" if $debug;
+                $@ = undef; # clear the error
+                next;
+            }
+            $networkDevice->snmp()->setTimeout(30);
+
+            my $etherChannelPortsTable  = $networkDevice->getEtherChannelPorts();
+
+            # At this point we have MDB details and switch oncfiguration details.
+            # We want to check each EtherChannel.
+
+            while (my ( $pagpAdminGroupCapability, $interfaceTable ) = each %$etherChannelPortsTable ) {
+                
+                # Get MDB entries for the current etherChannelGroup
+                our @MDBEtherChannelPorts;
+                eval {
+                    @MDBEtherChannelPorts = @{$MDBEtherChannelHash{$pagpAdminGroupCapability}};
+                };
+                if($@) {
+                        print "This machine $hostname has no EtherChannelSetup for EtherChannel$pagpAdminGroupCapability\nContinuing with the next step\n" if($debug);
+                }
+
+                # find interfacess that are configured for the current etherChannelGroup
+                my @portsConfiguredInEtherChannel;
+                foreach my $key (sort keys %$interfaceTable) {
+                    push (@portsConfiguredInEtherChannel, $key);
+                }
+
+                # Check for interfaces specified in MDB but not configured on the switch
+                my @portsInMDBNotConfiguredOnSwitch = differenceOfArrays(\@MDBEtherChannelPorts, \@portsConfiguredInEtherChannel);
+
+                # If any interfaces are in MDB but not configured on Switch. 
+                # Crit giving interface name.
+                if (@portsInMDBNotConfiguredOnSwitch) {
+                    $queries{"$hostname EtherChannel $pagpAdminGroupCapability ports in MDB not configured on switch"} = {
+                        uiHint => "$hostname/EtherChannel$pagpAdminGroupCapability",
+                        crit => 1,
+                        perl => "return qq(@portsInMDBNotConfiguredOnSwitch)",
+                        inf_tags => qq|datacenter=$datacenter,hostname=$hostname,hostname=$hostname,etherchannel_group=$pagpAdminGroupCapability|,
+                        inf_field => "ports_not_configured",
+                        inf_default => "none",
+                        group_by => "$datacenter,$hostname,$pagpAdminGroupCapability",
+                    };
+                }
+
+                # Go through interfaces configured on switch and find their status
+                while (my ( $ifName, $table ) = each %$interfaceTable ) {
+
+                    my $pagpEthcOperationMode = $table->{'pagpEthcOperationMode'};
+                    my $ifOperStatus = $table->{'ifOperStatus'};
+                    my ($crit, $warn);
+                    $crit = $warn = 0;
+                    my $info = 1;
+                    my $result;
+
+                    # check to see if port is up.
+                    if ( grep (/$ifName/, @MDBEtherChannelPorts)) {
+                        if ($ifOperStatus eq 'up') {
+                            #$result = "Everything is fine.";
+                            $result = "1";
+                        } else {
+                            #$result = "Port is correctly part of a EtherChannel, but is $ifOperStatus.";
+                            $result = "2";
+                            $crit = 1;
+                            $info = 0;
+                        }
+                    } else {
+                        if ($ifOperStatus eq 'up') {
+                            #$result = "MDB Doesn't know about this EtherChannel setup and the interface is up.";
+                            $result = "3";
+                            $crit = 1;
+                            $info = 0;
+                        } else {
+                            #$result = "MDB Doesn't know about this EtherChannel setup and the interface is down.";
+                            $result = "4";
+                            $warn = 1;
+                            $info = 0;
+                        }
+                    } 
+
+                    # append more details of the port to the end of the result.
+                    # $result .= " $ifName is $pagpEthcOperationMode in group $pagpAdminGroupCapability and port is $ifOperStatus";
+
+                    $queries{"$hostname $ifName"} = {
+                        uiHint => "$hostname/EtherChannel$pagpAdminGroupCapability",
+                        info => "'$info'",
+                        warn => "'$warn'",
+                        crit => "'$crit'",
+                        perl => "return qq($result)",
+                        inf_field => "status",
+                        inf_tags => qq|datacenter=$datacenter,hostname=$hostname,etherchannel_group=$pagpAdminGroupCapability,if_name=$ifName,operation_mode=$pagpEthcOperationMode|,
+                        inf_default => 0,
+                        group_by => "$datacenter,$hostname,$pagpAdminGroupCapability",
+                    };
+
+                }
+            }
+        }
+
+        if (%queries) {
+            $queries{influx_details} = {measurement => "network_etherchannel_status"};
+            my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+            my $qm = ariba::monitor::QueryManager->newWithDetails(
+                'Network EtherChannel Status', $pn, $me->service(), $me->customer(), \%queries
+            );
+            $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+        }
+    }
+}
+
+sub createQueriesForNexusDevices {
+    my $datacenter = shift;
+    my $mlist_aref = shift;
+    my $query_href = shift;
+
+    foreach my $machine ( @$mlist_aref ) {
+        my $hostname = $machine->hostname();
+        my $networkDevice = ariba::Ops::NetworkDeviceManager->newFromMachine($machine);
+        unless($networkDevice) {
+            print "[DEBUG] driver init failed for $hostname: '$@', skipping...\n" if $debug;
+            $@ = undef; # clear the error
+            next;
+        }
+
+        my $channelstatus_href = $networkDevice->channelStatus();
+
+
+        #------- port channel status ----------------------------------
+        my $uihint = "Nexus Port Channels";
+        my $pcstatus_href = $channelstatus_href->{pcstatus};
+        
+        foreach my $pcidx ( keys %$pcstatus_href ) {
+            my $result;
+            my $result_txt;
+            my $crit = 0;
+            
+            my $pcname = $pcstatus_href->{$pcidx}->{name};
+            $pcname .= "(" . $pcstatus_href->{$pcidx}->{alias} . ")" if $pcstatus_href->{$pcidx}->{alias};
+            my $pcstatus = $pcstatus_href->{$pcidx}->{status};
+
+            $result = "port channel status: $pcstatus";
+            my $mem_href = $pcstatus_href->{$pcidx}->{members};
+            foreach my $memidx ( keys %$mem_href ) {
+                my $memname = $mem_href->{$memidx}->{name};
+                $memname .= "(" . $mem_href->{$memidx}->{alias} . ")" if $mem_href->{$memidx}->{alias};
+                my $memstatus = $mem_href->{$memidx}->{status};
+                $result .= "\n$memname: $memstatus";  
+            }
+
+            if ( $result =~ /down/i ) {
+                $result = 2;
+                $result_txt = "down";
+                $crit = 1;
+            } else {
+                $result_txt = "up";
+                $result = 1;
+                $crit = 0;
+            }
+            $query_href->{"$hostname $pcname"} = {
+                uiHint => "$uihint/$hostname/$pcname:$pcstatus",
+                noRowCount => 1,
+                crit => $crit,
+                perl => "return qq($result)",
+                inf_field => "port_channel_status",
+                inf_tags => qq|datacenter=$datacenter,hostname=$hostname,device_os="nxos",port_channel="$pcname",pc_status_txt="$result_txt"|,
+                inf_default => 0,
+                group_by => "$datacenter,$hostname,$pcname",
+            };
+        }
+
+
+        #------- vpc health check ----------------------------------
+        $uihint = "Nexus VPC Health Check";
+        my $vpcstatus_href = $channelstatus_href->{vpcstatus};
+        
+        foreach my $vpcid ( keys %$vpcstatus_href ) {
+            my $domainid = $vpcid;
+            my $thisvpc_href = $vpcstatus_href->{$vpcid};
+
+            my $role = $thisvpc_href->{role};
+            my $peerkeepalivestatus = $thisvpc_href->{peerkeepalive}->{status};
+            my $peerlinkname = $thisvpc_href->{peerlink}->{name};
+            $peerlinkname .= " (" . $thisvpc_href->{peerlink}->{alias} . ")"
+                    if $thisvpc_href->{peerlink}->{alias};
+            my $peerlinkstatus = $thisvpc_href->{peerlink}->{status};
+
+            my $result = "Peer Keep Alive Status: $peerkeepalivestatus";
+            my $result_txt = "up";
+            $result .= "\nPeer Link Status with $peerlinkname: $peerlinkstatus";
+
+            my $crit = 0;
+            $result = 1;
+            if ( $peerlinkstatus !~ /up/i || $peerkeepalivestatus !~ /alive/i ) {
+                $crit = 1;
+                $result = 2;
+                $result_txt = "down";
+            }
+            
+            $query_href->{"$hostname domain $domainid ($role)"} = {
+                uiHint => "$uihint/$hostname",
+                noRowCount => 1,
+                crit => " $crit ",
+                perl => "return qq($result)",
+                inf_field => "vpc_status",
+                inf_tags => qq|datacenter=$datacenter,hostname=$hostname,device_os="nxos",vpc_domain=$domainid,role="$role",peer_link_name="$peerlinkname",peer_link_status="$peerlinkstatus",peer_keep_alive_status="$peerkeepalivestatus",vpc_status_txt="$result_txt"|,
+                inf_default => 0,
+                group_by => "$datacenter,$hostname,$domainid",
+            }
+        }
+    }
+
+    
+}
+
+###
+#
+# Returns the elements in second that are not in first
+#
+###
+
+sub differenceOfArrays {
+
+    my ($first, $second) = @_;
+    my @differences;
+
+    foreach my $i (@$first) {
+        if ( !grep (/$i/, @$second)){
+            push (@differences, $i);
+        }
+    }
+
+    return @differences;
+}
+
+main();

@@ -1,0 +1,135 @@
+#!/usr/local/bin/perl -w
+#
+# $Id:$
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Outage;
+use ariba::Ops::DateTime;
+use Time::Local;
+
+sub main
+{
+
+    my $debug     = 0;
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    ariba::monitor::Outage->connect();
+    ariba::monitor::Outage->setDebug(0);
+
+    while (my $arg = shift (@ARGV))
+    {
+        if ($arg =~ /^-d/o)
+        {
+            ariba::monitor::Outage->setDebug(1) if ($debug);
+            $debug = 1;
+        }
+        if ($arg =~ /^-e/o) {$sendEmail = 1;}
+        if ($arg =~ /^-p/o) {$sendPage  = 1;}
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+
+    my %queries;
+
+    #
+    # First check to see if we have any downtimes needing annotation
+    #
+    my ($startDate, $endDate) = endPoints();
+
+    # get localtime for today
+    my @tmpTime    = localtime ();
+    my $todayMonth = $tmpTime[4];
+
+    # get localtime for 3 days later to check for end of month
+    # if the month values are different, then we're within 3 days of the end of the month
+    @tmpTime = localtime (time () + (60 * 60 * 24 * 3));
+    my $laterMonth = $tmpTime[4];
+
+    my @allOutages = ariba::monitor::Outage->entriesForDateRange($startDate, $endDate);
+    my @outages    = ariba::monitor::Outage->unannotatedDowntimes(@allOutages);
+    my $answer     = scalar @outages;
+    my $text       = ariba::monitor::Outage->outageSummary(@outages);
+
+    if ($debug)
+    {
+        print "======= No Annotation =======\n";
+        print "$text\n";
+    }
+
+    $queries{"downtime db entries needing annotation"} = {
+                                                          perl    => sub {return $answer},
+                                                          info    => "defined(answer)",
+                                                          warn    => "!defined(answer) || answer > 10 || (answer > 0 && $todayMonth != $laterMonth)",
+                                                          crit    => 0,
+                                                          uiHint  => 'Entry Status',
+                                                          details => {
+                                                                      "list of entries needing annotation" => {
+                                                                                                               perl => sub {return $text},
+                                                                                                              }
+                                                                     },
+                                                          ticketOnWarnOpenAfterMinutes => 30,
+                                                          ticketSubmitter              => 'dept_an_ops_prod@ariba.com',
+                                                          #added by tarun 
+                                                          inf_field => "entries_needing_annotation", 
+                                                          inf_default => "none",
+                                                         };
+
+    #
+    # Now check for bad data
+    #
+    @outages = ariba::monitor::Outage->badDownTimes(@allOutages);
+    my $badAnswer = scalar @outages;
+    my $badText   = ariba::monitor::Outage->outageSummary(@outages);
+
+    if ($debug)
+    {
+        print "======= Missing Data =======\n";
+        print "$badText\n";
+    }
+
+    $queries{"downtime db entries missing end points"} = {
+        perl => sub {return $badAnswer},
+        #
+        # XXX - for now, force this to be info only until we fix
+        # downtime db
+        #
+        # info => "defined(answer) && badAnswer == 0",
+        # warn => "!defined(answer) || badAnswer > 0",
+        info    => 1,
+        warn    => 0,
+        crit    => 0,
+        uiHint  => 'Entry Status',
+        details => {
+                    "list of entries missing end points" => {
+                                                             perl => sub {return $badText},
+                                                            }
+                   },
+        ticketOnWarnOpenAfterMinutes => 30,
+        ticketSubmitter              => 'dept_an_ops_prod@ariba.com',
+         inf_field => "missing_end_points",
+         inf_default => "none",
+                                                         };
+    my $email = $me->default('notify.email');
+    $queries{"influx_details"} = { 'measurement' => "mon_downtime_entry_status"}; 
+    my $q = ariba::monitor::QueryManager->newWithDetails("downtime", 'mon', $me->service(), $me->customer(), \%queries);
+    $q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+}
+
+sub endPoints
+{
+    my ($s, $min, $h, $d, $mon, $y) = localtime ();
+    my $endDate = sprintf ("%4d-%02d-%02d:%02d:%02d:%02d", $y + 1900, $mon + 1, $d, $h, $min, $s);
+    ($s, $min, $h, $d, $mon, $y) = localtime (time () - (90 * 24 * 60 * 60));
+    my $startDate = sprintf ("%4d-%02d-%02d:%02d:%02d:%02d", $y + 1900, $mon + 1, $d, $h, $min, $s);
+
+    return ($startDate, $endDate);
+}
+
+main();

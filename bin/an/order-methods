@@ -1,0 +1,60 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/an/order-methods#13 $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+
+my %queries;
+
+sub main{
+    my $debug = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while(my $arg = shift(@ARGV) ){
+        if($arg =~ /^-d/o){ $debug = 1; }
+        if($arg =~ /^-e/o){ $sendEmail = 1; };
+        if($arg =~ /^-p/o){ $sendPage = 1; };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $an = ariba::rc::InstalledProduct->new("an", $me->service());
+
+    my $email = $me->default('notify.email');
+
+    my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+    my $communitiesList = join(", ", @communityIds);
+
+    #destination2 : order routing method (edi cxml email fax html Emergis.EDI IBM.EDI)
+    #destination1 : service provider
+    #destination0 : host or supplier id
+    
+    %queries=(
+        "paused order routing methods" =>
+        {
+          noRowCount => 1,
+          runForCommunities => $communitiesList,
+          info => "numrows <= 0",
+          crit => "numrows > 0",
+          sql => q` select count(*) as orm_method_count from stopped_doc_dest `,
+          inf_default => 0,
+        },
+    );
+    $queries{influx_details} = {measurement => 'an_order_methods'};
+
+    my $q = ariba::monitor::QueryManager->newWithDetails("order-methods", "an", $me->service(), $me->customer(), \%queries);
+
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $q);
+
+    $q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();
+

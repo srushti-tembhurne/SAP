@@ -1,0 +1,3048 @@
+#!/usr/local/bin/perl -w
+#
+#
+# $Id: //ariba/services/tools/bin/control-deployment#259 $
+#
+# A script to remotely start and stop a fresh or previously deployed service
+# instance
+#
+#
+# MODIFIED FOR HANASIM
+use strict;
+use File::Basename;
+use File::Path;
+use FindBin;
+use Expect;
+use IO::Tee;
+
+use lib ("$FindBin::Bin", "$FindBin::Bin/../lib", "$FindBin::Bin/../lib/perl");
+
+use ariba::rc::Passwords;
+use ariba::rc::Utils;
+use ariba::rc::Globals;
+use ariba::rc::RolesManager;
+use ariba::Ops::ControlDeploymentHelper;
+use ariba::Ops::RollingRecycleHelper;
+use ariba::Ops::MigrationHelper;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::DBConnection;
+use ariba::Ops::Machine;
+use ariba::Ops::Startup::Common;
+use ariba::Ops::Startup::Hadoop;
+use ariba::Ops::Startup::DB;
+use ariba::Ops::Startup::Arches;
+use ariba::Ops::Utils;
+use ariba::Ops::Url;
+use ariba::Ops::DateTime;
+use ariba::Ops::ServiceController;
+use ariba::rc::Product;
+use ariba::rc::ArchivedProduct;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::BusyPageController;
+use ariba::rc::dashboard::Client;
+use Term::ReadKey;
+use dmail::LockLib;
+use ariba::Ops::TopologyManager;
+use ariba::Ops::PreCheck;
+use ariba::Ops::ServiceController;
+use ariba::Ops::Constants;
+
+my $vers = '$Id: //ariba/services/tools/bin/control-deployment#259 $';
+my $nodrain = 0;
+my $debug = 0;
+my $testing = 0;
+my $checkBuckets = 1;
+my $pauseBetweenBuckets = 0;
+my $prodBehavior = 0;
+my $isProdService = 0;
+my $STOP = "stop";
+my $START = "start";
+my $TEST = "test";
+my $RECYCLE = "recycle";
+my $RELOAD = "reload";
+
+my $ALL = 'all';
+
+my $CONTINUE = 'continue';
+my $ABORT = 'abort';
+
+my $INIT = 'init';
+my $RESTOREMIGRATE = 'restoremigrate';
+my $RESTOREONLY = "restoreonly";
+my $LOADMETA = 'loadmeta';
+my $MIGRATE = 'migrate';
+
+my $firstBucket = 0;
+my $secondBucket = 1;
+
+my $lockfile;
+my $SHOULD_LOCK = 1;
+
+my $timelog;
+
+my $postActionInformHashRef;
+my $migrationHelper;
+my $loadMetaMarkersDeleted = 0; 
+my $topologyManager;
+my $clustertestFile;
+my $baseTMonly = 0;
+my $tenant;
+my $restartWS = 0;
+
+my $client = new ariba::rc::dashboard::Client();
+my ($rcBuild, $rcLog, $rcProduct, $rcBranch, $rcRelease, $rcService);
+
+my $LAYOUT_VERSION_5 = '^v5$';
+
+$SIG{INT} = 'sigint';
+
+sub sigint {
+    print "\nGot sigint, exiting.\n";
+    do_exit(1);
+}
+
+sub askShouldAbort {
+    my $question = shift;
+    my $topologyChange = shift;
+    my $mclID = shift;
+
+    my $shouldAbort = 0;
+
+    # drain STDIN of previous input
+    unless($nodrain) {
+        while (ReadKey(-1)) { }
+    }
+
+    print $question;
+
+    if ( $topologyChange ) {
+        print "This restart/upgrade contained a topology change.  The cluster may be in an inconsistent state.\n";
+        print "Find the error code '$mclID' in the Dynamic Capacity Recovery MCL\n";
+        print "and abort/continue control-deployment based on those instructions.\n";
+    }
+
+    my $answer;
+    do {
+        print "\n";
+        print "Enter '$CONTINUE' to continue or '$ABORT' abort control-deployment > ";
+        $answer = <STDIN>;
+    } until ($answer =~ /^(?:$CONTINUE|$ABORT)$/i);
+
+    if ($answer =~ /^$ABORT$/i) {
+        print "Aborting control-deployment\n";
+        $shouldAbort = 1;
+    }
+
+    return $shouldAbort;
+}
+
+sub checkProductsForAction {
+    my $specifiedCustomer = shift;
+    my $buildname = shift;
+    my $cluster = shift;
+    my $action = shift;
+    my $productName = shift;
+    my $service = shift;
+    my $migrateCommand = shift;
+    my $secondBucketOnly = shift;
+    my $force = shift;
+
+
+    my $isASPProduct = ariba::rc::Globals::isASPProduct($productName);
+    my @customers = ();
+
+    if ($isASPProduct) {
+        #
+        # use the specified customer else get a list of all customers
+        # currently installed
+        #
+        if ($specifiedCustomer) {
+            push(@customers, split(/,/, $specifiedCustomer));
+        } else {
+                my @allProducts = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+
+            for my $p (@allProducts) {
+                push(@customers, $p->customer());
+            }
+
+            @customers = sort(@customers);
+        }
+    } else {
+        push(@customers, undef);
+    }
+
+
+    foreach my $customer (@customers) {
+
+        if ( ($action eq 'start') ||
+              ($action eq 'stop')  ||
+              ($action eq 'uninstall') ) {
+
+            my $product = installedProduct($productName,$service, $buildname, $customer);
+
+            if (!defined($product)) {
+                print "product $productName, service $service not found!  Has product even been installed?";
+                print " for customer $customer" if ($customer);
+                print "\n";
+                return;
+            } else {
+
+                checkControlDeploymentBuild($product, scalar(@customers), $action, $force);
+
+                my $newProductName = $product->name();
+                my $newProductService = $product->service();
+                my $newProductBuildName = $product->buildName();
+                my $newProductCustomer = $product->customer();
+                my $newProductReleaseName = $product->releaseName();
+
+                print "\n";
+                print "PRODUCT:  $newProductName/$newProductService\n";
+                print "CUSTOMER: $newProductCustomer\n" if ($newProductCustomer);
+                print "ACTION:   $action\n";
+                print "BUILD:    $newProductBuildName RELEASE:  $newProductReleaseName";
+                print "\n\n";
+
+            }
+
+
+        } elsif ($action eq 'install' || $action eq 'test') {
+
+            my $product = archivedProduct($productName,$service,$buildname,$customer,$cluster);
+
+            if (!defined($product)) {
+                $product = installedProduct($productName,$service,$buildname,$customer);
+            }
+
+            if ( !defined($product)) {
+
+                print "$productName in $service is not currently archived or installed";
+                print " for customer $customer" if ($customer);
+                print "\n";
+                return;
+
+            } else {
+
+                checkControlDeploymentBuild($product, scalar(@customers), $action, $force);
+
+                my $newProductName = $product->name();
+                my $newProductService = $product->service();
+                my $newProductBuildName = $product->buildName();
+                my $newProductCustomer = $product->customer();
+                my $newProductReleaseName = $product->releaseName();
+
+                print "\n";
+                print "PRODUCT:  $newProductName/$newProductService\n";
+                print "CUSTOMER: $newProductCustomer\n" if ($newProductCustomer);
+                print "ACTION:   $action\n";
+                print "BUILD:    $newProductBuildName RELEASE:  $newProductReleaseName";
+                print "\n\n";
+
+                if ($migrateCommand) {
+                    print "This will run migration of type '$migrateCommand'\n\n";
+                }
+
+                # Check if there is any topology change
+                if ($action eq 'install') {
+                    print "Comparing to previously installed build for changes.\n";
+                    my $oldProduct = installedProduct($productName, $service, undef, $customer);
+
+                    if ($oldProduct) {
+                        unless ($force) {
+                            if ($isProdService &&
+                                newProductIsOlderThanInstalledProductOfSameFamily($product, $oldProduct)) {
+                                print "ERROR: You are attempting to deploy an older build.\n";
+                                print "\t   Deploy Build (Older): ", $product->buildName(), "\n";
+                                print "\tInstalled Build (Newer): ", $oldProduct->buildName(), "\n";
+                                print "Aborting control-deployment.  Run with '-force' if you want to deploy the older build.\n";
+                                do_exit(1);
+                            }
+                        }
+
+                        $product->setClusterName($cluster);
+                        my @newAppInstances = $product->appInstances();
+
+                        my @oldAppInstances;
+                        @oldAppInstances = $oldProduct->appInstances();
+
+                        if (scalar(@oldAppInstances) && scalar(@newAppInstances) &&
+                        !allowedChangesInAppInstances(\@oldAppInstances, \@newAppInstances)) {
+                            $restartWS = 1;
+                            print reminderMsg("$newProductName/$newProductService");
+                        } else {
+                            checkTopologyInBuilds($oldProduct, $product, $cluster, 1);
+                        }
+                    }
+                }
+            }
+
+        } elsif ($action eq 'upgrade' || $action eq 'restart') {
+
+            my ($oldProduct, $newProduct);
+            $newProduct = archivedProduct($productName, $service, $buildname, $customer, $cluster);
+            $oldProduct = installedProduct($productName, $service, undef, $customer);
+
+
+            if ( $action eq 'restart') {
+                $newProduct = $oldProduct;
+            }
+
+            if ( !defined($oldProduct)) {
+                $oldProduct = $newProduct;
+            }
+
+            if (!defined ($oldProduct) || !defined ($newProduct)) {
+                print "$productName in $service is not currently archived or installed";
+                print " for customer $customer" if ($customer);
+                print "\n\n";
+                return undef;
+            } else {
+
+                my $oldProductName = $oldProduct->name();
+                my $oldProductService = $oldProduct->service();
+                my $oldProductBuildName = $oldProduct->buildName();
+                my $oldProductCustomer = $oldProduct->customer();
+                my $oldProductReleaseName = $oldProduct->releaseName();
+
+                my $newProductName = $newProduct->name();
+                my $newProductService = $newProduct->service();
+                my $newProductBuildName = $newProduct->buildName();
+                my $newProductCustomer = $newProduct->customer();
+                my $newProductReleaseName = $newProduct->releaseName();
+
+                checkControlDeploymentBuild($newProduct, scalar(@customers), $action, $force);
+
+                print "\n";
+                print "PRODUCT:    $oldProductName/$oldProductService\n";
+                print "CUSTOMER:   $oldProductCustomer\n" if ($oldProductCustomer);
+                print "ACTION:     $action\n";
+                print "OLD BUILD:  $oldProductBuildName RELEASE:  $oldProductReleaseName\n";
+                print "NEW BUILD:  $newProductBuildName RELEASE:  $newProductReleaseName";
+                print "\n\n";
+
+                if ($secondBucketOnly) {
+                    print "This will ONLY affect second bucket of nodes in rolling-restart\n\n";
+                }
+
+                # Check if there is any topology change
+                $newProduct->setClusterName($cluster);
+                my @newAppInstances = $newProduct->appInstances();
+
+                my @oldAppInstances;
+                @oldAppInstances = $oldProduct->appInstances();
+
+                if (scalar(@oldAppInstances) && scalar(@newAppInstances) &&
+                        !allowedChangesInAppInstances(\@oldAppInstances, \@newAppInstances)) {
+
+                    $restartWS = 1;
+                    print reminderMsg("$newProductName/$newProductService");
+
+                    #
+                    # don't allow upgrades in non-devlab services which could cause
+                    # downtime.  See TMID 64885
+                    # Exception case : do allow upgrade  if topology manager supports topology chage [R3-Dynamic Capacity]
+                    #
+                    my @devlabServices = ariba::rc::Globals::servicesForDatacenter('devlab');
+                    $topologyManager = ariba::Ops::TopologyManager->new($oldProduct,$newProduct,$baseTMonly,$clustertestFile);
+                    my $canTMHandleTopoChange = $topologyManager->canTMHandleTopoChange();
+                    if ( !(grep /^$service$/, @devlabServices)  && !$force && !$canTMHandleTopoChange ) {
+                        print "*** Warning: it's HIGHLY likely that doing this will cause some downtime ***\n";
+                        print "Aborting control-deployment.  Run with '-force' if this is really what you want.\n";
+                        do_exit(1);
+                    }
+
+                } else {
+                    checkTopologyInBuilds($oldProduct, $newProduct, $cluster, 1);
+                }
+
+            }
+        }
+    }
+}
+
+sub checkControlDeploymentBuild {
+    my $productToDeploy = shift;
+    my $customerCount = shift;
+    my $action = shift;
+    my $force = shift;
+
+    return 1 if $force;
+
+    return 1 if $customerCount > 1; # exception for doing mass ASP operations
+
+    my $controlDeploymentProduct = ariba::rc::InstalledProduct->new();
+
+    # treat stop a bit differently, as it's common to do stop of the
+    # old build from the new build
+    if ($action eq "stop") {
+        my $isOk = 0;
+
+        if ($productToDeploy->name() eq $controlDeploymentProduct->name()) {
+            if ($productToDeploy->isASPProduct()) {
+                if ($productToDeploy->customer() eq $controlDeploymentProduct->customer()) {
+                    $isOk = 1;
+                }
+            } else {
+                $isOk = 1;
+            }
+        }
+
+        return 1 if $isOk;
+    }
+
+    unless ($controlDeploymentProduct->buildName() eq $productToDeploy->buildName()) {
+        print "*** ERROR: control-deployment must be run from the same build that it is operating on***\n";
+        print "  control-deployment build: ".$controlDeploymentProduct->buildName()."\n";
+        print "   product to deploy build: ".$productToDeploy->buildName()."\n";
+        print "Aborting control-deployment.  Run with '-force' to override this.\n";
+        do_exit(1);
+    }
+
+    return 1;
+}
+
+#
+# routine to inform people that the build is going down/up
+#
+sub inform {
+    my $product = shift;
+    my $cluster = shift;
+    my $action = shift;
+    my $numErrors = shift;
+    my $force = shift;
+
+    # Informing mon about a deployment allows it to be smart about suppressing alerts.  Thus we don't 
+    # need it in devlab, were it often times out and caused deployment delays.
+    informMon($product, $cluster, $action, $force) if $prodBehavior;
+
+    my($name, $service, $status);
+
+    $name = $product->name();
+    $service = $product->service();
+
+    if ($action eq "stop" || $numErrors) {
+        $status = "down";
+    } elsif ($action eq "recycle") {
+        $status = "up";
+    } elsif ($action eq "start") {
+        $status = "up";
+    }
+
+    if ( (
+        $prodBehavior || 
+        $service eq "sales"
+         ) && $action ne "stop"
+    ) {
+        $status = "inform";
+    }
+    my $cmd = "publish-deployment -product $name -service $service $status -cluster $cluster";
+
+    if ( $product->isASPProduct() ) {
+        $cmd .= " -customer " . $product->customer();
+    }
+    print("$cmd\n");
+
+    system($cmd) unless($testing);
+
+}
+
+sub informMon {
+    my $product = shift;
+    my $cluster = shift;
+    my $action = shift;
+    my $force = shift;
+
+    my($name, $customer, $service, $status);
+
+    $name = $product->name();
+    $service = $product->service();
+    $customer = $product->customer();
+
+    return if ($name eq 'mon');
+    return unless (ariba::rc::InstalledProduct->isInstalled('mon', $service));
+
+    my $mon = ariba::rc::InstalledProduct->new('mon', $service);
+    my ($host) = $mon->hostsForRoleInCluster('monserver', $cluster);
+    my $port = $mon->default('WebServerHTTPSPort');
+
+    my $url = "https://$host:$port/cgi-bin/event-handler";
+    $url .= "?event=controlDeployment&product=$name&action=$action";
+    $url .= "&customer=$customer" if ($customer);
+
+    print "\nInforming mon about the deployment: $url\n";
+
+    my $request = ariba::Ops::Url->new($url);
+    my $result = $request->request(60) || 'Strange, no result returned';
+
+    print "Result: $result\n";
+
+    if ( $isProdService && !( $result =~ /success/i ) && !( $force )) {
+        print "Can not continue until Mon successfully handles the event.\n";
+        do_exit(1);
+    }
+}
+
+sub allowedChangesInAppInstances {
+    my $oldAppInstancesRef = shift;
+    my $newAppInstancesRef = shift;
+
+    # for now, only kind of allowed change is -- identical before
+    # and after set of appinstance
+
+    # if the number of elements are not equal arrays are not same
+    return 0 unless (scalar(@$oldAppInstancesRef) eq scalar(@$newAppInstancesRef));
+
+    @$oldAppInstancesRef = sort { $a->instanceName() cmp $b->instanceName() } @$oldAppInstancesRef;
+    @$newAppInstancesRef = sort { $a->instanceName() cmp $b->instanceName() } @$newAppInstancesRef;
+
+    for (my $i = 0; $i < @$oldAppInstancesRef; $i++) {
+        if ($oldAppInstancesRef->[$i]->instanceName() ne $newAppInstancesRef->[$i]->instanceName()) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+sub controlAppInstances {
+    my $action = shift;
+    my $product = shift;
+    my $cluster = shift;
+    my $bucket = shift;
+    my $commandRef = shift;
+    my $appsRef = shift;
+    my $hostsRef = shift;
+    my $helpersRef = shift;
+    my $timeStarted = shift;
+    my $secondBucketOnly = shift;
+    my $master = shift;
+
+    my $name = $product->name();
+    my $service = $product->service();
+    my $customer = $product->customer();
+    my $user = ariba::rc::Globals::deploymentUser($name, $service);
+
+    my %nodeToHost = ();
+
+    my $password = ariba::rc::Passwords::lookup($user);
+
+    for my $appInstance ( @$appsRef ) {
+        my $instanceName = $appInstance->instanceName();
+        my $host = $appInstance->host();
+
+        #
+        # determine which bucket the action commands go into
+        # based in even/odd port#. This gurantees that each bucket
+        # has exactly half the apps from each community
+        #
+        next if ($appInstance->recycleGroup() != $bucket);
+
+        #
+        # Record roles that are being handled
+        #
+        for my $role ($product->rolesForHostInCluster($host, $cluster)) {
+            $hostsRef->{$role}->{$host} = 1;
+        }
+
+        # 
+        #  skip out here in case of second bucket, after
+        #  recording that we have "done" nodes in the first
+        #  bucket
+        if ($secondBucketOnly && $bucket != $secondBucket) {
+            next;
+        }
+
+        $nodeToHost{$host} = [] unless defined($nodeToHost{$host});
+        push(@{$nodeToHost{$host}}, $appInstance->instanceName());
+    }
+
+    for my $host (keys %nodeToHost) {
+        my $logName = $host;
+        my $description = "bucket: $bucket"; 
+        
+        $master = undef if $action eq "test";
+
+        my @commands;
+        my $instanceList = join(" ", @{$nodeToHost{$host}});
+        foreach my $command (@$commandRef) {
+            my $cmd = $command;
+            $cmd =~ s/\*INSTANCENAME\*/$instanceList/;
+            push(@commands, $cmd);
+        }
+
+        my $cdh = ariba::Ops::ControlDeploymentHelper->newUsingProductServiceAndCustomer($name, $service, $customer);
+        $cdh->setTesting($testing);
+        $cdh->setTimeStarted($timeStarted);
+        $cdh->setSkipOnSshFailure(1);
+        $cdh->launchCommandsInBackground(
+            $action, 
+            $user, 
+            $host, 
+            $logName, 
+            $password,
+            $master,
+            $description,
+            @commands
+            );
+        push(@$helpersRef, $cdh);
+    }
+
+    # Wait for first bucket fo finish fully, before starting the
+    # next one. This will guarantee that we do not accidentally
+    # take down more apps of one kind.
+
+    my $returnCode = ariba::Ops::ControlDeploymentHelper->waitForBackgroundCommands();
+    return $returnCode;
+}
+
+sub controlServiceUsingAppInstances {
+    my $oldProduct = shift;
+    my $newProduct = shift;
+    my $action = shift;
+    my $cluster = shift;
+    my $requestedRoles = shift;
+    my $args = shift;
+    my $timeStarted = shift;
+    my $secondBucketOnly = shift;
+    my $nopause = shift;
+
+    my $cmd;
+    my $name;
+    my $service;
+    my $customer;
+    my ($user, $oldBuild, $oldBindir, $newBuild, $newBindir, $oldLayout, $newLayout);
+    my $topologyChangeAllowed;
+
+    my @oldAppInstances;
+    my @newAppInstances;
+    my @appInstances;
+
+    my $useCoordinatorControl = 0;
+
+    #
+    # Get information about the product that should be stopped
+    #
+    if (defined($oldProduct)) {
+        $name = $oldProduct->name();
+        $user = ariba::rc::Globals::deploymentUser($name, $oldProduct->service());
+        $service = $oldProduct->service();
+        $customer = $oldProduct->customer();
+        $oldBuild = $oldProduct->buildName();
+        $oldLayout = $oldProduct->default('Ops.UseNewInstanceLayoutAlgorithm');
+        $oldProduct->setClusterName($cluster);
+        @oldAppInstances = grep { $_->supportsRollingRestart() } $oldProduct->appInstances();
+        @appInstances = @oldAppInstances;
+        $topologyChangeAllowed = $oldProduct->default('Ops.TopologyChangeSupported');
+
+        $oldBindir = ariba::rc::Globals::rootDir($name, $service, $customer) . "/$oldBuild/bin";
+
+        $useCoordinatorControl = defined($oldProduct->default("System.NodeManagers.Cluster.UseCoordinatorControl"));
+
+    }
+
+    #
+    # Get information about the product that should be started
+    #
+    if (defined($newProduct)) {
+        $name = $newProduct->name();
+        $user = ariba::rc::Globals::deploymentUser($name, $newProduct->service());
+        $service = $newProduct->service();
+        $customer = $newProduct->customer();
+        $newBuild = $newProduct->buildName();
+        $newLayout = $newProduct->default('Ops.UseNewInstanceLayoutAlgorithm');
+
+        $newProduct->setClusterName($cluster);
+        @newAppInstances = grep { $_->supportsRollingRestart() } $newProduct->appInstances();
+        @appInstances = @newAppInstances;
+        $topologyChangeAllowed = $newProduct->default('Ops.TopologyChangeSupported');
+
+        $newBindir = ariba::rc::Globals::rootDir($name, $service, $customer) . "/$newBuild/bin";
+    }
+    #instantiation of topology manager
+    my $topologyChange = 0;
+    $topologyChange = !allowedChangesInAppInstances(\@oldAppInstances, \@newAppInstances) if (scalar(@oldAppInstances) && scalar(@newAppInstances));
+    
+    #
+    # this causes downtime, but we don't care in devlab
+    #
+    if ($action eq "recycle" &&
+        $oldLayout ne $newLayout &&
+        !$topologyChangeAllowed &&
+        $isProdService) {
+            print "ERROR: unsupported topology change\n";
+            do_exit(1);
+    }
+
+    if($action eq "recycle") {
+        checkTopologyInBuilds($oldProduct, $newProduct, $cluster, $topologyChangeAllowed);
+    }
+
+    my $master = ariba::rc::Passwords::lookupMasterPci( $newProduct );
+
+    #
+    # divide up app instances into two buckets and work on each
+    #
+    my %roleToHostsHandledHash = ();
+    my @rolesCompleted = ();
+    my $shouldAbort = 0;
+
+    if ($secondBucketOnly) {
+        print "\n  Only doing second (last) bucket \n\n";
+    } else {
+        # Delete load meta marker in first bucket only
+        cleanupLoadMetaMarker(
+            $newProduct || $oldProduct,
+            $action,
+            $cluster,
+            $requestedRoles,
+            $timeStarted,
+            1);
+
+        # upgrade httpvendor role first, to handle versioning symlinks early
+        unless(@$requestedRoles) {
+            controlService($oldProduct, $newProduct, $action, $cluster, ['httpvendor', 'private-label', 'copyhost'], $args, undef, $timeStarted);
+            ariba::Ops::ControlDeploymentHelper->waitForBackgroundCommands();
+            push(@rolesCompleted, 'httpvendor');
+        }
+
+    }
+
+    if (defined($newProduct) && $newProduct->isLayout(5)) {
+        @appInstances = @oldAppInstances;
+    }
+
+    my (%allBuckets, @bucketList);
+    map { $allBuckets{$_->recycleGroup()}++; } @appInstances;
+    @bucketList = sort keys(%allBuckets);
+
+    for my $bucket (@bucketList) {
+        # Setting MaxParallelProcesses here as controlService will change to 1 for devlab
+        my $numAppInstances = scalar(@appInstances);
+        my $maxParallelProcesses = $numAppInstances/2;
+
+        ariba::Ops::ControlDeploymentHelper->setMaxParallelProcesses($maxParallelProcesses);
+
+        # Make sure all nodes in the 2nd bucket are all up before upgrading 1st bucket.
+        if ($action eq $RECYCLE && $checkBuckets) { 
+            my @appInstancesInOtherBuckets = grep { $_->recycleGroup() != $bucket } @appInstances;
+            print "\nChecking if all nodes in other buckets are up, this may take up to 5 min\n";
+            if (ariba::Ops::Startup::Common::waitForAppInstancesToInitialize(\@appInstancesInOtherBuckets)) {
+                print "\n";
+                print "Nodes in other buckets are all up\n";
+                print "\n";
+            } else {
+                print "\n";
+                print "!!! Warning !!!\n";
+                print "The following instances in the other buckets are down:\n";
+                print "\t", join(", ", map { $_->instanceName() } grep { !$_->isUp() } @appInstancesInOtherBuckets ), "\n";
+
+                if ($prodBehavior) {
+                    my $question = "Continuing now will probably result in a downtime, it is HIGHLY advised to abort now and call for help.\n" .
+                                   "Proceed only if you are 100% confident.\n";
+
+                    last if ( $shouldAbort = askShouldAbort( $question ) );
+                }
+            }
+        }
+
+        if ($useCoordinatorControl && $action eq $RECYCLE) {
+            prepareForRollingRecycle($oldProduct);
+        }
+
+        my @helpers = ();
+        my @appInstancesInThisBucket = ();
+        #
+        # Form the command
+        #
+        my $cmd;
+        my $flags = "-cluster $cluster -readMasterPassword *INSTANCENAME*";
+        my $product;
+        my @cmds;
+
+        #Invoking topology manager for pre-bucket-stop action
+        my $tmStatus = $topologyManager->callback("preBucket${bucket}stop", $action);
+        
+        if (($tmStatus == -1) && ($bucket != $firstBucket)) {
+            my $mclID = $topologyManager->mclid("preBucket${bucket}stop");
+            last if ( $shouldAbort = askShouldAbort( "", 1, $mclID ));
+        }
+
+        my $realmRebalance = $topologyManager->hasRCMapChanged();
+ 
+        if ($action eq "stop") {
+            $product = $oldProduct;
+            $cmd = "$oldBindir/stopsvc $flags";
+            $cmd .= " " . join(" ", @$args) if (@$args);
+            push(@cmds, $cmd);
+        } elsif ($action eq "start") {
+            $product = $newProduct;
+            $cmd = "$newBindir/startup $flags"; 
+            $cmd .= " " . join(" ", @$args) if (@$args);
+            push(@cmds, $cmd);
+        } elsif ($action eq "test") {
+            $product = $newProduct;
+            $cmd = "sudo -k; sudo echo *INSTANCENAME*";
+            push(@cmds, $cmd);
+        } elsif ($action eq "recycle") {
+            $product = $oldProduct;
+            @appInstances = @oldAppInstances;
+            $cmd = "$oldBindir/stopsvc $flags";
+            $cmd .= " " . join(" ", @$args) if (@$args);
+            push(@cmds, $cmd);
+            if(!$topologyChange && !$realmRebalance) {
+                $cmd = "$newBindir/startup $flags"; 
+                $cmd .= " " . join(" ", @$args) if (@$args);
+                push(@cmds, $cmd);
+            }
+        }
+
+        my $returnCode = controlAppInstances($action, $product, $cluster, $bucket, \@cmds, \@appInstances, \%roleToHostsHandledHash, \@helpers, $timeStarted, $secondBucketOnly, $master);
+
+        if ($returnCode == ariba::Ops::Startup::Common::EXIT_CODE_ABORT()) {
+            print "ERROR: bucket $bucket returned with ABORT, will not proceed with remaining buckets\n";
+            $shouldAbort = 1;
+            last;
+        }
+    
+        if($action eq "recycle" && ($topologyChange || $realmRebalance)) {
+            $cmd = "$newBindir/startup -topologychange $flags"; 
+            $cmd .= " " . join(" ", @$args) if (@$args);
+            my @cmds = ($cmd);
+
+            #Invoking topology manager for post-bucket-stop action
+            $tmStatus = $topologyManager->callback("postBucket${bucket}stop", $action);
+
+            if ($tmStatus == -1) {
+                my $mclID = $topologyManager->mclid("postBucket${bucket}stop");
+                last if ( $shouldAbort = askShouldAbort( "", 1, $mclID ));
+            }
+          
+           
+            #Invoking topology manager for pre-bucket-start action
+            $tmStatus = $topologyManager->callback("preBucket${bucket}start", $action);
+            if ($tmStatus == -1) {
+                my $mclID = $topologyManager->mclid("preBucket${bucket}start");                        
+                last if ( $shouldAbort = askShouldAbort( "", 1, $mclID ));
+            }
+            
+            $returnCode = controlAppInstances($action, $newProduct, $cluster, $bucket, \@cmds, \@newAppInstances, \%roleToHostsHandledHash, \@helpers, $timeStarted, $secondBucketOnly, $master);
+
+            if ($returnCode == ariba::Ops::Startup::Common::EXIT_CODE_ABORT()) {
+                print "ERROR: bucket $bucket returned with ABORT, will not proceed with remaining buckets\n";
+                $shouldAbort = 1;
+                last;
+            }
+        }
+
+        #Invoking topology manager for post-bucket-start action
+        $tmStatus = $topologyManager->callback("postBucket${bucket}start", $action);
+        if ($tmStatus == -1) {
+            my $mclID = $topologyManager->mclid("postBucket${bucket}start");
+            last if ( $shouldAbort = askShouldAbort( "", 1, $mclID ));
+        }
+
+        my @failedToStart = ();
+        my @failedWithError = ();
+        my $totalNodeCount = scalar(@helpers);
+
+        for my $helper (@helpers) {
+
+            if ($helper->exitStatus() eq ariba::Ops::Startup::Common::EXIT_CODE_TIMEOUT()) {
+                push(@failedToStart, $helper->description());
+            } elsif ($helper->exitStatus()) {
+                push(@failedWithError, $helper->description());
+            }
+        }
+        my $failedToStartCount = scalar(@failedToStart);
+        my $failedWithErrorCount = scalar(@failedWithError);
+
+        if ($failedToStartCount > 0 && $useCoordinatorControl && $action eq $RECYCLE) {
+            # could be the coordinator hasn't been found yet, help along
+            # this needs to happen no matter which bucket!
+            # if waitForCoordinator returns true, this means that the coordinator was unknown, but now was found
+            if (waitForCoordinator($bucket, $oldProduct)) {
+                # we were successful in selecting a new coordinator, but now the apps come up, which can
+                # take some time
+                my $waitTime = 12*60;
+                print "Coordinator came up, now waiting for app instances to come up. This can take $waitTime seconds\n";
+                if (ariba::Ops::Startup::Common::waitForAppInstancesToInitialize(\@appInstancesInThisBucket, $waitTime, undef, 1)) {
+                    # all the apps are up now, let's just move on ...
+                    $failedToStartCount = 0;
+                    @failedToStart = ();
+                }
+            }
+        }
+
+        my $alreadyPaused = 0;
+
+        unless($nopause) {
+            my @failed = (@failedWithError, @failedToStart);
+            my $failedCount = scalar(@failed);
+            if ($failedCount && $failedCount >  0) {
+                print "\n";
+                print "ERROR: bucket $bucket had $failedCount nodes that returned with errors or didn't come up in time (out of $totalNodeCount).\n";
+                print "\t", join("\n\t", @failed), "\n";
+                print "\n";
+                print "This could be due to nodes not starting, dying, or taking longer to start.\n";
+                print "To prevent a possible downtime, control-deployment has paused before launching restart of next bucket.\n";
+                print "\n";
+                print "Please check on the above nodes and verify that they have come up, or fix the problem.\n";
+
+                my $mclID = $topologyManager->mclid("bucket${bucket}StartFailed");
+                last if ( $shouldAbort = askShouldAbort( "", ($topologyChange || $realmRebalance), $mclID ) );
+            }
+        }
+
+        # upgrade the monitor host between first and second bucket
+        if(!@$requestedRoles and $bucket == $firstBucket) {
+            controlService($oldProduct, $newProduct, $action, $cluster, ['monitor'], $args, undef, $timeStarted);
+            ariba::Ops::ControlDeploymentHelper->waitForBackgroundCommands();
+            push(@rolesCompleted, 'monitor');
+        }
+
+        #
+        # block to help QA with their testing of rolling
+        # upgrade/ restart
+        #
+        if ( !$alreadyPaused && $pauseBetweenBuckets && $bucket != $bucketList[$#bucketList] ) {
+            my $question = "\n>>> First set of apps restarted.\n";
+            last if ( $shouldAbort = askShouldAbort( $question ) );
+        }
+    }
+
+    unless ($shouldAbort) {
+        #
+        # now upgrade non appserver hosts (things with no appinstances
+                # on it)
+        #
+        # If any hosts are left for a role, then that role was not
+        # really handled and just happened to share one or more hosts
+        # with an app instance role.
+        for my $role (keys %roleToHostsHandledHash) {
+
+            # this is the list of hosts that have been handled so far for
+            # this role
+            my @hostsHandled = keys %{$roleToHostsHandledHash{$role}};
+
+            # gather all hosts that should be handled for this role
+            my %allHostsForRole = ();
+            map { $allHostsForRole{$_} = 1 } $newProduct->hostsForRoleInCluster($role, $cluster) if $newProduct;
+            map { $allHostsForRole{$_} = 1 } $oldProduct->hostsForRoleInCluster($role, $cluster) if $oldProduct;
+
+            my $unhandledHosts = ariba::Ops::Utils::computeDifference([keys %allHostsForRole], \@hostsHandled);
+
+            # if there is no difference in the lists of hosts we are done
+            # with this role
+            push(@rolesCompleted, $role) unless scalar(@$unhandledHosts);
+        }
+
+        controlService($oldProduct, $newProduct, $action, $cluster, $requestedRoles, $args, \@rolesCompleted, $timeStarted);
+    }
+}
+
+#
+# do the grunt work of logging into each host, and running the magic command
+#
+sub controlService {
+
+    my $oldProduct = shift;
+    my $newProduct = shift;
+    my $action = shift;
+    my $cluster = shift;
+    my $requestedRoles = shift;
+    my $args = shift;
+    my $additionalskipRoles = shift;
+    my $timeStarted = shift;
+
+    my @skipRoles = (
+        'smtp',
+        'catalogserver',
+        'fs-replication-source',
+        'fs-replication-dest',
+        'fileserver',
+        'LTA-hosts', ##Added for Hanasim  HOA-41072
+    );
+
+    if ($additionalskipRoles) {
+        push(@skipRoles, @$additionalskipRoles);
+    }
+
+    my @roles;
+    #
+    # maintain 3 arrays of commands that should be run:
+    # commands that correspond to old build
+    # commands that correspong to new build
+    # allcommands
+    #
+    my @commands;
+    my @oldBuildCommands;
+    my @newBuildCommands;
+    my $cmd;
+    my $name;
+    my $customer;
+    my ($user, $oldBuild, $oldBindir, $newBuild, $newBindir);
+
+    my $starttime = time();
+    ariba::rc::Utils::writeTimingInfo($timelog, "Service $action", "BEGIN") unless $action eq "test";
+
+    my ($service, $password);
+    #
+    # Get information about the product that should be stopped
+    #
+    if (defined($oldProduct)) {
+        @roles = $oldProduct->allRolesInCluster($cluster);
+        $name = $oldProduct->name();
+        $user = ariba::rc::Globals::deploymentUser($oldProduct->name(), $oldProduct->service());
+        $service = $oldProduct->service();
+        $customer = $oldProduct->customer();
+        $oldBuild = $oldProduct->buildName();
+        $oldBindir = ariba::rc::Globals::rootDir($oldProduct->name(), $service, $customer) . "/$oldBuild/bin";
+    }
+
+    #
+    # Get information about the product that should be started
+    #
+    if (defined($newProduct)) {
+        @roles = $newProduct->allRolesInCluster($cluster);
+        $name = $newProduct->name();
+        $user = ariba::rc::Globals::deploymentUser($newProduct->name(), $newProduct->service());
+        $service = $newProduct->service();
+        $customer = $newProduct->customer();
+        $newBuild = $newProduct->buildName();
+        $newBindir = ariba::rc::Globals::rootDir($newProduct->name(), $service, $customer) . "/$newBuild/bin";
+    }
+
+
+    my $master = ariba::rc::Passwords::lookupMasterPci( $newProduct );
+
+    my $cmdFlags = "-cluster $cluster ";
+    if (defined($master) && $master) {
+        $cmdFlags .= "-readMasterPassword";
+    }
+
+    # do not try to do parallel deployments for services that
+    # use shared filesytem. With shared file sytem things get whacked
+    # if one process is trying to remove a directory and other is
+    # trying to create it. Stick to serial deployment in this case.
+    # Reload webserver configs can handle parallel deployment, though.
+    #
+    if (ariba::rc::Globals::serviceUsesSharedFileSystem($service) and $action ne 'reload') {
+        ariba::Ops::ControlDeploymentHelper->setMaxParallelProcesses(1);
+    }
+    
+    #
+    # Form the command
+    #
+    if ($action eq "stop") {
+        print "\nShutting down service...\n";
+        $cmd = "$oldBindir/stopsvc $cmdFlags";
+        $cmd .= " " . join(" ", @$args) if (@$args);
+        $cmd .= " -role " . join(" -role ", @$requestedRoles) if (@$requestedRoles);
+        push(@commands, $cmd);
+        push(@oldBuildCommands, $cmd);
+    } elsif ($action eq "start") {
+        print "\nStarting up service...\n";
+        $cmd = "$newBindir/startup $cmdFlags";
+        $cmd .= " " . join(" ", @$args) if (@$args);
+        $cmd .= " -role " . join(" -role ", @$requestedRoles) if (@$requestedRoles);
+        push(@commands, $cmd);
+        push(@newBuildCommands, $cmd);
+    } elsif ($action eq "test") {
+        print "\nTesting logging in...\n";
+        $master = undef;
+        $cmd = "sudo -k; sudo ls -ld $newBindir";
+        push(@commands, $cmd);
+        push(@newBuildCommands, $cmd);
+    } elsif ($action eq "recycle") {
+        print "\nRecycling service...\n";
+        $cmd = "$oldBindir/stopsvc $cmdFlags";
+        $cmd .= " " . join(" ", @$args) if (@$args);
+        $cmd .= " -role " . join(" -role ", @$requestedRoles) if (@$requestedRoles);
+        push(@commands, $cmd);
+        push(@oldBuildCommands, $cmd);
+        $cmd = "$newBindir/startup $cmdFlags";
+        $cmd .= " " . join(" ", @$args) if (@$args);
+        $cmd .= " -role " . join(" -role ", @$requestedRoles) if (@$requestedRoles);
+        push(@commands, $cmd);
+        push(@newBuildCommands, $cmd);
+    } elsif ($action eq "reload") {
+        print "\nReloading configs...\n";
+        $cmd = "$newBindir/reload $cmdFlags";
+        $cmd .= ' ' . join(' ', @$args) if (@$args);
+        $cmd .= ' -role ' . join(' -role ', @$requestedRoles) if (@$requestedRoles);
+        push(@commands, $cmd);
+        push(@newBuildCommands, $cmd);
+    }
+
+    # Delete load meta markers
+    cleanupLoadMetaMarker(
+        $newProduct || $oldProduct,
+        $action,
+        $cluster,
+        $requestedRoles,
+        $timeStarted,
+        0);
+
+    #
+    # cycle through each host and role to run the command.
+    # make sure that the same host is not encountered more than once.
+    #
+    my %done;
+    my $isHadoopProduct = 0;
+
+    my $sortRoleSub = \&ariba::Ops::Startup::Common::webLogicSortRoles;
+    if (grep(/^$name$/, ariba::rc::Globals::hadoopProducts())) {
+        $isHadoopProduct = 1;
+        if ($action eq 'stop') {
+            $sortRoleSub = \&ariba::Ops::Startup::Hadoop::sortRolesToStop;
+        } else {
+            $sortRoleSub = \&ariba::Ops::Startup::Hadoop::sortRoles;
+        }
+    }
+
+ROLE:
+    for my $role (sort $sortRoleSub @roles) {
+
+        my $skipThis = 0 ;
+
+        for my $skip (@skipRoles) {
+            if ($skip eq $role) {
+                $skipThis = 1;
+            }
+        }
+
+        if (scalar(@$requestedRoles)) {
+            my $launch = 0;
+            for my $requested (@$requestedRoles) {
+                if ($role eq $requested) {
+                    $launch = 1;
+                    last;
+                }
+            }
+            next unless ($launch);
+        }
+
+        next if ($skipThis);
+
+        $password = ariba::rc::Passwords::lookup($user);
+
+        my %allHosts;
+        my %oldHosts;
+        my %newHosts;
+
+        if (defined($oldProduct)) {
+            %oldHosts = map { $_ => 1 } $oldProduct->hostsForRoleInCluster($role, $cluster);
+        }
+
+        if (defined($newProduct)) {
+            %newHosts = map { $_ => 1 } $newProduct->hostsForRoleInCluster($role, $cluster);
+        }
+
+        %allHosts = map { $_ => 1 } (keys(%oldHosts), keys(%newHosts));
+
+
+        my %rolesArrayForHost = ();
+
+        for my $host (keys %allHosts) {
+            if (@$requestedRoles) {
+                $rolesArrayForHost{$host} = $requestedRoles;
+            } elsif ($isHadoopProduct) {
+                $rolesArrayForHost{$host} = [ $role ];
+            } else {
+                if (defined $oldProduct) {
+                    $rolesArrayForHost{$host} = [ $oldProduct->rolesForHostInCluster($host, $cluster) ];
+                } elsif (defined $newProduct) {
+                    $rolesArrayForHost{$host} = [ $newProduct->rolesForHostInCluster($host, $cluster) ];
+                }
+            }
+        }
+
+        for my $host (sort keys(%allHosts)) {
+            next if (!$isHadoopProduct && defined $done{$host});
+
+            #
+            # for robots, skip hosts other than localhost
+            #
+            if (ariba::Ops::DeploymentHelper::shouldSkipHostForUserAndService($host, $user, $service)) {
+                next;
+            }
+
+            my @launchCommands = ();
+            my $roleString     = $role;
+
+            #
+            # if a host exists in both old and new build, run
+            # all commands there.
+            # else only run oldbuild or newbuild commands on
+            # it, based on which build it existed in.
+            #
+            if ($oldHosts{$host} && $newHosts{$host}) {
+                @launchCommands = @commands;
+            } elsif ($oldHosts{$host}) {
+                @launchCommands = @oldBuildCommands;
+            } elsif ($newHosts{$host}) {
+                @launchCommands = @newBuildCommands;
+            }
+
+            if ($isHadoopProduct && !@$requestedRoles && $action ne 'test') {
+                map { $_ .= " -role $role" } @launchCommands;
+            }
+
+            # hosts can have more than one role, be sure to print
+            # it out. we split this out later to do process
+            # control, so make sure there aren't any spaces in it.
+            $roleString = join(',', @{$rolesArrayForHost{$host}});
+
+            my $logName = $host;
+            my $description = "roles(s): $roleString";
+            my $cdh = ariba::Ops::ControlDeploymentHelper->newUsingProductServiceAndCustomer($name, $service, $customer);
+            $cdh->setTesting($testing);
+            $cdh->setTimeStarted($timeStarted);
+            $cdh->setSkipOnSshFailure(1);
+            $cdh->launchCommandsInBackground(
+                $action,
+                $user,
+                $host,
+                $logName,
+                $password,
+                $master,
+                $description,
+                @launchCommands
+                );
+
+            if ($action eq $RECYCLE && grep(/^$name$/, ariba::rc::Globals::webServerProducts())) {
+                ariba::Ops::ControlDeploymentHelper->waitForBackgroundCommands();
+                if ($cdh->exitStatus() || $cdh->numErrors()) {
+                    print "ERROR: Aborting due to the above error from $host\n";
+                    last ROLE;
+                }
+            }
+
+            $done{$host} = 1;
+        }
+
+        ariba::Ops::ControlDeploymentHelper->waitForBackgroundCommands() if ($isHadoopProduct);
+    }
+
+    ariba::rc::Utils::writeTimingInfo($timelog, "Service $action", "END", $starttime) unless $action eq "test";
+}
+
+#
+# For dev/qa deployment, migrate the db
+# run idlalter/ibxalter. Also if a script with same name as buildname exists
+# run that as well
+#
+sub migrateDatabase {
+    my $archivedProduct = shift;
+    my $cluster = shift;
+    my $doInit = shift;
+    my $datasetType = shift;
+    my $sourceBuildname = shift;
+    my $realmSubset = shift;
+
+    my $service = $archivedProduct->service();
+
+    if ($isProdService) {
+        die ("Cannot run dbmigration automagically for $service!!!\n");
+    }
+
+    $client->running( $rcBuild, $doInit, $rcLog, $rcProduct, $rcBranch, $rcRelease, $rcService );
+
+    my $starttime = time();
+    ariba::rc::Utils::writeTimingInfo($timelog, "db migration", "BEGIN");
+
+    $migrationHelper =
+        ariba::Ops::MigrationHelper->newFromProduct($archivedProduct, $cluster);
+
+    my $installedProduct = installedProduct($archivedProduct->name(),
+                                        $archivedProduct->service(),
+                                        $sourceBuildname,
+                                        $archivedProduct->customer());
+
+    $migrationHelper->setOldProduct($installedProduct);
+    $migrationHelper->setDatasetType($datasetType);
+    # Setting Log file information for RC DB
+    $migrationHelper->setLogFile($rcLog);
+
+    if ($realmSubset) {
+        $migrationHelper->setRealmSubset($realmSubset);
+    }
+
+    if ( $tenant ){
+        $migrationHelper->setTenant( $tenant );
+    }
+
+    #
+    # If migrate option is initdb set 'doInit' to true
+    # else false. Also set 'migrateCmd' to migrate option
+    # which is 'restoremigrate', 'restoreonly', 'migrate'(without db) and 'loadmeta' as of now.
+    #
+    if ($doInit eq $INIT)  {
+        $migrationHelper->setDoInit(1);
+    }
+    elsif ($doInit eq $RESTOREMIGRATE) {
+        $migrationHelper->setDoInit(0);
+        $migrationHelper->setMigrateCmd($doInit);
+    }
+        elsif ($doInit eq $RESTOREONLY) {
+            $migrationHelper->setDoInit(0);
+            $migrationHelper->setMigrateCmd($doInit);
+        }
+    elsif ($doInit eq $MIGRATE) {
+        $migrationHelper->setDoInit(0);
+        $migrationHelper->setMigrateCmd($doInit);
+    }
+    elsif ($doInit eq $LOADMETA){
+        $migrationHelper->setDoInit(0);
+        $migrationHelper->setMigrateCmd($doInit);
+    }
+    $migrationHelper->setTesting($testing);
+
+    my $returncode = $migrationHelper->runMigrationCommands();
+
+    ariba::rc::Utils::writeTimingInfo($timelog, "db migration", "END", $starttime);
+
+    if ($returncode) {
+         $client->success( $rcBuild, $doInit, $rcLog, $rcProduct, $rcBranch, $rcRelease, $rcService );
+    }
+    else {
+         $client->fail( $rcBuild, $doInit, $rcLog, $rcProduct, $rcBranch, $rcRelease, $rcService );
+    }
+
+    return $returncode;
+}
+
+#
+# Get installed product
+#
+sub installedProduct {
+    my $prodname = shift;
+    my $service = shift;
+    my $buildname = shift;
+    my $customer = shift;
+    my $quiet = shift;
+
+    my $product;
+
+    if (ariba::rc::InstalledProduct->isInstalled($prodname, $service, $buildname, $customer)) {
+        $product = ariba::rc::InstalledProduct->new($prodname, $service, $buildname, $customer);
+        my $name = $product->name();
+        my $buildName = $product->buildName();
+        my $dir = $product->installDir();
+        print "$name ($buildName): $dir\n" unless ($quiet);
+    }
+
+    return $product;
+}
+
+#
+# Get archived product
+#
+sub archivedProduct {
+    my $prodname = shift;
+    my $service = shift;
+    my $buildname = shift;
+    my $customer = shift;
+    my $cluster = shift;
+    my $quiet    = shift;
+
+    my $product;
+
+    if (ariba::rc::ArchivedProduct->isArchived($prodname, $service, $buildname, $customer)) {
+        $product = ariba::rc::ArchivedProduct->new($prodname, $service, $buildname, $customer, undef, $cluster);
+        my $name = $product->name();
+        my $buildName = $product->buildName();
+        my $dir = $product->archiveDir();
+        print "$name ($buildName): $dir\n" unless ($quiet);
+    }
+
+    return $product;
+}
+
+#-------------------------------- these are the action methods
+
+# test login to all the machines.
+sub test {
+    my $prodname = shift;
+    my $service = shift;
+    my $customer = shift;
+    my $cluster = shift;
+    my $buildname = shift;
+    my $usingAppInstances = shift;
+    my $secondBucketOnly = shift;
+    my $nopause = shift;
+    my $requestedRoles = shift;
+    my $args = shift;
+    my $timeStarted = shift;
+
+    my $product = archivedProduct($prodname,$service,$buildname,$customer,$cluster);
+
+    if (!defined($product)) {
+        $product = installedProduct($prodname,$service,$buildname,$customer);
+    }
+
+    if ( !defined($product)) {
+        print "$service of $prodname is not currently archived or installed\n";
+        return undef;
+    }
+
+    $topologyManager = ariba::Ops::TopologyManager->new($product,$product,$baseTMonly,$clustertestFile);
+
+    if ($usingAppInstances) {
+        controlServiceUsingAppInstances($product,$product,$TEST,$cluster,$requestedRoles,undef, $timeStarted,$secondBucketOnly,$nopause);
+    } else {
+        controlService($product,$product,$TEST,$cluster,$requestedRoles,undef, undef, $timeStarted);
+    }
+}
+
+#
+# stop currently running service
+#
+sub stopsvc {
+    my $prodname = shift;
+    my $service = shift;
+    my $customer = shift;
+    my $cluster = shift;
+    my $buildname = shift;
+    my $usingAppInstances = shift;
+    my $secondBucketOnly = shift;
+    my $nopause = shift;
+    my $requestedRoles = shift;
+    my $args = shift;
+    my $timeStarted = shift;
+    my $force = shift;
+
+    my $product = installedProduct($prodname,$service, $buildname,$customer);
+
+    if (!defined($product)) {
+        print "product $prodname, service $service not found!\n";
+        return undef;
+    }
+    
+    $topologyManager = ariba::Ops::TopologyManager->new($product,$product,$baseTMonly,$clustertestFile);
+
+    inform($product, $cluster, $STOP, $force);
+    if ($usingAppInstances) {
+        controlServiceUsingAppInstances($product,undef,$STOP,$cluster,$requestedRoles,$args,$timeStarted,$secondBucketOnly,$nopause);
+    } else {
+        controlService($product,undef,$STOP,$cluster,$requestedRoles,$args,undef,$timeStarted);
+    }
+}
+
+sub startup {
+    my $prodname = shift;
+    my $service = shift;
+    my $customer = shift;
+    my $cluster = shift;
+    my $buildname = shift;
+    my $usingAppInstances = shift;
+    my $secondBucketOnly = shift;
+    my $nopause = shift;
+    my $requestedRoles = shift;
+    my $args = shift;
+    my $timeStarted = shift;
+
+    my $product = installedProduct($prodname,$service, $buildname, $customer);
+
+    if (!defined($product)) {
+        print "product $prodname, service $service not found!  Has product even been installed?\n";
+        return undef;
+    }
+
+    $topologyManager = ariba::Ops::TopologyManager->new($product,$product,$baseTMonly,$clustertestFile);
+
+    $topologyManager->callback("generateTopology", $cluster, $START);
+
+    if ($usingAppInstances) {
+        controlServiceUsingAppInstances(undef,$product,$START,$cluster,$requestedRoles,$args,$timeStarted,$secondBucketOnly,$nopause);
+    } else {
+        controlService(undef,$product,$START,$cluster,$requestedRoles,$args,undef,$timeStarted);
+    }
+    push(@{$postActionInformHashRef->{$START}}, $product);
+}
+
+#
+# start the latest or specified build
+#
+sub install {
+    my $prodname = shift;
+    my $service = shift;
+    my $customer = shift;
+    my $cluster = shift;
+    my $buildname = shift;
+    my $sourceBuildname = shift;
+    my $usingAppInstances = shift;
+    my $secondBucketOnly = shift;
+    my $nopause = shift;
+    my $migrateCommand = shift;
+    my $datasetType = shift;
+    my $requestedRoles = shift;
+    my $args = shift;
+    my $timeStarted = shift;
+    my $realmSubset = shift;
+
+    my $product = archivedProduct($prodname,$service,$buildname,$customer,$cluster);
+
+    if (!defined($product)) {
+        $product = installedProduct($prodname,$service,$buildname,$customer);
+    }
+
+    if ( !defined($product)) {
+        print "$service of $prodname is not currently archived or installed\n";
+        return undef;
+    }
+
+    $topologyManager = ariba::Ops::TopologyManager->new($product,$product,$baseTMonly,$clustertestFile);
+
+    if ($migrateCommand) {
+        #
+        # If migration steps are not successful, exit....
+        #
+        # In place of passing boolean for deciding to do initdb
+        # or not, we pass the migrate option directly and decide
+        # in migrateDatabase() for accomplishing the type of operation
+        #
+        if (!migrateDatabase($product, $cluster, $migrateCommand, $datasetType, $sourceBuildname, $realmSubset)) {
+            do_exit(1);
+        }
+    }
+
+    $topologyManager->callback("generateTopology", $cluster, $START);
+        
+    if ($usingAppInstances) {
+        controlServiceUsingAppInstances(undef,$product,$START,$cluster,$requestedRoles,$args,$timeStarted,$secondBucketOnly,$nopause);
+    } else {
+        controlService(undef,$product,$START,$cluster,$requestedRoles,$args,undef,$timeStarted);
+    }
+    print "Install completed to [buildname: " . $product->buildName() . " releasename: " . $product->releaseName() . "]\n";
+    push(@{$postActionInformHashRef->{$START}}, $product);
+}
+
+#
+# stop the current build and 'uninstall' it.
+#
+# stopsvc will remove the ClusterName file, any build symlinks, and
+# mon's Query/QueryManager objects for the product
+#
+sub uninstall {
+    my $prodname = shift;
+    my $service = shift;
+    my $customer = shift;
+    my $cluster = shift;
+    my $buildname = shift;
+    my $usingAppInstances = shift;
+    my $secondBucketOnly = shift;
+    my $nopause = shift;
+    my $requestedRoles = shift;
+    my $args = shift;
+    my $timeStarted = shift;
+
+    my $product = installedProduct($prodname,$service,$buildname,$customer);
+
+    if ( !defined($product) ) {
+        print "$service of $prodname is not currently installed\n";
+        return undef;
+    }
+    
+    $topologyManager = ariba::Ops::TopologyManager->new($product,$product,$baseTMonly,$clustertestFile);
+
+    #
+    # If we pass original $args to controlService for mon, it will
+    # uninstall monitoring! Can't let that happen.
+    #
+    my @fakeArgs = ();
+
+    my $mon = installedProduct('mon',$service);
+
+    #
+    # Stop the product and remove its symlinks
+    #
+    if ($usingAppInstances) {
+        controlServiceUsingAppInstances($product,$product,$STOP,$cluster,$requestedRoles,$args,$timeStarted,$secondBucketOnly,$nopause);
+    } else {
+        controlService($product,$product,$STOP,$cluster,$requestedRoles,$args,undef,$timeStarted);
+    }
+
+}
+
+#
+# shutdown the old service and start the new one, one host at a time
+# loadbalanced.
+#
+sub upgrade {
+    my $prodname = shift;
+    my $service = shift;
+    my $customer = shift;
+    my $cluster = shift;
+    my $buildname = shift;
+    my $usingAppInstances = shift;
+    my $secondBucketOnly = shift;
+    my $nopause = shift;
+    my $requestedRoles = shift;
+    my $args = shift;
+    my $timeStarted = shift;
+    my $force = shift;
+
+    my ($oldProduct, $newProduct);
+    $newProduct = archivedProduct($prodname,$service,$buildname,$customer,$cluster);
+    $oldProduct = installedProduct($prodname,$service,undef,$customer);
+
+    if ( !defined($oldProduct)) {
+        $oldProduct = $newProduct;
+    }
+
+    if (!defined ($oldProduct) || !defined ($newProduct)) {
+        print "$service of $prodname is not currently archived or installed\n";
+        return undef;
+    }
+    $topologyManager = ariba::Ops::TopologyManager->new($oldProduct,$newProduct,$baseTMonly,$clustertestFile);
+
+    my $tmStatus = $topologyManager->callback("performPreCheck", $cluster, $RECYCLE);
+    if ($tmStatus == -1) {
+        print "\tUpgrade Aborted ......... \n";
+        do_exit(1);
+    }
+    
+    $topologyManager->callback("generateTopology", $cluster, $RECYCLE);
+
+    #
+    # For arches, all zk nodes need to be up before doing RR or RU. Check for zk nodes status
+    # and bring up if needed
+    #
+    if (grep(/^$prodname$/, ariba::rc::Globals::archesProducts())) {
+        checkArchesRequiredNodes($prodname,$service,$cluster,$buildname,"upgrade",undef,$usingAppInstances,$nopause,$args,$timeStarted);
+    }
+
+    inform($oldProduct, $cluster, $STOP, $force);
+
+    if ($usingAppInstances) {
+        # flag start of rolling recycle
+        my $rollingRecycleHelper = ariba::Ops::RollingRecycleHelper->newFromProduct($oldProduct);
+        $rollingRecycleHelper->beginRollingUpgrade();
+
+        controlServiceUsingAppInstances($oldProduct,$newProduct,$RECYCLE,$cluster,$requestedRoles,$args,$timeStarted,$secondBucketOnly,$nopause);
+
+        # flag end of rolling recycle
+        $rollingRecycleHelper->setProduct($newProduct);
+        $rollingRecycleHelper->endRollingUpgrade();
+    } else {
+        controlService($oldProduct,$newProduct,$RECYCLE,$cluster,$requestedRoles,$args,undef,$timeStarted);
+    }
+    print "Upgrade completed to [buildname: " . $newProduct->buildName() . " releasename: " . $newProduct->releaseName() . "]\n";
+    push(@{$postActionInformHashRef->{$START}}, $newProduct);
+}
+
+#
+# shutdown the service and start it again, one host at a time
+# loadbalanced.
+#
+sub restart {
+    my $prodname = shift;
+    my $service = shift;
+    my $customer = shift;
+    my $cluster = shift;
+    my $buildname = shift;
+    my $usingAppInstances = shift;
+    my $secondBucketOnly = shift;
+    my $nopause = shift;
+    my $requestedRoles = shift;
+    my $args = shift;
+    my $timeStarted = shift;
+    my $force = shift;
+
+    my $product = installedProduct($prodname,$service,$buildname,$customer);
+
+    if ( !defined($product)) {
+        print "$service of $prodname is not currently installed\n";
+        return undef;
+    }
+
+    $topologyManager = ariba::Ops::TopologyManager->new($product,$product,$baseTMonly,$clustertestFile);
+
+    #
+    # For arches, all zk nodes need to be up before doing RR or RU. Check for zk nodes status
+    # and bring up if needed
+    #
+    if (grep(/^$prodname$/, ariba::rc::Globals::archesProducts())) {
+        checkArchesRequiredNodes($prodname,$service,$cluster,$buildname,"restart",undef,$usingAppInstances,$nopause,$args,$timeStarted);
+    }
+
+    inform( $product, $cluster, $STOP, $force);
+    if ($usingAppInstances) {
+        # flag start of rolling recycle
+        my $rollingRecycleHelper = ariba::Ops::RollingRecycleHelper->newFromProduct($product);
+        $rollingRecycleHelper->beginRollingRestart();
+
+        controlServiceUsingAppInstances($product,$product,$RECYCLE,$cluster,$requestedRoles,$args,$timeStarted,$secondBucketOnly,$nopause);
+
+        # flag end of rolling recycle
+        $rollingRecycleHelper->endRollingRestart();
+    } else {
+        controlService($product,$product,$RECYCLE,$cluster,$requestedRoles,$args,undef,$timeStarted);
+    }
+    push(@{$postActionInformHashRef->{$RECYCLE}}, $product);
+}
+
+sub reload {
+    my $prodname = shift;
+    my $service = shift;
+    my $customer = shift;
+    my $cluster = shift;
+    my $buildname = shift;
+    my $usingAppInstances = shift;
+    my $secondBucketOnly = shift;
+    my $nopause = shift;
+    my $requestedRoles = shift;
+    my $args = shift;
+    my $timeStarted = shift;
+
+    my $product = installedProduct($prodname,$service,$buildname,$customer);
+
+    if ( !defined($product)) {
+        print "$service of $prodname is not currently installed\n";
+        return undef;
+    }
+
+    $topologyManager = ariba::Ops::TopologyManager->new($product,$product,$baseTMonly,$clustertestFile);
+
+    controlService($product,$product,$RELOAD,$cluster,$requestedRoles,$args,undef,$timeStarted);
+}
+#-------------------------------- end of the action methods
+
+#
+# For products with appInstances that require certain nodes to be
+# up at all times in order to successfully initialize.
+# For now, this is set up for arches, if other products need to supported,
+# will need to update this and accept node instance type. For now, we bring
+# up all arches zk app instances if app is currently down for RR and RU
+#
+sub checkArchesRequiredNodes {
+    my $productName = shift;
+    my $service = shift;
+    my $cluster = shift;
+    my $buildname = shift;
+    my $action = shift;
+    my $oldProduct = shift;
+    my $usingAppInstances = shift;
+    my $nopause = shift;
+    my $args = shift;
+    my $timeStarted = shift;
+
+    my $product = ariba::rc::InstalledProduct->new($productName, $service);
+    my @appInstances = grep { $_->appName() eq 'ZooKeeper' } $product->appInstancesInCluster($cluster);
+    return unless @appInstances > 1;
+
+    print "Checking for required nodes status\n";
+    #
+    # Check if the specified app instances are all up on a given cluster. 
+    # If not then start all of them on the currently deployed build. 
+    #
+    if (ariba::Ops::Startup::Common::waitForAppInstancesToInitialize(\@appInstances, undef, undef, 1)) {
+        return;
+    } else {
+        print "Not all zookeeper nodes are up. Bringing them up before attempting c-d $action\n";
+        controlService($product,$product,$RECYCLE,$cluster,['zookeeper'],$args,undef,$timeStarted);
+        print "Done bringing up zookeeper nodes.\n";
+    }
+    return;
+}
+
+#
+# if the machine has access to archived/deployment and/or copysrc area
+# it can make the right decision about what to do in case of 'install'
+# 'start' etc.
+#
+sub isCopyhost {
+    my $prodname = shift;
+    my $service = shift;
+    my $customer = shift;
+    my $cluster = shift;
+
+    my $me = archivedProduct($prodname,$service,undef,$customer,$cluster,1);
+    if (!defined($me)) {
+        $me = installedProduct($prodname,$service,undef,$customer,1);
+    }
+
+    if ( !defined($me) ) {
+        print "$service of $prodname (customer $customer) is not currently archived\n";
+        return undef;
+    }
+
+    my @hosts = $me->hostsForRoleInCluster('copyhost', $cluster);
+
+    my $localHost = ariba::Ops::NetworkUtils::hostname();
+    for my $copyHost (@hosts) {
+        if ($localHost eq $copyHost) {
+            return 1;
+        }
+    }
+
+    if (@hosts) {
+        return 0;
+    } else {
+        return 1;
+    }
+}
+
+sub launchSelfOnCopyhostInstallDir {
+    my $prodname = shift;
+    my $service = shift;
+    my $customer = shift;
+    my $cluster = shift;
+    my $prog = shift;
+    my @args = @_;
+
+    my $me = installedProduct($prodname,$service,undef,$customer,1);
+
+    if ( !defined($me) ) {
+        print "$service of $prodname (customer $customer) is not currently installed\n";
+        return undef;
+    }
+
+    my @hosts = $me->hostsForRoleInCluster('copyhost', $cluster);
+
+    my $copyhost;
+
+    if (@hosts) {
+        $copyhost = $hosts[0];
+    } else {
+        $copyhost = ariba::Ops::NetworkUtils::hostname();
+    }
+
+    my $installDir = $me->installDir();
+
+    my $user = ariba::rc::Globals::deploymentUser($prodname, $service);
+
+    my $cmd = "ssh $user\@$copyhost $installDir/bin/$prog ". join(" ", @args);
+
+    my $password = ariba::rc::Passwords::lookup($user);
+    my $master = ariba::rc::Passwords::lookup('master');
+
+    my $localHost = ariba::Ops::NetworkUtils::hostname(); 
+
+    print ">>> Launching control deployment on copyhost $copyhost\n";
+
+    return(ariba::rc::Utils::sshCover("$cmd", $password, $master));
+}
+
+sub launchSelfOnCopyhost {
+    my $prodname = shift;
+    my $service = shift;
+    my $customer = shift;
+    my $cluster = shift;
+    my $prog = shift;
+    my @args = @_;
+
+    my $me = archivedProduct($prodname,$service,undef,$customer,$cluster,1);
+    if (!defined($me)) {
+        $me = installedProduct($prodname,$service,undef,$customer,1);
+    }
+
+    if ( !defined($me) ) {
+        print "$service of $prodname (customer $customer) is not currently archived\n";
+        return undef;
+    }
+
+    my @hosts = $me->hostsForRoleInCluster('copyhost', $cluster);
+
+    my $copyhost;
+
+    if (@hosts) {
+        $copyhost = $hosts[0];
+    } else {
+        $copyhost = ariba::Ops::NetworkUtils::hostname();
+    }
+
+    my $archiveDir = ariba::rc::Globals::copySrcDir($prodname, $service, $customer) . "/" . $me->buildName();
+
+    my $user = ariba::rc::Globals::copyUser($prodname, $service);
+    my $cmd = "ssh $user\@$copyhost $archiveDir/bin/$prog -force ". join(" ", @args);
+
+    my $password = ariba::rc::Passwords::lookup($user);
+    my $master = ariba::rc::Passwords::lookup('master');
+
+    print ">>> Launching control deployment on copyhost $copyhost\n";
+
+    return(ariba::rc::Utils::sshCover("$cmd", $password, $master));
+}
+
+sub launchSelfOnAllClusters {
+    my $product = shift;
+    my $service = shift;
+    my $customer = shift;
+    my $build = shift;
+    my $action = shift;
+    my $migrateCommand = shift;
+    my $secondBucketOnly = shift;
+    my $force = shift;
+    my @args = @_;
+
+    my $me;
+
+    $me = archivedProduct($product, $service, $build, $customer, 1) if ( $action =~ /^(?:install|upgrade|test)$/ );
+    $me = installedProduct($product, $service, $build, $customer, 1) unless ( defined $me );
+
+    unless ( defined $me ) {
+        my $customerName = $customer ? " (customer $customer)" : '';
+        my $buildName = $build ? " $build" : '';
+        print "$product $service$buildName$customerName is not currently archived/installed. Aborting deployment.\n";
+        return 1;
+    }
+
+    my $host = ariba::Ops::NetworkUtils::hostname();
+    my $currentCluster = $me->clusterForHost($host);
+    my @clusters = $me->allClusters();
+
+    $currentCluster = $clusters[0] unless ($currentCluster);
+
+    checkProductsForAction($customer,
+                $build,
+                $currentCluster,
+                $action,
+                $product,
+                $service,
+                $migrateCommand,
+                $secondBucketOnly,
+                $force,
+                );
+
+    ariba::rc::Passwords::initialize($service);
+
+    my $overallExitCode = 0;
+    my $lastExitCode = 0;
+    my %exitCodeForCluster;
+
+    my $archiveDir = ariba::rc::Globals::rootDir($product, $service, $customer) . "/" . $me->buildName();
+    my $controlDeploymentCmd = "$archiveDir/bin/" . basename($0);
+    my $user = ariba::rc::Globals::deploymentUser($product, $service);
+
+    my $password = ariba::rc::Passwords::lookup($user);
+    my $master = ariba::rc::Passwords::lookup('master');
+
+    unless ( $password ) {
+        print "Failed to retrieve password for '$user' to run remote command. Exiting\n";
+        return 1;
+    }
+
+    # Check and verify deploy product info on all clusters.
+    unless ( $force || scalar(@clusters) == 1 ) {
+        my %deployInfoForCluster;
+
+        foreach my $cluster ( @clusters ) {
+            my @hosts = $me->hostsForRoleInCluster('copyhost', $cluster);
+            @hosts = $me->allHostsInCluster($cluster) unless (@hosts);
+            my $copyhost = shift(@hosts);
+
+            unless ( $copyhost ) {
+                print "No copyhost or any host defined for $cluster to run remote control deployment. Exiting.\n";
+                return 1;
+            }
+
+            my $cmd = "ssh $user\@$copyhost $controlDeploymentCmd -skipProductionWarning -checkDeploymentOnly ". join(" ", @args);
+            $cmd =~ s/(-cluster) \w+/$1 $cluster/g;     # Override the cluster
+            $cmd =~ s/\b\s(?:-d|-debug)\b//g;           # Strip out debug flags as it prints cluster name
+
+            # Don't print these as it creates an inconsistent UI experience compared on single cluster deploy.
+            if ( $debug ) {
+                print "\n>>> Checking deployment information for $cluster cluster on host $copyhost\n";
+                print "$cmd\n\n";
+            }
+
+            my @output;
+            ariba::rc::Utils::sshCover($cmd, $password, undef, undef, \@output);
+            $deployInfoForCluster{$cluster} = join("\n", @output);
+        }
+
+        # Verify deploy info
+        my $clusterToCheckAgainst;
+        my $infoToCheckAgainst;
+        foreach my $cluster (sort keys %deployInfoForCluster) {
+            my $info = $deployInfoForCluster{$cluster};
+
+            unless ( $info && $info =~ /PRODUCT: .*$product\b/ ) {
+                print "Deployment info for $cluster seems to be missing PRODUCT tag: \n";
+                print '-' x 80, "\n";
+                print $info || '[no deployment info available??]', "\n";
+                print '-' x 80, "\n";
+                print "Aborting deployment.\n";
+
+                return 1;
+            }
+
+            if ( $clusterToCheckAgainst && $infoToCheckAgainst ) {
+                if ( $info ne $infoToCheckAgainst ) {
+                    print "Deployment for $cluster seems to be different than $clusterToCheckAgainst.\n";
+
+                    print '-' x 35, " $clusterToCheckAgainst ", '-' x 36, "\n";
+                    print $infoToCheckAgainst, "\n";
+                    print '-' x 80, "\n";
+
+                    print '-' x 35, " $cluster ", '-' x 34, "\n";
+                    print $info, "\n";
+                    print '-' x 80, "\n";
+
+                    my $question = "\nPlease review and make sure you understand the differences before proceeding.\n" . 
+                                   "Any discrepancies should be fixed before continuing.\n";
+
+                    return 1 if askShouldAbort( $question );
+                }
+            } else {
+                $clusterToCheckAgainst = $cluster;
+                $infoToCheckAgainst = $info;
+            }
+        }
+    }
+
+    #
+    # Unsafe to interrupt from here on:
+    #
+    local $SIG{INT} = 'IGNORE';
+
+    my $skipExitCode = -1;
+
+    while ( my $cluster = shift(@clusters) ) {
+        my @hosts = $me->hostsForRoleInCluster('copyhost', $cluster);
+        @hosts = $me->allHostsInCluster($cluster) unless (@hosts);
+        my $copyhost = shift(@hosts);
+
+        unless ( $copyhost ) {
+                print "No copyhost or any host defined for $cluster to run remote control deployment. Exiting.\n";
+                return 1;
+        }
+
+        my $cmd = "ssh $user\@$copyhost $controlDeploymentCmd -skipProductionWarning ". join(" ", @args);
+        $cmd =~ s/(-cluster) \w+/$1 $cluster/g;   # Override the cluster
+
+        print "\n>>> Launching control deployment for $cluster cluster on host $copyhost\n";
+        print "$cmd\n" if ( $debug );
+        print "\n";
+
+        my $exitCode = ariba::rc::Utils::sshCover($cmd, $password, $master, undef, undef, undef, undef, 'interactive');
+        $lastExitCode = $exitCode;
+        $exitCodeForCluster{$cluster} = $exitCode;
+        $overallExitCode ||= $exitCode;
+
+        if ( $exitCode && @clusters ) {
+            my $question = "\nDeployment on $cluster cluster exited with error.\n" .
+                           "Please review the errors/available logs before continuing.\n";
+
+            if ( askShouldAbort( $question ) ) {
+                map { $exitCodeForCluster{$_} = $skipExitCode } @clusters;
+                last;
+            }
+        }
+    }
+
+    if ( %exitCodeForCluster ) {
+        print "\n" if ( $lastExitCode );    # Need extra space when there is an error
+        print ">>> Deployment Summary\n";
+
+        foreach my $cluster (sort keys %exitCodeForCluster) {
+            my $successWords = 'Done successfully';
+
+            if ( $exitCodeForCluster{$cluster} == $skipExitCode ) {
+                $successWords = 'Skipped by user';
+            } elsif ( $exitCodeForCluster{$cluster} ) {
+                $successWords = 'Exited/completed with error code ' . $exitCodeForCluster{$cluster};
+            }
+
+            print ucfirst($cluster) . ": $successWords\n";
+        }
+    }
+
+    return $overallExitCode;
+}
+
+sub do_exit {
+    my $status = shift;
+
+    dmail::LockLib::releaselock($lockfile) if ( $lockfile && $SHOULD_LOCK );
+
+    # Exiting from password prompts with echo off.
+    system("stty echo") if (-t STDIN);
+
+    exit($status);
+}
+
+sub usage {
+    my $error = shift;
+
+    print "usage: $0 (version $vers)\n";
+    print " [-help]\n";
+    print " [-debug]\n";
+    print " [-testing] dont execute commands just print them\n";
+    print " [-migrate] run db migration before starting up\n";
+    print " [-restoremigrate] restore db and then migrate\n";
+    print " [-restoreonly] just restore the src build (dataset build) and bring up the server\n";
+    print " [-restoreDatasetType <type>] override the default dataset type for this product\n";
+    print " [-initdb]  (re)initialize db and realms\n";
+    print " [-loadmeta] runs loadmeta before starting up\n";
+    print " [-customer <customer1>[,<customer2>]... |-allcustomers]\n";
+    print " [-buildname <buildname>] buildname can be specified for 'install', 'upgrade' and 'restart' actions\n";
+    print " [-role <role1> [-role <role2>]...]\n";
+    print " [-log <logfile> location of the log file ]\n";
+    print " [-fast] fast (parallel) execution, customers may notice downtime\n";
+    print " [-slow] slow (serial) execution, customers may not notice downtime\n";
+    print " [-rolling] perform the operation in a rolling fashion (per AppInstance, instead of per host)\n";
+    print " [-norolling] don't perform the operation in a rolling fashion (per AppInstance, instead of per host)\n";
+    print " [-second-bucket-only] Used with -rolling, this will restart nodes in the second bucket ONLY\n";
+    print " [-nopause] Used with -rolling, this will not pause to check if the nodes are\n";
+    print "      up between buckets.  For use with ANRC cron page\n";
+    print " [-startupargs <any other startup/stopsvc options>]\n";
+    print " -cluster <primary|secondary|$ALL>\n";
+    print " <" . join("|", ariba::rc::Globals::allProducts())  . ">\n";
+    print " <service>\n";
+    print " <start|stop|install|uninstall|restart|upgrade|test>\n";
+    print "     start     - starts the currently installed product\n";
+    print "     stop      - stops the currently installed product\n";
+    print "     install   - installs the latest version of product\n";
+    print "     uninstall - stop mon, uninstall the currently\n";
+    print "                 installed product, and start mon\n";
+    print "     restart   - rolling stop followed by start\n";
+    print "     upgrade   - rolling stop followed by install\n";
+    print "     test      - test machine connectivity\n";
+    hadoopMsg();
+
+    print "\nError: $error\n" if ( $error );
+
+    exit(1);
+}
+
+sub hadoopMsg {
+    print " \n NOTE for hadoop product:\n";
+    print "     cluster restart must be done via a $0 stop, then $0 start for each cluster\n";
+    print "     cluster upgrade must be done via a $0 stop, then $0 install for each cluster\n";
+}
+
+sub allProductControlDeployment {
+    my $product = shift;
+    my $service = shift;
+    my $cluster = shift;
+    my $action = shift;
+    my $debug = shift;
+    my $testing = shift;
+    my $fast = shift;
+    my $force = shift;
+    my $timeStarted = shift;
+
+    #
+    # Start a log directory
+    #
+    my $logDir = ariba::Ops::ControlDeploymentHelper->logDirForProductServiceCustomerActionAndTime($ALL, $service, undef, $action, $timeStarted);
+    mkpath($logDir) unless (-d ($logDir));
+
+    #
+    # tee output to log directory
+    #
+    my $controlDeploymentLogFile = "$logDir/control-deployment.log";
+    my $tee = IO::Tee->new(\*STDOUT, ">$controlDeploymentLogFile");
+    select($tee);
+
+    if( $action eq "restart" || $action eq "upgrade" ) {
+        usage("$action is not supported for product wildcard '$ALL'.");
+    }
+
+    if( $cluster eq $ALL ) {
+        usage("Cluster '$cluster' is not supported for product wildcard '$ALL'.");
+    }
+
+    ariba::rc::Passwords::initialize($service);
+    my $master = ariba::rc::Passwords::lookup('master');
+    my $controlDeployment = $FindBin::Bin . "/" . basename($0);
+    ariba::Ops::ControlDeploymentHelper->setMaxParallelProcesses(1000);
+    my %prodSeen;
+    foreach my $p (ariba::rc::InstalledProduct->installedProductsList()) {
+        my $key = $p->name();
+        $key .= "/" . $p->customer() if($p->customer());
+        next if($prodSeen{$key});
+        $prodSeen{$key} = 1;
+        my @subargs = ( $p->name(), $service, "-cluster", $cluster, $action );
+        if($p->isASPProduct()) {
+            push(@subargs, "-customer");
+            push(@subargs, $p->customer());
+        }
+        push(@subargs, "-debug") if($debug);
+        push(@subargs, "-testing") if($testing);
+        push(@subargs, "-force");
+        push(@subargs, "-fast") if($fast);
+
+        my $cdCmd = join(' ', ($controlDeployment, @subargs) );
+        print $cdCmd,"\n";
+        my $desc = "$action $key";
+        my $cdh = ariba::Ops::ControlDeploymentHelper->newUsingProductServiceAndCustomer( $p->name(), $service, $p->customer() );
+        $cdh->setTesting($testing);
+        $cdh->setTimeStarted($timeStarted);
+        $cdh->launchCommandsInBackground(
+            $action,
+            undef, # no user
+            undef, # no host
+            "cd-" . $p->name() . "-$service",
+            undef, # no password
+            $master,
+            $desc,
+            $cdCmd
+        );
+    }
+
+    ariba::Ops::ControlDeploymentHelper->waitForBackgroundCommands();
+}
+
+sub main { 
+    my ($arg,$service,$product,$cluster,$root,$action,$buildname,$sourceBuildname);
+
+    my (@roles, @args);
+
+    my $force = 0;
+    my $migrateCommand;
+    my $datasetType;
+    my $allCustomers = 0;
+    my $specifiedCustomer;
+    my $fast;
+    my $usingAppInstances = 0;
+    my $dontUseAppInstances = 0;
+    my $secondBucketOnly = 0;
+    my $nopause = 0;
+    my $serviceOrAction;
+    my $realmSubset;
+
+    my @savedArgv = @ARGV;
+    my $timeStarted = time();
+    my $skipProductionWarning = 0;
+    my $checkDeploymentOnly = 0;
+
+    while ($arg = shift(@ARGV)) {
+        if ($arg =~ /^-help/) { usage();}
+        # Topology Manager will take clustertestFile as init parameter and
+        # will invoke CTF if this parameter is passed
+        if ($arg =~ /^-clustertest/) { $clustertestFile = shift(@ARGV); next; }
+        if ($arg =~ /^-baseTMonly/) { $baseTMonly = 1;next;}
+        if ($arg =~ /^(?:-d|-debug)$/) { $debug = 1; next;}
+        if ($arg =~ /^-nodrain/) { $nodrain = 1;next;}
+        if ($arg =~ /^-testing/) { $testing = 1; next;}
+        if ($arg =~ /^-restoremigrate/) { $migrateCommand = $RESTOREMIGRATE; next; }
+        if ($arg =~ /^-restoreonly/) { $migrateCommand = $RESTOREONLY; next; }
+        if ($arg =~ /^-restoreDatasetType/i) { $datasetType = shift(@ARGV); next; }
+        if ($arg =~ /^-migrate/) { $migrateCommand = $MIGRATE; next; }
+        if ($arg =~ /^-initdb/) { $migrateCommand = $INIT; next; }
+        if ($arg =~ /^-loadmeta/) { $migrateCommand = $LOADMETA; next; }
+        if ($arg =~ /^-force/) { $force = 1; next;}
+        if ($arg =~ /^-pause/) { $pauseBetweenBuckets = 1; next;}
+        if ($arg =~ /^-role/) { push(@roles, shift(@ARGV)); next;}
+        if ($arg =~ /^-allcustomer/i) { $allCustomers = 1; next;}
+        if ($arg =~ /^-customer/) { $specifiedCustomer = shift(@ARGV); next;}
+        if ($arg =~ /^-buildname/) { $buildname = shift(@ARGV); next;}
+        if ($arg =~ /^-sourcebuildname/i) { $sourceBuildname = shift(@ARGV); next;}
+        if ($arg =~ /^-cluster/) { $cluster = shift(@ARGV); next;}
+        if ($arg =~ /^-fast/) { $fast = 1; next;}
+        if ($arg =~ /^-slow/) { $fast = 0; next;}
+        if ($arg =~ /^-usingAppInstance/) { $usingAppInstances = 1; next;}
+        if ($arg =~ /^-rolling/) { $usingAppInstances = 1; next;}
+        if ($arg =~ /^-norolling/) { $dontUseAppInstances = 1; $usingAppInstances = 0;  next;}
+        if ($arg =~ /^-second-bucket-only/) { $usingAppInstances = 1; $secondBucketOnly = 1; next; }
+        if ($arg =~ /^-nopause/) { $nopause = 1; next; }
+        if ($arg =~ /^-nocheck/) { $checkBuckets = 0; next }
+        if ($arg =~ /^-nolock/i) { $SHOULD_LOCK = 0; next; }
+        if ($arg =~ /^-restoreRealmSubset$/) { $realmSubset = shift(@ARGV); next; }
+        if ($arg =~ /^-log/) { $rcLog = shift ( @ARGV ); next; }
+        if ($arg =~ /^-tenant/) { $tenant = shift ( @ARGV ); next; }
+        if ($arg =~ /^start$|^stop$|^upgrade$|^install$|^uninstall$|^restart$|^test$|^reload$/) {
+            if ($service) {
+                $action = $arg;
+            } elsif ($serviceOrAction) {
+                if (grep { $serviceOrAction eq $_ } ariba::rc::Globals::allServices()) {
+                    $action = $arg;
+                    $service = $serviceOrAction;
+                } else {
+                    $service = $arg;
+                    $action = $serviceOrAction;
+                }
+            } else {
+                $serviceOrAction = $arg;
+            }
+            next;
+        }
+        if ($arg =~ /^-startupargs/) {
+            @args = @ARGV;
+            @ARGV = ();
+            next;
+        }
+
+        # Private options. Do not document in usage.
+        if ($arg =~ /^-skipProductionWarning$/) { $skipProductionWarning = 1;   next; }
+        if ($arg =~ /^-checkDeploymentOnly$/)     { $checkDeploymentOnly = 1;   next; }
+        # End private options.
+
+        if ($arg =~ /^-/) { usage("Unknown arg: $arg"); }
+        if ($arg !~ /^-/) {
+            if (!$product) {
+                $product = $arg;
+            } elsif (!$service) {
+                $service = $arg;
+                if ($serviceOrAction) {
+                    $action = $serviceOrAction;
+                }
+            } else {
+                usage("Too many non-option args: $arg");
+            }
+            next;
+        }
+    }
+
+    if (!defined($product)) {
+        usage("Need a product name");
+    }
+
+    if ((grep(/^$product$/, ariba::rc::Globals::hadoopProducts())) && $action =~ /^(upgrade|restart)$/) {
+        usage("$product is not supported by rolling ugprade.");
+    }
+
+    if ($product =~ /^hadoop$/) {
+        hadoopMsg();
+    }
+
+    if ($product eq 'sdb' && ($action eq 'restart' || $action eq 'upgrade')) {
+        die "SDB does not support restart or upgrade.  Please do a full stop/start.\n";
+    }
+
+    if ($product =~ /^community$/) {
+        #add custom parameters required for AUC/Community
+        push(@args, "-- -timestarted=$timeStarted -action=$action");
+    }
+
+    if (!defined($service)) {
+        usage("Need a service name");
+    }
+
+    ariba::Ops::ControlDeploymentHelper->setMaxParallelProcesses( 100 );
+
+    # $isProdService is used for production only specific checks and behaviors
+    # $prodBehavior is used for behaviors we want in prod and other prod like services (opslab, beta, etc)  
+    $isProdService = 1 if ( ariba::Ops::ServiceController::isProductionServicesOnly( $service ) );
+    $prodBehavior = 1 if ( ariba::Ops::ServiceController::isProductionServices( $service ) ||
+                           ariba::Ops::ServiceController::isLabServiceOnly( $service ) );
+
+    $nodrain = 0 if($isProdService); ### don't honor nodrain option on prod
+
+    $pauseBetweenBuckets = 1 if $prodBehavior;
+
+    $fast = 1 if (!defined($fast) && grep( { $product eq $_ } ariba::rc::Globals::fastDeploymentPreferredProducts() ));
+
+    my $isRollingUpgradePreferredProduct = grep( { $product eq $_ } ariba::rc::Globals::rollingUpgradePreferredProducts() );
+    my $isRollingUpgradableProduct = grep( { $product eq $_ } ariba::rc::Globals::rollingUpgradableProducts() );
+
+    if ($isRollingUpgradePreferredProduct &&
+        !$usingAppInstances &&
+        !$dontUseAppInstances &&
+        $action =~ /upgrade|restart/) {
+        $usingAppInstances = 1;
+        print "Notice: -rolling is being implied for this $action.\n";
+    }
+    if ($usingAppInstances && !$isRollingUpgradableProduct) {
+        usage("-rolling only works with " . join(", ", ariba::rc::Globals::rollingUpgradableProducts()));
+    }
+
+    if ( !defined($cluster) ||
+         !grep { $cluster eq $_ } ( $ALL, ariba::rc::RolesManager->validClusters() ) ) {
+        usage("Missing or invalid cluster");
+    }
+
+    if ( $cluster eq $ALL &&
+         !grep { $product eq $_ } ariba::rc::Globals::activeActiveProducts() ) {
+        usage("Only active/active products can be deployed to '$ALL' cluster");
+    }
+
+    if (!defined($action)) {
+        usage("Need start/stop/install/upgrade/restart/reload argument");
+    }
+
+    my $isASPProduct = ariba::rc::Globals::isASPProduct($product);
+    if ( $isASPProduct && !defined($specifiedCustomer) && !$allCustomers) {
+        usage("Need to specify a customer for ASP products");
+    }
+    if ( !$isASPProduct && (defined($specifiedCustomer) || $allCustomers)) {
+        usage("Cannot specify customer for a shared service product");
+    }
+
+    #
+    # scream everytime anyone touches a production service.
+    #
+    $skipProductionWarning ||= $force;
+    if ( $isProdService && !$skipProductionWarning ) {
+        my $question = "****** WARNING ******\n" . 
+                       "You are about to touch $service $cluster cluster(s)!\n" . 
+                       "Are you sure you want to \"$action\" product $product";
+        $question .= " for customer $specifiedCustomer" if ( $specifiedCustomer );
+        $question .= " for ALL customers" if ( $allCustomers );
+        $question .= "?\n";
+
+        do_exit(1) if askShouldAbort( $question );
+
+        if ( ariba::rc::Globals::isActiveActiveProduct($product) && $cluster ne $ALL ) {
+            $question = "\n'$product' is an active/active product, but you are attempting to deploy \n" . 
+                        "to $cluster only instead of '$ALL' clusters. \n" . 
+                        "Do you really want to deploy only to $cluster?\n";
+
+            do_exit(1) if askShouldAbort( $question );
+        }
+
+        print "\n";
+    }
+
+    #
+    # scream a second time if we're not going to check bucket integrity
+    #
+    if ( $prodBehavior && !$checkBuckets ) {
+        my $question = "\nYou are about to proceed with a rolling upgrade/restart in $service without checking the integrity of the buckets.\n" .
+                       "If any nodes are off line this could result in a localized or full downtime.\n" .
+                       "Please verify you wish to proceed.\n";
+
+        do_exit(1) if askShouldAbort( $question );
+    }
+
+    #
+    # in a non-shared filesystem environment, check to make sure that
+    # we are being run from the copyhost
+    #
+    unless (ariba::rc::Globals::serviceUsesSharedFileSystem($service)) {
+        my $machine = ariba::Ops::Machine->new();
+
+        unless ($machine->provides("copyhost")) {
+            print "******* ERROR ******\n";
+            print "Please run this script from a copyhost machine\n";
+            do_exit(1);
+        }
+    }
+
+    if ( $product eq $ALL ) {
+        allProductControlDeployment(
+            $product,
+            $service,
+            $cluster,
+            $action,
+            $debug,
+            $testing,
+            $fast,
+            $force,
+            $timeStarted
+        );
+
+        exit(0);
+    }
+
+    if ( $cluster eq $ALL ) {
+        do_exit(launchSelfOnAllClusters($product, $service, $specifiedCustomer, $buildname, $action, $migrateCommand, $secondBucketOnly, $force, @savedArgv));
+    }
+
+    if ($SHOULD_LOCK) {
+        #
+        # Lock to prevent simultaneous deployments
+        #
+        $lockfile = "/tmp/.control-deployment-${product}-${service}";
+        if($isASPProduct && defined($specifiedCustomer)) {
+            $lockfile .= "-$specifiedCustomer";
+        }
+
+        dmail::LockLib::forceQuiet();
+         unless (dmail::LockLib::requestlock($lockfile,5)) {
+            print "Somebody else is running control-deployment, do you want to kill $lockfile?, if So please type 'yes' or 'y' here: \t";
+            my $input = <STDIN>;
+            chop($input);
+            if($input eq "yes" || $input eq "y") {
+               my $lock = $lockfile.'.lock';
+               print "lockfile : $lock \n";
+               eval {
+                  `mv $lock $lock"_bup"`;
+               };
+               if($@) {
+                  print "Error in removing lock file : $@ \n Please remove manually \n";
+                  exit();
+               }
+        else {
+            print "Lock file is removed.\n";
+                        dmail::LockLib::requestlock($lockfile,5)
+        }
+
+            }
+            else {
+               die "$0 can't grab lock on [$lockfile]\n";
+            }
+        }
+    }
+
+    #
+    # Start a log directory
+    #
+    my $logDir = ariba::Ops::ControlDeploymentHelper->logDirForProductServiceCustomerActionAndTime($product, $service, $specifiedCustomer, $action, $timeStarted);
+    mkpath($logDir) unless (-d ($logDir));
+
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    $cluster = ariba::rc::RolesManager->defaultCluster() unless($cluster);
+
+    #
+    # tee output to log directory
+    #
+    my $controlDeploymentLogFile = "$logDir/control-deployment-$cluster.log";
+    my $tee = IO::Tee->new(\*STDOUT, ">$controlDeploymentLogFile");
+    select($tee);
+    $tee->autoflush(1);
+
+    $root = dirname($FindBin::Bin);
+    $ENV{'PATH'} .= ":$root/bin";
+
+    if ($debug) {
+        print "product is $product\n";
+        print "service is $service\n";
+        print "customer is $specifiedCustomer\n" if $specifiedCustomer;
+        print "customer is all\n" if $allCustomers;
+        print "buildname is $buildname\n" if $buildname;
+        print "cluster is $cluster\n";
+        print "action is $action\n";
+        print "db migration is $migrateCommand\n" if defined($migrateCommand);
+        if (@roles) {
+            print "roles = ", join(",", @roles), "\n";
+        }
+    }
+
+    # Setting the global variables for populating RC DB
+    my $archivedProduct;
+    
+    if (ariba::rc::ArchivedProduct->isArchived($product, $service, $buildname, $specifiedCustomer)){
+        $archivedProduct = ariba::rc::ArchivedProduct->new ($product, $service, $buildname, $specifiedCustomer, undef, $cluster);
+    } elsif (ariba::rc::ArchivedProduct->isArchived($product, $service, undef, $specifiedCustomer)) {
+        $archivedProduct = ariba::rc::ArchivedProduct->new ($product, $service, undef, $specifiedCustomer, undef, $cluster);        
+    } else {
+        no strict 'subs';
+        $archivedProduct = bless {}, ariba::Ops::PersistantObject;
+    }
+    
+    $rcBranch = $archivedProduct->branchName() || 'Some-Branch' ;
+    $rcRelease = $archivedProduct->releaseName() || 'Some-Release' ;
+    $rcProduct = $product || $archivedProduct->productName() ;
+    $rcService = $service || $archivedProduct->service() ;
+    $rcBuild = $buildname || $archivedProduct->buildName();
+
+    checkProductsForAction ($specifiedCustomer,
+                $buildname,
+                $cluster,
+                $action,
+                $product,
+                $service,
+                $migrateCommand,
+                $secondBucketOnly,
+                $force,
+                );
+
+    do_exit(0) if ( $checkDeploymentOnly );
+
+    ariba::rc::Passwords::initialize($service);
+    if ( $archivedProduct && $archivedProduct->default( 'Ops.UsesPciPassword' ) eq 'true' ) {
+        my $pci = ariba::rc::Passwords::lookup( 'pci' );
+        die "ERROR: Concatenated <master>split<pci> password required.  Could not determine the PCI password from the password entered.\n" unless $pci;
+    }
+
+    print "\n";
+
+    $timelog = ariba::rc::Utils::getTimingInfoLogFile($product, $service, $buildname);
+
+    my @customers;
+
+    if ($isASPProduct) {
+        #
+        # use the specified customer else get a list of all customers
+        # currently installed
+        #
+        if ($specifiedCustomer) {
+            push(@customers, split(/,/, $specifiedCustomer));
+        } else {
+                my @allProducts = ariba::rc::InstalledProduct->installedProductsList($service, $product);
+
+            for my $p (@allProducts) {
+                push(@customers, $p->customer());
+            }
+
+            @customers = sort(@customers);
+        }
+    } else {
+        push(@customers, undef);
+    }
+
+    #FIXME This only works for AN for now
+
+    my @busyPages = ();
+
+    #
+    # Unsafe to interrupt from here on:
+    #
+    local $SIG{INT} = 'IGNORE';
+
+    $client->running( $rcBuild, $action, $rcLog, $rcProduct, $rcBranch, $rcRelease, $rcService );
+
+    print "Begin $action " . localtime(time()) . "\n";
+    my $starttime = time();
+    ariba::rc::Utils::writeTimingInfo($timelog, "CONTROL-DEPLOYMENT $action", "BEGIN") unless $action eq "test";
+    my $forceRunOnInstallDir = 0;
+
+    $forceRunOnInstallDir = 1 if (grep(/^$product$/, ariba::rc::Globals::activeActiveProducts()));
+
+    for my $customer (@customers) {
+
+        #
+        # Launch the command on copyhost if it is not running on copyhost
+        #
+        my $amIOnCopyHost = isCopyhost($product, $service, $customer,$cluster);
+        if (!$force && defined($amIOnCopyHost) && !$amIOnCopyHost) {
+            my $prog = basename($0);
+
+            if ($forceRunOnInstallDir) {
+                do_exit(launchSelfOnCopyhostInstallDir($product,$service,$customer,$cluster,$prog,@savedArgv));
+            } else {
+                do_exit(launchSelfOnCopyhost($product,$service,$customer,$cluster,$prog,@savedArgv));
+            }
+        }
+
+        if($action eq "stop") {
+            stopsvc($product, $service, $customer,$cluster, $buildname, $usingAppInstances, $secondBucketOnly, $nopause, \@roles,\@args,$timeStarted, $force);
+        } elsif ($action eq "start") {
+                if (!$usingAppInstances) {
+                push(@args, "-full");
+            }
+            startup($product, $service, $customer,$cluster, $buildname, $usingAppInstances, $secondBucketOnly, $nopause, \@roles,\@args,$timeStarted);
+        } elsif ($action eq "install") {
+                if (!$usingAppInstances) {
+                push(@args, "-full");
+            }
+            install($product,$service,$customer,$cluster,$buildname,$sourceBuildname,$usingAppInstances,$secondBucketOnly, $nopause,$migrateCommand, $datasetType, \@roles,\@args,$timeStarted,$realmSubset);
+        } elsif ($action eq "uninstall") {
+            push(@args,'-uninstall');
+
+            uninstall($product,$service,$customer,$cluster,$buildname,$usingAppInstances,$secondBucketOnly, $nopause,\@roles,\@args,$timeStarted);
+        } elsif ($action eq "upgrade") {
+            # we are doing upgrade do it serially, as we do not
+            # want to risk customers noticing downtime due to aggressive
+            # parallelization.
+            ariba::Ops::ControlDeploymentHelper->setMaxParallelProcesses(1) unless($fast);
+
+            if ($migrateCommand) {
+                die "Cannot perform db migration when doing rolling upgrade\n";
+            }
+            push(@args, "-rolling");
+
+            upgrade($product,$service,$customer,$cluster,$buildname,$usingAppInstances,$secondBucketOnly, $nopause,\@roles,\@args,$timeStarted,$force);
+        } elsif ($action eq "restart") {
+
+            if (ariba::rc::InstalledProduct->isInstalled($product, $service, undef, $customer)) {
+
+                my $productInstance = ariba::rc::InstalledProduct->new($product, $service, undef, $customer);
+                my $busyPage = ariba::Ops::BusyPageController->newFromProduct($productInstance);
+                $busyPage->setDebug($debug);
+                $busyPage->setTesting($testing);
+                $busyPage->setRolling();
+                push(@busyPages, $busyPage);
+            }
+
+            #
+            # do restart serially, if we are restarting with -slow option
+            # to prevent customers from noticing any downtime.
+            #
+            ariba::Ops::ControlDeploymentHelper->setMaxParallelProcesses(1) unless($fast);
+            push(@args, "-rolling");
+            restart($product,$service,$customer,$cluster,$buildname,$usingAppInstances,$secondBucketOnly, $nopause,\@roles,\@args,$timeStarted,$force);
+        } elsif ($action eq "test") {
+            test($product,$service,$customer,$cluster,$buildname,$usingAppInstances,$secondBucketOnly, $nopause,\@roles,\@args,$timeStarted);
+        } elsif ($action eq "reload") {
+            reload($product,$service,$customer,$cluster,$buildname,$usingAppInstances,$secondBucketOnly, $nopause,\@roles,\@args,$timeStarted);
+}
+    }
+
+    #
+    # Still have some background process running?
+    #
+    ariba::Ops::ControlDeploymentHelper->waitForBackgroundCommands();
+
+    if ($migrateCommand && $migrationHelper
+        && ($migrateCommand eq $RESTOREMIGRATE || $migrateCommand eq $MIGRATE)
+    ) {
+
+        $migrationHelper->runPostMigrationCommands();
+    }
+
+    # We have to keep up to date the busy pages symbolic link in case of un/installation or restart
+    #
+
+    for my $busyPage (@busyPages) {
+        $busyPage->setUnplanned();
+    }
+
+    my @logfiles = ();
+    my $numErrors = ariba::Ops::ControlDeploymentHelper->logFileNamesAnnotatedWithErrors(\@logfiles);
+
+    # some products need to notify arches to refresh a 'bundle'
+    if ( my $bundle = $archivedProduct->default( 'archesRefreshBundle' )) {
+        if( $action eq 'start' || $action eq 'install' || $action eq 'restart' || $action eq 'upgrade' ){
+            ariba::Ops::Startup::Arches::refreshBundle( $service, $bundle );
+        }
+	}
+
+    #
+    # Now that actions are complete, send out all the post action
+    # notifications.
+    #
+    for my $publishAction (keys(%$postActionInformHashRef)) {
+        for my $publishProduct(@{$postActionInformHashRef->{$publishAction}}) {
+            inform($publishProduct,$cluster,$publishAction,$numErrors);
+        }
+    }
+
+    print "End $action " . localtime(time()) . "\n";
+    ariba::rc::Utils::writeTimingInfo($timelog, "CONTROL-DEPLOYMENT $action", "END", $starttime) unless $action eq "test";
+    #
+    # print log summary
+    #
+    my $shortHost = $hostname;
+    $shortHost =~ s|\.ariba\.com||;
+
+    print "\n\nLog(s) of deployment can be found at:\n";
+    print "    control-deployment: $shortHost: $controlDeploymentLogFile\n\n";
+    print join("\n", @logfiles), "\n";
+
+    my $exit = 0;
+    if ($numErrors) {
+        print "\n";
+        print "ERROR: Finished with $numErrors error(s) for $action:\n";
+        print "       Refer to log(s) marked with '**' for error(s).\n";
+        print "\n";
+        $client->fail( $rcBuild, $action, $rcLog, $rcProduct, $rcBranch, $rcRelease, $rcService );
+        $exit = 1;
+    } else {
+        print "\n";
+        print "Info: Done successfully.\n";
+        print "\n";
+        $client->success( $rcBuild, $action, $rcLog, $rcProduct, $rcBranch, $rcRelease, $rcService );
+    }
+
+    ### Print friendly reminder msg to restart webservers
+    ### and page only for production env.
+    if ( $restartWS )
+    {
+        print reminderMsg("$product/$service");
+        pageSREs($product,$service,$shortHost,$controlDeploymentLogFile ) if $isProdService;
+        $restartWS = 0;
+    }
+
+    $tee->close();
+    do_exit($exit);
+}
+
+sub executeAny
+{
+    my $bucket = shift;
+    my $url    = shift;
+    my $string = shift;
+    my $product= shift;
+
+    my @appInstances = $product->appInstances();
+
+    my $appInstance;
+    my $i = 0;
+
+    for ($i = 0;$i < 10;$i++) {
+    while (1) {
+        $appInstance = $appInstances[int(rand(scalar(@appInstances)))];
+        if ($appInstance->isTomcatApp() && ($bucket == -1 || $appInstance->recycleGroup() == $bucket)) {
+
+        my $urlString = $appInstance->$url();
+        my $request = ariba::Ops::Url->new($urlString);
+
+        print "\tcalling direct action: $urlString\n";
+
+        my $result = $request->request(30);
+
+        if ($result =~ /$string/) {
+            return $result;
+        }
+        else {
+            print "Warning: Node " . $appInstance->workerName() . " did not respond to $url\n";
+            last;
+        }
+        }
+    }
+    }
+
+    return undef;
+}
+
+
+
+sub prepareForRollingRecycle
+{
+    my $product = shift;
+
+
+    my $ex = executeAny(-1, 'rollingRestartPrepareURL', 'OK', $product);
+
+    die "Cannot prepare for rolling restart" unless defined($ex);
+}
+
+sub waitForCoordinator
+{
+    my $bucket = shift;
+    my $product = shift;
+
+    my $i = 0;
+
+    for ($i = 0;$i < 10;$i++) {
+
+    my $coordinator = undef;
+    my $res = executeAny(1-$bucket, 'getGlobalCoordinatorURL', 'Coordinator', $product);
+
+    if (defined($res) && $res =~ /Coordinator:(.*)/) {
+        $coordinator = $1;
+        print "We think the coordinator is $1\n";
+        my $coordInstance = undef;
+
+        my @appInstances = $product->appInstances();
+
+        for my $appInstance (@appInstances) {
+        if ($appInstance->workerName() eq $coordinator) {
+            $coordInstance = $appInstance;
+            last;
+        }
+        }
+
+        if (defined($coordInstance)) {
+        my $urlString = $coordInstance->getGlobalCoordinatorURL();
+        my $request = ariba::Ops::Url->new($urlString);
+
+        my $results = $request->request(30);
+        if (!defined($results) || !($results eq $res)) {
+            print "But the coordinator doesn't think it's the coordinator ...\n";
+            $coordinator = undef;
+        }
+        }
+        else {
+        print "But we can't find the coordinator node ...\n";
+        $coordinator = undef;
+        }
+    }
+
+    if (defined($coordinator)) {
+        # if the coordinator was already ok ($i = 0), then we don't need to wait for other nodes to join the group
+        # otherwise we do!
+        return ($i > 0);
+    }
+
+    print "Coordinator doesn't seem to be known, prodding the cluster, sleeping 60 seconds and trying again ...\n";
+
+        $res = executeAny(1-$bucket, 'rollingRestartSuspectURL', 'OK', $product);
+
+    # no need to really verify, if this doesn't work, we'll skip our eventually
+
+    sleep(60);
+    }
+
+    return 0;
+}
+
+sub runSwitchTopology {
+    my $product = shift;
+    my $action = shift;
+    my $cluster = shift;
+    my $phase = shift;
+    my $bindir = shift;
+    my $timeStarted = shift;
+
+    my $name = $product->name();
+    my @commands;
+
+    push(@commands, "$bindir/switch_topology -$phase");
+
+    my $service = $product->service();
+    my $customer = $product->customer();
+    my $user = ariba::rc::Globals::deploymentUser($name, $service);
+    my $password = ariba::rc::Passwords::lookup($user);
+    $product->setClusterName($cluster);
+    my $appInstance = ($product->appInstancesInCluster($cluster))[0];
+    my $host = $appInstance->host();
+    my $logName = "$host--switch-topology-$phase";
+
+    my $cdh = ariba::Ops::ControlDeploymentHelper->newUsingProductServiceAndCustomer($name, $service, $customer);
+    $cdh->setTesting($testing);
+    $cdh->setTimeStarted($timeStarted);
+    $cdh->launchCommandsInBackground(
+        $action,
+        $user,
+        $host,
+        $logName,
+        $password,
+        undef,
+        "switch topology $phase",
+        @commands
+        );
+    ariba::Ops::ControlDeploymentHelper->waitForBackgroundCommands();
+}
+
+sub cleanupLoadMetaMarker {
+    my $product = shift;
+    my $action = shift;
+    my $cluster = shift;
+    my $requestedRoles = shift;
+    my $timeStarted = shift;
+    my $usingAppInstance = shift;
+
+    my $name = $product->name();
+
+    return if (
+        $loadMetaMarkersDeleted ||
+        scalar(@$requestedRoles) ||
+        !($action eq 'start' || $action eq 'recycle') ||
+        !ariba::Ops::Startup::DB::shouldRunLoadMetaForProduct($name));
+
+    my $service = $product->service();
+    my $customer = $product->customer();
+    my $user = ariba::rc::Globals::deploymentUser($name, $service);
+    my $password = ariba::rc::Passwords::lookup($user);
+    $product->setClusterName($cluster);
+    my $appInstance = ($product->appInstancesInCluster($cluster))[0];
+    my $host = $appInstance->host();
+    my $instanceName = $appInstance->instanceName();
+    my $logName = ($usingAppInstance ? $instanceName : $host) . "--cleanup-load-meta";
+
+    my $successMarkerFile = ariba::Ops::Startup::Common::loadmetaSuccessMarker($product);
+    my $failureMarkerFile = ariba::Ops::Startup::Common::loadmetaFailureMarker($product);
+    my @commands;
+    push(@commands, "rm -f $successMarkerFile");
+    push(@commands, "rm -f $failureMarkerFile");
+
+    my $cdh = ariba::Ops::ControlDeploymentHelper->newUsingProductServiceAndCustomer($name, $service, $customer);
+    $cdh->setTesting($testing);
+    $cdh->setTimeStarted($timeStarted);
+    $cdh->launchCommandsInBackground(
+        $action,
+        $user,
+        $host,
+        $logName,
+        $password,
+        undef,
+        "cleanup loadmeta markers",
+        @commands
+        );
+    ariba::Ops::ControlDeploymentHelper->waitForBackgroundCommands();
+
+    $loadMetaMarkersDeleted = 1;
+}
+
+sub checkTopologyInBuilds {
+    my $oldProduct = shift;
+    my $newProduct = shift;
+    my $cluster = shift;
+    my $advisory = shift;
+
+    return if ($oldProduct->name() eq 'mon');
+
+    my $oldexe = $oldProduct->installDir() . "/bin/print-topology";
+    my $newexe = $newProduct->installDir() . "/bin/print-topology";
+
+    if( -x $oldexe && -x $newexe ) {
+        $oldexe .= " -cluster $cluster";
+        $newexe .= " -cluster $cluster";
+
+        my $oldLayoutString = "";
+        my $newLayoutString = "";
+
+        open(F, "$oldexe |");
+        while(my $line = <F>) { $oldLayoutString .= $line if($line =~ /in bucket \d+$/); }
+        close(F);
+
+        open(F, "$newexe |");
+        while(my $line = <F>) { $newLayoutString .= $line if($line =~ /in bucket \d+$/); }
+        close(F);
+
+        if($oldLayoutString eq "" || $newLayoutString eq "") {
+            if($advisory) {
+                print "control-deployment failed to get the layout of one or more of the\n";
+                print "deployments.  You should be wary of possible changes to topology\n";
+                print "\n\n";
+                return;
+            } else {
+                print "control-deployment failed to get the layout of one or more of the\n";
+                print "deployments.  Rolling restart or upgrade cannot be done in this\n";
+                print "condition.\n";
+                do_exit(1);
+            }
+        }
+
+        if($oldLayoutString ne $newLayoutString) {
+            if($advisory) {
+                $restartWS = 1;
+                my $psName = $newProduct->name(). "/" . $newProduct->service();
+                print reminderMsg($psName);
+            } else {
+                print "Instances have changed, which makes rolling upgrade invalid\n";
+                print "this was detected by running print-topology on the builds,\n";
+                print "which suggests that this may be the result of a code change.\n";
+                do_exit(1);
+            }
+        }
+    }
+}
+
+sub newProductIsOlderThanInstalledProductOfSameFamily {
+    my $newProduct = shift;
+    my $installedProduct = shift;
+
+    if(ariba::rc::Globals::isASPProduct($newProduct->name())) {
+        my ($oldCustBuild, $oldProdBuild, $newCustBuild, $newProdBuild);
+        my ($stem, $num) = ariba::rc::Globals::stemAndBuildNumberFromBuildName($installedProduct->buildName());
+        if($num =~ /^([0-9]+)([^0-9]+)([0-9]+)$/) {
+            $oldCustBuild = "${stem}-$1";
+            $oldProdBuild = "${2}-$3";
+        }
+        ($stem, $num) = ariba::rc::Globals::stemAndBuildNumberFromBuildName($newProduct->buildName());
+        if($num =~ /^([0-9]+)([^0-9]+)([0-9]+)$/) {
+            $newCustBuild = "${stem}-$1";
+            $newProdBuild = "${2}-$3";
+        }
+
+        if($oldCustBuild && $oldProdBuild && $newCustBuild && $newProdBuild) {
+            return(
+                compareBuilds($oldCustBuild, $newCustBuild) &&
+                compareBuilds($oldProdBuild, $newProdBuild)
+            );
+        }
+    } else {
+        return(compareBuilds($installedProduct->buildName(), $newProduct->buildName()));
+    }
+}
+
+sub compareBuilds {
+    my $old = shift;
+    my $new = shift;
+
+    my ($installedBuildFamily, $installedBuildNumber) = ariba::rc::Globals::stemAndBuildNumberFromBuildName($old);
+    my ($newBuildFamily, $newBuildNumber) = ariba::rc::Globals::stemAndBuildNumberFromBuildName($new);
+
+    return $newBuildFamily eq $installedBuildFamily &&
+           $newBuildNumber <= $installedBuildNumber;
+}
+
+sub reminderMsg {
+    my $psName = shift;
+
+    my $msgBody = qq(Instances have changed for $psName. You might want to check the following points :\n);
+    $msgBody .= qq(\t- Webservers might have to be bounced\n);
+    $msgBody .= qq(\t- port-range may need adjustments\n);
+    $msgBody .= qq(\n\n);
+    return $msgBody;
+}
+
+sub pageSREs{
+    my ($productName,$service,$host,$cdLog) = @_;
+    my $msgBody = reminderMsg("$productName/$service");
+    $msgBody    .= qq(\nLog found here:$host $cdLog);
+
+    my $to = ariba::Ops::Constants::operationsPagerAddress();
+    my $subject = qq(Instances have changed for $productName in service:$service.  May have to restart webservers);
+    ariba::Ops::Utils::email($to,$subject, $msgBody);
+}
+
+
+main();

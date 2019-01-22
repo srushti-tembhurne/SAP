@@ -1,0 +1,118 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/everywhere/all-diskstats-watcher#6 $
+#
+# Determine if a filesystem is mounted readonly, or is otherwise inaccessable.  The request is/was for arches, but
+# this should probably be run for every host out there.  This script is in "everywhere", so it is cfengine deployed
+# to every host.  It will only need to access disks on the local host on which it is running, so all it needs to
+# do is verify that it should in fact be running on the host in question.  I believe this would mean all app
+# servers, db servers, monitors, etc. that are inservice, as well as all spares.
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../lib/perl";
+use Data::Dumper;
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::Ops::CFEngine::MonitoringGlueUtils;
+use ariba::Ops::Constants;
+
+my $debug = 0;
+
+sub main
+{
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $service;
+
+    while (my $arg = shift (@ARGV))
+    {
+        if ($arg =~ /^-e/o) {$sendEmail = 1;}
+        if ($arg =~ /^-p/o) {$sendPage  = 1;}
+        if ($arg =~ /^-d/o) {$debug++;}
+    }
+
+    my $hostname = ariba::Ops::NetworkUtils::hostname ();
+
+    my $machine = ariba::Ops::Machine->new ($hostname);
+
+    my $machineOS = $machine->os ();
+    exit unless $machineOS eq 'redhat' or $machineOS eq 'suse';
+
+    my $monserver = ariba::Ops::CFEngine::MonitoringGlueUtils::monitorServer($hostname);
+    my $email = ariba::Ops::Constants->operationsEmailNotificationAddress; # as of 2016/03/14:  an_auto@ariba.com
+
+    my $datacenter = $machine->datacenter();
+    my $tab   = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+    my $machineStatus = lc $machine->status ();
+    if ($machineStatus && ($machineStatus eq 'inservice' || $machineStatus eq 'spare'))
+    {
+        # Need to get the list of mounted filesystems to check.  This will be the loop within which the set
+        # of queries will be created for this host.  This is limited to local file systems by looking for
+        # the prefix /dev/ (see processProcMounts ())
+        my (%queries);
+
+        foreach my $mountedArrayRef (processProcMounts ())
+        {
+            my $result;
+            # The returned array ref points to a 3 element array:  device mount-point read/write
+            # If the open is successful, remove the newly created file.
+            if (open my $FILE, '>', $mountedArrayRef->[1] . '/file')
+            {
+                close $FILE;
+                unlink $mountedArrayRef->[1] . '/file';
+                $result = $mountedArrayRef->[2];
+            }
+            else
+            {
+                # The open failed, nothing to close.
+                $result = "ro/failed:  $!";
+            }
+            if ($debug)
+            {
+                print "@$mountedArrayRef  result:  $result\n";
+            }
+            # Create a query for each locally mounted FS, set to critical if the attempt to open a file for
+            # writting fails.
+            $queries {"$hostname:  $mountedArrayRef->[0]($mountedArrayRef->[1])"} =
+                                                                {
+                                                                    info => "answer eq 'rw'",
+                                                                    crit => "answer =~ /^ro/",
+                                                                    perl => sub {return $result},
+                                                                    inf_field => "mountStatus",
+                                                                    inf_tags => "datacenter=\"$datacenter\",hostname=\"$hostname\",mountPoint=\"$mountedArrayRef->[0]($mountedArrayRef->[1])\"",
+                                                                    group_by => "$datacenter",
+                                                                    inf_default => 0,
+                                                                };
+        }
+        print Dumper (\%queries) if $debug == 2;
+
+
+        queries{"infux_details"} = {measurement => "add_diskstats_watcher"};
+        my $queryManager = ariba::monitor::QueryManager->newWithDetails("all-diskstats-watcher", $tab, $machine->service(), undef, \%queries);;
+        # The implementation of processQueriesUsingServer () uses these names for it's arguments:
+        #                                       quickview, notifyEmailAddress, notifyOnWarn, notifyOnCrit, monserver
+        # This means the paging destination is coded elsewhere, but the email destination can be set here.
+        $queryManager->processQueries($debug, $email, $sendEmail, $sendPage, $monserver);
+    }
+}
+
+sub processProcMounts
+{
+    open (my $MOUNTS, '<', '/proc/mounts') or die "WARNING:  cannot open /proc/mounts. $!\n";
+    return map {/^(\S+) # This should be the device name
+                \s+       # Followd by white space,
+                (\S+)     # followed by mount point
+                \s+\S+\s+ # followed by white space, the fs type and white space
+                (\S\S)    # and the next two non-white space characters, which should be rw or ro
+                /x and [$1,$2,$3]} grep (m@^/dev/@, <$MOUNTS>);
+}
+
+main ();
+
+__END__

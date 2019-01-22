@@ -1,0 +1,138 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/esig/esig-status#6 $
+
+#
+# Script to monitor the queue of documents waiting to be signed by the
+# trustweaver signature service.
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+
+my $debug = 0;
+
+sub main {
+
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; };
+		if ($arg =~ /^-d/o) { $debug = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $an = ariba::rc::InstalledProduct->new('an', $me->service());
+
+	my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+	my $communitiesList = join(", ", @communityIds);
+
+	my %cqueries = (
+		"Esig invoice queue count" => 
+		{
+			runForCommunities => $communitiesList,
+			info => "numrows <= 0",
+                        warn => "numrows > 0",
+                        crit => "numrows >= 5",
+			sql => q`
+				select count(*) as esig_status_count
+				from
+				  CXML_DOC_PENDING_OPS, CXML_DOCUMENT
+				where
+				  ( CXML_DOC_PENDING_OPS.SHOULD_SIGN = 1 or CXML_DOC_PENDING_OPS.SHOULD_VERIFY = 1 )
+				and
+				  CXML_DOC_PENDING_OPS.DOCUMENT = CXML_DOCUMENT.ID
+				and
+				  CXML_DOCUMENT.DOCUMENT_TYPE = 'InvoiceDetailRequest'
+				and
+				  CXML_DOCUMENT.STATUS = 'Queued'				  
+				and
+				  CXML_DOCUMENT.DOCUMENT_STATUS = 'invalid'
+				and
+				  CXML_DOCUMENT.DASHBOARD_STATUS = 'INVOICE_REJECTED'
+				and
+				  CXML_DOCUMENT.FROM_ORG_TYPE = 'Supplier'
+				and
+				  CXML_DOCUMENT.TO_ORG_TYPE = 'Buyer'
+				and
+				  CXML_DOCUMENT.STATUS_CHANGED < CURRENT_TIMESTAMP
+				and
+				  CXML_DOCUMENT.STATUS_CHANGED >  CURRENT_TIMESTAMP - 0.01
+			`,
+		},
+	);
+
+
+	my %queries = (
+		"Esig invoice queue" => 
+		{
+			runForCommunities => $communitiesList,
+			aggregationMethod => "rows",
+			recordMaxResults  => 60000,
+			recordItem        => "numrows",
+			recordDataType    => "gauge",
+			ticketOnWarnOpenAfterMinutes => 30,
+			info => "numrows <= 0",
+                        warn => "numrows > 0",
+                        crit => "numrows >= 5",
+			correctiveActions => [
+                    		Ops => 'For ToW open an S2 CR for AN.  For a page start an S1 escalation.',
+			],
+			sql => q`
+				select
+				  /*+ ordered use_nl(CXML_DOC_PENDING_OPS, CXML_DOCUMENT) */
+				  CXML_DOC_PENDING_OPS.SHOULD_SIGN as should_sign,
+				  CXML_DOC_PENDING_OPS.SHOULD_VERIFY as should_verify,
+				  TO_CHAR(CXML_DOC_PENDING_OPS.DOCUMENT) as document,
+				  CXML_DOCUMENT.DOCUMENT_NUMBER as document_number,
+				  CURRENT_TIMESTAMP as current_timestamp,
+				  CXML_DOCUMENT.STATUS_CHANGED as status_changed,
+				  CURRENT_TIMESTAMP - 0.01 as current_timestamp2
+				from
+				  CXML_DOC_PENDING_OPS, CXML_DOCUMENT
+				where
+				  ( CXML_DOC_PENDING_OPS.SHOULD_SIGN = 1 or CXML_DOC_PENDING_OPS.SHOULD_VERIFY = 1 )
+				and
+				  CXML_DOC_PENDING_OPS.DOCUMENT = CXML_DOCUMENT.ID
+				and
+				  CXML_DOCUMENT.DOCUMENT_TYPE = 'InvoiceDetailRequest'
+				and
+				  CXML_DOCUMENT.STATUS = 'Queued'				  
+				and
+				  CXML_DOCUMENT.DOCUMENT_STATUS = 'invalid'
+				and
+				  CXML_DOCUMENT.DASHBOARD_STATUS = 'INVOICE_REJECTED'
+				and
+				  CXML_DOCUMENT.FROM_ORG_TYPE = 'Supplier'
+				and
+				  CXML_DOCUMENT.TO_ORG_TYPE = 'Buyer'
+				and
+				  CXML_DOCUMENT.STATUS_CHANGED < CURRENT_TIMESTAMP
+				and
+				  CXML_DOCUMENT.STATUS_CHANGED >  CURRENT_TIMESTAMP - 0.01
+			`,
+		},
+	);
+
+	my $email = $me->default('notify.email');
+    $queries{"influx_details"} = { measurement => "an_esig_status"};
+    $cqueries{"influx_details"} = { measurement => "an_esig_status_count"};
+
+	my $q = ariba::monitor::QueryManager->newWithDetails("esig-status", $an->name(), $me->service(), undef, \%queries);
+	ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $q);
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+	my $q2 = ariba::monitor::QueryManager->newWithDetails("esig-status", $an->name(), $me->service(), undef, \%cqueries);
+	ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $q2);
+	$q2->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();
+
+__END__

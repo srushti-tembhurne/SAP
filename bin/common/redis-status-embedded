@@ -1,0 +1,108 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/common/redis-status-embedded#4 $
+
+$quiet = 1;
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Utils;
+
+my $debug = 0;
+
+sub usage {
+	my $error = shift; 
+
+	print <<USAGE;
+Usage: $0 [-e|-p|-d|-h] -product  <<product name>>
+
+This script pings each redis instance being used by an application to determine if they are all up.
+
+	-e    Enables sending of email for monitor query.
+	-p    Enables sending of pages for monitor query.
+	-d    Turns on debug mode. 
+	-h    Shows this help.
+
+USAGE
+
+	print "(error) $error\n" if ($error);
+
+	exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $role = 'redis';
+
+    while (my $arg = shift) {
+        if ($arg =~ m/^-h$/o) { usage(); next; }
+        if ($arg =~ m/^-d$/o) { $debug++; next; }
+        if ($arg =~ m/^-e$/o) { $sendEmail = 1; next; }
+        if ($arg =~ m/^-p$/o) { $sendPage = 1; next; }
+        usage("Invalid argument: $arg");
+    }
+	
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $service = $mon->service();
+    my $cluster = $mon->currentCluster();
+
+    my @products = ariba::rc::InstalledProduct->installedProductsListInCluster( $service, undef, undef, $cluster );
+
+    foreach my $product (@products) {
+
+        # The config generator is a componenet used by redis embedded with an app.  Key on its existence
+        # to see if we should proceed
+        next unless $product->default('Ops.Redis.ConfigGenerator');
+
+        my %queries = ();
+        my @instances = $product->appInstancesLaunchedByRoleInCluster( $role, $cluster );
+        my $stopProgram = $product->installDir() . "/" . $product->default('Ops.Redis.CLIProgram');   
+
+        foreach my $instance (@instances) {
+
+            my $instanceName = $instance->instanceName();
+            my $appName = $instance->appName();
+            $queries{"$instanceName redis isup"} = {
+                info => 'answer eq "ok"',
+                crit => 'answer ne "ok"',,
+                perl => sub { redisPing( $instance, $stopProgram );},
+                uiHint => "default community/$appName",
+                inf_field => "status",
+                inf_default => "none",
+                inf_tags => qq(instance_name="$instanceName",app_name="$appName"),
+                group_by => qq($appName,$instanceName)
+            };
+        }
+
+        $queries{"influx_details"} = { 'measurement' => "redi_status" };
+        my $q = ariba::monitor::QueryManager->newWithDetails( "redis-status", $product->name(), $service, $product->customer(), \%queries);
+        $q->setUiManager('http-urls-status');
+
+        my $ret = $q->processQueries($debug, $product->default('notify.email'), $sendEmail, $sendPage);
+    }
+}
+
+sub redisPing {
+    my $instance = shift;
+
+    my $ret;
+    my ($return, @output) = $instance->checkIsUp();
+
+    # success when $return = 1;
+    if ($return) {
+        $ret = 'ok';
+    } else {
+        $ret = join("\n", @output);
+    }
+
+    return $ret;
+}
+
+main(@ARGV);
+
+__END__

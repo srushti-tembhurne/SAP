@@ -1,0 +1,218 @@
+#!/usr/local/bin/perl -w
+
+my $VERSION = '1.0';	# Controls the SDK release.
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/Netapp";
+use NaServer;
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+
+my $debug = 0;
+
+sub usage {
+	my $error = shift;
+
+	print <<USAGE;
+	Usage: $0 [-e|-p|-d|-h] -i <netapp instance hostname>
+	Example: $0 -i nfs16.opslab.ariba.com
+
+	-e    Enables sending of email for monitor query.
+	-p    Enables sending of pages for monitor query.
+	-d    Turns on debug mode.
+	-h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	my $host;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e$/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p$/o) { $sendPage  = 1; };
+		if ($arg =~ /^-d$/o) { $debug     = 1; };
+		if ($arg =~ /^-i$/o) { $host = shift @ARGV; next; }
+		if ($arg =~ /^-h$/o) { usage(); }
+	}
+
+	my $me    = ariba::rc::InstalledProduct->new();
+	my $email = $me->default('notify.email');
+	my $username = $me->default('Ops.Netapp.username');
+	my $password = $me->default('Ops.Netapp.password');
+
+	my @machines = ();
+	for my $dataCenter ( ariba::Ops::ProductAPIExtensions::datacentersForProducts($me) ) {
+		my %match = (
+			status         => 'inservice',
+			datacenter     => $dataCenter,
+			hardwareVendor => 'netapp'
+		);
+		@machines = map { $_->hostname() }  ariba::Ops::Machine->machinesWithProperties(%match);
+	}
+
+ foreach my $host (@machines) {
+	my $machine    = ariba::Ops::Machine->new($host);
+	my $dataCenter = $machine->datacenter();
+ 	my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($dataCenter);
+
+ 	my %queries  = ();
+
+ 	my $session = connectToFiler($host, $username, $password);
+
+ 	# For performance metricts we need 2 snapshots to be able to calculate the %s
+ 	my (@results1, @results2);
+
+ 	@results1 = getPerfMetrics($session);    # get current performance metrics
+  if (scalar(@results1) == 0) { next; } # nothing returned keep going
+ 	sleep 1;
+
+ 	@results2 = getPerfMetrics($session);    # get current performance metrics
+
+ 	my $results_len = @results1;
+ 	foreach my $iter (0..$results_len-1) {
+ 		my $instance1 = $results1[$iter];
+ 		my $instance2 = $results2[$iter];
+ 		my $instance_name1 = $instance1->child_get_string("name");
+ 		my $instance_name2 = $instance2->child_get_string("name");
+ 		if ($instance_name1 ne $instance_name2) {
+ 			die "Something is wrong with the logic: $instance_name1 and $instance_name2 should match\n";
+ 		}
+
+ 		# get counters from both snapshots and process results
+ 		my $counters1 = $instance1->child_get("counters");
+ 		my $counters2 = $instance2->child_get("counters");
+ 		my @results = fetch_data($counters1, $counters2);
+
+ 		# populate the queries
+ 		my @labels = qw/processor_busy domain_busy.idle domain_busy.kahuna domain_busy.network domain_busy.storage domain_busy.exempt domain_busy.raid domain_busy.target domain_busy.netcache domain_busy.netcache2 domain_busy.cifs domain_busy.wafl_exempt/;
+
+ 		for my $label (@labels) {
+ 			my $result = shift @results;
+ 			$queries{"$host : $instance_name1 : $label"} = {
+ 				"recordMaxResults" => 110000,
+ 				"recordDataType" => "gauge",
+ 				info => "",
+ 				warn => "",
+ 				crit => "",
+ 				format => "%.2f%%\n",
+ 				perl => "return $result",
+        inf_field => "percent",
+        inf_tags => "hostname=$host,instance=$instance_name1,stat=$label",
+        inf_default => 0,
+        group_by => "$dataCenter,$host,$instance_name1,$label",
+ 			};
+ 		}
+
+ 		# printf "%s: %.2f%%\n", $instance_name1, $result;
+ 	}
+
+   $queries{influx_details} = {measurement => "netapp_domain"};
+ 	my $qm = ariba::monitor::QueryManager->newWithDetails(
+ 	              'netapp-domain', $tab, $me->service(), $me->customer(), \%queries);
+ 	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+ }
+}
+
+
+sub connectToFiler {
+	my ($filer, $user, $password) = @_;
+	my $s = NaServer->new($filer, 1, 1);
+	# $s = $s->set_style('LOGIN');
+	# $s->results_errno != 0 or die "Connection to $filer failed: $s->results_reason()\n";
+	$s->set_admin_user($user, $password);
+	return $s;
+}
+
+sub getPerfMetrics {
+    my $session = shift;
+
+	# get the Performance metrics from Netapp
+	my @results = ();
+	my $in = NaElement->new("perf-object-get-instances");
+	$in->child_add_string("objectname", "processor");  # get data per CPU
+	my $perf_out = $session->invoke_elem($in);
+
+	if ($perf_out->results_status() eq "failed") {
+		warn $perf_out->results_reason();
+		return @results;
+	}
+
+	my $instance_info = $perf_out->child_get("instances");
+	@results = $instance_info->children_get("instance-data");
+
+	return @results;
+}
+
+sub fetch_data {
+
+	my ($counters1, $counters2) = @_;
+
+	my @counter_data1 = $counters1->children_get();
+	my @counter_data2 = $counters2->children_get();
+
+	my ($counter1, $base_counter1, $counter2, $base_counter2);
+	my ($domain_counters_string1, $domain_counters_string2);
+
+	my $counter_data_len = @counter_data1;
+	foreach my $counter (0..$counter_data_len-1) {
+		my $counter_name1 = $counter_data1[$counter]->child_get_string("name");
+		if ($counter_name1 eq 'processor_busy') {
+			$counter1 = $counter_data1[$counter]->child_get_string("value");
+		} elsif ($counter_name1 eq 'processor_elapsed_time') {
+			$base_counter1 = $counter_data1[$counter]->child_get_string("value");
+		} elsif ($counter_name1 eq 'domain_busy') {
+			$domain_counters_string1 = $counter_data1[$counter]->child_get_string("value");
+		}
+
+		my $counter_name2 = $counter_data2[$counter]->child_get_string("name");
+		if ($counter_name2 eq 'processor_busy') {
+			$counter2 = $counter_data2[$counter]->child_get_string("value");
+		} elsif ($counter_name2 eq 'processor_elapsed_time') {
+			$base_counter2 = $counter_data2[$counter]->child_get_string("value");
+		} elsif ($counter_name2 eq 'domain_busy') {
+			$domain_counters_string2 = $counter_data2[$counter]->child_get_string("value");
+		}
+	}
+
+	my @results;
+	my $result;
+
+	# calucalte total CPU utilization percentage
+	$result = 100 * ($counter2 - $counter1)/($base_counter2 - $base_counter1);
+	push @results, $result;
+
+	# calculate per domain CPU utilization percentage
+	# Netapp returns a comma separated string for the domain counters
+	my @domain_counters1 = split ',', $domain_counters_string1;
+	my @domain_counters2 = split ',', $domain_counters_string2;
+
+	if (@domain_counters1 ne @domain_counters2) {
+		die "Something is wrong with the logic here: domain counters should match";
+	}
+
+	while (@domain_counters1 and @domain_counters2) {
+		my $domain_counter1 = shift @domain_counters1;
+		my $domain_counter2 = shift @domain_counters2;
+
+		$result = 100 * ($domain_counter2 - $domain_counter1)/($base_counter2 - $base_counter1);
+		push @results, $result;
+	}
+
+	return @results;
+}
+
+main();

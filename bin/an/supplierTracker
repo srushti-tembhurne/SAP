@@ -1,0 +1,131 @@
+#!/usr/local/bin/perl -w
+
+###############################################################################
+# $Id: //ariba/services/monitor/bin/an/supplierTracker#2 $
+# $HeadURL:$
+#
+# Copyright (c) 2016 Ariba
+#
+# supplierTracker-status - Monitor SupplierTracker
+#
+###############################################################################
+
+=head1 NAME
+
+supplierTracker-status - Monitor SupplierTracker
+
+=head1 SYNOPSIS
+
+supplierTracker-status [options]
+
+=head1 OPTIONS
+
+=over
+
+=item B<-help|-h>
+
+Print this usage information and exit.
+
+=item B<-debug|-d>
+
+Enable debugging output / dryrun
+
+=item B<-e>
+
+Enable sending of emails
+
+=item B<-p>
+
+Enable sending of pages
+
+=back
+
+=head1 DESCRIPTION
+
+C<supplierTracker-status> - Monitor the status of SupplierTracker
+
+=cut
+
+=author
+
+Saran Thiyagarajan<< saran.thiyagarajan@sap.com >>
+
+=head1 LICENSE
+
+Copyright 2016 Ariba
+
+=cut
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use Pod::Usage;
+use Getopt::Long;
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    GetOptions(
+        "help|h" => sub { pod2usage(1); },
+        "debug|d+" => \$debug,
+        "e" => \$sendEmail,
+        "p" => \$sendPage,
+    );
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $an = ariba::rc::InstalledProduct->new("an", $mon->service());
+    my $cluster = $mon->currentCluster();
+    my $email = $mon->default('notify.email');
+    my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+    my $communitiesList = join(", ",  @communityIds  );
+
+    my %queries_summary = ();
+    my %queries_details = ();
+
+    $queries_summary{'influx_details'} = { 'measurement' => "an_supplier_tracker_summary"};
+
+    $queries_summary{"number of items stuck is more than 500 in community"}  = {
+        warn     => "answer > 500",
+        ticketOnWarnOpenAfterMinutes => 30,
+        description => 'number of items stuck is more than 500 in community', 
+        severity => 1,
+        runForCommunities => $communitiesList,
+        sql => q`select /*+ INDEX(SUP_TRKR_EVLTR_QUEUE IND_21F5D32E_CF6759DB)*/ count( * ) as stuck_more_than_500 from SUP_TRKR_EVLTR_QUEUE where status in ('Queued','Processing')`,
+    };
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('supplierTracker', $an->name(), $mon->service(), undef, \%queries_summary);
+    $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+    $queries_details{'influx_details'} = { 'measurement' => "an_supplier_tracker_details"};
+
+    $queries_details{"number of items stuck is more than 3 hours in community"}  = {
+        warn     => "numrows>0",
+        ticketOnWarnOpenAfterMinutes => 30,
+        description => 'number of items stuck is more than 3 hours in community', 
+        severity => 1,
+        runForCommunities => $communitiesList,
+        sql => q`select /*+ INDEX(SUP_TRKR_EVLTR_QUEUE IND_21F5D32E_CF6759DB) */ id as id,item,schema_community,status,(sysdate-status_changed)*24 as stuck_time from SUP_TRKR_EVLTR_QUEUE where status in ('Queued','Processing') and (sysdate-status_changed)*24 > 3`,
+    };
+
+    $qm = ariba::monitor::QueryManager->newWithDetails('supplierTracker', $an->name(), $mon->service(), undef, \%queries_details);
+    $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+}
+
+main(@ARGV);
+
+__END__

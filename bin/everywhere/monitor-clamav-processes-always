@@ -1,0 +1,259 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/operations/cfengine/cfengine/scripts/000260-monitor-system-processes-always#50 $
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../../../tools/lib/perl";
+use lib "$FindBin::Bin/../../../../monitor/lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Constants;
+use ariba::Ops::CFEngine::MonitoringGlueUtils;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProcessTable;
+use ariba::Ops::Utils;
+use ariba::SNMP::Session;
+
+use Data::Dumper;
+use DateTime;
+
+local $| = 1;
+my $debug = 0;
+
+sub main {
+
+    my $sendEmail = 1;
+    my $sendPage = 1;
+    
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-d/o) { $debug++; next;}
+    }
+
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my $machine  = ariba::Ops::Machine->new($hostname);
+    my @services = $machine->providesServices();
+    my %queries  = ();
+
+    exit unless ($machine->status() eq 'inservice' or $machine->status() eq 'spare');
+    exit unless $machine->provides( 'clamav' ); ## This shouldn't happen but to be safe ...
+
+    my $service = $machine->service();
+    my $dataCenter = $machine->monitoringDatacenter() || $machine->datacenter();
+
+    ## clamd process monitor
+    my $processTable = ariba::Ops::ProcessTable->new();
+    my @processes = qw{ clamd };
+    for my $process (sort @processes) {
+
+        ## We want to check for a process that STARTS with clamd:
+        my $status = $processTable->processWithNameExists( "^$process" ) ? 'up' : 'down';
+
+        $queries{"$process-$hostname"} = {
+            info => "answer eq 'up'",
+            crit => "answer eq 'down'",
+            correctiveActions => [
+                Ops => 'Notify the oncall SysAdmin',
+            ],
+            openTicketInServices => "all",
+            ticketOwner => "unassigned-sysadmin",
+            perl => "return '$status'",
+            uiHint => "$hostname/Processes",
+            inf_field => "status",
+            inf_tags => "uihint=\"$hostname/Processes\",datacenter=\"$dataCenter\"",
+            inf_default => 0,
+            group_by => "$hostname/Processes,$dataCenter",
+        };
+    }
+
+    ## %iowait monitoring
+    ## Copied this from monitor/bin/everywhere/per-cpu-usage
+    open my $STAT, '<', "/proc/stat" or die "Could not open /proc/stat\n";
+    my @stats;
+
+    while(my $line = <$STAT>) {
+        next if $line !~ m/^cpu(\d+)/;
+        my $cpuid = $1;
+        my($dummy, $user, $nice, $system, $idle, $iowait, $irq, $softirq) = split(/\s+/, $line);
+        my $total = $user + $nice + $system + $idle + $iowait + $irq + $softirq; #with idle
+        my $usage = $user + $nice + $system + $iowait + $irq + $softirq; #without idle
+        push(@stats, [$cpuid, $total, $user, $nice, $system, $idle, $iowait, $irq, $softirq, $usage]);
+    }
+
+    close $STAT or die "Error closing /proc/stat: $!\n";
+
+    foreach my $cpu (@stats) {
+        my $cpuid = $cpu->[0];
+        if ( $cpuid eq 'cpu' ){
+            ## See note after __END__ block.  Looks like 'cpu' is the total and 'cpu#' is per processor
+            $cpuid = 'Total';
+        }
+        #$queries{"$hostname: CPU $cpuid IO Wait"} = {
+        $queries{"CPU $cpuid IO Wait-$hostname"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => 'gauge',
+#            'format' => '%.2f%%',
+            'info' => 1,
+            'uiHint' => "$hostname/IO Wait",
+            'perl' => "return $cpu->[6]",
+            inf_field => "IOWait",
+            inf_tags => "uihint=\"$hostname/IO Wait\",datacenter=\"$dataCenter\"",
+            inf_default => 0,
+            group_by => "$hostname/IO Wait,$dataCenter",
+        };
+    }
+
+    ## Network IO monitoring
+    my $snmp = ariba::SNMP::Session->newFromMachine($machine);
+    my $data = $snmp->bulkWalkOids( 'ifTable' );
+
+    IF:
+    foreach my $if ( sort keys %{ $data } ){
+        my $descr = $data->{ "$if" }->{'ifDescr'} || "";
+        if ( $descr =~ /lo/ ){ ## ignore loopback
+            next IF;
+        }
+        my $in  = $data->{ "$if" }->{'ifInOctets'};
+        my $out = $data->{ "$if" }->{'ifOutOctets'};
+        my $tot;
+        if ( $in || $out ){
+            $tot = $in + $out;
+            print "$descr: In: $in        Out: $out        Total: $tot\n" if $debug;
+        } else {
+            next IF;
+        }
+        $queries{"Network IO (total): $descr-$hostname"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => 'gauge',
+            'info' => 1,
+            'uiHint' => "$hostname/Network IO/$descr",
+            'perl' => "return $tot",
+            inf_field => "NetworkIOTotal",
+            inf_tags => "uihint=\"$hostname/Network IO/$descr\",datacenter=\"$dataCenter\"",
+            inf_default => 0,
+            group_by => "$hostname/Network IO/$descr,$dataCenter",
+        };
+        $queries{"Network IO (inbound): $descr-$hostname"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => 'gauge',
+            'info' => 1,
+            'uiHint' => "$hostname/Network IO/$descr",
+            'perl' => "return $in",
+            inf_field => "NetwokIOinbound",
+            inf_tags => "uihint=\"$hostname/Network IO/$descr\",datacenter=\"$dataCenter\"",
+            inf_default => 0,
+            group_by => "$hostname/Network IO/$descr,$dataCenter",
+        };
+        $queries{"Network IO (outbound): $descr-$hostname"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => 'gauge',
+            'info' => 1,
+            'uiHint' => "$hostname/Network IO/$descr",
+            'perl' => "return $out",
+            inf_field => "NetworkIOoutbound",
+            inf_tags => "uihint=\"$hostname/Network IO/$descr\",datacenter=\"$dataCenter\"",
+            inf_default => 0,
+            group_by => "$hostname/Network IO/$descr,$dataCenter",
+        };
+    }
+
+
+    my $server   = ariba::Ops::CFEngine::MonitoringGlueUtils::monitorServer($hostname);
+    print "SERVER: $server\n", if $debug;
+
+    #exit unless defined $server;
+    ## calling die here rather than exit.  We should note this and not just blindly exit.
+    die "Unrecoverable error: Cannot find Monitoring server!!\n" unless defined $server;
+
+    my $product  = ariba::monitor::StatusPage::fakeProductNameForDatacenter($dataCenter);
+    my $customer = undef;
+
+    print "PRODUCT: $product \n", if $debug;
+    print "SERVICE: $service \n", if $debug;
+
+    queries{influx_details} = {measurement => "ClamAVStatus"};
+    my $q = ariba::monitor::QueryManager->newWithDetails(
+        'ClamAV Status', $product, $service, $customer, \%queries
+    );
+
+    $q->processQueries($debug, ariba::Ops::Constants->operationsEmailNotificationAddress(), $sendEmail, $sendPage, $server);
+}
+
+main();
+
+__END__
+
+ $ cat /proc/stat
+cpu  106646 210 114665 213693825 378850 2 4195 0 0
+cpu0 16579 8 16511 26734965 4766 0 2 0 0
+cpu1 26802 0 18963 26659322 57618 2 4136 0 0
+cpu2 5524 0 8471 26776467 1473 0 2 0 0
+cpu3 6944 15 14792 26764192 10470 0 22 0 0
+cpu4 15390 14 18736 26744007 8142 0 0 0 0
+cpu5 12342 15 16244 26756828 6107 0 0 0 0
+cpu6 13355 56 8036 26770602 3164 0 0 0 0
+cpu7 9706 97 12909 26487439 287107 0 28 0 0
+intr 44389077 128 2 0 0 2 0 0 0 1 1 0 0 4 0 0 0 39 4188 0 34 0 0 0 45 893 0 0 0 0 26178 166 379805 56 332 5684990 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+ctxt 77087361
+btime 1422299543
+processes 214750
+procs_running 1
+procs_blocked 0
+softirq 31391493 0 9703090 53625 5685303 361977 0 3609 4335804 106189 11141896
+
+/var/log/clamav/freshclam.log:
+<SNIP>
+Fri Jan 30 04:02:05 2015 -> --------------------------------------
+Fri Jan 30 04:02:05 2015 -> Current working dir is /var/lib/clamav
+Fri Jan 30 04:02:05 2015 -> Max retries == 3
+Fri Jan 30 04:02:05 2015 -> ClamAV update process started at Fri Jan 30 04:02:05 2015
+Fri Jan 30 04:02:05 2015 -> Using IPv6 aware code
+Fri Jan 30 04:02:05 2015 -> Querying current.cvd.clamav.net
+Fri Jan 30 04:02:05 2015 -> TTL: 1796
+Fri Jan 30 04:02:05 2015 -> Software version from DNS: 0.98.6
+Fri Jan 30 04:02:05 2015 -> WARNING: Your ClamAV installation is OUTDATED!
+Fri Jan 30 04:02:05 2015 -> WARNING: Local version: 0.98.4 Recommended version: 0.98.6
+Fri Jan 30 04:02:05 2015 -> DON'T PANIC! Read http://www.clamav.net/support/faq
+Fri Jan 30 04:02:05 2015 -> main.cvd version from DNS: 55
+Fri Jan 30 04:02:05 2015 -> Connecting via proxy.ariba.com
+Fri Jan 30 04:02:05 2015 -> main.cvd is up to date (version: 55, sigs: 2424225, f-level: 60, builder: neo)
+Fri Jan 30 04:02:05 2015 -> daily.cvd version from DNS: 20000
+Fri Jan 30 04:02:05 2015 -> Connecting via proxy.ariba.com
+Fri Jan 30 04:02:05 2015 -> Retrieving http://db.us.clamav.net/daily-20000.cdiff
+Fri Jan 30 04:02:05 2015 -> Trying to download http://db.us.clamav.net/daily-20000.cdiff (IP: 10.162.14.16)
+Fri Jan 30 04:02:06 2015 -> Downloading daily-20000.cdiff [100%]
+Fri Jan 30 04:02:06 2015 -> cdiff_apply: Parsed 151 lines and executed 151 commands
+Fri Jan 30 04:02:07 2015 -> Loading signatures from daily.cld
+Fri Jan 30 04:02:09 2015 -> Properly loaded 1316405 signatures from new daily.cld
+Fri Jan 30 04:02:09 2015 -> daily.cld updated (version: 20000, sigs: 1316354, f-level: 63, builder: neo)
+Fri Jan 30 04:02:09 2015 -> Querying daily.20000.77.1.0.0AA20E10.ping.clamav.net
+Fri Jan 30 04:02:09 2015 -> bytecode.cvd version from DNS: 245
+Fri Jan 30 04:02:09 2015 -> Connecting via proxy.ariba.com
+Fri Jan 30 04:02:09 2015 -> bytecode.cld is up to date (version: 245, sigs: 43, f-level: 63, builder: dgoddard)
+Fri Jan 30 04:02:13 2015 -> Database updated (3740622 signatures) from db.us.clamav.net
+Fri Jan 30 04:02:13 2015 -> Clamd successfully notified about the update.
+Fri Jan 30 08:00:47 2015 -> --------------------------------------
+Fri Jan 30 08:00:47 2015 -> Current working dir is /var/lib/clamav
+Fri Jan 30 08:00:47 2015 -> Max retries == 3
+Fri Jan 30 08:00:47 2015 -> ClamAV update process started at Fri Jan 30 08:00:47 2015
+Fri Jan 30 08:00:47 2015 -> Using IPv6 aware code
+Fri Jan 30 08:00:47 2015 -> Querying current.cvd.clamav.net
+Fri Jan 30 08:00:47 2015 -> TTL: 1755
+Fri Jan 30 08:00:47 2015 -> Software version from DNS: 0.98.6
+Fri Jan 30 08:00:47 2015 -> WARNING: Your ClamAV installation is OUTDATED!
+Fri Jan 30 08:00:47 2015 -> WARNING: Local version: 0.98.4 Recommended version: 0.98.6
+Fri Jan 30 08:00:47 2015 -> DON'T PANIC! Read http://www.clamav.net/support/faq
+Fri Jan 30 08:00:47 2015 -> main.cvd version from DNS: 55
+Fri Jan 30 08:00:47 2015 -> Connecting via proxy.ariba.com
+Fri Jan 30 08:00:47 2015 -> main.cvd is up to date (version: 55, sigs: 2424225, f-level: 60, builder: neo)
+Fri Jan 30 08:00:47 2015 -> daily.cvd version from DNS: 20000
+Fri Jan 30 08:00:47 2015 -> Connecting via proxy.ariba.com
+Fri Jan 30 08:00:47 2015 -> daily.cld is up to date (version: 20000, sigs: 1316354, f-level: 63, builder: neo)
+Fri Jan 30 08:00:47 2015 -> bytecode.cvd version from DNS: 245
+Fri Jan 30 08:00:47 2015 -> Connecting via proxy.ariba.com
+Fri Jan 30 08:00:47 2015 -> bytecode.cld is up to date (version: 245, sigs: 43, f-level: 63, builder: dgoddard)

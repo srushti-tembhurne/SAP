@@ -1,0 +1,216 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/s4/sizeof-bulk-allocated-resources#24 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::OracleClient;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DBConnection;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ServiceController;
+use Data::Dumper;
+
+my $maxResults = 17520; # (a year of data at twice an hour)
+
+sub main {
+    my $debug = 0;
+    my $quiet = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $productName;
+
+    while(my $arg=shift(@ARGV)){
+            print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+            if($arg =~ /^-d/o){ $debug=1; }
+            if($arg =~ /^-e/o){ $sendEmail=1; };
+            if($arg =~ /^-p$/o){ $sendPage=1; };
+            if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+
+    my $product;
+    unless (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
+        exit(0);
+    }
+    $product = ariba::rc::InstalledProduct->new($productName, $service);
+
+
+    my ($sharedStarSchemas, $dedicatedStarSchemas);
+    my @dedicatedConn = ariba::Ops::DBConnection->connectionsForProductOfDBType(
+            $product, ariba::Ops::DBConnection->typeMainStarDedicated());
+    $dedicatedStarSchemas = scalar(@dedicatedConn);
+    my @sharedConn = ariba::Ops::DBConnection->connectionsForProductOfDBType(
+            $product, ariba::Ops::DBConnection->typeMainStarShared());
+    $sharedStarSchemas = scalar(@sharedConn);
+
+    my(%bySid);
+
+    foreach my $conn (@dedicatedConn) {
+        my $sid = $conn->sid();
+        $bySid{$sid} = {} unless defined($bySid{$sid});
+        $bySid{$sid}->{$conn->schemaId()} = 1;
+    }
+
+    my $defaultDbc = ariba::Ops::DBConnection->connectionsForProductOfDBType($product, ariba::Ops::DBConnection->typeMain());
+    my $oc = ariba::Ops::OracleClient->newFromDBConnection($defaultDbc);
+    my $sql = "select distinct databaseschema as dbschema from schematypemaptab where schematype = 'Star' and isDedicated = 1";
+
+    exit unless $oc->connect();
+    my @usedSchemas = $oc->executeSql($sql);
+
+    foreach my $schemaHash (@usedSchemas) {
+         my $schema = $schemaHash->{DBSCHEMA};
+        $schema =~ m/(\d+)$/;
+        my $id = $1;
+        foreach my $key (keys %bySid) {
+            delete $bySid{$key}->{$id} if($bySid{$key}->{$id});
+        }
+    }
+
+    my $skip = 0;
+
+    my %queries  = ();
+
+    $queries{"Number of dedicated star schemas (total)"} = {
+        info => 1,
+        perl => $dedicatedStarSchemas,
+        recordMaxResults => $maxResults,
+        recordDataType => 'gauge',
+        recordItem => 'answer',
+        inf_field => "dedicated_star_schemas_total",
+        inf_default => 0,
+    };
+
+    my $unallocatedStarSchemaWarn = 30;
+    my $unallocatedStarSchemaCrit = 20;
+    my $salesUnallocatedStarSchemaWarn = 10;
+    my $salesUnallocatedStarSchemaCrit = 5;
+
+    foreach my $key (keys %bySid) {
+        my $qname = "Number of dedicated star schemas on $key (unallocated)";
+        my $availSchemas = scalar keys(%{$bySid{$key}});
+        my ($warn, $crit, $w_threshold, $c_threshold);
+
+        # Warn and Crit values for unallocated dedicated schemas should be the same accross all production services
+        # Tracked by: HOA-14511
+        if (ariba::Ops::ServiceController::isProductionServicesOnly($service)){
+            $w_threshold = $unallocatedStarSchemaWarn;
+            $c_threshold = $unallocatedStarSchemaCrit;
+        }
+
+        if ($service =~ /sales/i) {
+            $w_threshold = $salesUnallocatedStarSchemaWarn;
+            $c_threshold = $salesUnallocatedStarSchemaCrit;
+        }
+
+        $w_threshold = -1  unless ( defined $w_threshold );
+        $warn = "answer <= $w_threshold";
+        $queries{"$qname warn threshold"} = {
+            perl      => sub { $w_threshold },
+            inf_field => "dedicated_star_schema_warn_threshold",
+            inf_tags  => qq(schema_name="$key"),
+            group_by  => $key,
+        };
+
+        $c_threshold = -1  unless ( defined $c_threshold );
+        $crit = "answer <= $c_threshold";
+        $queries{"$qname crit threshold"} = {
+            perl      => sub { $c_threshold },
+            inf_field => "dedicated_star_schema_crit_threshold",
+            inf_tags  => qq(schema_name="$key"),
+            group_by  => $key,
+        };
+
+        $queries{$qname} = {
+            info => 1,
+            warn => $warn,
+            crit => $crit,
+            perl => sub { $availSchemas },
+            recordMaxResults => $maxResults,
+            recordDataType => 'gauge',
+            recordItem => 'answer',
+            ticketOnWarnOpenAfterMinutes => 1,
+            inf_field => "dedicated_star_schema",
+            inf_tags  => qq(schema_name="$key"),
+            inf_default => 0,
+            group_by => $key,
+        };
+    }
+
+    $queries{"Number of dedicated star schemas (unallocated)"} = {
+        info => 1,
+        sql => "select ($dedicatedStarSchemas - count(distinct databaseschema)) as dedicated_star_schemas from schematypemaptab where schematype = 'Star' and isDedicated = 1",
+        recordMaxResults => $maxResults,
+        recordDataType => 'gauge',
+        recordItem => 'answer',
+    };
+
+    $queries{"Number of shared star schemas (total)"} = {
+        info => 1,
+        perl => $sharedStarSchemas,
+        recordMaxResults => $maxResults,
+        recordDataType => 'gauge',
+        recordItem => 'answer',
+        inf_field => "shared_star_schema_total",
+        inf_default => 0,
+    };
+
+    my $dbc = ariba::Ops::DBConnection->connectionsForProductOfDBType(
+        $product, ariba::Ops::DBConnection->typeMain()
+    );
+
+    undef($oc);
+    if($dbc) {
+        $oc = ariba::Ops::OracleClient->newFromDBConnection($dbc);
+    }
+    if($oc && $oc->connect()) {
+
+        my $sql = q`
+            select
+                distinct databaseschema as dbschemas, count(databaseschema) as schema_cnt
+            from
+                schematypemaptab
+            where
+                schematype = 'Star' and isDedicated = 0 and realmid != -1
+            group by databaseschema
+            order by count(databaseschema) desc
+        `;
+        my @results = $oc->executeSql($sql);
+
+        foreach my $row (@results) {
+            my $schemaName = $row->{DBSCHEMAS};
+            my $realmCount = $row->{SCHEMA_CNT};
+            $queries{"Number of realms for shared star schema $schemaName"} = {
+                info => 1,
+                perl => $realmCount,
+                recordMaxResults => $maxResults,
+                recordDataType => 'gauge',
+                recordItem => 'answer',
+                inf_field  => "realm_cnt",
+                inf_tags   => qq(schema="$schemaName"),
+                inf_default => 0,
+                group_by => $schemaName,
+            };
+        }
+    }
+
+    my $email = $me->default('notify.email');
+    $queries{influx_details} = { measurement => 'sizeof_bulk_allocated_resources' };
+    my $q = ariba::monitor::QueryManager->newWithDetails(
+        "sizeof-bulk-allocated-resources", $product->name(), $service, $product->customer(), \%queries
+    );
+
+    $q->setSQLConnectInfo($product->connectInfoForOracleClient());
+
+    $q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

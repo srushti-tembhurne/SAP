@@ -1,0 +1,275 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/common/durable-email-monitoring#12 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::Query;
+use ariba::monitor::Url;
+use ariba::rc::InstalledProduct;
+use dmail::LockLib;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+
+use Data::Dumper;
+use XML::Simple;
+use Date::Parse;
+
+my %thresholds = (
+                  '5' => {
+                          warn => 'answer > 0.25 && answer < 0.5',
+                          crit => 'answer >= 0.5',
+                         },
+                  '0' => {
+                          warn => 'answer > 2 && answer < 3',
+                          crit => 'answer >= 3',
+                         },
+                  '10' => {
+                           warn => 'answer > 4 && answer < 8',
+                           crit => 'answer >= 8',
+                          },
+                 );
+
+my %priority_tag = (5 => 'High', 0 => 'Normal', 10 => 'Low');
+
+sub main
+{
+    my $debug     = 0;
+    my $quiet     = 0;
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $productName;
+
+    while (my $arg = shift (@ARGV))
+    {
+        print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+        if ($arg =~ /^-d/o)    {$debug++;}
+        if ($arg =~ /^-e/o)    {$sendEmail = 1;}
+        if ($arg =~ /^-p$/o)   {$sendPage = 1;}
+        if ($arg =~ /^-prod/o) {$productName = shift (@ARGV);}
+    }
+
+    my $me      = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+    my $email   = $me->default('notify.email');
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+
+    unless (@products)
+    {
+        exit (0);
+    }
+
+    for my $product (@products)
+    {
+
+        my $lockfile = "/tmp/stratus-durable-email-monitoring";
+        $lockfile .= "-" . $product->name();
+        $lockfile .= "-" . $product->customer() if ($product->customer());
+        if (!dmail::LockLib::requestlock($lockfile, 5))
+        {
+            print STDERR "can't grab lock $lockfile\n";
+            next;
+        }
+
+        my @dbcs = ariba::Ops::DBConnection->connectionsFromProducts($product);
+        my $dbc  = $dbcs[0];
+        my $oc   = ariba::Ops::OracleClient->newFromDBConnection($dbc);
+        $oc->connect();
+        my $skip = 0;
+
+        my %queries    = ();
+        my $realm_href = {};
+
+        #Durable Email Monitoring
+
+        my %instance_hash;
+        my @instance_array;
+        map {push (@instance_array, $_)} $product->appInstancesInCluster($cluster);
+        my @countgen = (1 .. scalar @instance_array);
+        for my $cg (@countgen)
+        {
+            map {$instance_hash{$cg} = $_} $product->appInstancesInCluster($cluster);
+        }
+
+        my $instanceToMonitor = generateRandom(\%instance_hash, scalar @instance_array);
+
+        for my $instance (@$instanceToMonitor)
+        {
+            my $durable_url = $instance->durableEmailStatsURL();
+            print "current url : $durable_url   \n" if ($debug > 1);
+
+            my $durableEmailStats = ariba::monitor::Url->new($durable_url);
+
+            #remove possible newline at the end of the results that messed up xml parser
+            chomp(my $results = $durableEmailStats->request(600));
+            print "\n---\n $results \n---\n" if ($debug > 1);
+
+            my $xml_ref = parseDurableEmailStatsDetails($results);
+            print "Dumper of xml:" . Dumper($xml_ref) if ($debug > 1);
+
+            if ($xml_ref)
+            {
+                foreach my $realmid (keys (%{$xml_ref->{realm}}))
+                {
+                    foreach my $priorityid (keys (%{$xml_ref->{realm}->{$realmid}->{priority}}))
+                    {
+
+                        my $created_last_hour  = $xml_ref->{realm}->{$realmid}->{priority}->{$priorityid}->{created_last_hour};
+                        my $pending            = $xml_ref->{realm}->{$realmid}->{priority}->{$priorityid}->{pending};
+                        my $oldest_unsent_time = $xml_ref->{realm}->{$realmid}->{priority}->{$priorityid}->{oldest_unsent_time};
+                        print " created_last_hour : $created_last_hour,pending : $pending , oldest_unsent_time : $oldest_unsent_time \n" if ($debug > 2);
+
+                        #store in hash.Can be merged with previous statements.Just keeping for debugging
+                        $realm_href->{$realmid}->{$priorityid}->{'created_last_hour'}  = $created_last_hour;
+                        $realm_href->{$realmid}->{$priorityid}->{'pending'}            = $pending;
+                        $realm_href->{$realmid}->{$priorityid}->{'oldest_unsent_time'} = $oldest_unsent_time;
+                    }
+                }
+
+                #Get all realms from DB
+                my @realms = $oc->executeSql("select id from realmtab");    #whatever it is
+                print "total number of realms" . scalar (@realms) . "\n" if ($debug > 1);
+
+                foreach my $realm (@realms)
+                {
+                    my $realmid = $realm->{'ID'};
+                    foreach my $priorityid (keys %thresholds)
+                    {
+
+                        #For every [realms*priority] we need to store Query results.Not a scalable solution.
+                        my ($created_last_hour, $pending, $oldest_unsent_time);
+
+                        #If data exist in xml for a given realm and priority ,retrieve it,else make it as 0
+                        if (exists $realm_href->{$realmid}->{$priorityid})
+                        {
+                            $created_last_hour  = $realm_href->{$realmid}->{$priorityid}->{'created_last_hour'};
+                            $pending            = $realm_href->{$realmid}->{$priorityid}->{'pending'};
+                            $oldest_unsent_time = $realm_href->{$realmid}->{$priorityid}->{'oldest_unsent_time'};
+                        }
+                        else
+                        {
+                            $created_last_hour  = 0;
+                            $pending            = 0;
+                            $oldest_unsent_time = 0;
+                        }
+
+                        #create pending result query in all cases and plot graph
+                        $queries{"$priority_tag{$priorityid} priority pending email(s) for realm $realmid"} = {
+                                                                                                               'recordMaxResults' => 8760,
+                                                                                                               'uiHint'           => "Realms/Realm $realmid",
+                                                                                                               'perl'             => sub {return $pending;},
+                                                                                                               inf_tags           => qq(realm_id=$realmid,priority=$priority_tag{$priorityid}),
+                                                                                                               inf_field          => qq(pending),
+                                                                                                               inf_default        => 0,
+                                                                                                               group_by           => qq($realmid,$priority_tag{$priorityid}),
+                                                                                                              };
+
+                        #Create oldest_unsent_time when there is a data in xml and graph
+                        #if($oldest_unsent_time) {
+                        $queries{"$priority_tag{$priorityid} priority oldest unsent email(s) time for realm $realmid"} = {
+                            'recordMaxResults' => 8760,
+                            'uiHint'           => "Realms/Realm $realmid",
+                            'warn'             => $thresholds{$priorityid}{'warn'},
+                            'crit'             => $thresholds{$priorityid}{'crit'},
+                            'format'           => '%.2f hours',
+
+                            #if $oldest_unsent_time is exit it will return the difference with current time else
+                            #it return the $oldest_unsent_time (which is set as empty string at line # 130 )
+                            'perl' => sub {return ($oldest_unsent_time ? ((time - str2time($oldest_unsent_time)) / 3600) : $oldest_unsent_time);},
+                            inf_tags    => qq(realm_id=$realmid,priority=$priority_tag{$priorityid}),
+                            inf_field   => qq(oldest_unsent_time),
+                            inf_default => 0,
+                            group_by    => qq($realmid,$priority_tag{$priorityid}),
+                                                                                                                         };
+
+                        #create "created_last_hour" query when there is a data in xml and graph
+                        $queries{"$priority_tag{$priorityid} priority email(s) created last one hour for realm $realmid"} = {
+                                                                                                                             'recordMaxResults' => 8760,
+                                                                                                                             'uiHint'           => "Realms/Realm $realmid",
+                                                                                                                             'perl'             => sub {return $created_last_hour;},
+                                                                                                                             inf_tags           => qq(realm_id=$realmid,priority=$priority_tag{$priorityid}),
+                                                                                                                             inf_field          => qq(created_last_hour),
+                                                                                                                             inf_default        => 0,
+                                                                                                                             group_by           => qq($realmid,$priority_tag{$priorityid}),
+                                                                                                                            };
+
+                        #Get Previous Results
+                        my $qname = $priority_tag{$priorityid} . " priority pending email(s) for realm $realmid";
+                        my $previous_instance = ariba::monitor::Query->generateInstanceName($qname, $productName, $me->customer(), $me->currentCluster());
+
+                        my $completedQuery   = ariba::monitor::Query->new($previous_instance);
+                        my $previous_results = $completedQuery->results();
+
+                        print "previous_results : $previous_results\n Formula : [ $previous_results + $created_last_hour - $pending ] " if ($debug > 1);
+
+                        my $sent_emails_last_hour = $previous_results + $created_last_hour - $pending;
+                        print "sent email last hour : $sent_emails_last_hour\n" if ($debug > 1);
+
+                        #create sent_email_last_hour query when created_last_hour and previous_results > 0, otherwise we get -ve value
+                        $queries{"$priority_tag{$priorityid} priority email(s) sent in last one hour for realm $realmid"} = {
+                                                                                                                             'recordMaxResults' => 8760,
+                                                                                                                             'uiHint'           => "Realms/Realm $realmid",
+                                                                                                                             'perl'             => sub {return "$sent_emails_last_hour";},
+                                                                                                                             inf_tags           => qq(realm_id=$realmid,priority=$priority_tag{$priorityid}),
+                                                                                                                             inf_field          => qq(sent_emails_last_hour),
+                                                                                                                             inf_default        => 0,
+                                                                                                                             group_by           => qq($realmid,$priority_tag{$priorityid}),
+                                                                                                                            };
+                    }
+                }
+
+                # Skip parsing of redundant xml
+                last;
+            }
+        }
+
+        $queries{influx_details} = {measurement => 'buyer_durable_email_monitoring'};
+        my $q = ariba::monitor::QueryManager->newWithDetails("persisted-mail-queue", $product->name(), $service, $product->customer(), \%queries);
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        dmail::LockLib::releaselock($lockfile);
+    }
+}
+
+sub parseDurableEmailStatsDetails
+{
+    my ($xml_content) = @_;
+
+    my $xml_href;
+    eval {$xml_href = XMLin($xml_content, ForceArray => 1);};
+
+    if ($@ or ref ($xml_href) !~ /Hash/i)
+    {
+        return (0);
+    }
+
+    return ($xml_href);
+}
+
+sub generateRandom
+{
+    my $ho     = shift;
+    my $c      = shift;
+    my $random = int (rand ($c)) + 1;
+    if ($random + 2 >= $c)
+    {
+        $random = $random - 2;
+    }
+    my @randhashfive;
+    my @randcount = ($random .. $random + 2);
+    foreach my $rc (@randcount)
+    {
+        push (@randhashfive, $ho->{$rc});
+    }
+    return \@randhashfive;
+}
+
+main();
+

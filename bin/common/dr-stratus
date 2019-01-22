@@ -1,0 +1,524 @@
+#!/usr/local/bin/perl
+
+use lib '/usr/local/ariba/lib';
+use ariba::rc::Utils;
+use Getopt::Long;
+use strict;
+use File::Basename;
+use FindBin;
+
+
+use ariba::Ops::PersistantObject;
+use ariba::Ops::MCLGen;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Passwords;
+use ariba::rc::Globals;
+use ariba::Ops::MCL;
+use ariba::Ops::Utils;
+use Data::Dumper;
+
+use ariba::rc::Utils;
+use ariba::Ops::Utils;
+use ariba::Ops::Logger;
+use ariba::Ops::Machine;
+
+
+my $command = 'sudo crontab -l';
+my @output;
+my @incs;
+my $action;
+my $step;
+my $verbose;
+my $product;
+my $service;
+my @gen_mcls;
+my $sname;
+my $failtype;
+my $jira;
+my %peersForHost;
+my $help;
+my $dc;
+my $restoreDataSet = 'N';
+my $kapacitorPrimaryHost = 'stratusinfluxdb03';
+#---------------------------------------------------------------------------------------------------------
+# Dependencies
+# Follow rows / equivallent should go to roles.cfg under primary & secondary cluster as minimum dependency
+#---------------------------------------------------------------------------------------------------------
+#kapacitor-server    stratusinfluxdb03.snv.ariba.com stratusinfluxdb02.snv.ariba.com
+#
+#influxdb-meta-node    stratusinfluxdb01.snv.ariba.com stratusinfluxdb02.snv.ariba.com stratusinfluxdb03.snv.ariba.com
+#
+#influxdb-data-node    stratusinfluxdb01.snv.ariba.com stratusinfluxdb02.snv.ariba.com
+#---------------------------------------------------------------------------------------------------------
+#Usage
+# 	perl dr-stratus -action init -type failover -datasetrestore=Y -service prod
+#        /usr/local/ariba/bin/mcl-control reset /tmp/stratus-failover/stratus-failover.mcl	
+#---------------------------------------------------------------------------------------------------------
+
+##############################################################
+# Reading the command line arguments
+##############################################################
+GetOptions(
+              "action=s"   => \$action,     #init, run, retry
+	      "datasetrestore=s" => \$restoreDataSet, 	
+              "type:s"   => \$failtype,
+              "product:s"   => \$product,
+              "service:s"   => \$service,
+	      "kapacitorprimary:s"	=> \$kapacitorPrimaryHost,	
+              "mcl:s"   => \$step,     #mcl name, used to get the mcl name
+              "stepname:s"   => \$sname,     #step name, incase of retry
+              "jira:s"   => \$jira, 
+              "verbose"  => \$verbose,   # flag
+              "help|h" => \$help
+           );
+
+
+usage() unless ($action && $failtype && $service);
+usage() if $help;
+usage() unless ($restoreDataSet eq 'Y' || $restoreDataSet eq 'N');
+
+print "Running for service : $service\n";
+##############################################################
+#Verifying & Creating essential folder struture
+##############################################################
+my $odir = '/tmp/stratus-failover';
+if($failtype eq 'failback') { 
+	$odir = '/tmp/stratus-failback';
+}
+if(! -d $odir){
+	my $r = `mkdir -p $odir`;
+}
+
+ariba::rc::Passwords::initialize($service);
+if($action eq 'init'){
+        die "\n no service specified"   if($service !~/\S+/);
+	
+	if($failtype eq 'failover'){
+	        generateFailoverMCLS($service);
+	}
+	if($failtype eq 'failback'){
+	        generateFailbackMCLS($service);
+	}
+}elsif($action eq 'run'){
+	my $mcl = $step.'.mcl';
+	my $ecom = '/usr/local/ariba/bin/mcl-control run -dir '.$odir.' '.$mcl. ' -noui';
+	print "\n Running $ecom";
+	#my $result = `$ecom`;
+	#print "\n $result";
+	ariba::Ops::MCL::setDirectory($odir);
+	my $mcl = ariba::Ops::MCL->new($mcl);
+	$mcl->executeInParallel();
+	my $mclStatus = $mcl->topLevelStatus();
+	print "\nStatus : [$mclStatus]\n";
+	foreach my $step ($mcl->steps()) {
+		print "\n", $step->output();
+	}
+	
+} elsif($action eq 'retry'){
+	my $mcl = $step.'.mcl';
+	ariba::Ops::MCL::setDirectory($odir);
+	my $mcl = ariba::Ops::MCL->new($mcl);
+	my $mclStatus = $mcl->topLevelStatus();
+	print "\nStatus : [$mclStatus]\n";
+	foreach my $step ($mcl->steps()) {
+		if($step->name eq $sname){
+			$step->execute();
+			print "\n ", $step->output(), "|", $step->status();
+		}
+	}
+	
+} else {
+	die "\n wrong action ";
+}
+
+
+sub generateFailoverMCLS {
+	my $service = shift;
+
+	# Generating Sanity MCL file sanity.mcl
+	#my $mcl_file = generateSanity();
+	#print "\n $mcl_file Generated";
+	#push @incs, $mcl_file;	
+
+	my $mcl_file = generateKapacitorSteps($service);
+	print "\n $mcl_file Generated";
+	push @incs, $mcl_file;	
+
+	$mcl_file = generateTelegrafMCLS($service);
+	print "\n $mcl_file Generated";
+	push @incs, $mcl_file;
+
+	if($restoreDataSet eq 'Y') {	
+		$mcl_file = generateDataSetRestoreMCLS($service);
+		print "\n $mcl_file Generated";
+		push @incs, $mcl_file;
+	}
+	
+	
+	open my $OUT, ">", "$odir/stratus-failover.mcl" or die "cannot open file";	
+	my $mtext = "Variable: SERVICE=$service\n";
+	print $OUT $mtext;
+	foreach my $inc ( @incs) {
+           my $in;
+           print "\n ====== Reading $inc";
+           chomp($inc);
+	   next if($inc !~ /\S+/);
+           open my $in, "<", $inc || die("\n Cannot open $inc for reading.$!");
+           my @data = <$in>;
+           close($in);
+           print $OUT join("", @data), "\n\n";
+        }
+        close $OUT;
+        exit;
+
+}
+
+
+sub generateFailbackMCLS {
+	my $service = shift;
+	# Generating Sanity MCL file sanity.mcl
+	#my $mcl_file = generateSanity();
+	#print "\n $mcl_file Generated";
+	#push @incs, $mcl_file;
+	
+	my $mcl_file = generateKapacitorStepsFailback($service);
+	print "\n $mcl_file Generated";
+	push @incs, $mcl_file;
+	
+	$mcl_file = generateTelegrafMCLSFailback($service);
+        print "\n $mcl_file Generated";
+        push @incs, $mcl_file;
+
+	print "Wrtiting to file : $odir/stratus-failback.mcl\n";
+	open my $OUT, ">", "$odir/stratus-failback.mcl" or die "cannot open file";
+        foreach my $inc ( @incs) {
+           my $in;
+           print "\n ====== Reading $inc";
+           chomp($inc);
+           next if($inc !~ /\S+/);
+           open my $in, "<", $inc || die("\n Cannot open $inc for reading.$!");
+           my @data = <$in>;
+           close($in);
+           print $OUT join("", @data), "\n\n";
+        }
+        close $OUT;
+        exit;
+
+}
+sub generateTelegrafMCLSFailback {
+        my $service = shift;
+        #Handling the tasks in primary
+        my $cluster  = 'primary';
+        my $mon = ariba::rc::InstalledProduct->new('mon', $service);
+        my @monservers = $mon->hostsForRoleInCluster('monserver', $cluster);
+        my $expando = 'Telegraf-Changes-Primary';
+        my $group = 'Telegraf-Changes';
+        my $pr = defineExpando($expando, "Apply changes in primary for telegraf");
+        $pr .= defineRunGroup($group, 10);
+        my $stepCount = 0;
+        foreach my $server(@monservers) {
+                $stepCount++;
+                $pr .=  defineStep("telegrafstep$stepCount","telegraf primary -> secondary in $server", undef, $expando, $group, undef, undef, undef);
+                $pr .=  defineAction("Shell", "mon$service\@$server",
+                                "\$ cd /home/monprod/stratus/bin",
+                                "\$ perl stratus-discovery -dc snv -deploy"
+                        );
+        }
+        $expando = 'Telegraf-Changes-Secondary';
+        $cluster = 'secondary';
+        $mon = ariba::rc::InstalledProduct->new('mon', $service);
+        @monservers = $mon->hostsForRoleInCluster('monserver', $cluster);
+        print @monservers;
+        print "---\n";
+        $pr .= defineExpando($expando, "Apply changes in secondary for telegraf");
+        $pr .= defineRunGroup($group, 10);
+        foreach my $server(@monservers) {
+                $stepCount++;
+                $pr .=  defineStep("telegrafstep$stepCount","telegraf secondary -> primary in $server", undef, $expando, $group, undef, undef, undef);
+                $pr .=  defineAction("Shell", "mon$service\@$server",
+                                "\$ cd /home/monprod/stratus/bin",
+                                "\$ perl stratus-discovery -dc snv -deploy -drsite"
+                );
+        }
+        my $mcl_file = "$odir/telegraf.mcl";
+        open my $mcl, ">" ,$mcl_file ||  die "\n Cannot open mcl file $mcl_file : $!";
+        print $mcl $pr;
+        close $mcl;
+        return $mcl_file;
+}
+
+sub generateDataSetRestoreMCLS {
+	my $service = shift;
+	#Handling the tasks in seondary
+	
+	
+	my $expando = 'Influxdb-Changes-Secondary';
+	my $group = 'Influxdb-Changes';
+	my $pr = defineExpando($expando, "Apply changes in secondary for influxdb");
+	$pr .= defineRunGroup($group, 10);
+
+	my $cluster = 'secondary';
+	my $mon = ariba::rc::InstalledProduct->new('stratus', $service);
+	my @monservers = $mon->hostsForRoleInCluster('influxdb-data-node', $cluster);
+	my $incBackupLoc = '/influxstratusbackupreplica/stratus_inc_bkp';
+	my $server = $monservers[0];
+	$pr .=  defineStep("Influxdbdatarestore","Restoring data in secondary using $server", undef, $expando, $group, undef, undef, undef);
+	$pr .=  defineAction("Shell", "mon$service\@$server",
+			"\$ sudo su - root -c \'influxd-ctl restore -db stratus -newdb stratus_dr $incBackupLoc\'",					
+		);
+        my $mcl_file = "$odir/influxdb.mcl";
+        open my $mcl, ">" ,$mcl_file ||  die "\n Cannot open mcl file $mcl_file : $!";
+        print $mcl $pr;
+        close $mcl;
+        return $mcl_file;
+
+}
+
+sub generateTelegrafMCLS {
+	my $service = shift;
+	#Handling the tasks in primary
+	my $cluster  = 'primary';
+	my $mon = ariba::rc::InstalledProduct->new('mon', $service);	
+	my @monservers = $mon->hostsForRoleInCluster('monserver', $cluster);
+	#my @backupMonServers = $mon->hostsForRoleInCluster('backup-monserver',$cluster);	
+	#my $bkpMonServer = $backupMonServers[0];
+	#if(!$bkpMonServer) {
+	#	print "Unable to find backup server details\n";
+	#	exit 1;	
+	#}else {
+	#	$bkpMonServer =~ //
+	#}
+	my $expando = 'Telegraf-Changes-Primary';
+	my $group = 'Telegraf-Changes';
+	my $pr = defineExpando($expando, "Apply changes in primary for telegraf");
+	$pr .= defineRunGroup($group, 10);
+	my $stepCount = 0;
+	foreach my $server(@monservers) {
+		$stepCount++;
+		$pr .=  defineStep("telegrafstep$stepCount","telegraf primary -> secondary in $server", undef, $expando, $group, undef, undef, undef);
+		$pr .=  defineAction("Shell", "mon$service\@$server",
+				"\$ cd /home/monprod/stratus/bin",
+				"\$ perl stratus-discovery -dc snv -deploy -failover"
+			);
+	}
+	$expando = 'Telegraf-Changes-Secondary';
+	$cluster = 'secondary';
+	$mon = ariba::rc::InstalledProduct->new('mon', $service);
+	@monservers = $mon->hostsForRoleInCluster('monserver', $cluster);
+	print @monservers;
+	print "---\n";
+	$pr .= defineExpando($expando, "Apply changes in secondary for telegraf");
+	$pr .= defineRunGroup($group, 10);
+	foreach my $server(@monservers) {
+		$stepCount++;
+		$pr .=  defineStep("telegrafstep$stepCount","telegraf secondary -> primary in $server", undef, $expando, $group, undef, undef, undef);
+		$pr .=  defineAction("Shell", "mon$service\@$server",
+				"\$ cd /home/monprod/stratus/bin",
+				"\$ perl stratus-discovery -dc snv -deploy -drsite"
+		);
+	}
+        my $mcl_file = "$odir/telegraf.mcl";
+        open my $mcl, ">" ,$mcl_file ||  die "\n Cannot open mcl file $mcl_file : $!";
+        print $mcl $pr;
+        close $mcl;
+        return $mcl_file;
+}
+
+sub generateKapacitorStepsFailback {
+        my $service = shift;
+        #Handling the tasks in secondary
+	my $cluster  = 'secondary';
+        my $mon = ariba::rc::InstalledProduct->new('stratus', $service);
+        my @monservers = $mon->hostsForRoleInCluster('kapacitor-server', $cluster);
+        my $expando = 'Kapacitor-Changes-Secondary';
+        my $group = 'Kapacitor-Changes';
+        my $pr = defineExpando($expando, "Apply changes in Secondary for Kapacitor");
+        $pr .= defineRunGroup($group, 10);
+        my $stepCount = 0;
+        my $newMode = '';
+        my $date = `date "+%Y%m%d%H%M%S"`;
+        chomp($date);
+        foreach my $server(@monservers) {
+                $stepCount++;
+                $pr .=  defineStep("kapacitorstep$stepCount","kapacitor secondary -> primary in $server", undef, $expando, $group, undef, undef, undef);
+		my $kapCmdTmpDel = "kapacitor list templates | cut -d ' ' -f1 | xargs --no-run-if-empty kapacitor delete templates";
+		my $kapCmdTskDel = "kapacitor list tasks | cut -d ' ' -f1 | xargs kapacitor delete tasks";	
+		if($server =~ /$kapacitorPrimaryHost/i) {
+                	$pr .=  defineAction("Shell", "mon$service\@$server",
+                                "\$ touch  /var/tmp/is_dr.lock",
+                                "\$ sudo su - root -c \"$kapCmdTmpDel\"",
+                                "\$ sudo su - root -c \"$kapCmdTskDel\"",
+                                "\$ rm -f /var/tmp/kapacitor_staged_config/*",
+                                "\$ cd /home/monprod/",
+                                "\$ ./stratus-alerts.run --target ./stratus-alerts"
+                        );
+		} else {
+			$pr .=  defineAction("Shell", "mon$service\@$server",
+                                "\$ touch  /var/tmp/is_dr.lock",
+				"\$ sudo su - root -c \"$kapCmdTmpDel\"",
+				"\$ sudo su - root -c \"$kapCmdTskDel\"",
+                                "\$ rm -f /var/tmp/kapacitor_staged_config/*",
+                                "\$ cd /home/monprod/",
+                                "\$ ./stratus-alerts.run --noexec --target ./stratus-alerts"
+                        );
+		}
+        }
+	$cluster = 'primary';
+        @monservers = $mon->hostsForRoleInCluster('kapacitor-server', $cluster);
+        $expando = 'Kapacitor-Changes-Primary';
+        $group = 'Kapacitor-Changes';
+        $pr .= defineExpando($expando, "Apply changes in Primary for Kapacitor");
+        $pr .= defineRunGroup($group, 10);
+        #$stepCount = 0;
+        $newMode = '';
+        $date = `date "+%Y%m%d%H%M%S"`;
+        chomp($date);
+        foreach my $server(@monservers) {
+                $stepCount++;
+                $pr .=  defineStep("kapacitorstep$stepCount","kapacitor primary -> secondary in $server", undef, $expando, $group, undef, undef, undef);
+		my $kapCmdTmpDel = "kapacitor list templates | cut -d ' ' -f1 | xargs --no-run-if-empty kapacitor delete templates";
+		my $kapCmdTskDel = "kapacitor list tasks | cut -d ' ' -f1 | xargs kapacitor delete tasks";
+		if($server =~ /$kapacitorPrimaryHost/i) {
+                	$pr .=  defineAction("Shell", "mon$service\@$server",
+                                "\$ rm  -f /var/tmp/is_dr.lock",
+                                "\$ sudo su - root -c \"$kapCmdTmpDel\"",
+                                "\$ sudo su - root -c \"$kapCmdTskDel\"", 
+                                "\$ rm -f /var/tmp/kapacitor_staged_config/*",
+                                "\$ cd /home/monprod/",
+                                "\$ ./stratus-alerts.run --target ./stratus-alerts"
+                        );
+		}else {
+			$pr .=  defineAction("Shell", "mon$service\@$server",
+                                "\$ rm  -f /var/tmp/is_dr.lock",
+                                "\$ sudo su - root -c \"$kapCmdTmpDel\"", 
+                                "\$ sudo su - root -c \"$kapCmdTskDel\"", 
+                                "\$ rm -f /var/tmp/kapacitor_staged_config/*",
+                                "\$ cd /home/monprod/",
+                                "\$ ./stratus-alerts.run --noexec --target ./stratus-alerts"
+                        );
+		}
+        }
+        my $mcl_file = "$odir/kapacitor.mcl";
+        open my $mcl, ">" ,$mcl_file ||  die "\n Cannot open mcl file $mcl_file : $!";
+        print $mcl $pr;
+        close $mcl;
+        return $mcl_file;
+
+
+
+}
+
+
+sub generateKapacitorSteps {
+	my $service = shift;
+	#Handling the tasks in primary
+	my $cluster  = 'primary';
+	my $mon = ariba::rc::InstalledProduct->new('stratus', $service);
+	my @monservers = $mon->hostsForRoleInCluster('kapacitor-server', $cluster);	
+	my $expando = 'Kapacitor-Changes-Primary';
+	my $group = 'Kapacitor-Changes';
+	my $pr = defineExpando($expando, "Apply changes in Primary for Kapacitor");
+	$pr .= defineRunGroup($group, 10);
+	my $stepCount = 0;
+	my $newMode = '';
+	my $date = `date "+%Y%m%d%H%M%S"`;
+	chomp($date);	
+	foreach my $server(@monservers) {
+		$stepCount++;
+		$pr .=  defineStep("kapacitorstep$stepCount","kapacitor primary -> secondary in $server", undef, $expando, $group, undef, undef, undef);
+		my $kapCmdTmpDel = "kapacitor list templates | cut -d ' ' -f1 | xargs --no-run-if-empty kapacitor delete templates";
+		my $kapCmdTskDel = "kapacitor list tasks | cut -d ' ' -f1 | xargs kapacitor delete tasks";
+		if($server =~ /$kapacitorPrimaryHost/i) {
+			$pr .=  defineAction("Shell", "mon$service\@$server", 
+				"\$ touch  /var/tmp/is_dr.lock",
+				"\$ sudo su - root -c \"$kapCmdTmpDel\"",
+				"\$ sudo su - root -c \"$kapCmdTskDel\"",
+				"\$ rm -f /var/tmp/kapacitor_staged_config/*",
+				"\$ cd /home/monprod/stratus-alerts",
+				"\$ ./stratus-alerts.run --target ./stratus-alerts"
+			);
+		}else {
+			$pr .=  defineAction("Shell", "mon$service\@$server",
+                                "\$ touch  /var/tmp/is_dr.lock",
+                                "\$ sudo su - root -c \"$kapCmdTmpDel\"", 
+                                "\$ sudo su - root -c \"$kapCmdTskDel\"", 
+                                "\$ rm -f /var/tmp/kapacitor_staged_config/*",
+                                "\$ cd /home/monprod/stratus-alerts",
+                                "\$ ./stratus-alerts.run --noexec --target ./stratus-alerts"
+                        );
+		}
+	}	
+	$cluster = 'secondary';	
+	@monservers = $mon->hostsForRoleInCluster('kapacitor-server', $cluster);
+	$expando = 'Kapacitor-Changes-Secondary';
+	my $group = 'Kapacitor-Changes';
+	$pr .= defineExpando($expando, "Apply changes in Secondary for Kapacitor");
+	$pr .= defineRunGroup($group, 10);
+	$stepCount = 0;
+	$newMode = '';
+	$date = `date "+%Y%m%d%H%M%S"`;
+	chomp($date);
+	foreach my $server(@monservers) {
+		$stepCount++;
+		$pr .=  defineStep("kapacitorstep$stepCount","kapacitor secondary -> primary in $server", undef, $expando, $group, undef, undef, undef);
+		my $kapCmdTmpDel = "kapacitor list templates | cut -d ' ' -f1 | xargs --no-run-if-empty kapacitor delete templates";
+                my $kapCmdTskDel = "kapacitor list tasks | cut -d ' ' -f1 | xargs kapacitor delete tasks";
+		if($server =~ /$kapacitorPrimaryHost/i) {
+			$pr .=  defineAction("Shell", "mon$service\@$server",
+                                "\$ rm  -f /var/tmp/is_dr.lock",
+                               	"\$ sudo su - root -c \"$kapCmdTmpDel\"", 
+                                "\$ sudo su - root -c \"$kapCmdTskDel\"",	
+                                "\$ rm -f /var/tmp/kapacitor_staged_config/*",
+                                "\$ cd /home/monprod/stratus-alerts",
+                                "\$ ./stratus-alerts.run --target ./stratus-alerts"
+                        );
+		} else {
+			$pr .=  defineAction("Shell", "mon$service\@$server",
+                                "\$ rm  -f /var/tmp/is_dr.lock",
+				"\$ sudo su - root -c \"$kapCmdTmpDel\"",
+                                "\$ sudo su - root -c \"$kapCmdTskDel\"",
+                                "\$ rm -f /var/tmp/kapacitor_staged_config/*",
+                                "\$ cd /home/monprod/stratus-alerts",
+                                "\$ ./stratus-alerts.run --noexec --target ./stratus-alerts"
+                        );
+		}	
+	}	
+	my $mcl_file = "$odir/kapacitor.mcl";
+	open my $mcl, ">" ,$mcl_file ||  die "\n Cannot open mcl file $mcl_file : $!";
+	print $mcl $pr;
+	close $mcl;
+	return $mcl_file;	
+	
+		
+
+}
+
+
+
+sub generateSanity {
+        my $pr; 
+        $pr .= defineStep("SANITY", "SANITY",undef, undef, undef, undef, undef, undef);
+        $pr .= defineAction("Wait", undef, "Wait Step for SANITY");
+        my $mcl_file = "$odir/sanity.mcl";
+        open my $mcl, ">" ,$mcl_file ||  die "\n Cannot open mcl file $mcl_file : $!";
+        print $mcl $pr;
+        close $mcl;
+        return $mcl_file;       
+
+}
+
+#sub apply
+
+sub usage {
+     	print <<EOF;
+Usage: $0 -action init| -run -type failover|failback -datasetrestore=Y|N -service service_name
+      init: Exit after generating mcls
+      run:  Generate and run the mcl
+EOF
+
+	exit(1);
+
+}
+
+
+

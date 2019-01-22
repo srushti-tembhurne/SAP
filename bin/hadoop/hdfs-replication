@@ -1,0 +1,196 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/hadoop/hdfs-replication#19 $
+
+#
+# Monitoring for Hadoop:
+# * replication status monitoring
+# Refer to: //ariba/cloudsvc/hadoop/build/R2/bin/distcp-inremental.sh#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use JSON;
+
+use ariba::monitor::Url;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::Ops::Constants;
+use ariba::Ops::Startup::Hadoop;
+use ariba::Ops::HadoopConfig;
+use ariba::Ops::HadoopProperties;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h] <-health>
+    -health check health status of replication
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my ($health) = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-health$/o) { $health = 1; next; }
+        if ($arg =~ /^-h$/o) { usage();          next; }
+        if ($arg =~ /^-d$/o) { $debug++;         next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;   next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;    next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    usage("Specify -health option") unless $health;
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled('hadoop', $me->service()));
+    my $hadoop = ariba::rc::InstalledProduct->new('hadoop', $me->service());
+    my $cluster = $hadoop->currentCluster();
+
+    ariba::Ops::Startup::Hadoop::setRuntimeEnv($hadoop);
+
+    my $results;
+    my $email = $me->default('notify.email');
+
+    if ($health == 1) {
+        debug("Using HADOOP_HOME=" . $ENV{'HADOOP_HOME'});
+
+        my @virtualHostsHBaseRegion = $hadoop->rolesManager()->hostsForRoleInCluster('hbase-region', $cluster);
+        my %queriesHealth;
+
+        for my $rhost (@virtualHostsHBaseRegion) {
+            $results = healthCheck($rhost);
+
+            while ( my ($metric, $value) = each(%$results) ) {
+                my $warn;
+                my $crit;
+                my $format;
+                if ($metric eq "ageOfLastShippedOp") {
+                    #
+                    # Check current value of sizeOfLogQueue. If value is > 0,
+                    # crit if ageOfLastShippedOp is > 6h 
+                    #
+                    my $sizeOfLogQueueQueryName = "hadoop/$cluster/$rhost\_sizeOfLogQueue";
+                    my $sizeOfLogQueueQuery ;
+                    if (ariba::monitor::Query->objectWithNameExists($sizeOfLogQueueQueryName)) {
+                        $sizeOfLogQueueQuery = ariba::monitor::Query->new($sizeOfLogQueueQueryName);
+                    }
+                    my $crit_condition  =  ($sizeOfLogQueueQuery && ($sizeOfLogQueueQuery->results() > 1) ) || 0; 
+                    my $warn_condition  =  ($sizeOfLogQueueQuery && ($sizeOfLogQueueQuery->results() > 0) ) || 0;
+                    $crit = "answer > 21600 && $crit_condition"; # > 6 hours 
+                    $warn = "answer >= 3600 && $warn_condition"; # > 1 hour
+                    $value = $value / 1000;
+                    $format = "$value seconds";
+                } elsif ($metric eq "sizeOfLogQueue") {
+                    $warn = "answer > 5";
+                    $crit = "answer > 10 && previousAnswer > 10";
+                }
+
+                $queriesHealth{"$rhost $metric"} = {
+                    uiHint  => "replication/health check/$rhost",
+                    severity    => 2,
+                    warn => $warn,
+                    crit => $crit,
+                    format => $format,
+                    perl => sub { return $value },
+                    recordItem => "answer",
+                    recordDataType => "gauge",
+                    recordMaxResults => 35000,
+                    description => "hbase replication health check for $metric",
+                    correctiveActions => [
+                        Ops => "Follow up with DBAs", 
+                    ],
+                    inf_field => "${rhost}_$metric",
+                    inf_default => "none",
+                    inf_tags => "host=$rhost",
+                };
+            }
+        }
+        $queriesHealth{"influx_details"} = {measurement => "hdfs_replication"};
+        my $qmHealth = ariba::monitor::QueryManager->newWithDetails('hbase', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queriesHealth);
+        $qmHealth->processQueries($debug, $email, $sendEmail, $sendPage);
+        
+    }
+}
+
+#
+# healthCheck metrics that we care about
+# ie. TEST service http://hdp108.lab1.ariba.com:54030/jmx
+# "sizeOfLogQueue" : 0,
+# "ageOfLastShippedOp" : 0,
+# "logEditsReadRate" : 0.0,
+# "shippedOpsRate" : 0.0,
+# "logEditsFilteredRate" : 0.0, 
+# "shippedBatchesRate" : 0.0
+#
+
+sub healthCheck {
+    my $host = shift;
+    
+    ## sample url to get health information
+    ## http://hdp108.lab1.ariba.com:54030/jmx
+    my $port = ariba::Ops::HadoopProperties::getHbaseRegionServerInfoPort($ENV{'HADOOP_HOME'});
+    my $jmxUrl = "http://$host:$port/jmx";
+    debug("Checking health for HBase Region for $host via $jmxUrl");
+
+    my $url= ariba::monitor::Url->new($jmxUrl);     
+    my $response = $url->request(); 
+    my %results;
+
+    eval { 
+        die $url->error() if ($url->error()); 
+        die "Odd. No response from $jmxUrl" unless ($response); 
+
+        my $jmx = decode_json($response);
+
+        for my $key (keys(%$jmx) ){
+            my @records = @{$jmx->{$key}};
+            foreach my $f ( @records ) {
+                my $name = $f->{"name"};
+                if ($name =~ /name=ReplicationSource for (DR|PM|ST)$/) {
+                    $results{"sizeOfLogQueue"} = $f->{"sizeOfLogQueue"};
+                    $results{"ageOfLastShippedOp"} = $f->{"ageOfLastShippedOp"};
+                    $results{"logEditsReadRate"} = $f->{"logEditsReadRate"};
+                    $results{"shippedOpsRate"} = $f->{"shippedOpsRate"};
+                    $results{"logEditsFilteredRate"} = $f->{"logEditsFilteredRate"};
+                    $results{"shippedBatchesRate"} = $f->{"shippedBatchesRate"};
+                    last;
+                }
+            }
+        }
+
+        die "Missing 'beans->sizeOfLogQueue' element in jmx json: $response" unless (defined $results{"sizeOfLogQueue"});
+        die "Missing 'beans->ageOfLastShippedOp' element in jmx json: $response" unless (defined $results{"ageOfLastShippedOp"});
+        die "Missing 'beans->logEditsReadRate' element in jmx json: $response" unless (defined $results{"logEditsReadRate"});
+        die "Missing 'beans->shippedOpsRate' element in jmx json: $response" unless (defined $results{"shippedOpsRate"});
+        die "Missing 'beans->logEditsFilteredRate' element in jmx json: $response" unless (defined $results{"logEditsFilteredRate"});
+        die "Missing 'beans->shippedBatchesRate' element in jmx json: $response" unless (defined $results{"shippedBatchesRate"});
+    }; 
+    return \%results;
+}
+
+sub debug {
+    my $msg = shift; 
+
+    print "(debug) $msg\n" if ($debug);
+}
+
+main(@ARGV);
+
+__END__

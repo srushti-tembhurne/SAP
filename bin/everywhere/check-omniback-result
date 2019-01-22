@@ -1,0 +1,404 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/everywhere/check-omniback-result#22 $
+#
+# Monitoring the OMNI backup result.
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib qw(/usr/local/ariba/lib);
+
+use ariba::Ops::CFEngine::MonitoringGlueUtils;
+use ariba::Ops::Constants;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::NotificationRequest;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+
+my $debug     = 0;
+my $rSync = "/usr/local/bin/rsync";
+
+unless (-e $rSync) { 
+    die "Unable to find rsync\n" ;
+} 
+
+sub main {
+
+    my $progName  = 'check-omniback-result';
+    # This script execute through backup scheduler of each database sid file
+    # So rather than modifying each sid file I am enabling page and email here only
+    my $sendEmail = 1;
+    my $sendPage  = 1; 
+        
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-d/o) { $debug++; };
+        if ($arg =~ /^-e/o) { $sendEmail = 1; };
+        if ($arg =~ /^-p/o) { $sendPage = 1; };
+    }
+
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my $machine = ariba::Ops::Machine->new($hostname);
+    my $datacenter = $machine->datacenter();
+    my $service  = $machine->service();
+
+    # Omniback sets these variables, which contain the status.
+    my $backupResult = $ENV{'SMEXIT'};
+    my $sessionId    = $ENV{'SESSIONID'} || 0;
+
+    unless ($sessionId) {
+        warn "No \$SESSIONID environment variable set!";
+    }
+
+    # First, Check how the current backup finished
+    if ($backupResult == 0) {
+        $backupResult = 'Completed';
+    } else {
+        $backupResult = 'Failed';
+    }
+
+    # Generate a pager report:
+    my $shortReport = `/opt/omni/bin/omnidb -rpt $sessionId`;
+
+    # get the job name:
+    my $jobName = (split(/\n/, $shortReport))[1];
+    
+    $jobName =~ s/^\s*(.*?)\s*$/$1/;
+    
+    # preserve job name with backup type prefix (Oracle8)
+    my $jobNameType = $jobName;
+
+    # remove leading "Oracle8" from oracle jobs
+    $jobName =~ s/^Oracle8 (.*)$/$1/;
+
+    # get db sid (first part of backup name):
+    my $sid = (split(/_/, $jobName))[0];
+
+    my $report = `/opt/omni/bin/omnidb -session $sessionId -report`;
+    $report  =~ /(DBID .*?)\n/; 
+    my $DBID = $1; 
+
+    # Generate a mail report:
+    my $fullReport  = `/opt/omni/bin/omnirpt -report single_session -session $sessionId`;
+
+    # get extra session stats
+    $fullReport =~ /(Start Time: .*?)\n/;
+    my $startTime = $1;
+    $fullReport =~ /(Queuing: .*?)\n/;
+    my $queue = $1;
+    $fullReport =~ /(Duration: .*?)\n/;
+    my $duration = $1;
+    $fullReport =~ /(GB Written: .*?)\n/;
+    my $written = $1;
+
+    # Generate a running report:
+    my $runningReport = `/opt/omni/bin/omnidb -session $sessionId -report`;
+
+    # check if any RMAN- error exist in the report
+    my @rmanList = $runningReport =~ /RMAN-08137:\s*[^=]+?\n/g;
+    my %rmanHash;
+    my $rmanStr = "";
+
+    if (@rmanList) {
+
+        # filter duplicate RMAN error
+        foreach my $rmanError (@rmanList) {
+            $rmanError =~ s/^\s*(.*?)\s*$/$1/;
+            $rmanHash{$rmanError}++;
+        }
+
+        $rmanStr = "RMAN Error Found: (". join(", ", sort(keys %rmanHash)) . ")";
+        $backupResult = 'Failed';
+    }
+
+    # get archivelog sequence
+    my @arch = $runningReport =~ /sequence=\S+/g;
+    my @deleted = $runningReport =~ /archive log filename=.*_\d+\.arc/g;
+
+    @arch = sort{$a <=> $b}(map{s/sequence=(.*)/$1/; $_}@arch);
+    @deleted = sort{$a <=> $b}(map{s/archive log filename=.*_(\d+)\.arc/$1/; $_}@deleted);
+
+    my $archStr = "";
+
+    if (@arch) {
+        my ($lowArch, $highArch) = @arch[0,-1];
+        my $archLength = (($highArch - $lowArch) + 1);
+
+        # check if logs are in sequence
+        if ($archLength == scalar(@arch)) {
+            $archStr = $lowArch . " .. " . $highArch . " (Written) ";
+        } else {
+            $archStr = join(", ", @arch) . " (Written) ";
+        }
+    }
+
+    if (@deleted) {
+        my ($lowDeleted, $highDeleted) = @deleted[0,-1];
+        my $deletedLength = (($highDeleted - $lowDeleted) + 1);
+        my %deletedHash;
+
+        # filter duplicate duplicate log
+        foreach my $log (@deleted) {
+            $deletedHash{$log}++;
+        }
+
+        # check if logs are in sequence
+        if ($deletedLength == scalar(keys %deletedHash)) {
+            $archStr = $archStr . $lowDeleted . " .. " . $highDeleted . " (Deleted)";
+        } else {
+            $archStr = $archStr . join(", ", keys %deletedHash) . " (Deleted)";
+        }
+    }
+
+    $archStr = "none" if (!@arch && !@deleted);
+
+    # check controlfile autobackup
+    my $ctlBackup = ($runningReport =~ /Finished Control File Autobackup/) ? "Yes" : "No";
+
+    # get slots used in backup
+    my @slot = $runningReport =~ /Loading medium from slot .*? /g;
+
+    @slot = map{s/Loading medium from slot (.*?) /$1/; $_}@slot;
+
+    my $slotStr = @slot ? join(", ", sort{$a <=> $b}@slot) : "none";
+
+    # get drive(s) used in backup
+    my @drives = $runningReport =~ /STARTING Media Agent ".*?"/g;
+
+    foreach my $drive (@drives) {
+        $drive =~ s/STARTING Media Agent "(.*?)"/$1/;
+    }
+
+    # get drive statistics
+    open(DRIVESTATS, "/opt/omni/bin/omnirpt -report session_devices -session $sessionId |") or die "Can't run: [opt/omni/bin/omnirpt -report session_devices -session $sessionId] : $!";
+
+    my $driveMatch = join("|", @drives);    # drive string used in regex
+    my %driveStat;  # drive stats hash (key: drive, values: gb written, gb/h)
+
+    while (my $stats = <DRIVESTATS>) {
+        next unless $stats =~ /$driveMatch/;
+
+        my ($device, $data, $perf) = (split/\s+/, $stats)[1,7,8];
+
+        push(@{$driveStat{$device}}, $data . " GB Written,", $perf . " GB/h");
+    }
+
+    close(DRIVESTATS);
+
+    my @driveList;
+
+    foreach my $drive (sort keys %driveStat) {
+        push(@driveList, "$drive" . " (@{$driveStat{$drive}})");
+    }
+
+    my $mirrored = 0;
+    my $driveStr = "none";
+
+    if (@driveList) {
+        # mirrored if mulitple drives used
+        $mirrored = 1 if (scalar(@driveList) > 1);
+        $driveStr = join(", ", @driveList);
+    }
+
+    # Generate a schedule report:
+    my $scheduleReport = `/opt/omni/bin/omnirpt -report dl_sched -datalist "$jobNameType" -tab`;
+
+    # get next schedule time
+    my $nextSchedule = "n/a";
+
+    if ($scheduleReport =~ /$jobName(.*?AM)/) {
+        $nextSchedule = $1;
+    } elsif ($scheduleReport =~ /$jobName(.*?PM)/) {
+        $nextSchedule = $1;
+    }
+
+    $nextSchedule =~ s/^\s*(.*?)\s*$/$1/;
+
+    # Setup a simple query to inform the monitoring server what our status is.
+    # my ($sec, $min, $hr, $mday, $mon, $year) = localtime();
+    # my $timestr = sprintf "%d-%02d-%02d %02d:%02d:%02d", $year + 1900, $mon + 1, $mday, $hr, $min, $sec;
+    my $timestr = localtime();
+    my $status = "$backupResult on $timestr";
+    my $summaryStatus = "Backup Status: $status\nNext Schedule Time: $nextSchedule\nSession ID: $sessionId\n$queue\n$duration";
+
+    my $lastThree = '';
+    my $lastThreeStatus = 0;
+    my $dir = "/var/log/backupStatus"; 
+    my $file = "$dir/$jobName.txt";
+    my $DBHIS; 
+
+    unless (-d $dir){
+        my $createDir = system("mkdir -p $dir");
+    }
+
+    open $DBHIS, '>>', $file ;
+    print $DBHIS "$jobName, $startTime, $status, $duration, $sessionId\n";
+    close ($DBHIS);
+
+    my $user = "mon$service";
+    my $cipher = ariba::rc::CipherStore->new($service);
+    my $password = $cipher->valueForName($user);
+    my $server   = ariba::Ops::CFEngine::MonitoringGlueUtils::monitorServer($hostname);
+
+    ##Sending logs to monserver
+    sendOmniLogs($user, $server, $password, $file);
+
+    ($lastThree, $lastThreeStatus) = previousArchBackupResult($file, $status), if ($jobName =~ /ARCH/i);
+    my $criticalStatus = 0;
+
+    $criticalStatus = 1 if ( ( $lastThreeStatus >= 2 ) or ( $backupResult !~ /Completed/ && $jobName =~ /FULL/i ) );
+    
+    my %queries = (
+
+        "$jobName" => {
+            hasErraticSchedule => 1,
+            info => "'$backupResult' eq 'Completed'",
+            warn => "'$backupResult' eq 'Failed' && $lastThreeStatus == 4",
+            crit => "$criticalStatus",
+            noRowCount => 1,
+            note => "$rmanStr",
+            #perl => sub { main::queryMessages($status, $lastThree, $archStr, $ctlBackup, $written, $driveStr, $slotStr, $sessionId, $DBID, $startTime, $queue, $duration, $nextSchedule, $jobNameType, $mirrored) },   
+            perl => sub { return $backupResult},   
+            uiHint => "rman-backup-session-status/$sid",
+            inf_field => "backupResult",
+            inf_tags => "datacenter=\"$datacenter\",sid=\"$sid\",uiHint=\"rman-backup-session-status/$sid\",jobName=\"$jobName\"",
+            inf_default => 0,
+            group_by => "rman-backup-session-status/$sid",
+        },
+        "$jobName-Summary" => {
+            hasErraticSchedule => 1,
+            info => "'$backupResult' eq 'Completed'",
+            warn => "'$backupResult' eq 'Failed'",
+            crit => "'$backupResult' eq ''",
+            noRowCount => 1,
+            note => "$rmanStr",
+            perl => sub { return "$summaryStatus" },   
+            uiHint => "product-level-backup-status",
+            inf_field => "productLevelBackupResult",
+            inf_tags => "datacenter=\"$datacenter\",sid=\"$sid\",uiHint=\"product-level-backup-status\",jobName=\"$jobName-Summary\"",
+            inf_default => 0,
+            group_by => "product-level-backup-status",
+
+        },
+    );
+
+    my $product  = ariba::monitor::StatusPage::fakeProductNameForDatacenter($machine->datacenter());
+    my $customer = undef;
+    my $to       = ariba::Ops::Constants->operationsDBAEmailNotificationAddress();
+       $to      .= ", an_ops_sre_ariba\@sap.com";
+ 
+    my $qm = ariba::monitor::QueryManager->newWithDetails(
+        'dba', $product, $service, $customer, \%queries
+    );
+
+    $queries{influx_details} = {measurement => "dba"};
+    my $result = $qm->processQueries($debug, $to, $sendEmail, $sendPage, $server);
+    # $result will be '0' on success
+
+#    if (!$debug && $backupResult eq 'Failed') {
+#        # Send out a separate notificationRequest with more data from omnirpt
+#        my $subject = "Backup failed for: $jobName";
+#
+#        my $notificationRequest = ariba::Ops::NotificationRequest->newWarn(
+#            $progName, $product, $service, $customer, undef, $subject, $fullReport, $to
+#        );
+#
+#        $notificationRequest->setDebug($debug);
+#        $result |= !$notificationRequest->send();
+#        # send() will return non-zero value for success, but we are using
+#        # $result as an exit() value so take the inverse of what send returns
+#    }
+#
+    exit($result);
+}
+
+sub queryMessages {
+    my ($status, $lThree, $archStr, $ctlBackup, $written, $driveStr, $slotStr, $sessionId, $DBID, $startTime, $queue, $duration, $nextSchedule, $jobNameType, $mirrored) = @_;
+    my @msg;
+
+    $status = "Backup Status: " . $status;
+    my $lastThree = $lThree, if ($lThree);
+    $archStr = "Archivelog Sequence: " . $archStr if ($jobNameType =~ /Oracle8/);
+    $ctlBackup = "Control File Autobackup: " . $ctlBackup;
+    $written = "Total " . $written;
+    $written = $written . " (Mirrored)" if $mirrored;
+    $driveStr = "Drive(s) Used: " . $driveStr;
+    $slotStr = "Slot(s) Used: " . $slotStr;
+    $sessionId = "Session ID: " . $sessionId;
+    $nextSchedule = "Next Schedule Time: " . $nextSchedule;
+
+    if ($jobNameType =~ /Oracle8/) {
+        push(@msg, $status, $lastThree, $archStr, $ctlBackup, $written, $driveStr, $slotStr, $sessionId, $DBID, $startTime, $queue, $duration, $nextSchedule);
+    }
+    else {
+        push(@msg, $status, $lastThree, $written, $driveStr, $slotStr, $sessionId, $DBID, $startTime, $queue, $duration, $nextSchedule);
+    }
+
+    return join("\n", @msg);
+}
+
+
+sub previousArchBackupResult {
+    my $file = shift;
+    my $current = shift;
+    my $result = 0;
+    my $REVERSE_FILE;  
+
+    open($REVERSE_FILE, "-|", "/usr/bin/tac $file");
+    my @content = <$REVERSE_FILE>;
+    close($REVERSE_FILE);
+    my @lastOneDay = @content[0..2]; ##Get the last Three Result
+    
+    foreach my $status ($current, @lastOneDay){
+         $result += 1, if ($status !~ /Completed/);
+    }
+
+    my $last  = "Last Backup Status: ". shift @lastOneDay;
+    my $secLast = "Second Last Backup Status: ". shift @lastOneDay;
+    my $thirdLast = "Third Last Backup Status: ". shift @lastOneDay;
+
+    my $lastThree = join ("", $last, $secLast, $thirdLast );    
+    chomp($lastThree); 
+    return ($lastThree, $result), if $lastThree;
+} 
+
+sub sendOmniLogs {
+    my $user = shift;
+    my $server = shift;
+    my $password = shift;
+    my $file = shift;
+
+    ##Remove  Old Omni-logs from mon server
+    my $remove_logs = "ssh -l $user $server rm -rf $file";
+    my $copy_logs = "$rSync -az $file $user\@$server:/var/mon/docroot/omni-logs/";
+
+    my @removelogs;
+    my @copylogs;
+
+    unless ($debug) {
+        close(STDERR);
+        close(STDOUT);
+        open(STDERR, '>>', "/var/log/omni-logs-transfer.txt");
+        open(STDOUT, '>>', "/var/log/omni-logs-transfer.txt");
+    }
+
+    for (my $i = 1; $i < 4;$i++){
+        my $status = ariba::rc::Utils::executeRemoteCommand($remove_logs, $password, 0, undef, undef, \@removelogs );
+        last if $status;
+        print "REMOVE Failed for $i time \n";
+    }
+
+    for (my $i = 1; $i < 4;$i++){
+        my $status = ariba::rc::Utils::executeRemoteCommand($copy_logs, $password, 0, undef, undef, \@copylogs );
+        last if $status;
+        print "RSYNC Failed for $i time \n";
+    }
+    select(STDERR);
+    select(STDOUT);
+}
+
+main();
+
+__END__

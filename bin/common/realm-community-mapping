@@ -1,0 +1,160 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/s4/activity-stats#23 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+use ariba::rc::InstalledProduct;
+
+my $product;
+
+# OracleClient objects, key on dbsid-dbhost-dbuser
+my %oracleClientCache = ();
+my $bucketStateTableExists = 0;
+my $debug = 0;
+
+sub main {
+    my $quiet = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $productName;
+
+    while(my $arg=shift(@ARGV)){
+            print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+            if($arg =~ /^-d/o){ $debug=1; }
+            if($arg =~ /^-e/o){ $sendEmail=1; };
+            if($arg =~ /^-p$/o){ $sendPage=1; };
+            if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+
+    unless (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
+        exit(0);
+    }
+    $product = ariba::rc::InstalledProduct->new($productName, $service);
+
+    my %queries  = ();
+    my %communitiesHash;
+    my $community;
+    my @communities = ();
+    my @instances = $product->appInstancesWithNameInCluster("UI", $cluster);
+
+    for my $instance (@instances) {
+        $community = $instance->community();
+        $communitiesHash{$community} = 1;
+    }
+
+    for my $communityKey (keys (%communitiesHash)) {
+        my $qname = "UI_app_instances_down_on_" . $community;
+        my $query = ariba::monitor::Query->new($qname);
+        my $status = $query->results();
+
+        if ($status =~ /^All nodes are unresponsive$/) {
+            push(@communities, $community);
+        }
+    }
+
+    #This table check is introduced as part of HOA-64075
+    my ($dbType, $user, $password, $sid, $host, $port) = $product->connectInfoWithDBType();
+	print "$dbType, $user, $sid, $host, $port" if($debug);
+	my $oracleClient;
+	if(	$dbType =~ /oracle/si ) {
+	  
+            my $queryCacheKey = join('-', $sid, $host, $dbType);
+
+            my $ocCacheKey = join("", $user, $sid, $host);
+            if ($oracleClientCache{$ocCacheKey}) {
+                $oracleClient = $oracleClientCache{$ocCacheKey};
+            }
+            else {
+                $oracleClient = ariba::Ops::OracleClient->new($user, $password, $sid, $host);
+                # on connect timeout, just keep going; this will cause
+                # queries to fail with a connect error, which is what
+                # we want.
+                $oracleClientCache{$ocCacheKey} = $oracleClient;
+                unless ($oracleClient->connect(20,4)) {
+                    # continue on even if there is an error, this way
+                    # the error shows up once in the query and not
+                    # many times in email
+                }
+            }
+      		my $tableCheckSql = "select 1 from user_tables where table_name='BUCKETSTATETAB'";
+      		my $checkResult = $oracleClient->executeSql($tableCheckSql);
+      
+      		if($checkResult) {
+      			$bucketStateTableExists=1;
+      			print "Debug : Bucketstate table exists $checkResult\n" if($debug);
+      		}
+      		else {
+      			$bucketStateTableExists=0;
+      			print "Debug :  Bucketstate table does not exists $checkResult\n" if($debug);
+      		}
+	}
+
+    my $sql = getCommunitySql(@communities);
+
+    #$queries{"Realms affected by communities down (Community ID, Realm ID, Name, Label, State)"} = {
+    #    'rowCountLimit' => 8000,
+    #    'info'          => "numrows > -1",
+    #    'warn'          => "numrows > 1",
+    #    'sql'           => $sql,
+    #};
+
+    $queries{"Realm community mapping (Community ID, Realm ID, Name, Label, State)"} = {
+        'rowCountLimit' => 8000,
+        'info'          => 1,
+        'sql'           => getSql(),
+    };
+
+    $queries{"influx_details"} = { 'measurement' => "realm_community_mapping" };
+
+    my $email = $me->default('notify.email');
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails(
+        "realm-community-mapping", $product->name(), $service, $product->customer(), \%queries
+    );
+    
+    if ($dbType eq ariba::Ops::DBConnection->hanaDBServerType()) {
+        $qm->setSQLConnectInfoForHana($user, $password, $host, $port);     
+    }
+    else {  
+        $qm->setSQLConnectInfo($user, $password, $sid, $host);
+    }
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+sub getSql {
+    my $extraClause = shift;
+    my $versionClause = "";
+    
+    $versionClause = " and (c.Version is null or c.Version = (select b.RealmToCommunityVersion from BucketStateTab b where b.Bucket = 0)) " if $bucketStateTableExists;
+    print "select c.CommunityId, r.Id, r.Name, r.Label,r.State from CommunityTab c, RealmTab r where r.Id = c.RealmId$versionClause$extraClause order by c.CommunityId, r.Label" if($debug);
+    return "select c.CommunityId community , r.Id realm_id, r.Name realm_name, r.Label label,r.State state from CommunityTab c, RealmTab r where r.Id = c.RealmId$versionClause$extraClause order by c.CommunityId, r.Label";
+}
+
+sub getCommunitySql {
+    my @communitiesList = @_;
+    my $sql;
+
+    if(@communitiesList) {
+        my $where = " and c.CommunityId in(" . join(",", @communitiesList) . ")"; 
+        $sql = getSql($where);
+    }
+
+    return $sql;
+}
+
+
+
+main();

@@ -1,0 +1,145 @@
+{
+  "scripts" : 
+	[
+		{
+			"script" : "/home/montest/FOVEA/bin/parseServices providesServices",
+			"measurement_data" : 
+			[
+				{
+					"measurement_name" : "datacenter_services",
+					"tags" : ["service"],
+					"fields" : ["bou","cn1-ms","cn1","cn2-ms","cn2","eu1-ms","eu1","eu2-ms","eu2","ru1","ru2","sc1-ms","snv","us1-ms","us1"] 				
+				}
+			]
+		},
+                {
+    			"script" : "/home/montest/FOVEA/bin/an/discovery-status",
+    			"measurement_data" : 
+    			[
+    				{
+    					"measurement_name" : "discovery_status_search_updater",
+    					"tags" : ["product","service","ran_on_host","ran_by","node"],
+    					"fields" : ["quote_since_last_crawl","primary","supplier_crawl_number","supplier_since_last_crawl","quote_crawl_number","quote_crawl_total","supplier_crawl_total"] 				
+    				}
+    			]
+    		},
+                {
+			"script" : "/home/montest/FOVEA/bin/common/aql-metrics -product s4",
+			"measurement_data" : 
+			[
+				{
+					"measurement_name" : "aql_metrics",
+					"tags" : ["product","service","ran_on_host","ran_by","aqlfile"],
+					"fields" : ["result"] 				
+				}
+			]
+		},
+		{
+			"script" : "/home/montest/FOVEA/bin/machinedb/hostinfo.sh -dc usi.com",
+			"measurement_data" : 
+			[
+				{
+					"measurement_name" : "hostinfo",
+					"tags" : ["dc","ran_by","hostname"],
+					"fields" : ["status"]
+				},
+				{
+					"measurement_name" : "hostcount",
+					"tags" : ["dc"],
+					"fields" : ["notinservice","inservice"]
+				}
+			]
+		},
+		{
+			"script" : "/home/montest/FOVEA/bin/db_monitoring/gather-db-monitoring-metrics --dbType db_hana --metricCFG /home/I857797/config/hana_metrics.cfg --service test",
+			"measurement_data" :
+			[
+				{
+					"measurement_name" : "hana_hosts",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["FailoverStatus","Host","IndexserverConfiguredAndActualRole","IsActive","NameserverConfiguredAndActualRole","Status","StoragePartition"]
+				},
+				{
+					"measurement_name" : "transaction_management_inside_heap_memory",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["EXCLUSIVE_SIZE_IN_USE","host"]
+				},
+				{
+					"measurement_name" : "deltaMerge_allocator",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["CATEGORY","HOST","PORT","size_in_GB","status"]
+				},
+				{
+					"measurement_name" : "redo_log_size_per_host",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["GBRedoLogsize","Host"]
+				},
+				{
+					"measurement_name" : "memory_management_component_inside_heap_memory",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["EXCLUSIVE_SIZE_IN_USE","host"]
+				},
+				{
+					"measurement_name" : "mics_component_inside_heap_memory",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["exclusive_size_in_use","host"]
+				},
+				{
+					"measurement_name" : "persistance_comp_inside_heap",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["EXCLUSIVE_SIZE_IN_USE","host"]
+				},
+				{
+					"measurement_name" : "physical_memory_utilization_by_host",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["AllocationLimit","GBAvailablePhysicalMemory","GBUsedPhysicalMemory","Host","PercentUsed"]
+				},
+				{
+					"measurement_name" : "prepare_statement_cache_inside_heap_memory",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["EXCLUSIVE_SIZE_IN_USE","host"]
+				},
+				{
+					"measurement_name" : "stack_allocated_kernal_datastructure_component_inside_heap_memory",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["EXCLUSIVE_SIZE_IN_USE","host"]
+				},
+				{
+					"measurement_name" : "status_by_host",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["CPUPercentageUsed","Detail","EffectiveAllocationLimit","Host","IsActive","MBMemoryUsed","PhysicalMemoryonHost","Port","ServiceName","StartTime"]
+				},
+				{
+					"measurement_name" : "top_delta_merge_transaction",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["ExecutionTimeInMilliSeconds","Host","MergedDeltaRecordsCount","SchemaName","TableName"]
+				},
+				{
+					"measurement_name" : "measurement_name",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["HEAP_MEMORY_USED_IN_GB","host"]
+				},
+				{
+					"measurement_name" : "total_memory_used_by_host",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["TOTAL_MEMORY_USED_IN_GB","host"]
+				},
+				{
+					"measurement_name" : "trace_data_by_host", 
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["DiskId","GBTotal","GBUsed","Host","Path","PercentUsed"]
+				},
+				{
+					"measurement_name" : "transaction_management_inside_heap_memory",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields": ["EXCLUSIVE_SIZE_IN_USE","host"]
+				},
+				{
+					"measurement_name" : "virtual_memory_utilization_by_host",
+					"tags" : ["product","service","sid","ran_on_host","ran_by"],
+					"fields" : ["GBAvailable","GBUsed","Host","PercentUsed"]
+				}
+			]
+		}
+	]
+}

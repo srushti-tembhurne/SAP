@@ -1,0 +1,181 @@
+<center>
+<span style="font-family: sans-serif; font-size: 150%; color: #0069C6">
+<b>SS-SSP-10s2-Test-Robot</b> run ended with status: <b><span style="color: #FF0000">FAILURE</span></b>
+
+</span>
+<p>
+<table style="font-family: sans-serif; border: 1px solid #666;" border=0 cellpadding=2 cellspacing=1>
+<tr>
+<td align=right valign=middle><b>Robot:</b></td>
+<td align=left valign=middle><A href="http://rc.ariba.com:8080/cgi-bin/robot-status?robot=buildbox78.ariba.com">buildbox78.ariba.com</a></td>
+</tr>
+<tr>
+<td align=right valign=middle><b>Product:</b></td>
+<td align=left valign=middle>buyer</td>
+</tr>
+<tr>
+<td align=right valign=middle><b>Last Action Ran:</b></td>
+<td align=left valign=middle>wait-for-target-BQ</td>
+</tr>
+<tr>
+<td align=right valign=middle><b>Last Status Change Time:</b></td>
+<td align=left valign=middle>2010-05-18 10:38:34</td>
+</tr>
+<tr>
+<td align=right valign=middle><b>Number of consecutive failures:</b></td>
+<td align=left valign=middle>4</td>
+</tr>
+<tr>
+<td align=right valign=middle><b>Robot started failing on:</b></td>
+<td align=left valign=middle>Mon May 17 20:13:19 2010</td>
+</tr>
+<tr>
+<td align=right valign=middle><b>Started failing at changelist:</b></td>
+<td align=left valign=middle>1714039</td>
+</tr>
+</table></center><br><span style="font-family: sans-serif"><b>Changes:</b>
+<br>
+List of changes from the last good run (1714039) till this run (1715415): 
+<table style="font-family: sans-serif" border=1 cellpadding=1 cellspacing=1 width="100%">
+<tr bgcolor="#efefef">
+<td width="10%" align=center valign=middle><b>User</b></td>
+<td width="10%" align=center valign=middle><b>Change</b></td>
+<td width="80%" align=left valign=middle><b>Title</b></td>
+</tr>
+<tr bgcolor="#FFEB99">
+<td width="10%" align=center valign=middle>coinam</td>
+<td width="10%" align=center valign=middle><a href="https://rc.ariba.com/cgi-bin/change-info?change=1715415">1715415</a></td>
+<td width="80%" align=left valign=middle>sandbox:(erp.10s2): push test.expenseerp from @1710024</td>
+</tr>
+<tr bgcolor="#FFEB99">
+<td width="10%" align=center valign=middle>coinam</td>
+<td width="10%" align=center valign=middle><a href="https://rc.ariba.com/cgi-bin/change-info?change=1715413">1715413</a></td>
+<td width="80%" align=left valign=middle>sandbox:(erp.10s2): push test.procureerp from @1710024</td>
+</tr>
+<tr bgcolor="#FFEB99">
+<td width="10%" align=center valign=middle>coinam</td>
+<td width="10%" align=center valign=middle><a href="https://rc.ariba.com/cgi-bin/change-info?change=1715411">1715411</a></td>
+<td width="80%" align=left valign=middle>sandbox:(erp.10s2): push test.buyer.invoicingerp from @1710024</td>
+</tr>
+<tr bgcolor="#FFEB99">
+<td width="10%" align=center valign=middle>amandal</td>
+<td width="10%" align=center valign=middle><a href="https://rc.ariba.com/cgi-bin/change-info?change=1715390">1715390</a></td>
+<td width="80%" align=left valign=middle>10S2 CR 1-AZ0WGN: JDBC Warning:  Out Of Community DB schema Transaction.Schema07 being accessed. This is a manual integration.</td>
+</tr>
+<tr bgcolor="#FFEB99">
+<td width="10%" align=center valign=middle>poleary</td>
+<td width="10%" align=center valign=middle><a href="https://rc.ariba.com/cgi-bin/change-info?change=1715240">1715240</a></td>
+<td width="80%" align=left valign=middle>Adding newly created Polish Jupiter branch:</td>
+</tr>
+<tr bgcolor="#FFEB99">
+<td width="10%" align=center valign=middle>adtripathi</td>
+<td width="10%" align=center valign=middle><a href="https://rc.ariba.com/cgi-bin/change-info?change=1715160">1715160</a></td>
+<td width="80%" align=left valign=middle>10s2 Integration. Integrating below change to main line.</td>
+</tr>
+<tr bgcolor="#FFEB99">
+<td width="10%" align=center valign=middle>stjohnson</td>
+<td width="10%" align=center valign=middle><a href="https://rc.ariba.com/cgi-bin/change-info?change=1714600">1714600</a></td>
+<td width="80%" align=left valign=middle>10s2 checkin: 1-AZWCFB: Services' AppInfo should be updated to have version numbers 10s2 for both Buyer and S4</td>
+</tr>
+<tr bgcolor="#FFEB99">
+<td width="10%" align=center valign=middle>mzheng</td>
+<td width="10%" align=center valign=middle><a href="https://rc.ariba.com/cgi-bin/change-info?change=1714294">1714294</a></td>
+<td width="80%" align=left valign=middle>Summary: There is no need to reset the error in executeSqlWithTimeout as the error will be reset in executeSql. This is to avoid resetting the 'error' set by the connect sub as executeSql will return when handle is empty therefore retaining the connect error.</td>
+</tr>
+<tr bgcolor="#FFEB99">
+<td width="10%" align=center valign=middle>jharimuthy</td>
+<td width="10%" align=center valign=middle><a href="https://rc.ariba.com/cgi-bin/change-info?change=1714153">1714153</a></td>
+<td width="80%" align=left valign=middle>Jupiter SP11 checkin: 1-AXLKP7 : Auchan Polish Language support</td>
+</tr>
+<tr bgcolor="#FFEB99">
+<td width="10%" align=center valign=middle>skhadkekar</td>
+<td width="10%" align=center valign=middle><a href="https://rc.ariba.com/cgi-bin/change-info?change=1714145">1714145</a></td>
+<td width="80%" align=left valign=middle>Manual Integration from Hawk_sp to 10s2.</td>
+</tr>
+<tr bgcolor="#FFEB99">
+<td width="10%" align=center valign=middle>jbakermalone</td>
+<td width="10%" align=center valign=middle><a href="https://rc.ariba.com/cgi-bin/change-info?change=1714119">1714119</a></td>
+<td width="80%" align=left valign=middle>Integrating below change to mainline:</td>
+</tr>
+</table>
+</span>
+<br>
+<table style="font-family: sans-serif; border: 1px solid #666;" border=0 cellpadding=2 cellspacing=1>
+<tr>
+<td align=left valign=top colspan=2 bgcolor="#efefef">
+<b>start-target:</b><br>
+Front Door URL: <a href="https://buildbox78.ariba.com:7443/Buyer/Main">https://buildbox78.ariba.com:7443/Buyer/Main</a><br>
+Inspector URL: <a href="https://buildbox78.ariba.com:7443/Buyer/inspector">https://buildbox78.ariba.com:7443/Buyer/inspector</a><br>
+Service Manager URL: <a href="https://buildbox78.ariba.com:9443/Buyer/Main">https://buildbox78.ariba.com:9443/Buyer/Main</a><br>
+Customer Sites URL: <a href="https://buildbox78.ariba.com:7443/Buyer/Main/ad/ss">https://buildbox78.ariba.com:7443/Buyer/Main/ad/ss</a><br>
+Product Install Dir: <tt>/home/robot78/archive/deployments/personal_robot78/buyer/Voyageurs_robot20-80</tt><br>
+Application Keep Running logs Dir: <tt>/tmp/personal_robot78/buyer</tt><br>
+
+</td>
+</tr>
+</table>
+<br>
+<table style="font-family: sans-serif; border: 1px solid #666;" border=0 cellpadding=2 cellspacing=1>
+<tr>
+<td align=left valign=top colspan=2 bgcolor="#efefef">
+<b>wait-for-target-BQ:</b><br>
+<b>Qual Type</b>: BQ<br><b>Product</b>: buyer<br><b>Service</b>: personal_robot78<br><b>Overall Status</b>: Errors (117 tests failed out of 287)<br><b>Qual Time</b>: 1 hrs 30 mins 36 secs <br><b>Detailed Log</b>: <a href = file://maytag/export/home/robot78/personal_robot78/buyer/logs/1274198851741/runtests.output.all.email.html>/home/robot78/personal_robot78/buyer/logs/1274198851741/runtests.output.all.email.html</a><BR><h3>Components Summary</h3><table border=1><tr><td>Component</td><td>Owners</td><td>Total</td><td>Error</td><td>Failed</td><td>Skipped</td><td>Not run</td><td>Time Taken</td></tr><tr><td>test.procure.selenium</td><td>Downstream_Core_Buyer_DEV</td><td>8</td><td bgcolor=red>8</td><td>0</td><td>0</td><td>0</td><td>1 mins 6 secs </td></tr>
+<tr><td>test.baseui.selenium</td><td>Platform_UI_Framework_DEV</td><td>14</td><td bgcolor=red>13</td><td>0</td><td>0</td><td>0</td><td>4 mins 20 secs </td></tr>
+<tr><td>test.contract.selenium</td><td>Downstream_Contracts_DEV</td><td>7</td><td bgcolor=red>7</td><td>0</td><td>0</td><td>0</td><td>1 mins 43 secs </td></tr>
+<tr><td>test.util.selenium</td><td>Platform_Core_Server_DEV</td><td>2</td><td bgcolor=red>2</td><td>0</td><td>0</td><td>0</td><td>12 mins 40 secs </td></tr>
+<tr><td>test.buyer.msg.selenium</td><td>Platform_Messaging_DEV </td><td>6</td><td bgcolor=red>6</td><td>0</td><td>0</td><td>0</td><td>1 mins 39 secs </td></tr>
+<tr><td>test.collaboration.selenium</td><td>Downstream_ACP_DEV</td><td>7</td><td bgcolor=red>7</td><td>0</td><td>0</td><td>0</td><td>59 secs </td></tr>
+<tr><td>test.invoicing.selenium</td><td>Downstream_Invoicing_DEV</td><td>2</td><td bgcolor=red>1</td><td>0</td><td>1</td><td>0</td><td>9 secs </td></tr>
+<tr><td>test.user.selenium</td><td>Platform_BF_DEV</td><td>10</td><td bgcolor=red>7</td><td>0</td><td>0</td><td>0</td><td>2 mins 42 secs </td></tr>
+<tr><td>test.dashboard.selenium</td><td>Platform_UI_Framework_DEV</td><td>10</td><td bgcolor=red>10</td><td>0</td><td>0</td><td>0</td><td>2 mins 1 secs </td></tr>
+<tr><td>test.approvable.selenium</td><td>Platform_App_Framework_DEV</td><td>52</td><td bgcolor=red>51</td><td>0</td><td>0</td><td>0</td><td>32 mins 11 secs </td></tr>
+<tr><td>test.expense.selenium</td><td>Downstream_TE_DEV</td><td>5</td><td bgcolor=red>5</td><td>0</td><td>0</td><td>0</td><td>41 secs </td></tr>
+<tr><td>test.workforce</td><td>Downstream_ACP_DEV</td><td>5</td><td>0</td><td>0</td><td>0</td><td>0</td><td>3 mins 12 secs </td></tr>
+<tr><td>test.contract.ss</td><td>Downstream_Contracts_DEV</td><td>15</td><td>0</td><td>0</td><td>0</td><td>0</td><td>1 mins 37 secs </td></tr>
+<tr><td>test.approvable.app</td><td>Platform_App_Framework_DEV</td><td>6</td><td>0</td><td>0</td><td>0</td><td>0</td><td>3 secs </td></tr>
+<tr><td>test.catalog</td><td>Downstream_Catalog_DEV</td><td>18</td><td>0</td><td>0</td><td>0</td><td>0</td><td>6 mins 35 secs </td></tr>
+<tr><td>test.collaboration</td><td>Downstream_ACP_DEV</td><td>9</td><td>0</td><td>0</td><td>0</td><td>0</td><td>2 mins 23 secs </td></tr>
+<tr><td>test.buyer.invoicingerp</td><td>ERP_Invoicing_DEV</td><td>2</td><td>0</td><td>0</td><td>0</td><td>0</td><td>58 secs </td></tr>
+<tr><td>test.charge.ss</td><td>Downstream_Charge_DEV</td><td>4</td><td>0</td><td>0</td><td>0</td><td>0</td><td>34 secs </td></tr>
+<tr><td>test.channel.util.app</td><td>Platform_Messaging_DEV </td><td>29</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0 secs</td></tr>
+<tr><td>test.admin.selenium</td><td>Platform_App_Framework_DEV</td><td>5</td><td>0</td><td>0</td><td>5</td><td>0</td><td>0 secs</td></tr>
+<tr><td>test.appcore.cds</td><td>Platform_BF_DEV</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0 secs</td></tr>
+<tr><td>test.procure.ss</td><td>Downstream_Core_Buyer_DEV</td><td>2</td><td>0</td><td>0</td><td>0</td><td>0</td><td>2 mins 13 secs </td></tr>
+<tr><td>test.procureerp</td><td>ERP_Procure_DEV</td><td>5</td><td>0</td><td>0</td><td>0</td><td>0</td><td>2 mins 39 secs </td></tr>
+<tr><td>test.invoicing.ss</td><td>Downstream_Invoicing_DEV</td><td>39</td><td>0</td><td>0</td><td>0</td><td>0</td><td>6 mins 37 secs </td></tr>
+<tr><td>test.channel.cxml.app.buyer</td><td>Platform_Messaging_DEV </td><td>8</td><td>0</td><td>0</td><td>0</td><td>0</td><td>2 secs </td></tr>
+<tr><td>test.amf.app.buyer</td><td>Platform_Messaging_DEV </td><td>6</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0 secs</td></tr>
+<tr><td>test.expenseerp</td><td>ERP_Expense_DEV</td><td>4</td><td>0</td><td>0</td><td>0</td><td>0</td><td>2 mins 30 secs </td></tr>
+<tr><td>test.expense.ss</td><td>Downstream_TE_DEV</td><td>7</td><td>0</td><td>0</td><td>0</td><td>0</td><td>36 secs </td></tr>
+</table>
+</td>
+</tr>
+</table>
+<br>
+<span style="font-family: sans-serif">
+<b>Log File:</b> <a href="http://nashome.ariba.com/~robot78/logs/20100513-120156/run_20.log">http://nashome.ariba.com/~robot78/logs/20100513-120156/run_20.log</a>
+</span>
+<table width="100%" style="font-family: sans-serif" border=0 cellpadding=2 cellspacing=1>
+<tr>
+<td align=left valign=top bgcolor="#efefef"><tt><pre>2010-05-18 10:21:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,14m)
+2010-05-18 10:22:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,15m)
+2010-05-18 10:23:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,16m)
+2010-05-18 10:24:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,17m)
+2010-05-18 10:25:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,18m)
+2010-05-18 10:26:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,19m)
+2010-05-18 10:27:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,20m)
+2010-05-18 10:28:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,21m)
+2010-05-18 10:29:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,22m)
+2010-05-18 10:30:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,23m)
+2010-05-18 10:31:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,24m)
+2010-05-18 10:32:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,25m)
+2010-05-18 10:33:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,26m)
+2010-05-18 10:34:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,27m)
+2010-05-18 10:35:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,28m)
+2010-05-18 10:36:32 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,29m)
+2010-05-18 10:37:33 (info) DA to qual is still running, sleeping 60 seconds to check again (1h,30m)
+Looking in /home/robot78/personal_robot78/buyer/logs
+2010-05-18 10:38:33 (info) qual BQ NOT successfull, DA returned: Errors
+2010-05-18 10:38:33 (error) Failed to execute wait-for-target-BQ
+</pre></tt></td></tr>
+</table>

@@ -1,0 +1,126 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/dba/listener-log#6 $
+#
+# This script parses the oracle listener log file to record the number 
+# of connection attempts for each sid on this host.
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::monitor::misc;
+use ariba::Ops::LogParser::ListenerLogParser;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::NetworkUtils;
+use ariba::util::OraInfo;
+use ariba::Ops::DBConnection;
+
+my $debug	= 0;
+my $me		= ariba::rc::InstalledProduct->new();
+my $service	= $me->service();
+
+sub lastListenerLogFilePosition {
+	my $newFilePosition = shift; 
+	my $currentFilePosition;
+	my $setNewPosition = defined $newFilePosition;
+
+	my $positionFile = '/tmp/listener-log-file-position-for-' . $service;
+	my $readOrWriteOp = $setNewPosition ? '>' : '<';
+	if (open(my $fh, $readOrWriteOp, $positionFile)) {
+		if ($setNewPosition) {
+			print $fh $newFilePosition;
+		} else {
+			$currentFilePosition = <$fh>; 
+		}
+		close($fh);	
+	}
+	
+	return $currentFilePosition || $newFilePosition ||
+		-s ariba::Ops::LogParser::ListenerLogParser->logFile() || 0;;	
+}
+
+sub parseListenerLogForConnectionAttempts {
+	my $lastFilePosition = lastListenerLogFilePosition();	
+	my $listenerLogParser = ariba::Ops::LogParser::ListenerLogParser->new();
+
+	$listenerLogParser->setDebug($debug);
+	$listenerLogParser->setFilePosition($lastFilePosition);	
+	$listenerLogParser->parseLog();
+	lastListenerLogFilePosition($listenerLogParser->filePosition());
+
+	return $listenerLogParser;
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/) { $sendEmail = 1;	next; };
+		if ($arg =~ /^-p/) { $sendPage = 1;		next; };
+		if ($arg =~ /^-d/) { $debug++;			next; };
+	}
+
+	my @products    = ariba::rc::InstalledProduct->installedProductsList($service);
+	my $hostname    = ariba::Ops::NetworkUtils::hostname();
+	my $cluster     = $me->currentCluster();
+
+	my @connections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+
+	my $listenerLog = parseListenerLogForConnectionAttempts();
+
+	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections)) {
+
+		my $virtualHost	= $dbc->host();
+		my $sid			= uc($dbc->sid());
+
+		my $product		= $dbc->product();
+		my $activeHost	= $product->activeHostForVirtualHostInCluster($virtualHost, $cluster);
+
+		if (!$activeHost || $activeHost ne $hostname) {
+			next;
+		}
+
+		# if the sid does not exist on this db, skip
+		ariba::util::OraInfo::sidToOracleHome($sid) || next;
+
+		my %queries = ();
+		$queries{"$hostname $sid connection attempts for service $service"} = {
+			info    => 1,
+			perl    => sub { return $listenerLog->connectionAttemptsForSid($sid); },
+			uiHint	=> 'listener-log',
+			recordMaxResults	=> 110000,
+                        inf_field => "connection_attempt",
+                        inf_tags => qq|sid="$sid",hostname="$hostname"|,
+                        group_by => "$sid-$hostname",
+		};
+
+		$queries{"$hostname $sid connection attempts - highest per second in last 5 min(s) for service $service"} = {
+			info    => 1,
+			perl    => sub { return $listenerLog->highestConnectionAttemptsForSid($sid); },
+			uiHint	=> 'listener-log',
+			recordMaxResults	=> 110000,
+                        inf_field => "max_connection_attempt_per_second",
+                        inf_tags => qq|sid="$sid",hostname="$hostname"|,
+                        group_by => "$sid-$hostname",
+		};
+
+		my $email = $me->default('notify.email');
+                $queries{influx_details} = {measurement => "dba"};
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			"dba", $product->name(), $service, undef, \%queries
+		);
+
+		$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+
+}
+
+main();
+
+__END__

@@ -1,0 +1,239 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/an/replication-status#21 $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DateTime;
+
+sub processDurationAnswer
+{
+    my $repairingCommunitiesRef = shift;
+    my $query                   = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+    if ($repairingCommunitiesRef->{$query->communityId()})
+    {
+        $query->setWarn("answer > 1200 && previousAnswer > 1200");
+        if (   $query->anReplicatorIsRepairing()
+            && $query->anReplicatorIsRepairing() eq 'false')
+        {
+            $query->setAnReplicatorIsRepairingStartTime(time ());
+        }
+        $query->setAnReplicatorIsRepairing('true');
+    }
+    else
+    {
+        if (   $query->anReplicatorIsRepairing()
+            && $query->anReplicatorIsRepairing() eq 'true'
+            && $query->anReplicatorIsRepairingStartTime())
+        {
+            $query->setAnReplicatorLastRepairStartTime($query->anReplicatorIsRepairingStartTime());
+            $query->setAnReplicatorLastRepairEndTime(time ());
+            $query->setAnReplicatorLastRepairLength(ariba::Ops::DateTime::scaleTime($query->anReplicatorLastRepairEndTime() - $query->anReplicatorLastRepairStartTime()));
+            $query->deleteAnReplicatorIsRepairingStartTime();
+        }
+        $query->setAnReplicatorIsRepairing('false');
+    }
+
+    return $query->results();
+}
+
+sub processStalledReplicationAnswer
+{
+    my $repairingCommunitiesRef = shift;
+    my $minutes                 = shift;
+    my $query                   = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+    if ($repairingCommunitiesRef->{$query->communityId()})
+    {
+        $query->deleteWarn() if ($minutes == 10);
+        $query->setTicketOnWarnOpenAfterMinutes(($minutes == 60) ? 10 : 0);
+        $query->setAnReplicatorIsRepairing('true');
+    }
+    else
+    {
+        $query->setTicketOnWarnOpenAfterMinutes(($minutes == 30) ? 10 : 0);
+        $query->setAnReplicatorIsRepairing('false');
+    }
+
+    return $query->results();
+}
+
+sub main
+{
+    my $debug     = 0;
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my %repairingCommunities;
+
+    while (my $arg = shift (@ARGV))
+    {
+        if ($arg =~ /^-d/o) {$debug     = 1;}
+        if ($arg =~ /^-e/o) {$sendEmail = 1;}
+        if ($arg =~ /^-p/o) {$sendPage  = 1;}
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $an = ariba::rc::InstalledProduct->new("an", $me->service());
+
+    my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+    my $communitiesList = join (", ", @communityIds);
+
+    my @replicatorInstances = grep {$_->appName() =~ /ANReplicatorDaemon/} $an->appInstancesInCluster($me->currentCluster());
+    for my $instance (@replicatorInstances)
+    {
+        my $monStats = ariba::monitor::AppInstanceStats->newFromAppInstance($instance);
+        $monStats->fetch();
+        $repairingCommunities{$instance->community()} = 1 if ($monStats->isRepairing() eq 'true');
+    }
+
+    my %queries = (
+        "Replication errors, row count does not match" => {
+            runForCommunities            => $communitiesList,
+            aggregationMethod            => "counts",
+            info                         => "answer > -1",
+            warn                         => "answer > 0 && previousAnswer > 0",
+            ticketOnWarnOpenAfterMinutes => 10,
+
+            sql => q`
+            select count(id) as row_count_does_not_match from replication_error where fixed is null and nvl(fix_attempts,0) >= 3
+            `,
+        },
+
+        "Replication errors some rows have failed" => {
+            runForCommunities            => $communitiesList,
+            aggregationMethod            => "counts",
+            info                         => "answer > -1",
+            warn                         => "answer > 0 && previousAnswer > 0",
+            ticketOnWarnOpenAfterMinutes => 10,
+
+            sql => q`
+            select count(id) as failed_rows from replication_error_rows where fixed is null and nvl(fix_attempts,0) >= 3
+            `,
+        },
+
+        #
+        # Pass 1 runs every minute and replicates data from last
+        # 1 minute, make sure it can run in under a min.
+        #
+        "Duration in secs of the longest Pass 1 replication task" => {
+            runForCommunities            => $communitiesList,
+            info                         => "answer > -1",
+            warn                         => "answer > 200 && previousAnswer > 200",
+            ticketOnWarnOpenAfterMinutes => 10,
+            recordMaxResults             => 20000,
+            recordDatatype               => "gauge",
+            recordItem                   => "answer",
+            format                       => "%0.2f",
+            processAnswer                => sub {return main::processDurationAnswer(\%repairingCommunities);},
+            sql                          => q`
+            select round(max(duration),3) as longest_pass_1 from ( 
+                select source, sum(rep_execution_finish-rep_execution_start)*24*3600
+                duration from replication_status 
+                where pass = 1 
+                group by source)
+            `,
+        },
+
+        #
+        # Pass 2 runs every 20 mins and replicates data from last 1 min AND
+        # data from 1 hour and 1 hour and 20 mins ago. This takes longer
+        # than Pass 1, but should still finish fast enough.
+        #
+        "Duration in secs of the longest Pass 2 replication task" => {
+            runForCommunities => $communitiesList,
+            info              => "answer > -1",
+            warn              => "answer > 240 && previousAnswer > 240",
+            recordMaxResults  => 20000,
+            recordDatatype    => "gauge",
+            recordItem        => "answer",
+            format            => "%0.2f",
+            processAnswer     => sub {return main::processDurationAnswer(\%repairingCommunities);},
+            sql               => q`
+            select round(max(duration),3) as longest_pass_2 from ( 
+                select source, sum(rep_execution_finish-rep_execution_start)*24*3600
+                duration from replication_status 
+                where pass = 2 
+                group by source)
+            `,
+        },
+
+        "Stalled Pass 1 replication tasks for more than 10 mins" => {
+            runForCommunities => $communitiesList,
+            aggregationMethod => "counts",
+            info              => "answer > -1",
+            warn              => "answer > 0 && previousAnswer > 0",
+            recordMaxResults  => 20000,
+            recordDatatype    => "gauge",
+            recordItem        => "answer",
+            processAnswer     => sub {return main::processStalledReplicationAnswer(\%repairingCommunities, 10);},
+            sql               => q`
+            select count(id) as pass1_more_than_10_mins from replication_status where pass=1 and
+            (rep_execution_finish < sysdate - 10/(24*60))
+            `,
+        },
+
+        "Stalled Pass 1 replication tasks for more than 30 mins. Replication is stopped" => {
+            runForCommunities => $communitiesList,
+            aggregationMethod => "counts",
+            info              => "answer > -1",
+            warn              => "answer > 0 && previousAnswer > 0",
+            recordMaxResults  => 20000,
+            recordDatatype    => "gauge",
+            recordItem        => "answer",
+            processAnswer     => sub {return main::processStalledReplicationAnswer(\%repairingCommunities, 30);},
+            sql               => q`
+            select count(id) as pass1_more_than_30_mins from replication_status where pass=1 and
+            (rep_execution_finish < sysdate - 30/(24*60))
+            `,
+        },
+
+        "Stalled Pass 1 replication tasks for more than 60 mins. Replication is stopped" => {
+            runForCommunities => $communitiesList,
+            aggregationMethod => "counts",
+            info              => "answer > -1",
+            warn              => "answer > 0 && previousAnswer > 0",
+            recordMaxResults  => 20000,
+            recordDatatype    => "gauge",
+            recordItem        => "answer",
+            processAnswer     => sub {return main::processStalledReplicationAnswer(\%repairingCommunities, 60);},
+            sql               => q`
+            select count(id) as pass1_more_than_60_mins from replication_status where pass=1 and
+            (rep_execution_finish < sysdate - 60/(24*60))
+            `,
+        },
+
+        "Stalled Pass 2 replication tasks for more than 2 hours. Replication is stopped" => {
+            runForCommunities => $communitiesList,
+            aggregationMethod => "counts",
+            info              => "answer > -1",
+            warn              => "answer > 0 && previousAnswer > 0",
+            recordMaxResults  => 20000,
+            recordDatatype    => "gauge",
+            recordItem        => "answer",
+            sql               => q`
+            select count(id) as pass2_more_than_2_hours from replication_status where pass=2 and
+            (rep_execution_finish < sysdate - 2/24)
+            `,
+        },
+
+    );
+
+    my $email = $me->default('notify.email');
+    $queries{influx_details} = {measurement => "an_replication_status"};
+    my $q = ariba::monitor::QueryManager->newWithDetails("replication-status", "an", $me->service(), $me->customer(), \%queries);
+
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $q);
+
+    $q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

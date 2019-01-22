@@ -1,0 +1,251 @@
+#!/usr/local/bin/perl 
+
+# $Id: //ariba/services/monitor/bin/common/db-conn-status#9 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Url;
+use Data::Dumper;
+use XML::Simple;
+my $debug = 0;
+
+sub usage
+{
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit ();
+}
+
+sub main
+{
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while (my $arg = shift)
+    {
+        if ($arg =~ /^-h$/o) {usage();  next;}
+        if ($arg =~ /^-d$/o) {$debug++; next;}
+        if ($arg =~ /^-e$/o) {$sendEmail = 1; next;}
+        if ($arg =~ /^-p$/o) {$sendPage  = 1; next;}
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me       = ariba::rc::InstalledProduct->new();
+    my $cluster  = $me->currentCluster();
+    my $service  = $me->service();
+    my @products = ('buyer', 's4');
+
+    foreach my $product (@products)
+    {
+
+        my %summary_query = ();
+        my %details_query = ();
+
+        my @monitorproducts = init($service, $cluster, $product);
+        my @dbconn_status;
+
+        foreach my $product (@monitorproducts)
+        {
+            my ($url, $url1) = geturls($product, $me);
+            my ($instance, %dbinfo) = getdbconn_info($url);
+            if (!%dbinfo)
+            {
+                print "No status from 1st Node: $instance, trying next node\n";
+                ($instance, %dbinfo) = getdbconn_info($url1);
+            }
+            my $hostSID = getHostSID($product);
+
+            $summary_query{"Connection to DB : Overall Status"} = {
+                                                                   crit   => "previousAnswer && answer && (answer ne 'OK') && (previousAnswer ne 'OK')",
+                                                                   perl   => sub {return check_database_status($instance, \%dbinfo, $hostSID);},
+                                                                   format => "%s\n",
+                                                                   uiHint => 'General/Connection to DB',
+                                                                   logURL => $url->logURL() || "",
+                                                                   inf_field => "overall_status",
+                                                                  };
+
+            # Setting up so individual SID queries show problems as warnings, so they don't page.
+            foreach my $db (keys %dbinfo)
+            {
+                $details_query{"Connection to DB : SID $db"} = {
+                                                                warn      => 'answer ne "OK"',
+                                                                perl      => sub {return $dbinfo{$db};},
+                                                                format    => "%s\n",
+                                                                uiHint    => 'General/Connection to DB',
+                                                                logURL    => $url->logURL() || "",
+                                                                inf_field => "status",
+                                                                inf_tags  => qq(sid="$db"),
+                                                                group_by  => $db,
+                                                               };
+            }
+
+            my $email = $me->default('notify.email');
+            $summary_query{"influx_details"} = {'measurement' => "front_door_db_connections_summary"};
+            $details_query{"influx_details"} = {'measurement' => "front_door_db_connections_details"};
+
+            my $qm = ariba::monitor::QueryManager->newWithDetails('http-urls-status', $product->name(), $me->service(), $me->customer(), \%summary_query);
+            $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+            my $qm2 = ariba::monitor::QueryManager->newWithDetails('http-urls-status', $product->name(), $me->service(), $me->customer(), \%details_query);
+            $qm2->processQueries($debug, $email, $sendEmail, $sendPage);
+        }
+    }
+}
+
+sub init
+{
+    my $serviceName = shift;
+    my $clusterName = shift;
+    my $prodName    = shift;
+    my @products    = ariba::rc::InstalledProduct->installedProductsListInCluster($serviceName, $prodName, undef, $clusterName);
+    for my $product (@products)
+    {
+        printf ("%s called for %s%s\n", (caller)[0], $product->name(), $product->service()) if $debug;
+    }
+    return @products;
+
+}
+
+sub geturls
+{
+    my @monitorproducts = shift;
+    my $me              = shift;
+
+    my @urls;
+    foreach my $product (@monitorproducts)
+    {
+        my $productName = $product->name();
+        my $cluster     = $product->currentCluster();
+        my $service     = $product->service();
+        my $timeout     = 35;                                          # time the url has to reply
+        my @instances   = $product->appInstancesInCluster($cluster);
+        my $customer    = $product->customer();
+
+        for my $instance (@instances)
+        {
+            my $url    = $instance->databaseStatusURL();
+            my $monUrl = ariba::monitor::Url->new($url);
+            $monUrl->setForceSickOnConnectionError(1);
+            $monUrl->setTimeout($timeout);
+            $monUrl->setNotify($me->default('notify.email'));
+            $monUrl->setProductName($productName);
+            $monUrl->setCustomerName($customer) if $customer;
+
+            my $logURL = $instance->logURL();
+            $monUrl->setLogURL($logURL);
+            $monUrl->setUiHint("General");
+            push @urls, $monUrl;
+
+        }
+
+    }
+    return shift @urls, shift @urls;
+}
+
+sub getdbconn_info
+{
+
+    my $url      = shift;
+    my $instance = $url->instance();
+    my $statsXml = $url->request(60);
+    my $error    = $url->error();
+    my $stats;
+    my %dbconn_status = ();
+
+    unless ($statsXml =~ /<Databases/)
+    {
+        $statsXml = "<xml>$statsXml</xml>";
+    }
+    unless ($error)
+    {
+        eval {$stats = XMLin("$statsXml");};
+        $error = "Malformed XML: $@" if ($@);
+    }
+    $error = "Failed to parse XML: $statsXml for $instance" unless ($stats);
+    print $error, if $debug;
+
+    while (my ($family, $database) = each %{$stats})
+    {
+        while (my ($dbname, $dbinfo) = each %$database)
+        {
+            my $status = $dbinfo->{'Status'};
+            $status =~ s/\s*//g;
+            my $timestamp = $dbinfo->{'Timestamp'};
+            $dbconn_status{$dbname} = $status;
+            print "$dbname=$status\n", if $debug;
+        }
+    }
+
+    return $instance, %dbconn_status;
+}
+
+sub check_database_status
+{
+    my ($url, $db_info, $hostSID) = @_;
+
+    #if %{$db_info} returns 0/null, it will XML with below message.
+    if (!%{$db_info})
+    {
+        print "Did not find XML or Invalid XML found at $url,\n", if $debug;
+        return "Did not find XML or Invalid XML found at $url,\n";
+    }
+
+    # We need to include the failed SID name, for reference, in the message, while
+    # also checking whether any of the databases are down.
+    my @statuses = grep {$_ if $db_info->{$_} ne 'OK'} keys (%{$db_info});
+    my $statusStr = getStatusStr(\@statuses, $hostSID);
+
+    print $statusStr ? "DBs down for $url:\n$statusStr" : "OK", if $debug;
+    return $statusStr ? "DBs down for $url:\n$statusStr" : "OK";
+}
+
+sub getHostSID
+{
+    my $product = shift;
+
+    my $databasePrefix = "System.Databases.";
+    my %dbHash;
+    for my $dictKeypath ($product->defaultKeysForPrefix(quotemeta ($databasePrefix)))
+    {
+        my $sid = $product->default("$dictKeypath.AribaDBServer");
+        $dbHash{$sid} = $product->default("$dictKeypath.AribaDBHostname");
+    }
+    return \%dbHash;
+}
+
+sub getStatusStr
+{
+    my ($statusesRef, $hostSID) = @_;
+
+    return undef unless (@$statusesRef);
+    my @retVal;
+
+    for (@$statusesRef)
+    {
+        push @retVal, $_ . ": " . $hostSID->{uc ($_)};
+    }
+    return join (", ", @retVal);
+}
+
+main(@ARGV);
+
+__END__
+

@@ -1,0 +1,482 @@
+#!/usr/local/bin/perl -w 
+
+use strict;
+
+use Date::Parse;
+use POSIX qw(strftime);
+use Data::Dumper;
+use JSON;
+
+use FindBin; 
+use lib "$FindBin::Bin/../../lib";
+use ariba::rc::Globals;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::DateTime;
+use ariba::Ops::Startup::Hadoop;
+use ariba::Ops::HadoopConfig;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::HadoopProperties;
+use ariba::util::Misc;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Query;
+use ariba::monitor::Url;
+
+our $quiet = 1; # Suppresses prints in ariba::Ops::Startup::Common.pm
+my $debug = 0;
+my $GB = 1024 * 1024 * 1024;
+my $MB = 1024 * 1024;
+
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-fsck|-sanity|-replica] [-e|-p|-d|-h]
+Sends hdfs health information to monitoring
+
+    -fsck     Run 'hdfs fsck' monitoring
+    -sanity   Run 'hdfs sanity' monitoring
+    -replica  Run 'hdfs fsck' and get information for missing replicas
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode. 
+    -h        Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub debug {
+    my $msg = shift; 
+
+    print "(debug) $msg\n" if ($debug);
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $runFsck;
+    my $runSanity = 0;
+    my $runReplica = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-fsck$/o) { $runFsck = 1; next; }
+        if ($arg =~ /^-sanity$/o) { $runSanity = 1; next; }
+        if ($arg =~ /^-replica$/o) { $runReplica = 1; next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled('hadoop', $me->service()));
+    my $hadoop = ariba::rc::InstalledProduct->new('hadoop', $me->service());
+    my $cluster = $hadoop->currentCluster();
+
+    my ($virtualHost) = $hadoop->rolesManager()->virtualHostsForRoleInCluster('hadoop-name', $cluster);
+    if ($virtualHost) {
+        my $activeHost = $hadoop->activeHostForVirtualHostInCluster($virtualHost, $cluster);
+        my $host = ariba::Ops::NetworkUtils::hostname();
+        debug("Current Host: $host / Active Host: $activeHost / Virtual Host: $virtualHost");   
+        if ($host ne $activeHost) {
+            debug("Exiting as current host is not the active host");
+            exit(0);
+        }
+    }
+
+    my %queries;
+
+    if ($runFsck) {
+        $queries{'file system check'} = {
+            crit                => 'answer !~ /Status: HEALTHY/',
+            perl                => sub { return runFsck($hadoop); },
+            timeout             => 3600,    # 1 hour. fsck could take awhile to run 
+            noRowCount          => 1,
+            description         => qq`Runs 'hdfs fsck' and shows the output. fsck is a utilty that comes with
+                Hadoop that checks HDFS for any problems`,
+            correctiveActions   => [
+                Ops => 'Correct the problem based on the reported error from fsck. Escalate to Tools if needed.', 
+                Tools => 'Debug based on error',
+            ],
+            inf_field => "file_system_check",
+            inf_default => "none",
+        };
+    } elsif ($runSanity) {
+        my $host = ariba::Ops::NetworkUtils::hostname();
+        $queries{"file system sanity check: $host"} = {
+            crit                => 'answer =~ /ERROR/',
+            warn                => 'answer =~ /WARN/',
+            perl                => sub { return runSanity($hadoop, $host); },
+            timeout             => 60,    # 60 secs. fsck could take awhile to run 
+            noRowCount          => 1,
+            description         => qq`Runs 'hdfs dfs -put' and shows the output. fsck is a utilty that comes with
+                Hadoop that checks HDFS for any problems`,
+            correctiveActions   => [
+                Ops => 'Correct the problem based on the reported error from fsck. Escalate to Tools if needed.', 
+                Tools => 'Debug based on error',
+            ],
+            inf_field => "file_system_check",
+            inf_default => "none",
+            inf_tags => qq|host="$host"|,
+        };
+    } elsif ($runReplica) {
+        my $results = runFsck($hadoop, $runReplica);
+        my @value = split(' \(', $results);
+
+        $queries{'missing replicas'} = {
+            crit                => $value[0] > 5,
+            perl                => sub { return $results },
+            description         => qq`Runs 'hdfs fsck' and report on the number of blocks with no replicas in the cluster.
+                CRIT if the number of missing replicas is > 5`,
+            inf_field => "missing_replicas",
+            inf_default => "none",
+        };
+    } else {
+        my $stats = hdfsHealth($hadoop);
+        populateQueriesForStatsWithNamePrefix(\%queries, $stats, '');
+    }
+
+    my $email = $me->default('notify.email');
+    $queries{"influx_details"} = {measurement => "hdfs_health"};
+
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('HDFS', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+} 
+
+sub runFsck {
+    my $me = shift;
+    my $replica = shift;
+    ariba::Ops::Startup::Hadoop::setRuntimeEnv($me);
+
+    my $cmd = "hdfs fsck";
+    $cmd .= " -blocks" if $replica;
+    $cmd .= " /";
+
+    my $output = runCmd($cmd);
+    my @filteredOutput; 
+    $output =~ s/\.{2,}//g;
+
+    my @splitLine = split("\n", $output);
+    foreach my $sl (@splitLine) {
+        # remove blank lines and lines with a '.' only
+        next if ($sl =~ /^$/);
+        next if ($sl =~ /^.$/);
+        if ($replica) {
+            ## Sample output:
+            ## Missing replicas:         67280 (2.950828 %
+            if ($sl =~ /Missing replicas:/) {
+                $sl =~ s/Missing replicas:\s*//;
+                push(@filteredOutput, $sl);
+             }
+         } else {
+             # Skip '...' or Under replicated block messages or Replica placement policy is violated
+             push(@filteredOutput, $sl) unless ($sl =~ /^\.+$|^\s+$|Under replicated blk|Replica placement policy is violated/o);
+        }
+    }
+
+    $output = join("\n", @filteredOutput) if (scalar @filteredOutput > 0);
+
+    return $output;
+}
+
+=comment
+# sample output of 'hdfs -fsck /':
+FSCK started by svclab (auth:SIMPLE) from /172.22.18.11 for path / at Thu Mar 27 11:33:50 PDT 2014
+....................................................................................................
+....................................................................................................
+...<repeats for many more lines>...
+/tmp/hadoop/mapred/staging/svclab/.staging/job_201402191251_0291/libjars/zookeeper-3.4.5-cdh4.4.0.jar:  Under replicated BP-380354090-172.22.18.11-1392156024760:blk_-1688783652535023188_72177. Target Replicas is 10 but found 3 replica(s).
+/tmp/hadoop/mapred/staging/svclab/.staging/job_201402191251_0291/libjars/protobuf-java-2.4.0a.jar:  Under replicated BP-380354090-172.22.18.11-1392156024760:blk_1467919220408468684_72179. Target Replicas is 10 but found 3 replica(s).
+...<repeats for many more jobs>...
+........Status: HEALTHY
+Total size: 25061209456 B
+Total dirs: 166065
+Total files:    135208 (Files currently being written: 3)
+Total blocks (validated):   130765 (avg. block size 191650 B)
+Minimally replicated blocks:    130765 (100.0 %)
+Over-replicated blocks: 0 (0.0 %)
+Under-replicated blocks:    245 (0.187359 %)
+Mis-replicated blocks:      0 (0.0 %)
+Default replication factor: 3
+Average block replication:  3.0
+Corrupt blocks:     0
+Missing replicas:       1715 (0.43526813 %)
+Number of data-nodes:       3
+Number of racks:        2
+FSCK ended at Thu Mar 27 11:33:56 PDT 2014 in 6094 milliseconds
+
+=cut
+
+sub runSanity {
+    my $me = shift;
+    my $host = shift;
+    ariba::Ops::Startup::Hadoop::setRuntimeEnv($me);
+    my $testfile_hdfs = "/tmp/hosts.$host";
+    my $testfile_local = "/etc/hosts";
+    my $timeout = 2;     # acceptable file creation time
+
+# remove test file in hdfs, if any
+    my $cmd = "hdfs dfs -rm -r $testfile_hdfs";
+    my $output = runCmd($cmd);
+    $cmd = "hdfs fsck $testfile_hdfs";
+    $output = runCmd($cmd);
+    return "WARN:unknown issue" unless defined $output;
+    return "WARN:test file exist in hdfs\n" unless $output =~ /Path \'$testfile_hdfs\' does not exist/;
+
+# make sure test file in local
+    return "WARN:test file does not exist in local\n" unless (-e $testfile_local);
+
+    my ($expected, $real);
+    $expected->{len} = -s $testfile_local;
+    $expected->{status} = "HEALTHY";
+
+# copy test file from local to hdfs
+    $cmd = "hdfs dfs -put $testfile_local $testfile_hdfs";
+    $output = runCmd($cmd);
+    return "ERROR:hdfs file created failed\n" unless defined $output;
+
+#    sleep($timeout);
+
+# verify if test file is created successfully
+# size of the file, relica factor and md5 are checked
+    $cmd = "hdfs fsck $testfile_hdfs -locations -files -blocks";
+    $output = runCmd($cmd);
+    return "ERROR:fsck failed\n" unless defined $output;
+    foreach my $line (split /\n/, $output) {
+        if ($line =~ / len\=(\d+) repl\=(\d+) \[/) {
+            $real->{len} = $1;
+            $real->{replicafactor} = $2;
+        }
+        if ($line =~ /Default replication factor\:(\t+)(\d+)/) {
+            $expected->{replicafactor} = $2;
+        }
+        if ($line =~ /The filesystem under path \'$testfile_hdfs\' is (\S+)/) {
+            $real->{status} = $1;
+        }
+    }
+    return "WARN:length does not match\n" unless ($real->{len} == $expected->{len});
+    return "WARN:replica factor does not match\n" unless $real->{replicafactor} eq $expected->{replicafactor};
+    return "WARN:status does not match\n" unless $real->{status} eq "HEALTHY";
+
+# clean up test file
+    my $dfsNameService = ariba::Ops::HadoopProperties::getDfsNameservices($ENV{'HBASE_HOME'});
+    $cmd = "hdfs dfs -rm -r $testfile_hdfs";
+    $output = runCmd($cmd);
+    return "ERROR:test file $testfile_hdfs can not be removed\n" unless $output =~ /Moved/;
+    $cmd = "hdfs fsck $testfile_hdfs";
+    $output = runCmd($cmd);
+    return "ERROR:test file can not be removed\n" unless $output =~ /Path \'$testfile_hdfs\' does not exist/;
+
+    return "OK: HEALTHY\n";
+}
+
+sub runCmd {
+    my $cmd = shift;
+    my $output = `$cmd 2>&1`;
+    if ($?) {
+        return undef;
+    } else {
+        return $output;
+    }
+}
+
+sub hdfsHealth {
+    my $me = shift;
+    ariba::Ops::Startup::Hadoop::setRuntimeEnv($me);
+
+    my $stat = {};
+    my @output = `hdfs dfsadmin -report`;
+    my $inNode;
+    my $nodeStat = {};
+    
+    my @dataHosts = $me->hostsForRoleInCluster('hadoop-data', $me->currentCluster());
+    my %ipToHost;
+    map {
+        my $machine = ariba::Ops::Machine->new($_);
+        $ipToHost{$machine->ipAddr()} = $machine->hostname();
+    } @dataHosts;
+
+    foreach my $line (@output) {
+        my ($name, $value);
+        if ($line =~ /Name: ([\d\.]+)/) {
+            my $nodeIp = $1;
+            $inNode = $ipToHost{$nodeIp} || $nodeIp;
+            $nodeStat = {};
+            next;
+        } elsif ($line =~ /^(Last contact): (.+)$/) {
+            $name = $1;
+            $value = str2time($2) || $2;
+        } elsif ($line =~ /^(Safe mode) is (.+)$/) {
+            $name = $1;
+            $value = $2;
+        } elsif ($line =~ /^([\w ]+): ([\d\w]+)/) {
+            $name = $1;
+            $value = $2;
+        } elsif ($line =~ /^([\w ]+)%: ([\d\.]+)%$/) {
+            $name = "$1 Percent";
+            $value = $2;
+        } else {
+            print "Skipping: $line" if ($debug);
+            next;
+        }
+
+        $name = ariba::util::Misc::xmlNameForText($name);
+        if ($inNode) {
+            $nodeStat->{$name} = $value;
+            if ($name eq 'lastContact') {
+                $stat->{'node'}->{$inNode} = $nodeStat;
+                undef($inNode);
+            }
+            ## Not sure why this is here but it's breaking stuff because we undef $inNode ...
+#            if ($name eq 'lastContact') {
+#                $stat->{'node'}->{$inNode} = $nodeStat;
+#                undef($inNode);
+#            }
+        } else {
+            $stat->{$name} = $value;
+        }
+
+
+        if ($line =~ /\(\d+ total, (\d+) dead\)/) {
+            my $count = $1;
+            my @badHosts;
+
+        if ( $count ){
+            ## Scrape dead nodes from:
+            ## http://app256.lab1.ariba.com:50050/jmx?qry=Hadoop:service=NameNode,name=NameNodeInfo
+            my $port = $me->default( 'Hadoop.DFS.Name.JMXPort' ) || die "ERROR: Cannot read 'Hbase.Master.HttpPort' from DD.xml/P.table!\n";
+            print "Got port '$port'\n" if $debug;
+
+            my $host = ariba::Ops::NetworkUtils::hostname();
+
+            my $url = 'http://' . $host . ':' . $port . '/jmx?qry=Hadoop:service=NameNode,name=NameNodeInfo';
+            print "Scraping JMX from '$url'\n" if $debug;
+            my $monUrl = ariba::monitor::Url->new( $url );
+            my $timeout = 15;
+            my $response = $monUrl->request($timeout);
+
+            my $json = JSON->new->ascii->allow_nonref;
+            my $jsonText = $json->decode( $response );
+
+            foreach my $entry ( keys %{ $jsonText->{ 'beans' }[0] } ){
+                next unless $entry =~ m/DeadNodes/;
+                chomp $entry;
+                my $value = $jsonText->{ 'beans' }[0]->{$entry};
+                my @stuff = split /},"/, $value;
+                ## $VAR1 = [
+                ##           '{"hdp152.lab1.ariba.com":{"lastContact":223037,"decommissioned":false',
+                ##           'hdp157.lab1.ariba.com":{"lastContact":91306,"decommissioned":false',
+                ##           'hdp161.lab1.ariba.com":{"lastContact":10016,"decommissioned":false}}'
+                ##         ];
+                foreach my $crap ( @stuff ){
+                                ## Cleanup each line:
+                                $crap =~ s/^{"//;
+                                #$crap =~ s/^\'//;
+                                $crap =~ s/":.*//;
+                                push @badHosts, $crap
+                }       
+            }
+                $stat->{'datanodesDead'} = join ',', @badHosts;
+            } else {
+                $stat->{'datanodesDead'} = 'None';
+            }
+        }
+    }
+
+    # Prevent attribute from going stale as it is not in output when off
+    $stat->{'safeMode'} = 'OFF' unless ($stat->{'safeMode'});
+
+    my $output = `hdfs dfs -count /`;
+    if ($output && $output =~ /^\s+(\d+)\s+(\d+)\s+\d+\s+/) {
+        $stat->{'filesAndDirectories'} = $1 + $2;
+    }
+
+    return $stat;
+}
+
+sub populateQueriesForStatsWithNamePrefix {
+    my $queries = shift;
+    my $stats = shift;
+    my $queryNamePrefix = shift;
+    my $uiHint = shift || $queryNamePrefix;
+
+    return unless ($queries && $stats);
+
+    foreach my $name (keys %$stats) {
+        my $value = $stats->{$name};
+        my $warn;
+        my $crit;
+        my $format;
+        my $recordMaxResults = 35000;
+        my $critOnWarnAfterMinutes;
+
+        if ($name eq 'node') {
+            foreach my $node (keys %$value) {
+                my $nodeStats = $value->{$node};
+                populateQueriesForStatsWithNamePrefix($queries, $nodeStats, $node);
+            }
+            next;
+        } elsif ($name =~ /^(?:configuredCapacity|presentCapacity|dfsRemaining|dfsUsed|nonDfsUsed)$/) {
+            $value = $value / $GB if ($value);
+            $warn = 'answer < 1' unless ($name =~ /Used$/);
+            $format = '%.2f GB';
+        } elsif ($name =~ /dfsUsedPercent/) {
+            $warn = 'answer > 75';
+            $crit = 'answer > 85';
+            $format = '%.2f %%';
+        } elsif ($name =~ /dfsRemainingPercent/) {
+            $warn = 'answer <= 10';
+            $format = '%.2f %%';
+        } elsif ($name =~ /^(?:blocksWithCorruptReplicas|missingBlocks)$/) {
+            $warn = 'answer > 0';
+        } elsif ($name eq 'datanodesDead') {
+            $crit = 'answer ne "None"';
+        } elsif ($name eq 'datanodesAvailable') {
+            $crit = 'answer < 1';
+        } elsif ($name eq 'lastContact') {
+            $value = time() - $value if ($value);
+            $format = 'scaleTime(answer) ago';
+            $crit = 1 if ($value > 60 * 10);
+        } elsif ($name eq 'safeMode') {
+            $warn = 'answer eq "ON"';
+            $critOnWarnAfterMinutes = 30;
+            undef($recordMaxResults);
+        } elsif ($name eq 'filesAndDirectories') {
+            $warn = 'answer > 10000000';
+            $crit = 'answer > 14000000';
+        } elsif ($name eq 'decommissionStatus') {
+            $crit = 'answer ne "Normal"';
+        } else {
+            undef($recordMaxResults) unless ($name eq 'underReplicatedBlocks');
+        }
+
+        my $queryName = ariba::util::Misc::textForXmlName($name);
+        $queryName =~ s/\bdfs\b/storage/g;
+
+        (my $inf_field = "$queryNamePrefix $queryName") =~ s/^\s*(.*?)$/$1/;
+        $inf_field =~ s/\s+/_/g;
+
+        $queries->{"$queryNamePrefix $queryName"} = {
+            format  => $format,
+            uiHint  => $uiHint,
+            warn    => $warn,
+            crit    => $crit,
+            perl    => sub { return $value },
+            recordMaxResults => $recordMaxResults,
+            critOnWarnAfterMinutes => $critOnWarnAfterMinutes,
+            inf_field => $inf_field,
+            inf_default => "none",
+            group_by => "1", 
+        };
+    }
+}
+
+main(@ARGV);

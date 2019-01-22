@@ -1,0 +1,219 @@
+#!/usr/local/bin/perl
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use Data::Dumper;
+use LWP::Simple qw($ua get);
+use Getopt::Long;
+
+sub usage
+{
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h|-port] [-cluster <name>]
+
+    -e              Enables sending of email for monitor query.
+    -p              Enables sending of pages for monitor query.
+    --debug, -d     Turns on debug mode. 
+    -h              Shows this help.
+    -port           Specifies the port to query the log-viewer.   Default: 61502
+    -warn           Specifies the log size to raise warning.      Default: 1.5GB
+    -crit           Specifies the log size to raise critical.     Default: 10GB
+    -timeout        Sets timeout for hitting log-viewer.          Default: 30 seconds
+    -cluster        Specifies the name of the cluster.            Default: Current cluster of the product
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+    return 0;
+}
+
+sub main
+{
+    my %opts;    # setting defaults here
+    my $debug     = 0;
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $port      = ariba::Ops::Constants->logViewerPort();
+    my $warn      = 1.5;                                      # 1.5GB
+    my $crit      = 10;                                       # 10GB
+    my $help      = 0;
+    my $timeout   = 30;                                       # 30 second timeout for LWP::Simple
+    my $cluster;
+
+    GetOptions(
+               "h"         => \$help,
+               "debug|d"   => sub {$debug++;},
+               "e"         => \$sendEmail,
+               "p"         => \$sendPage,
+               "port=i"    => \$port,
+               "warn=i"    => \$warn,
+               "crit=i"    => \$crit,
+               "timeout=i" => \$timeout,
+               "cluster=s" => \$cluster,
+              );
+
+    exit (usage()) if ($help);
+
+    my $me       = ariba::rc::InstalledProduct->new();
+    my $service  = $me->service();
+    my @products = ariba::rc::InstalledProduct::installedProductsList($service);
+
+    my $crit_condition = "answer =~ /crit/";    # purposely set here so that we can "undef" this to prevent pages when hitting log-viewer fails
+
+    $ua->timeout($timeout);                     # setting LWP::Simple timeout
+
+    print "DEBUG: $debug\n" if $debug;
+
+    $cluster = $me->currentCluster() unless ($cluster);
+
+    foreach my $product (@products)
+    {
+        print $product->name(), "\n" if $debug;
+        print "cluster: " . $product->currentCluster() . "\n" if $debug;
+
+        next unless ($product->currentCluster() eq $cluster);
+
+        my @hosts = $product->allHostsInCluster($product->currentCluster());
+        my %queries;
+        my $productName = $product->name();
+
+        my $customer = $product->customer();
+
+        foreach my $host (@hosts)
+        {
+            print $host, "\n" if $debug;
+
+            next if ($host =~ /^(nfs|storadmin|backup)/);    # OK list of hostname patterns to skip
+
+            my $url = "http://$host:$port/lspat/$service/" . $product->name();
+            $url .= "/$customer" if defined ($customer);     # appending customer to the URL if defined
+
+            my $content     = LWP::Simple::get($url);
+            my $queryString = 0;
+            my $errorString = '';
+            my $roundedGB;
+            my $logName;
+            my $size;
+            my $sizeGB;
+
+            if ($content)
+            {
+                my @lines = split (/\n/, $content);
+
+                foreach my $line (@lines)
+                {
+                    $line =~ s/^\s+//g;
+                    my @elements = split (/\s+/, $line);
+                    $size = $elements[0];
+
+                    if (defined $size && $size =~ /^\d+$/)
+                    {
+                        ($logName) = $elements[-1] =~ />(.*)</;
+
+                        if (defined $logName)
+                        {
+
+                            ### Skip warning or critical alert for tls-security log files
+                            next if ($logName =~ /^tls-security/);
+
+                            $sizeGB = $size / 1024 / 1024 / 1024;     # converting to Gigabytes
+                            $roundedGB = sprintf ("%.2f", $sizeGB);
+
+                            #if ( $sizeGB > $crit ) {
+                            #    print "$host crit: $logName size ${roundedGB}GB > ${crit}GB\n" if $debug;
+                            #    $queryString .= "crit: $logName size ${roundedGB}GB > ${crit}GB\n";
+                            #}
+                            if ($sizeGB > $warn)
+                            {
+                                print "$host warn: logname:$logName size ${roundedGB}GB > ${warn}GB\n" if $debug;
+                                $queryString = 1;
+                                $queries{qq|KR log size for $host host|} = {
+                                                                       warn          => "answer =~ /warn/",
+                                                                       crit          => $crit_condition,
+                                                                       error         => $errorString,
+                                                                       perl          => "return $queryString",
+                                                                       'inf_field'   => "krlog_size_status",
+                                                                       'inf_default' => "none",
+                                                                       'inf_tags'    => qq(host="$host"),
+                                                                       'group_by'    => qq($host),
+                                                                      };
+                                $queries{qq|KR log size for $host size|} = {
+                                                                            warn          => "answer =~ /warn/",
+                                                                            crit          => $crit_condition,
+                                                                            error         => $errorString,
+                                                                            perl          => "return $roundedGB",
+                                                                            'inf_field'   => "size",
+                                                                            'inf_default' => 0,
+                                                                            'inf_tags'    => qq(host="$host"),
+                                                                            'group_by'    => qq($host),
+                                                                           };
+                                $queries{qq|KR log size for $host error|} = {
+                                                                             warn          => "answer =~ /warn/",
+                                                                             crit          => $crit_condition,
+                                                                             error         => $errorString,
+                                                                             perl          => "return q($errorString)",
+                                                                             'inf_field'   => "error",
+                                                                             'inf_default' => "none",
+                                                                             'inf_tags'    => qq(host="$host"),
+                                                                             'group_by'    => qq($host),
+                                                                            };
+                                $queries{qq|KR log size for $host logname|} = {
+                                                                               warn          => "answer =~ /warn/",
+                                                                               crit          => $crit_condition,
+                                                                               error         => $errorString,
+                                                                               perl          => "return q($logName)",
+                                                                               'inf_field'   => "logname",
+                                                                               'inf_default' => "none",
+                                                                               'inf_tags'    => qq(host="$host"),
+                                                                               'group_by'    => qq($host),
+                                                                              };
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                $errorString    = "Could not hit log-viewer";
+                $queryString    = 1;
+                $crit_condition = undef;
+                $queries{qq|KR log size for $host host|} = {
+                                                       warn          => "answer =~ /warn/",
+                                                       crit          => $crit_condition,
+                                                       error         => $errorString,
+                                                       perl          => "return $queryString",
+                                                       'inf_field'   => "krlog_size_status",
+                                                       'inf_default' => 1,
+                                                       'inf_tags'    => qq(host="$host"),
+                                                       'group_by'    => qq($host),
+                                                      };
+                $queries{qq|KR log size for $host error|} = {
+                                                             warn          => "answer =~ /warn/",
+                                                             crit          => $crit_condition,
+                                                             error         => $errorString,
+                                                             perl          => "return q($errorString)",
+                                                             'inf_field'   => "error",
+                                                             'inf_default' => "none",
+                                                             'inf_tags'    => qq(host="$host"),
+                                                             'group_by'    => qq($host),
+                                                            };
+            }
+        }
+        $queries{"influx_details"} = {'measurement' => "logsize_watcher"};
+        my $email = $me->default('notify.email');
+        my $qm = ariba::monitor::QueryManager->newWithDetails('logsize-watcher', $product->name(), $product->service(), $product->customer(), $cluster, \%queries);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+main();
+
+__END__
+
+

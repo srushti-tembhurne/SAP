@@ -1,0 +1,133 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/arches/system-rebuild#10 $
+#
+# Monitorign for system rebuild on DR 
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Url;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode. 
+    -h        Shows this help.
+    -prod     Product name
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $prodname = 'arches';
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-prod$/o) { $prodname = shift;   next; }
+
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled($prodname, $me->service()));
+    my $arches = ariba::rc::InstalledProduct->new($prodname, $me->service());
+
+
+    foreach my $cluster ( $arches->allClusters() ) {
+           my $qManager = $cluster eq 'primary' ? "system reshard" : "system rebuild";
+
+    	   my @appinstances = grep { $_->appName() eq 'IndexMgr' } $arches->appInstancesInCluster($cluster);
+	  
+    	   my %queries;
+           my $response;
+    	   foreach my $instance (@appinstances) {
+    	    	my $system_rebuild_url = $instance->systemRebuildURL();
+    		    my $status = systemRebuildStatus($system_rebuild_url);
+    		    print "instance name : ".$instance->appName()."\t".$system_rebuild_url."\t"."status: $status"."\n" if ($debug > 1);
+
+		        if($status) {
+		            $response = $status;
+		            last;
+		        }
+    	   }
+    
+           if ($response) {
+           ## If there is an error response from the url, return the url error
+    
+              $queries{"$qManager status"} = {
+                   crit => 'answer =~ /error/ && previousAnswer =~ /error/', 
+                   warn => 'answer =~ /error/',
+                   perl => sub { return $response; }, 
+                   description => "Checks $qManager status", 
+                   correctiveActions   => [
+                       Ops => 'Follow up with engineering',
+                   ],
+                   inf_field => "status",
+                   inf_tags  => qq(system="$qManager"),
+                   group_by  => $qManager,
+              };
+           }
+           # For the top level expando, we need to replace the space with a dash, because this one is used literally.
+           $qManager =~ s/\s/-/;
+
+           my $email = $me->default('notify.email');
+           $queries{'influx_details'} = { measurement => 'arches_system_reshard',tags => qq(cluster=$cluster)};
+           my $qm = ariba::monitor::QueryManager->newWithDetails($qManager, $arches->name(), $arches->service(), undef, $cluster, \%queries);
+           $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub systemRebuildStatus {
+    my $rebuildUrl = shift;
+
+    debug("Checking $rebuildUrl");
+
+    my $url = ariba::monitor::Url->new($rebuildUrl);
+    my $response = $url->request();
+    debug("Response: $response");
+
+    if ($url->error()) {
+        debug("Error: " . $url->error());
+        return ($url->error());
+    }
+    
+    return $response;
+}
+
+sub debug {
+    print "(debug) @_\n" if ($debug);
+}
+
+#
+# sample output DEV8 service
+# http://app469.lab1.ariba.com:43003/Arches/api/jobs/systemrebuildstatus?awpwd=awpwd
+#
+# ok
+#
+
+main(@ARGV);
+
+__END__

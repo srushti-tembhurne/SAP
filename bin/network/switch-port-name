@@ -1,0 +1,212 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/network/switch-port-name#10 $
+
+use strict;
+use File::Basename;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::NetworkDeviceManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::CipherStore;
+use ariba::rc::InstalledProduct;
+use ariba::SNMP::Session;
+use dmail::LockLib;
+
+my $debug = 0;
+my $lockFile = "/tmp/Stratus" . basename($0);
+
+sub main {
+
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage  = 1; };
+		if ($arg =~ /^-d/o) { $debug     = 1; };
+	}
+
+	die "can't grab lock\n" unless dmail::LockLib::requestlock($lockFile, 5);
+
+	my $me    = ariba::rc::InstalledProduct->new();
+	my $email = $me->default('notify.email');
+
+	my $user = $me->deploymentUser();
+	my $ouiDB = "/home/$user/etc/oui.txt";
+
+	my $cipherStore    = ariba::rc::CipherStore->new($me->service());
+	my $accessPassword = $cipherStore->valueForName('networkAccess');
+	my $enablePassword = $cipherStore->valueForName('networkEnable');
+
+	for my $datacenter ( ariba::Ops::ProductAPIExtensions::datacentersForProducts($me) ) {
+
+		my %match = (
+			'datacenter'       => $datacenter,
+			'providesServices' => 'switch',
+			'status'	   => 'inservice',
+		);
+
+		my @switches = ariba::Ops::Machine->machinesWithProperties(%match);
+		my %queries  = ();
+
+		return unless scalar @switches > 0;
+
+		for my $switch (@switches) {
+
+			my $switchName    = $switch->hostname();
+			my $networkDevice = ariba::Ops::NetworkDeviceManager->newFromMachine($switch);
+
+			unless($networkDevice) {
+				print "[DEBUG] driver init failed for $switchName: '$@', skipping...\n" if $debug;
+				$@ = undef; # clear the error
+				next;
+			}
+
+			my $snmp          = ariba::SNMP::Session->newFromMachine($switch);
+
+			$networkDevice->setAccessPassword($accessPassword);
+			$networkDevice->setEnablePassword($enablePassword);
+
+			my $arpTable      = $networkDevice->arpTable();
+			my $camTable      = $networkDevice->camTable();
+			my @errors        = ();
+
+			my $portsWithNoDesc = $networkDevice->getPortsWithNoDesc();
+			@errors = @$portsWithNoDesc;
+
+			while (my ($ifPort, $table) = each %$camTable) {
+
+				my $portName = $table->{'portName'};
+				my $macAddr  = $table->{'macAddr'};
+				my $machine;
+				my $portType = "";
+
+				# Skip over well known cisco HSRP and VRRP mac addresses.  See TMID:56972
+				if ($macAddr =~ /^(?:0:0:c:7:ac:|0:0:5e:0:1:)/) {
+					print "skipping macaddress $macAddr.  It's a well known CISCO HSRP or VRRP address\n" if $debug;
+					next;
+				}
+
+				# Always skip over these..
+				# Adding ignor for loki. This is the safeguard host in pghdev.
+				if (defined $portName && $portName =~ /(?:trunk|hsrp|ldir|pix|asa\d\d|mirror|netmon|manage|loki|fe\d-\d)/i) {
+					next;
+				}
+
+				if (defined $ifPort && $ifPort =~ /GEC/) {
+					next;
+				}
+
+				# We don't have any good way of ORing two different fields.
+				for my $type (qw(macAddr macAddrSecondary macAddrTernary macAddrQuadrary macAddrConsole)) {
+
+					my %match = (
+						$type => $macAddr,
+						'datacenter' => $datacenter,
+					);
+														     
+					($machine) = ariba::Ops::Machine->machinesWithProperties(%match);
+
+					if ($type eq 'macAddr') {
+						$portType = ' Pri';
+					} elsif ($type eq 'macAddrSecondary') {
+						$portType = ' Sec';
+					} elsif ($type eq 'macAddrTernary') {
+						$portType = ' Ter';
+					} elsif ($type eq 'macAddrQuadrary') {
+						$portType = ' Quad';
+					} elsif ($type eq 'macAddrConsole') {
+						$portType = ' Con';
+					}
+
+					last if defined $machine;
+
+				}
+
+				unless (defined $machine) {
+
+					# Try looking harder.. snarf the mac
+					# address out of the arp table, and
+					# see if we can find a match.
+					my $ipAddr = $arpTable->{$macAddr};
+
+					if (defined $ipAddr && ariba::Ops::NetworkUtils::isIPAddr($ipAddr)) {
+
+						my $hostname = ariba::Ops::NetworkUtils::addrToHost($ipAddr);
+
+						push @errors, sprintf("Found %s on %s - %s not in the machinedb!\n", $hostname, $ifPort, $macAddr);
+
+					} else {
+
+						push @errors, sprintf("Couldn't find a machine on port %s matching macAddr: %s - vendor: %s\n",
+							$ifPort, $macAddr, ariba::Ops::NetworkUtils::vendorForMacAddress($macAddr, $ouiDB),
+						);
+					}
+
+					next;
+				}
+
+				my $shortHost = ariba::Ops::NetworkUtils::fqdnToShortHostname($machine->hostname()); 
+				$shortHost .= $portType;
+
+				unless ($portName) {
+
+					if ($debug) {
+						print "\tPort $ifPort doesn't have a description!\n";
+						print "\tMaybe it should be: [$shortHost]\n";
+					}
+
+					unless ($networkDevice->setPortName($ifPort, $shortHost)) {
+						push @errors, "Couldn't setPortName() for $ifPort / $shortHost !\n";
+					}
+
+					next;
+				}
+
+				# If the description set on the switch doesn't match the shortHost derived from MDB
+				# Change the description on the port.
+				if ( $shortHost ne $portName) {
+
+					if ($debug) {
+						print "\tPort $ifPort doesn't match the existing description ($portName)!\n";
+						print "\tMaybe it should be: [$shortHost]\n";
+					}
+
+					unless ($networkDevice->setPortName($ifPort, $shortHost)) {
+						push @errors, "Couldn't setPortName() for $ifPort / $shortHost !\n";
+					}
+				}
+			}
+
+			my $errors = join('', @errors);
+                        my $error_count = scalar (@errors);
+
+			$queries{"$switchName port name problems"} = {
+				info => "answer > -1",
+				warn => "answer > 0", 
+				perl => "return qq{$error_count}",
+				inf_field => "error_count",
+				inf_tags => "switch_name=\"$switchName\"",
+				default => 0,
+			};
+
+		}
+
+		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+		$queries{influx_details} = {measurement => "network_switch_port_name"};
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			'network-switch-port-name', $pn, $me->service(), $me->customer(), \%queries
+		);
+
+		$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+	dmail::LockLib::releaselock($lockFile);
+}
+
+main();

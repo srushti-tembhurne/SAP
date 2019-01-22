@@ -1,0 +1,315 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/common/integration-events#17 $
+#
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::Url;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Query;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use Data::Dumper;
+
+my $sqlError;
+
+sub main {
+    my $debug = 0;
+    my $quiet = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $productName;
+    
+    while(my $arg=shift(@ARGV)){
+        print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+        if($arg =~ /^-d/o){ $debug=1; }
+        if($arg =~ /^-e/o){ $sendEmail=1; };
+        if($arg =~ /^-p$/o){ $sendPage=1; };
+        if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+    }
+    
+    my $me = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+    
+    my $product;
+    unless (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
+        exit(0);
+    }
+    $product = ariba::rc::InstalledProduct->new($productName, $service);
+    
+    my $skip = 0;
+    
+    my %queries  = ();
+    
+    $queries{"Failed pending queue exports"} = {
+        'info' => "numrows > -1",
+        'skip' => $skip,
+        'crit' => "numrows > 0",
+        'perl' => sub { main::failedPendingQueue($product) },
+        inf_field => "failed_pending_queue",
+        inf_default => 0,
+        group_by => "one",
+    };
+    $queries{"Failed toolkit import events and other exports (prod realm)"} = {
+        'info' => "numrows > -1",
+        'crit' => "numrows >= 1",
+        'recordMaxResults' => 40000,
+                'recordItem' => 'numrows',
+        'skip' => $skip,
+        'perl' => sub { main::failedEvents($product) },
+        inf_field => "failed_import_export",
+        inf_default => 0,
+        group_by => "one",
+    };
+    $queries{"Failed events (test realms)"} = {
+        'info' => "numrows > -1",
+        'crit' => 0, # Set in code later
+        'skip' => $skip,
+        'perl' => sub { main::failedOther($product) },
+        inf_field => "failed_events",
+        inf_default => 0,
+        group_by => "one",
+    };
+    $queries{"Failed to send events (current) count"} = {
+        'sql' => q/
+            SELECT count(*) as failed_event_current_cnt
+            FROM IntegrationEventLogTab Int1, GlobalIntegrationErrorTab Rec2, 
+                IntegrationErrorItemTab Int3 
+            WHERE Int1.arl_ErrorDetails = Rec2.rootId AND Rec2.gie_Items = Int3.lvId AND 
+                Rec2.rootId = Int3.rootId AND Int1.arl_Status = 'Error' AND 
+                Int3.iei_ErrorMessage LIKE 'Fault received when processing the WS exchange%Couldn''t send message.' AND 
+                (Int1.arl_Active = 1) AND (Int1.arl_PurgeState = 0) AND (Rec2.gie_Active = 1) AND 
+                (Rec2.gie_PurgeState = 0)
+            /,
+        inf_default => 0,
+        group_by => "one",
+    };
+    $queries{"Failed to send events in last 24 hours count"} = {
+        'sql' => q/
+            SELECT count(*) as failed_event_24hrs_cnt
+            FROM IntegrationEventLogHistoryTab Int1, GlobalIntegrationErrorTab Rec2, 
+                IntegrationErrorItemTab Int3 
+            WHERE Int1.alh_ErrorDetails = Rec2.rootId AND Rec2.gie_Items = Int3.lvId AND
+                Rec2.rootId = Int3.rootId AND (Int1.alh_Status = 'Error' AND
+                Int1.alh_TimeCreated > sysdate-1 AND
+                Int3.iei_ErrorMessage LIKE 'Fault received when processing the WS exchange%Couldn''t send message.') AND 
+                (Int1.alh_Active = 1) AND (Int1.alh_PurgeState = 0) AND (Rec2.gie_Active = 1) AND
+                (Rec2.gie_PurgeState = 0)
+            /,
+        inf_default => 0,
+        group_by => "one",
+    };
+
+
+    ### Leaving the sql in the source code, jic we need for future
+=pod
+    $queries{"Failed to send events (current)"} = {
+        'info' => 'numrows > -1', 
+        'recordMaxResults'  => 40000,
+        'recordItem'        => 'numrows',
+        'format'            => "RootId %s, Created %s, Partition %s, Error %s\n",
+        'sql' => q/
+            SELECT Int1.rootId as rootid, to_char(Int1.arl_TimeCreated, 'YYYY-MM-DD HH24:MI:SS') as time_created, Int1.arl_PartitionNumber as partition_num,
+                Int3.iei_ErrorMessage as iei_errormsg, 'current' as type
+            FROM IntegrationEventLogTab Int1, GlobalIntegrationErrorTab Rec2, 
+                IntegrationErrorItemTab Int3 
+            WHERE Int1.arl_ErrorDetails = Rec2.rootId AND Rec2.gie_Items = Int3.lvId AND 
+                Rec2.rootId = Int3.rootId AND Int1.arl_Status = 'Error' AND 
+                Int3.iei_ErrorMessage LIKE 'Fault received when processing the WS exchange%Couldn''t send message.' AND 
+                (Int1.arl_Active = 1) AND (Int1.arl_PurgeState = 0) AND (Rec2.gie_Active = 1) AND 
+                (Rec2.gie_PurgeState = 0)
+            /,
+    };
+    $queries{"Failed to send events in last 24 hours"} = {
+        'info' => 'numrows > -1', 
+        'recordMaxResults'  => 40000,
+        'recordItem'        => 'numrows',
+        'format'            => "RootId %s, Created %s, Partition %s, Error %s\n",
+        'sql' => q/
+            SELECT Int1.rootId as rootid, to_char(Int1.alh_TimeCreated, 'YYYY-MM-DD HH24:MI:SS') as time_created, Int1.alh_PartitionNumber as partition_num,
+                Int3.iei_ErrorMessage as iei_errormsg, 'last_24_hours' as type
+            FROM IntegrationEventLogHistoryTab Int1, GlobalIntegrationErrorTab Rec2, 
+                IntegrationErrorItemTab Int3 
+            WHERE Int1.alh_ErrorDetails = Rec2.rootId AND Rec2.gie_Items = Int3.lvId AND
+                Rec2.rootId = Int3.rootId AND (Int1.alh_Status = 'Error' AND
+                Int1.alh_TimeCreated > sysdate-1 AND
+                Int3.iei_ErrorMessage LIKE 'Fault received when processing the WS exchange%Couldn''t send message.') AND 
+                (Int1.alh_Active = 1) AND (Int1.alh_PurgeState = 0) AND (Rec2.gie_Active = 1) AND
+                (Rec2.gie_PurgeState = 0)
+            /,
+    };
+=cut
+    
+    my $email = $me->default('notify.email');
+   
+    $queries{influx_details} = { measurement => "integration_events" };
+    my $q = ariba::monitor::QueryManager->newWithDetails(
+        "integration-events", $product->name(), $service, $product->customer(), \%queries
+        );
+    
+    $q->setSQLConnectInfo($product->connectInfoForOracleClient());
+    $q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+my %realms = ();
+my @results = ();
+
+sub getStatus {
+    my $product = shift;
+
+    my $dbc = ariba::Ops::DBConnection->connectionsForProductOfDBType($product, ariba::Ops::DBConnection->typeMain());
+
+#
+# check the last 30 days of event log history for all events currently in error state. 
+# note that we use a heuristic approach to pick out export events, since there's no easy way to get to it
+#
+    
+    my $rcmap = "SELECT id, name, communityid, rp_realmtype from realmtab, communitytab, realmprofiletab where realmid = id AND rp_id = id";
+
+    my $badEventsSql =  
+    "SELECT Int1.alh_AdapterName as adaptername,Int1.alh_Status as status,Int2.arl_clienttype as client_type,
+       CASE WHEN Int2.arl_lastqueuedtime IS NOT NULL OR Int2.arl_objectspending > 0 THEN 'PENDING' ELSE 'EXPORT' END as last_queuedtime
+       FROM IntegrationEventLogHistoryTab Int1, IntegrationEventLogTab Int2 
+WHERE 
+Int2.arl_AdapterName = Int1.alh_AdapterName AND 
+Int2.arl_UniqueName IN 
+   (SELECT Int101.arl_UniqueName FROM IntegrationEventLogTab Int101 
+     WHERE Int101.arl_Status = 'Error' AND 
+           (
+           (
+              (LOWER(Int101.arl_UniqueName) LIKE '%push%' 
+                 OR 
+               LOWER(Int101.arl_UniqueName) LIKE '%export%') 
+            AND 
+               LOWER(Int101.arl_UniqueName) NOT LIKE '%exportmap%'
+            AND
+                (Int101.arl_StatusMessage IS NULL OR Int101.arl_StatusMessage NOT LIKE '%65535%')
+           ) 
+           OR Int101.arl_clienttype = 'DataTransferTool') AND (Int101.arl_Active = 1) AND (Int101.arl_PurgeState = 0)) AND 
+      (SYSTIMESTAMP - cast(Int1.alh_TimeCreated as TIMESTAMP) < interval '30' day) AND (Int1.alh_Active = 1) AND (Int1.alh_PurgeState = 0) ORDER BY Int1.alh_AdapterName ASC, Int1.alh_TimeCreated  DESC";
+        
+        my $oc = ariba::Ops::OracleClient->newFromDBConnection($dbc);
+        my @schemaResults = ();
+        my @schemaRealms = ();
+        if ($oc->connect()) {
+            $oc->executeSqlWithTimeout($rcmap, 60, \@schemaRealms);
+            if($oc->error()) {
+                $sqlError = $oc->error();
+                @schemaRealms = ();
+            }
+            $oc->executeSqlWithTimeout($badEventsSql, 300, \@schemaResults);
+            if($oc->error()) {
+                $sqlError = $oc->error();
+                @schemaResults = ();
+            }
+            $oc->disconnect();
+        } else {
+            $sqlError = $oc->error();
+        }
+
+        push @results, @schemaResults;
+
+        for my $r (@schemaRealms) {
+            $realms{$r->{ID}} = qq($r->{NAME}\t$r->{COMMUNITYID}\t$r->{RP_REALMTYPE});
+        }
+}
+
+sub failedPendingQueue {
+    my $product = shift;
+
+    return getFailed($product, 'PENDING',-1);
+}
+
+sub failedEvents {
+    my $product = shift;
+
+    return getFailed($product, 'EXPORT',0);
+}
+
+sub failedOther {
+    my $product = shift;
+
+    return getFailed($product, 'EXPORT',1);
+}
+
+sub getFailed
+{
+    my $product = shift;
+    my $filterkind = shift;
+    my $filtertype = shift;
+
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+    
+    if (!%realms) {
+        getStatus($product);
+    }
+
+    if(defined($sqlError)) {
+        $query->setError($sqlError);
+    $query->setCrit(1);
+    return ($sqlError);
+    }
+
+    my @bad = ();
+
+    my $prev = "";
+    my $count = 0;
+    
+#
+# each event (adapter source) for which the latest two statuses is error is bad
+# for pending queue events (not web services though at this point), we need to send a page, we'll add a string we check for crit
+#
+
+    for my $result (@results) {
+        my $adapter = $result->{ADAPTERNAME};
+        my $status  = $result->{STATUS};
+        my $cl      = $result->{CLIENT_TYPE};
+        my $kind    = $result->{LAST_QUEUEDTIME};
+
+        if ($adapter ne $prev) {
+            $count = 0;
+            $prev = $adapter;
+        }
+        if ($count != -1 && $status eq 'Error') {
+            $count++;
+            if ($count == 2) {
+                my $name = $adapter;
+                $adapter =~ /realm_(\d+)/;
+                my $realmId = $1;
+                my ($realmname, $realmcomm, $realmtype) = split("\t", $realms{$realmId});
+# note realtime (= web services) events also show up as pending due to the query, so we do some name magic check
+                if ($kind eq 'PENDING' && ($adapter =~ /realtime/i)) {
+                    $kind = 'EXPORT';
+                }
+                if ($filterkind eq $kind && 
+                    ($filtertype == -1 || $filtertype eq $realmtype)) {
+                    push @bad, "$name ($realmname Community $realmcomm)";
+                }
+            }
+        }
+        else {
+# we're not interested in the further history
+            $count = -1;
+        }
+    }
+
+    # Adding severity to 'Failed toolkit import events and other exports (prod realm)' query
+    # tmid: 159160
+    if ($filterkind eq 'EXPORT' && $filtertype == 0) {
+        $query->setSeverity(1);
+        $query->setSeverity(0) if (scalar(@bad) > 1);
+    }
+    
+    return join(";",@bad);
+}
+
+main();
+

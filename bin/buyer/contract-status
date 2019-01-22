@@ -1,0 +1,55 @@
+#!/usr/local/bin/perl
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../../lib";
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::OracleClient;
+use ariba::Ops::NotificationRequest;
+use ariba::Ops::ProductAPIExtensions;
+
+sub main {
+    my $debug = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while(my $arg = shift) {
+        if($arg =~ /^-d/) { $debug = 1; next; }
+        if($arg =~ /^-e/) { $sendEmail = 1; next; } 
+        if($arg =~ /^-p/) { $sendPage = 1; next; }  
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    # exit unless($me->service() =~ /^(?:prod|dev)$/);
+    my $buyer = ariba::rc::InstalledProduct->new("buyer", $me->service());
+    my $email = $me->default('notify.email');
+
+    my %q;
+    $q{"Broken contracts needing attention from support"} = {
+        info => 1,
+        timeout => 3600,
+        sql => "SELECT count(*) as contract_count 
+            FROM
+            ContractRequestTab Con1, ApprovableTab App2 WHERE App2.rootId =
+            Con1.rootId AND (App2.ap_StatusString IN ('SourcingConfirming',
+            'SourcingFailed', 'SourcingCompleted', 'Processing') AND App2.ap_Type =
+            'ariba.contract.core.ContractRequest') AND (App2.ap_Active = 1) AND
+            (App2.ap_PurgeState = 0) ORDER BY App2.ap_PartitionNumber,
+            App2.ap_LastModified, App2.ap_StatusString ASC, App2.ap_UniqueName ASC",
+    };
+
+    $q{influx_details} = {measurement => 'buyer_contract_status'};
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails(
+        "contract-status", "buyer", $me->service(), undef, $me->currentCluster(), \%q
+    );
+
+    $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($buyer));
+
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);

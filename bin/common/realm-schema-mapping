@@ -1,0 +1,250 @@
+#!/usr/local/bin/perl
+#
+# $Id: $
+#
+# Script to monitor realm-to-schema mappings and wrongly-assigned realms
+#
+# Checks the results of a scheduled task which in turn checks whether rootIds
+# for a particular table are mapped correctly to the right schema.
+#
+# https://devwiki.ariba.com/bin/view/Main/DBSchemaRealmMappingVerificationTask
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::OracleClient;
+use ariba::Ops::HanaClient;
+use ariba::Ops::DBConnection;
+use Data::Dumper;
+
+my $debug = 0;
+
+my %misallocated_realms;
+
+my $hana_dbtype   = lc(ariba::Ops::DBConnection->hanaDBServerType);
+my $oracle_dbtype = lc(ariba::Ops::DBConnection->oracleDBServerType);
+
+sub main {
+	my $quiet = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $productName;
+
+	while(my $arg=shift(@ARGV)){
+			print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+			if($arg =~ /^-d/o){ $debug=1; }
+			if($arg =~ /^-e/o){ $sendEmail=1; };
+			if($arg =~ /^-p$/o){ $sendPage=1; };
+			if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $cluster = $me->currentCluster();
+	my $service = $me->service();
+
+	my $product;
+	unless (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
+		print "ERROR: $productName is not installed in $service\n";
+		exit(-1);
+	}
+	$product = ariba::rc::InstalledProduct->new($productName, $service);
+
+	#
+	# fetch via front-door instead of hitting instances directly to
+	# avoid dead/unresponsive instances
+	#
+	my $url = $product->default('VendedUrls.FrontDoor') . "/ad/schemaRealmMappingStatus/MonitorActions";
+
+	my ($realmSchemaMapStatus, $error, $requestString) = fetchAndParse($url);
+
+	my (%queries, %queries2) = ( (), () );
+	$queries{"Realm to schema mapping status"} = {
+		info => "answer && answer =~ /^OK/i",
+		warn => "!answer || '$error' || answer =~ /^ERROR/i",
+		crit => 0,
+		perl => sub { return $realmSchemaMapStatus; },
+		note => "results from $url",
+		requestString => $requestString,
+        inf_field => "status",
+        inf_default => "none",
+	};
+
+	$queries{"Realm to schema to SID  mapping (ID, Name, Schema, SID)"} = {
+		rowCountLimit => 20000,
+		info => 1,
+		perl => sub { realmSchemaSid($product); },
+		timeout => 360,
+	};
+
+	# check for wrongly-assigned realms.
+	# realmSchemaSid() gets this data, so we need to ensure its QM runs before this one.
+	for my $dbtype ($oracle_dbtype, $hana_dbtype) {
+		$queries2{"wrongly assigned $dbtype realms (ID, Name, Schema, SID)"} = {
+			crit => 'answer',
+			perl => sub { return $misallocated_realms{$dbtype}; },
+			correctiveActions => [
+				Ops => 'Contact the Ariba-on-Hana engineering team.',
+			],
+		};
+	}
+
+	$queries{"influx_details"} = { 'measurement' => "realm_schema_mapping"};
+	my $email = $me->default('notify.email');
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails(
+		"realm-schema-mapping", $product->name(), $service, $product->customer(), \%queries
+	);
+
+	my $qm2 = ariba::monitor::QueryManager->newWithDetails(
+		"wrongly-assigned-realms", $product->name(), $service, $product->customer(), \%queries2
+	);
+
+	$qm->processQueries ($debug, $email, $sendEmail, $sendPage);
+	$qm2->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+sub fetchAndParse {
+	my $url = shift;
+
+	my $da = ariba::monitor::Url->new($url);
+
+	$da->setTimeout(60*10);
+	$da->useOutOfBandErrors();
+	$da->setSaveRequest(1);
+
+	my @results = $da->request();
+	my $error = $da->error();
+
+	# Retry once on timed out
+	if ($error =~ /timed out/) {
+		@results = $da->request();
+		$error = $da->error();
+	}
+
+	my $requestString = $da->requestString();
+
+	my $status = "";
+
+# OK result
+#
+#<?xml version="1.0" ?>
+#<SchemaRealmMapping>
+#<status>OK</status>
+#</SchemaRealmMapping>
+#
+# Error result
+#
+#<?xml version="1.0" ?>
+#<SchemaRealmMapping>
+#<status>ERROR - RootId: AAAUACtBf+y, which belongs to Realm: [Realm id=2 name=realmtest label="sdf" state=enabled weight=1 variant=[Variant vrealm_2 "vrealm_2" 20 realm] baseDomainVariant=null version=5 timeStateChanged=Tue Oct 30 00:00:00 PDT 2007], is mapped to the wrong Schema: Transaction.Schema3 ...</status>
+#<status>ERROR - RootId: AAAUACtBf45, which belongs to Realm: [Realm id=2 name=realmtest label="sdf" state=enabled weight=1 variant=[Variant vrealm_2 "vrealm_2" 20 realm] baseDomainVariant=null version=5 timeStateChanged=Tue Oct 30 00:00:00 PDT 2007], is mapped to the wrong Schema: Transaction.Schema3 ...</status>
+#...
+#</SchemaRealmMapping>
+
+	if ($error) {
+		$status = $error;
+	} else {
+		for my $line (@results) {
+			while ($line =~ s|<(\w+)>\s*(.*?)\s*</(\w+)>||i) {
+				next if ($1 ne $3);
+
+				my $property = $1;
+				my $value = $2;
+
+				$status .= "$value\n";
+			}
+		}
+	}
+
+	return ($status, $error, $requestString);
+}
+
+sub realmSchemaSid {
+	my $product = shift;
+	my $realmResults;
+	my %schemaSid;
+
+	my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+	my @dbcs = ariba::Ops::DBConnection->connectionsForProductOfDBType($product, ariba::Ops::DBConnection->typeMain());
+	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSidAndSchema(@dbcs))  {
+                my $dbsid = ($dbc->isHana()) ? uc($dbc->host()). ":". $dbc->port() : uc($dbc->sid());
+		my $dbschema = $dbc->schemaId();
+		$schemaSid{$dbschema} = $dbsid;
+	}
+
+	my @hana_dbcs     = ariba::Ops::DBConnection->connectionsForProductOfDBServerType(undef, $hana_dbtype,   \@dbcs);
+	my @oracle_dbcs   = ariba::Ops::DBConnection->connectionsForProductOfDBServerType(undef, $oracle_dbtype, \@dbcs);
+	my @hana_tx_schema_ids   = map { $_->schemaId } @hana_dbcs;
+	my @oracle_tx_schema_ids = map { $_->schemaId } @oracle_dbcs;
+	my $dbc;
+	my ($dbType, $user, $password, $sid, $host, $port) = $product->connectInfoWithDBType();
+	if ($dbType eq ariba::Ops::DBConnection->hanaDBServerType()) {
+	    $dbc = ariba::Ops::HanaClient->new($user, $password, $host, $port);
+	}
+	else {
+	    $dbc = ariba::Ops::OracleClient->new($user, $password, $sid, $host);
+	}
+
+	# up til now, all TX schemas were on oracle. but with the advent of "S4 Lite",
+	# s4 now has hana TX schemas. other products will follow.
+	#
+	# thus, the "realmtab" table in s4's controlling SID ("main") has been extended with
+	# a new "dbtype" column. S4 Lite realms should be assigned to hana TX schemas, hence
+	# "dbtype" for the realm would be set to "hana".
+	#
+	# we need to ensure oracle realms are not assigned to hana schemas, and vice versa.
+	#
+	# but how do we know which query to run?
+	# we can obviously switch on product name, but in an effort to make this more adaptable
+	# with less need for manual intervention, I propose we switch based on the existence of
+	# hana TX schemas -- the supposition being: if a product has hana TX schemas configured,
+	# then it most likely has the new "dbtype" column.
+
+	my $has_hana_tx_schemas = @hana_tx_schema_ids;
+    my $extra_query = $has_hana_tx_schemas ? ',nvl(b.dbtype, \'hana\') as dbtype' : '';
+	my $realmQuery = "select a.realmid realmid, b.name realmname, a.schematype, a.databaseschema, a.isprimary $extra_query"
+		       . " from schematypemaptab a, realmtab b"
+		       . " where a.realmid = b.id"
+		       . " order by a.realmid, a.schematype, a.isprimary";
+
+	unless($dbc->connect()) {
+	    print "Debug message : Error connecting to " . $dbType . " database with info: User: " . $user
+		. " Password: *****  SID: " . $sid . " Host: " . $host . " Port: " . $port . " \n Error: "
+		. $dbc->error() . "\n" if $debug;
+		$query->setError($dbc->error());
+		return $dbc->error();
+	}
+
+	my @results;
+	$dbc->setDebug($debug > 1);
+	$dbc->executeSqlWithTimeout($realmQuery, 120, \@results);
+	$dbc->disconnect();
+	if($dbc->error()) {
+		print "sql error: " . $dbc->error() . "\n";
+		return $dbc->error();
+	}
+	my $colsep = $dbc->colsep();
+	foreach my $result (@results) {
+		# only transactional schems will have sid
+		my $schema = $result->{DATABASESCHEMA};
+		my ($type, $schema_id) = split(/\.Schema/, $schema);
+		my $sid =  $schemaSid{$schema_id};
+		$result->{SID} = $sid;
+	}
+	### If hana datatype, return the results, else set to Oralce
+	return (\@results) if ($has_hana_tx_schemas);
+
+	foreach my $result (@results) {
+		$result->{DBTYPE} = $oracle_dbtype;
+	}
+	return (\@results);
+}
+main();

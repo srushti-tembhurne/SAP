@@ -1,0 +1,315 @@
+#!/usr/local/bin/perl 
+#
+# $Id: //ariba/services/monitor/bin/common/aql-metrics#11 $
+
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DateTime;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::AQLClient;
+use ariba::Ops::AQLConnection;
+use ariba::monitor::ReportingConstants;
+use ariba::monitor::QueryManager;
+use ariba::util::Simplefind;
+use File::Basename;
+use ariba::rc::Utils;
+use DateTime;
+use Date::Parse;
+
+
+
+sub initializeTokens {
+	my $time = shift; 
+	my %tokenMap;
+
+	my ($startOfPreviousMonth, $startOfThisMonth) = ariba::Ops::DateTime::computeStartAndEndDate($time);
+
+	my ($startYear, $startMonth, $startDay) =  $startOfPreviousMonth =~ m/(\w+)-(\w+)-(\w+)/;
+	my ($endYear, $endMonth, $endDay) =  $startOfThisMonth =~ m/(\w+)-(\w+)-(\w+)/;
+
+
+	# Start token
+	
+
+	my $startDt = DateTime->new( year   => $startYear,
+									month  => $startMonth,
+									day    => $startDay,
+									hour   => 0,
+									minute => 0,
+									second => 0,
+									time_zone => 'local',
+                        );
+
+	
+	$tokenMap{"start-date"} = "Date('" . $startDt->ymd . " " . $startDt->time_zone_short_name() . "')";
+
+
+
+	# End token
+	
+	my $endDt = DateTime->new( year   => $endYear,
+									month  => $endMonth,
+									day    => $endDay,
+									hour   => 0,
+									minute => 0,
+									second => 0,
+									time_zone => 'local',
+                        );
+
+	
+	$tokenMap{"end-date"} = "Date('" . $endDt->ymd . " " . $endDt->time_zone_short_name() . "')";
+
+
+	return \%tokenMap;
+
+}
+
+sub replaceTokens {
+	my $tokenMapRef = shift;
+	my @aqlStatements = shift;
+
+	my @parsedAQLStatement;
+
+	foreach my $aqlStatement (@aqlStatements) {
+		foreach my $token (keys(%$tokenMapRef)) {
+			my $tokenValue = $$tokenMapRef{$token};
+			$aqlStatement =~ s/\*$token\*/$tokenValue/ig;
+		}
+		push(@parsedAQLStatement, $aqlStatement);
+	}
+	return @parsedAQLStatement;
+}
+
+
+sub usage {
+	my $error = shift;
+
+	if ($error) {
+		print "Error: $error\n";
+	}
+
+	print "$0 [-h|-d] -product <Product Name> [-date <YYYY-MM-DD>]\n";
+	print "    -h : this help messsage\n";
+	print "    -d : debug mode\n";
+	print "    -product <Product name> : Name of the product\n";
+	print "    -customer <customer> : customer name\n";
+	print "    -destinationDir <path> : Where the results will be stored\n";
+	print "    -date <date> : Specifies the run date instead of today.\n";
+
+	exit(1);
+}
+
+sub aqlStorageForProduct {
+	my $product = shift;
+
+	my $installDir = $product->isASPProduct() ? $product->baseInstallDir() : $product->installDir();
+	my $aqlDir = 'lib/aql/';
+
+	$installDir .= '/' unless ($installDir =~ m#/$#);
+
+	return $installDir . $aqlDir;
+
+}
+
+sub collectAQLForProduct {
+	my $product = shift;
+	my @files = ();
+
+	my $aqlLocation = aqlStorageForProduct($product);
+	return(@files) unless ( -r $aqlLocation && -d $aqlLocation );
+
+	my $sf = ariba::util::Simplefind->new($aqlLocation);
+	@files = $sf->find();
+
+	@files = grep {m/\.aql$/} @files;
+
+	return @files;
+
+}
+
+sub extractAQLFromFile {
+	my $file = shift;
+
+	open my $FILEIN,  $file  or die "Couldn't read file [$file]";
+	my @lines = <$FILEIN>;
+	close($FILEIN); 
+
+	@lines = grep {/^[^\#]/} @lines;
+	return join ('', @lines);
+}
+
+sub updateCurrentDestinationDirForTime {
+	my $destinationDir = shift;
+	my $time = shift;
+
+	unlink("$destinationDir/current") if (-e "$destinationDir/current");
+	symlink("$destinationDir/$time", "$destinationDir/current");
+}
+
+sub checkForAqlError { 
+	my $clientError = shift; 
+	my $result = shift; 
+
+	return $clientError if ($clientError); 
+	return $result if ($result && $result =~ /Error in AQL query/io); 
+
+	return 'ok'; 
+} 
+
+
+sub main {
+
+	my $debug = 0;
+	my $productName;
+	my $customerName;
+	my $runTime; 
+	my $runDate;
+	my $sendEmail = 0; 
+	my $sendPage = 0;  
+
+	my $baseDestinationDirRoot = '/var/mon/docroot/aql-metrics';
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ m/^-h/o) { usage(); next; }
+		if ($arg =~ m/^-d$/o) { $debug = 1; next; }
+		if ($arg =~ m/^-e/o) { $sendEmail = 1; next; } 
+		if ($arg =~ m/^-p$/o) { $sendPage = 1; next; } 
+		if ($arg =~ m/^-product/o) { $productName = shift(@ARGV); next; }
+		if ($arg =~ m/^-customer/i) { $customerName = shift(@ARGV); next; }
+		if ($arg =~ m/^-destinationDir/o) { $baseDestinationDirRoot = shift(@ARGV); next; }
+		if ($arg =~ m/^-date/o) { $runDate = shift(@ARGV); next; }
+	}
+	
+	usage() unless (defined $productName);
+
+	$runTime = Date::Parse::str2time($runDate) if ($runDate); 
+	$runTime = time() unless ($runTime); 
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $email = $me->default("notify.email");
+	my $service = $me->service();
+	my @products = ariba::rc::InstalledProduct->installedProductsList($me->service(), $productName, $customerName);
+	unless (@products) {
+		print "Error: can't find installed $productName" . ($customerName?"/$customerName":"")."\n";
+		exit(1);
+	}
+
+	for my $product (@products) {
+
+		# When the queries are run
+		my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($runTime);
+		$mon++;
+		$year += 1900;
+		my $prettyTime = "$year/$mon/$mday"; 
+
+		# We want to separate the results per product
+		my $destinationDirRoot = "$baseDestinationDirRoot/$productName";
+		$customerName = $product->customer();
+		$destinationDirRoot .= "/$customerName" if $customerName;
+
+		# So $destinationDir is the original $destinationDir . "/$productName/$prettyTime"
+		my $destinationDir = "$destinationDirRoot/$prettyTime";
+
+		# We need to create the directory that will contain the results
+		ariba::rc::Utils::mkdirRecursively( "$destinationDir") unless (-d "$destinationDir");
+
+		###############
+
+		# We list all the AQL files to run.
+		my @listAQLFiles = collectAQLForProduct($product);
+
+		# We create a hash : filename => aql to run
+		my %AQLs = map {$_ => extractAQLFromFile($_)} @listAQLFiles;
+
+		my $connection = ariba::Ops::AQLConnection->newFromProduct($product);	
+		my $client = ariba::Ops::AQLClient->newFromAQLConnection($connection);
+		my $colsep = $client->colsep();
+
+		my $tokenMapRef = initializeTokens($runTime);
+
+		my %queries = (); 
+
+		# For each aql file
+		foreach my $aqlFile (keys(%AQLs)) {
+
+			print "AQL Query : [$aqlFile]\n-----\n" if ($debug);
+
+			print "Non-parsed version : [". $AQLs{$aqlFile} . "\n" if ($debug);
+
+			# First we parse the AQL
+			my ($parsedAQL) = replaceTokens($tokenMapRef, $AQLs{$aqlFile});
+
+			print "This AQL is going to be executed : [$parsedAQL]\n" if ($debug);
+
+
+			# Then the AQL statement is executed
+			my $result = $client->executeAQL($parsedAQL);
+			my $error = $client->error(); 	
+
+			# To avoid error messages if nothing is returned
+			$result = "" unless ($result);
+			
+			# We want to create a csv file. So we need to replace the column separator by a comma
+			$result =~ s/$colsep/,/g if $result;
+			print "AQL Result is : [$result]\n" if ($debug);
+			print "-----\n\n" if ($debug && $error);
+
+			print "ERROR : ", $error, "\n" if ($debug && $error);
+			print "-----\n\n\n" if ($debug);
+
+			# Add query to check for error. 	
+			my $aqlBaseFile = basename($aqlFile);
+			$queries{"$aqlBaseFile result"} = { 
+				"info" => "answer eq 'ok'", 
+				"noRowCount" => 1,
+				"hasErraticSchedule" => 1, # So Ops can re-run to fix mon page
+				"perl" => sub { main::checkForAqlError($error, $result) },
+				'inf_field' => "result",
+				'inf_default' => 0,
+				'inf_tags' =>  "aqlfile=\"$aqlBaseFile\"",
+				'group_by' =>  "$aqlBaseFile"
+			}; 
+
+			# We exctract the filename and replace its .aql extension by .csv
+			my $fileOut = $aqlBaseFile; 	
+			$fileOut =~ s/\.aql$/\.csv/;
+
+			# $destinationSubDir is the subdirectory of the aql repository.
+			# Ex : if the AQL are stored in the path /home/svcdev/s4/lib/aql/ they might be under some directories such as
+			# /home/svcdev/s4/lib/aql/Common/aaaa/bbbb/ 
+			# This part will extract Common/aaaa/bbbb/ so we can recreate the same layout for the csv files
+			my $destinationSubDir = dirname($aqlFile);
+			my $aqlLocation =  aqlStorageForProduct($product);
+			$destinationSubDir =~ s/^$aqlLocation//;
+			$destinationSubDir =~ s/^\///;
+			$destinationSubDir =~ s/\/$//;
+
+			# We recreate the layout
+			ariba::rc::Utils::mkdirRecursively( "$destinationDir/$destinationSubDir");
+
+			# We create the csv file and write in the result of the aql
+			$fileOut = "$destinationDir/$destinationSubDir/$fileOut"; 
+			open my $FILEOUT,  ">$fileOut"  or die "Couldn't read file [$fileOut]";
+			print $FILEOUT $result;
+			close($FILEOUT); 
+
+
+		}
+
+		# We update "current" ("current" is a symlink to the latest results) to the latest results
+		updateCurrentDestinationDirForTime($destinationDirRoot, $prettyTime) unless ($runDate);
+		$queries{"influx_details"} = { 'measurement' => 'aql_metrics'};
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			"aql-metric", $product->name(), $product->service(), $product->customer(), \%queries); 
+		$qm->processQueries($debug, $email, $sendEmail, $sendPage); 
+	}
+}
+
+main();
+

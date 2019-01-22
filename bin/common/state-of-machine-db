@@ -1,0 +1,245 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/state-of-machine-db#10 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Machine;
+use ariba::Ops::Constants;
+use ariba::Ops::NetworkUtils qw(isIPAddr);;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Globals;
+
+my %serviceProvidedToExclude = (
+			"switch" => 1,
+			safeguard => 1,
+			storage => 1,	  
+			shellsvr => 1,	  
+			power => 1,	  
+			dns => 1,
+			smtp => 1,	  
+			irc => 1,	  
+			router => 1,	  
+			consoleserver => 1,	  
+			cfd => 1, 
+			bastion => 1, 
+			bootsvr => 1, 
+			ntp => 1, 
+			fs => 1,
+			netmon => 1,
+			ids => 1,
+			firewall => 1,
+			loadbalancer => 1,
+			rc => 1,
+			auth => 1,
+			up2date => 1,
+			dummynet => 1,
+			procuriextract => 1,
+ );
+
+my %machineToExclude = (
+		"action.ariba.com" => 1,	  
+		"aries.ariba.com" => 1,	  
+		"centaurus.ariba.com" => 1,	  
+		"dummynet.ariba.com" => 1,	  
+		"hydra.ariba.com" => 1,	  
+		"lynx.ariba.com" => 1,	 
+);
+
+
+
+
+
+
+my $debug = 0;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	while (my $arg = shift @ARGV) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; };
+		if ($arg =~ /^-d/o) { $debug = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	
+	
+	for my $datacenter (ariba::Ops::ProductAPIExtensions::datacentersForProducts($me)) {
+		my %queries = ();
+
+		machinesInUseForDatacenter ($datacenter);
+		my @machinesFromMdb = constructHashOfMachinesInDatacenter ($datacenter);
+                my @machinesUnusedAndInService = machinesUnusedAndInService(\@machinesFromMdb);
+                foreach my $m (@machinesUnusedAndInService)
+                {
+		    $queries{"Machines unused and in service: $m"} = {
+			info => "1",
+			perl => sub {return 'UnusedAndInService'},
+                        inf_field => "machine_status",
+                        inf_tags => "machine_name=\"$m\"",
+		    };
+                }
+                
+                my @machinesUsedAndNotInService = machinesUsedAndNotInService(\@machinesFromMdb);
+                foreach my $n (@machinesUsedAndNotInService)
+                {
+		    $queries{"Machines used and not inservice: $n"} = {
+			info => "1",
+			crit => "answer eq 'UsedAndNotInService'",
+			perl => sub {return 'UsedAndNotInService'},
+                        inf_field => "machine_status",
+                        inf_tags => "machine_name=\"$n\"",
+		    };
+                }
+		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+                $queries{influx_details} = {measurement => "state_of_machine_db"};	
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+				'State of Machine DB', $pn, $me->service(), $me->customer(), \%queries
+	 	);
+
+		$qm->processQueries($debug, $me->default('notify.email'), $sendEmail, $sendPage);
+	}
+}
+
+
+sub machinesUnusedAndInService {
+	my $machinesFromMdbRef = shift;
+
+
+	return checkMachines( $machinesFromMdbRef, \&checkMachineUnusedAndInService  );
+}
+
+sub machinesUsedAndNotInService {
+	my $machinesFromMdbRef = shift;
+
+	return checkMachines($machinesFromMdbRef, \&checkMachineUsedAndNotInService  );
+}
+
+sub checkMachines {
+	my $machinesRef = shift ;
+	my $checkCodeRef = shift;
+
+	my @listOfMachinesReturned;
+
+	for my $machine (@$machinesRef) {
+		
+		my $returnValue = &$checkCodeRef($machine);
+		if ($returnValue) {
+			push (@listOfMachinesReturned, $returnValue);
+		}
+	}
+
+	return @listOfMachinesReturned;
+}
+
+
+
+
+
+sub machinesInUseForDatacenter {
+	my $datacenter = shift;
+
+	my @services = ariba::rc::Globals::servicesForDatacenter($datacenter);
+
+	my @listOfProducts;
+	for my $service (@services) {
+		push (@listOfProducts, ariba::rc::InstalledProduct->installedProductsList($service));	  
+	}
+
+	foreach my $product (@listOfProducts) {
+		for my $host ($product->allHosts()) {
+			my $mc = ariba::Ops::Machine->new($host);
+			$mc->setIsInRoles(1);
+			$mc->appendToAttribute('usedBy', productInfos($product));
+		 }
+	}
+	
+}
+
+sub productInfos {
+	my $product = shift;
+
+	my $infos = $product->name() . "/" . $product->service();
+	$infos .= "/" . $product->customer() if ($product->customer());
+
+	return $infos;
+}
+
+sub constructHashOfMachinesInDatacenter {
+	my $datacenter = shift;
+
+	my @machinesToReturn;
+
+	my %match = (
+		'datacenter'       => $datacenter,
+	);
+		
+	my @machines = ariba::Ops::Machine->machinesWithProperties(%match);
+
+	for my $machine (@machines) {
+		
+		my $excludeMachine = 0;
+
+
+		my @servicesProvided = $machine->providesServices();
+		my @servicesNotToExclude = grep {!(exists $serviceProvidedToExclude{$_} )} @servicesProvided;
+
+
+		my $hostname = $machine->hostname();
+
+
+		# The machine is excluded if either :
+		#  - All the services it provides are blacklisted
+		#  - The machine itself is blacklisted
+		$excludeMachine = 1 if ( (exists $machineToExclude{$hostname}) || (scalar(@servicesNotToExclude) == 0)  );
+
+
+		push(@machinesToReturn, $machine) unless ($excludeMachine);
+	}
+
+	return @machinesToReturn;
+}
+
+
+
+
+
+sub checkMachineUnusedAndInService {
+
+	my $machine = shift;
+
+	if ( !$machine->isInRoles() && ($machine->status() eq 'inservice') ) {
+		return $machine->hostname();
+	}
+
+	return 0
+}
+
+sub checkMachineUsedAndOutOfService {
+	return(checkMachineUsedAndNotInService(@_));
+}
+
+sub checkMachineUsedAndNotInService {
+
+	my $machine = shift;
+
+
+	if ($machine->isInRoles() && ($machine->status() ne 'inservice')) {
+		return $machine->hostname() . " is used by [" . join(', ', grep {$_ } $machine->usedBy()) . "] but is marked as " . $machine->status();
+	}
+
+	return 0;
+}
+
+
+main();
+
+__END__

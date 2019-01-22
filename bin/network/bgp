@@ -1,0 +1,150 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/network/bgp#2 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Machine;
+use ariba::Ops::Constants;
+use ariba::Ops::NetworkUtils qw(isIPAddr);;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use ariba::SNMP::Session;
+
+my $debug = 0;
+
+# 9 minutes should cover any 2 pollings allowing some time for delay.
+my $bgpUptimeThreshold = 60 * 9;
+
+my $bgpDocUrl = 'http://ops.ariba.com/documentation/network-admin/docs/bgpsession.txt';
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	while (my $arg = shift @ARGV) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; };
+		if ($arg =~ /^-d/o) { $debug = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+
+	for my $datacenter (ariba::Ops::ProductAPIExtensions::datacentersForProducts($me)) {
+
+		my %match = (
+			'datacenter'	   => $datacenter,
+			'providesServices' => 'router',
+			'status'		   => 'inservice',
+		);
+		
+		my @routers = ();
+
+		for my $router (ariba::Ops::Machine->machinesWithProperties(%match)) {
+			push(@routers, ariba::SNMP::Session->newFromMachine($router));
+		}
+
+		next unless scalar @routers > 0;
+
+		my %queries = ();
+
+		for my $router (@routers) {
+
+			my $hostname = $router->hostname();
+			my $peers	= $router->bulkWalkOids('bgpPeerRemoteAddr');
+
+			for my $peer (keys %$peers) {
+
+				$queries{"$hostname, bgp peer $peer, current state time"} = {
+					format => "%s mins",
+					info => "answer > 59",
+					warn => "answer < 15 or answer == -1",
+					crit => "answer eq 'BGP is flapping'",
+					perl => sub { main::checkBGPTime($peer, $router) },
+					inf_field => "current_state_time",
+					inf_tags => qq|datacenter="$datacenter",hostname="$hostname",peer="$peer"|,
+					inf_default => "NA",
+					group_by => "$datacenter,$hostname,$peer",
+				};
+
+				# this is a hack to make a graph for TMID 5325
+				$queries{"$hostname, bgp peer $peer, current state"} = {
+					#recordMaxResults => 20000,
+					#recordDataType=> "gauge",
+					#recordItem => "answer eq 'established' ? 1 : 0",
+					info => "answer eq 'established'",
+					warn => "answer eq 'unknown'",
+					crit => "answer ne 'established' && answer ne 'unknown'",
+					snmp => "$hostname, bgpPeerState.$peer",
+					inf_field => "current_state",
+					inf_tags => qq|datacenter="$datacenter",hostname="$hostname",peer="$peer"|,
+					inf_default => "NA",
+					group_by => "$datacenter,$hostname,$peer",
+				};
+			}
+		}
+
+		#$queries{'For more info about bgp see'} = {
+		#	perl => " 'below' ",
+		#	note => "<html><a href=\"$bgpDocUrl\">$bgpDocUrl</a></html>",
+		#	info => 1,
+		#};
+
+		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+		$queries{influx_details} = {measurement => "network_bgp"};
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			'network-bgp', $pn, $me->service(), $me->customer(), \%queries
+		);
+
+		$qm->processQueries($debug, $me->default('notify.email'), $sendEmail, $sendPage);
+	}
+}
+
+sub checkBGPTime {
+	my $peer   = shift;
+	my $router = shift;
+
+	my $now	= time();
+	my $historyFile = "/tmp/network-bgp-last-flap-$peer";
+
+	for (my $i = 0; $i < 3; $i++) {
+
+		my $bgpUptime = $router->valueForOidExpr("bgpPeerFsmEstablishedTime.$peer") || next;
+
+		$bgpUptime = sprintf("%.0f", ($bgpUptime / 60));
+
+		if ($bgpUptime < 5) {
+
+			my @lastFlap = ();
+
+			if (-r $historyFile) {
+				open (FILE, $historyFile) or die "Can't open [$historyFile]: $!";
+				@lastFlap = <FILE>;
+				close(FILE);
+			}
+
+			open(FILE, ">$historyFile") or die "Can't write to [$historyFile]: $!";
+			print FILE $now;
+			close(FILE);
+
+			$lastFlap[0] ||= 0;
+
+			if (($now - $lastFlap[0]) < $bgpUptimeThreshold) {
+				return "BGP is flapping";
+			}
+		}
+
+		return $bgpUptime;
+	}
+
+	return 'unknown';
+}
+
+main();
+
+__END__

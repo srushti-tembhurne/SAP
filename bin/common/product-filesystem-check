@@ -1,0 +1,139 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/common/product-filesystem-check#5 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Globals;
+use ariba::Ops::OracleClient;
+use ariba::Ops::ProductAPIExtensions; 
+
+my $YES = 'yes'; 
+my $NO = 'no';
+my $debug = 0;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $productName;
+
+	while (my $arg = shift) {
+		print STDERR "parsing arg $arg\n" if ($debug);
+		if ($arg =~ /^-d/)		{ $debug = 1; 			}
+		if ($arg =~ /^-e/)		{ $sendEmail = 1; 		}
+		if ($arg =~ /^-p$/)		{ $sendPage = 1; 		}
+		if ($arg =~ /^-prod/)	{ $productName = shift; }
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $service = $me->service();
+	
+	my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+
+	for my $product (@products) {
+		my $productName = $product->name();
+		my $customerName = $product->customer();
+		my $filesystemRoot = filesystemRootForProduct($product);
+		my %queries;
+
+		next unless ($filesystemRoot);
+
+		if ($filesystemRoot =~ /realms$/) { 
+			my ($realmIdsRef, $oracleError) = realmIdsForProduct($product); 
+			print "Oracle error when getting realms for $productName: $oracleError\n" if ($debug && $oracleError);
+
+			for my $realmId_hash (@$realmIdsRef) { 
+				my $realmId = $realmId_hash->{'ID'};
+				my $realmRoot = "$filesystemRoot/realm_$realmId";
+				$queries{"$realmRoot exists with content"} = {
+					'info'		    => "answer eq '$YES'",
+					'crit'		    => "answer ne '$YES'",
+					'perl'		    => sub { return main::checkDirForContents($realmRoot); },
+                    'inf_field' 	=> "content_exists",
+                    'inf_tags'  	=> "realm_root=\"$realmRoot\"",
+                    'inf_default' 	=> 'none',
+					'group_by'   	=> $realmRoot,
+				}
+			}
+		} else { 
+			$queries{"$filesystemRoot exists with content"} = {
+				'info'		    => "answer eq '$YES'",
+				'crit'		    => "answer ne '$YES'",
+				'perl'		    => sub { return main::checkDirForContents($filesystemRoot); },
+                'inf_field' 	=> "content_exists",
+                'inf_tags'  	=> "filesystem_root=\"$filesystemRoot\"",
+                'inf_default' 	=> 'none',
+			    'group_by'   	=> $filesystemRoot,
+			}
+		}
+
+        	$queries{influx_details} = { measurement => 'file_system' };
+		my $email = $me->default('notify.email');
+
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			"filesystem", $productName, $service, $customerName, \%queries
+		);
+
+		$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+sub checkDirForContents { 
+	my $dir = shift;
+	
+	if (opendir(my $dh, $dir)) { 
+		my @contents = grep(!/^\./, readdir($dh));
+		closedir($dh);
+		return $YES if (@contents);
+	} 
+	
+	return $NO;
+}
+
+sub realmIdsForProduct { 
+	my $product = shift; 
+	my @realmIds;
+
+	my $oc = ariba::Ops::OracleClient->new($product->connectInfoForOracleClient()); 
+	if ($oc->connect()) { 
+		my @results; 
+		$oc->executeSqlWithTimeout("select id from realmtab", 30, \@results); 
+		@realmIds = @results unless ($oc->error()); 
+		$oc->disconnect();
+	}
+
+	return (\@realmIds, $oc->error()); 
+} 
+
+sub filesystemRootForProduct {
+	my $product = shift;
+	my $fsRoot;
+	my $productName = $product->name();
+
+	if ($productName =~ /^(?:s4|s4pm|buyer|sdb)$/) { 
+		$fsRoot = $product->default("System.Base.RealmRootDir"); # ex. /fs/buyerprod/realms
+	} elsif ($productName =~ /^an$/) {
+		$fsRoot = $product->default("attachmentdir"); # ex. /fs/anprod/attachments
+	} elsif ($productName =~ /^estore$/) {
+		$fsRoot = $product->default("reportdir"); # ex. /fs/anprod/attachments
+	} elsif ($productName =~ /^s2$/) {
+		$fsRoot = $product->default("System.Analysis.SharedFileDir"); # ex. /fs/s2prod/honda
+	} elsif ($productName =~ /^acm$/) {
+		$fsRoot = $product->default("System.Base.Directories.AttachmentDir") # ex. /fs/acmprod/alstompowersource/attachments
+	} elsif ($productName =~ /^aes$/) {
+		$fsRoot = $product->default("attachment_dir"); # ex. /fs/aesprod/rclwebsource/attachments
+	} elsif ($productName =~ /^anl$/) {
+		$fsRoot = $product->default("System.Analysis.InstanceFilesDirectory");	# ex. /fs/anlprod/dell
+	}
+
+	$fsRoot =~ s/(transactionData)?\/attachments$// if ($fsRoot && $productName =~ /^(?:an|acm|aes)$/);
+
+	return $fsRoot;
+} 
+
+main(@ARGV);

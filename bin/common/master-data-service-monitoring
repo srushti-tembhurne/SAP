@@ -1,0 +1,148 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use Data::Dumper;
+use Getopt::Long qw(:config no_ignore_case_always no_getopt_compat require_order);
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Url;
+use ariba::monitor::QueryManager;
+use Data::Dumper;
+
+sub main
+{
+    my ($debug, $sendEmail, $sendPage, $productName);
+    GetOptions(
+               'debug|d'        => \$debug,
+               'sendemail|e'    => \$sendEmail,
+               'sendpage|p'     => \$sendPage,
+               'product|prod=s' => \$productName,
+              );
+
+    my $monProduct = ariba::rc::InstalledProduct->new();
+    my $product    = ariba::rc::InstalledProduct->new($productName, $monProduct->service());
+    my $cluster    = $product->currentCluster() || 'primary';
+
+    my $adminurl   = $product->default("VendedUrls.AdminFrontDoorTopURL");
+    my @mdsactions = qw(mdsRealmLooperDelay mdsExportDataDelay mdsWorkItemsDelay mdsParentChildNotSync);
+    my $prodname   = $product->name();
+    my $service    = $product->service();
+    my $customer   = $product->customer() || undef;
+    my $email      = $product->default('notify.email');
+
+    my %queries;
+
+    my %queryitems = (
+        'mdsRealmLooperDelay' => {
+                                  'qname'     => 'Extract Data Realm Looper Delay ',
+                                  'inf_field' => 'extract_data_realm_looper_delay',
+                                  'description' => q(Informs about delay in Realm Looper task to Extract Data for MDS)
+                                 },
+
+        'mdsExportDataDelay' => {
+                                 'qname'     => 'Extract Data Delay ',
+                                 'inf_field' => 'extract_data_delay',
+                                 'description' => q(Informs about the delay in processing extract data task at individual realm level.)
+                                },
+
+        'mdsWorkItemsDelay' => {
+                                'qname'     => 'Long Pending Work Items ',
+                                'inf_field' => 'long_pending_work_items',
+                                'description' => q(Informs about the work items which are long pending at realm level)
+                               },
+
+        'mdsParentChildNotSync' => {
+                                    'qname'     => 'Parent Child Inconsistency ',
+                                    'inf_field' => 'parent_child_inconsistency',
+                                    'description' => q(Informs when the parent and child work items are not consistent. Parent is success but there are failures in the child work items)
+                                   }
+
+                     );
+
+    foreach my $action (@mdsactions)
+    {
+
+        my $uri      = $adminurl . '/' . ucfirst ($prodname) . '/Main/ad/' . $action . '/MonitorActions';
+        my $url      = ariba::monitor::Url->new($uri);
+        my $response = $url->request();
+
+        my $warnflag;
+        print "url : $uri \n" if ($debug);
+        my $hoursdelay;
+        my $reccount;
+        my @rec;
+        if ($action eq 'mdsRealmLooperDelay')
+        {
+            if ($response !~ /^No result/i)
+            {
+                $response =~ m/NO_OF_HOURS\|(.*?)\,/;
+                $hoursdelay = $1;
+            }
+            else
+            {
+                $hoursdelay = 0;
+            }
+            print "**hours delay is $hoursdelay\n" if ($debug);
+        }
+        else
+        {
+            if ($response !~ /^No result/i)
+            {
+                @rec = split ("\n", $response);
+                $reccount = scalar @rec;
+            }
+            else
+            {
+                $reccount = 0;
+            }
+            print "**rec count is $reccount\n" if ($debug);
+        }
+
+        next if ( $reccount && $rec[-1] eq '</html>');
+
+        $queries{"$queryitems{$action}->{qname}"} = {
+            uiHint            => "$queryitems{$action}->{qname}",
+
+                                                    };
+
+        if (defined $hoursdelay)
+        {
+            $queries{"$queryitems{$action}->{qname}"}->{'perl'}        = sub {return "$hoursdelay";};
+            $queries{"$queryitems{$action}->{qname}"}->{'inf_field'}   = ($queryitems{$action}->{inf_field});
+            $queries{"$queryitems{$action}->{qname}"}->{'inf_default'} = 0;
+            $queries{"$queryitems{$action}->{qname}"}->{'warn'}        = "answer >= 2";
+            $queries{"$queryitems{$action}->{qname}"}->{'group_by'}    = "row_1";
+        }
+        elsif (defined $reccount)
+        {
+            #$queries{"$queryitems{$action}->{qname}"}->{'perl'} = sub { return "@rec"; };
+            $queries{"$queryitems{$action}->{qname}"}->{'perl'}        = sub {return "$reccount";};
+            $queries{"$queryitems{$action}->{qname}"}->{'warn'}        = "numrows >= 1";
+            $queries{"$queryitems{$action}->{qname}"}->{'inf_field'}   = ($queryitems{$action}->{inf_field});
+            $queries{"$queryitems{$action}->{qname}"}->{'inf_default'} = 0;
+            $queries{"$queryitems{$action}->{qname}"}->{'group_by'}    = "row_1";
+
+            my $i = 0;
+            foreach my $line (@rec)
+            {
+                $queries{"$queryitems{$action}->{qname}.$i"}->{'perl'}       = sub {return lc ($line)};
+                $queries{"$queryitems{$action}->{qname}.$i"}->{'inf_field'}  = "details",
+                $queries{"$queryitems{$action}->{qname}.$i"}->{'inf_tags'}   = qq(row_id=$i,type="$queryitems{$action}->{inf_field}"),
+                $queries{"$queryitems{$action}->{qname}.$i"}->{'group_by'}   = qq($i,$queryitems{$action}->{inf_field}),
+                $i++;
+            }
+
+        }
+    }
+
+    $queries{influx_details} = {measurement => 'mds_monitoring'};
+    my $qm = ariba::monitor::QueryManager->newWithDetails('MDS', $prodname, $service, $customer, \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+main();
+__END__
+

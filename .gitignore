@@ -1,0 +1,12 @@
+tests/master_tests.sh
+
+# exclude generated config files
+etc/discovery/monitor_config/*
+!etc/discovery/monitor_config/.gitkeep
+etc/discovery/host_config/*
+!etc/discovery/host_config/.gitkeep
+
+# this file is downloaded from artifactory to merge Cookies
+stratus.tar.gz
+.DS_Store
+.*.swp

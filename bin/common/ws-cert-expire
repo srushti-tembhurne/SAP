@@ -1,0 +1,118 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/common/ws-cert-expire#8 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Constants;
+use ariba::rc::Globals;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use ariba::Crypto::Certificate;
+
+use Crypt::OpenSSL::X509 qw(FORMAT_PEM FORMAT_ASN1);
+use Symbol;
+
+sub main {
+
+	my $debug     = 0;
+	my $sendEmail = 0;
+   	my $sendPage  = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if( $arg =~ /^-e/o ){ $sendEmail = 1; };
+		if( $arg =~ /^-p/o ){ $sendPage = 1; };
+		if( $arg =~ /^-d/o ){ $debug = 1; };
+	}
+
+	my $cert	    = ariba::Crypto::Certificate->new();
+	my $me		    = ariba::rc::InstalledProduct->new();
+	my @products    = ariba::rc::InstalledProduct->installedProductsList( $me->service() );
+	my $email       = $me->default('notify.email');
+
+	# Find out what we run
+	for my $product (@products) {
+		my $name     = $product->name();
+		my $service  = $product->service();
+		my $install  = $product->installDir();
+
+		my %queries  = ();
+		my $certDir = $install . "/lib/certs";
+
+		if (grep /^$name$/, (ariba::rc::Globals::webServerProducts(),"mon")) {
+			my $serviceHost = '';
+
+			for my $keyPathFile (
+				'CertServiceHost',
+				'ServiceHost',
+				'AdminServiceHost',
+				'TestServiceHost',
+				'MonServiceHost',
+				'SafeguardServiceHost',
+			) {
+
+				if ($product->default($keyPathFile)) {
+					print "Processing webserver certs $keyPathFile for ", $product->name(), "\n" if $debug;
+
+					$serviceHost = $product->default($keyPathFile);
+
+					processCert($cert, $certDir, $serviceHost, \%queries);
+
+				}	
+			}	
+				
+			if (%queries) {
+
+                $queries{"influx_details"} = { 'measurement' => "ws_cert_expire"};
+				my $q  = ariba::monitor::QueryManager->newWithDetails(
+					"ws-cert-expire", $name, $me->service(), $me->customer(), \%queries
+					);
+
+				$q->processQueries($debug, $email, $sendEmail, $sendPage);
+			}	
+		}	
+	}	
+}
+
+sub processCert {
+	my $cert     = shift;
+	my $dir      = shift;
+	my $certHost = shift;
+	my $queries  = shift;
+	
+	my $file = '';
+
+	my $path = "//ariba/services/operations/documentation/prodops/common/certificate_management.shtml";
+
+	$file = $certHost . ".cert" if $certHost;
+
+	return unless (-f "$dir/$file"); 
+
+	my $days = $cert->daysToCertExpireTimeForX509("$dir/$file");
+		
+	$queries->{"Days to Expire for $file"} = {
+		noRowCount => 1,
+		format => "%d days\n",
+		info => "answer >= 20",
+		warn => "answer < 90",
+		crit => "answer < 60",
+		perl => "return $days",
+		ticketOnWarnOpenAfterMinutes => 30,
+		openTicketInServices => "prod,sales",
+		description => "For initial debugging refer to $path",
+        inf_field => "days_to_expire",
+        inf_tags => "cert=\"$file\"",
+        group_by => "$file",
+        inf_default => 0
+	};
+}
+
+main();
+
+__END__

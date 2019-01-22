@@ -1,0 +1,272 @@
+#!/usr/local/tools/perl-5.22.1/bin/perl
+# $Id: $
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use Data::Dumper;
+use JSON;
+use Getopt::Long;
+use Pod::Usage;
+
+use JMX::Jmx4Perl;
+use JMX::Jmx4Perl::Request;
+use JMX::Jmx4Perl::Agent;
+use HTTP::Config;
+
+my $debug = 0;
+my $sendEmail = 0;
+my $sendPage = 0;
+my $help = 0;
+my $productName = "an";
+
+my $amq_appname = qr(MicroQueue);
+
+#-----------------------------------------------------------------
+#process the command line options: standard monitor cmd line options
+GetOptions (
+    "debug"   =>  \$debug,
+    "eMail"   =>  \$sendEmail,
+    "page"    =>  \$sendPage,
+    "help|?"    =>  \$help,
+) or pod2usage(2);
+
+pod2usage(1) if $help;
+die "This script is for an only" if ( "$productName" ne "an" );
+
+#-----------------------------------------------------------------
+my $me = ariba::rc::InstalledProduct->new();
+die "no product found" unless $me;
+
+my $installdir = $me->installDir();
+my $service = $me->service();
+my $product = ariba::rc::InstalledProduct->new($productName, $service);
+die "No product $productName in $service" unless defined($product);
+my $email = $me->default('notify.email');
+
+#-----------------------------------------------------------------
+# get the configuration in the DATA section at the end
+my $cfg = eval {
+    local $/ = undef;
+    my $cfgdata = <DATA>;
+    return decode_json($cfgdata);
+};
+die "Error parsing the configuration data: $@\n" if $@;
+
+#-----------------------------------------------------------------
+# retrieve data
+#my $qspec = $cfg->{queryspec};
+my $qspec = undef;
+
+my $amq_data = eval {
+    getQueueData($product, $cfg->{queue_props}); 
+};
+die "Failed to retrieve queue data: $@\n" if ( $@ );
+print Dumper($amq_data) if $debug;
+die "No queue data retrieved\n" unless ( keys %$amq_data );
+
+#-----------------------------------------------------------------
+# construct query hash
+my $queries = buildQueries($amq_data, $cfg);
+print Dumper($queries) if $debug;
+die "No queries for processing\n"  unless ( keys %$queries );
+
+#-----------------------------------------------------------------
+# create QueryManager object and process queries
+my $qmName = "micro-queue-status";
+$queries->{influx_details} = { measurement => 'an_micro_queue_status' };
+my $qm = ariba::monitor::QueryManager->newWithDetails (
+        $qmName, $productName, $service, undef, $queries
+);
+$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+exit(0);
+
+#-----------------------------------------------------------------
+#-----------------------------------------------------------------
+# populate the hash with data
+# scenarios with no data: exception, no active MicroQueue
+sub getQueueData {
+    my $product = shift;
+    my $qprops = shift;
+
+    my $qdata = {};
+    my $cluster = $product->currentCluster();
+    my $instances = $product->appInstanceManager()->appInstancesInCluster($cluster);
+
+    # there is supposed to be only one instance that runs activemq
+    # and only that instance will provide the information via mbeans
+
+    foreach my $instance ( @$instances ) {
+        # the appinstance for activemq has springboot type and MicroQueue name
+        next unless ( $instance->appName =~ $amq_appname );
+    
+        my $host = $instance->host;
+        my $queue_port = $instance->queuePort;
+        my $jolokia_url = $instance->monitorStatsURL;
+        
+        # this is the mbean for the broker itself
+        my $mbean =  "org.apache.activemq:" .
+                "brokerName=ANMQBroker${host}_${queue_port},type=Broker";
+
+        #---------get all the queues from this broker----
+        # exception with the JMX calls will be caught by the caller
+        my $jmx = JMX::Jmx4Perl->new( url => $jolokia_url );
+        my $jmxreq = JMX::Jmx4Perl::Request->new( {
+            type => READ,
+            mbean => $mbean,
+            attribute => "Queues"
+        });
+        my $jmxres = $jmx->request($jmxreq);
+ 
+        # the setting with ActiveMQ is a master instance with 
+        # multiple slaves, with one of them coming up and becoming
+        # the new master in case the master is down.
+        # mbean only available via the active master ActiveMQ instance
+        # and the above query is successfully only with this instance.
+        next unless ( $jmxres->{status} == 200 );
+
+        #--------go through each queue------------
+        foreach my $queue ( @{$jmxres->{value}} ) {
+            $mbean = $queue->{objectName};
+            $jmxreq = JMX::Jmx4Perl::Request->new( {
+                type => READ,
+                mbean => $mbean,
+                attribute => "",    #get all attributes
+            } );
+            $jmxres = $jmx->request( $jmxreq );
+            my $value = $jmxres->{value};   # a hash ref
+            my $queue_name = $value->{Name};
+            $qdata->{$queue_name}->{mbean} = $mbean; #information for display
+            foreach my $p ( @$qprops) {
+                $qdata->{$queue_name}->{$p} = $value->{$p};
+            }
+        }
+        
+        last; # we have got the right instance and done
+    }
+
+    return $qdata;
+}
+
+# this is for monitoring queue sizes
+sub buildQueries {
+    my $data = shift;
+    my $cfg = shift;
+
+    my $qs = {};
+
+    my $qspec = $cfg->{query_specs};
+    my $qprops = $cfg->{queue_props};
+
+    # create monitor query for each queue
+    # data structure: $data->{queuename}->{prop}
+    for my $queue ( keys %$data ) { 
+
+        my $qdata = $data->{$queue};
+    
+        my $mbean = $qdata->{mbean};
+        $mbean =~ s/destination/<br>destination/;
+        my $description = "MBean: $mbean";
+        $description .= "<br>Other Queue Information<br>";
+        foreach my $p ( @$qprops ) {
+            $description .= "($p " . $qdata->{$p} . ") ";
+        } 
+
+        # create monitor query for each query configuration
+        for my $qn ( keys %$qspec ) {
+            my $q1 = $qspec->{$qn};
+            my $monitor = $q1->{monitor_flag};
+            next unless $monitor;
+
+            my $prop = $q1->{prop_name};
+            my $display = $q1->{display_name};
+            my $warn = $q1->{warn};
+            my $crit = $q1->{crit};
+
+            my $queryname = "$queue $display";
+            my $qvalue = $qdata->{$prop};
+            # at the moment we only have "QueueSize" as being monitored, so 'queuesize' is the fieldname
+            my $f_name = lc($prop);
+
+            ### Replace '-' (also to be safe  ',' and ' ') with '_'
+            $queue =~ tr/-, /___/;
+            $queue = lc($queue);
+            my $query = {
+                description => $description, #same per queue
+                perl        => sub { $qvalue },
+                warn        => $warn,
+                crit        => $crit,
+                inf_field   => $f_name,
+                inf_tags    => qq|queue="$queue"|,
+                group_by    => $queue,
+            };
+            $qs->{$queryname} = $query; # a query prepared for QueryManager
+        } # end for all queries for a given queue
+    } # end of loop for all the queues
+    return $qs;
+}
+
+
+=pod
+
+=head1 NAME
+
+micro-queue-status
+
+=head1 SYNOPSIS
+
+micro-queue-status [-d] [-e] [-p]
+    -d: debug
+    -e: send email for alerts
+    -p: send page for alerts
+
+=head1 DESCRIPTION
+
+This script uses JMX queries to retrive queue data from Micro Queue via Jolokia.
+There is only one active Micro Queue instance (the master) for AN with
+standby instances (slaves). The queue informaton is available only
+from the active instance. 
+Currently the configuration is for monitoring queue size only, but 
+other queue information can be added for monitoring via the configuration
+in the DATA section.
+Wikipeadia.org has a good brief introduction about JMX (Java Management Extensions) 
+and jolokia.org is the start point to Jolokia and JMX perl modules.
+
+=cut
+
+__DATA__
+{
+    "queue_props" : [ 
+            "QueueSize",
+            "DequeueCount",
+            "AverageEnqueueTime",
+            "AverageMessageSize",
+            "EnqueueCount",
+            "MaxEnqueueTime",
+            "ConsumerCount",
+            "ExpiredCount"
+    ],
+    "query_specs" : {
+        "queue_size" : {
+            "prop_name" : "QueueSize",
+            "display_name" : "Queue Size",
+            "monitor_flag" : 1,
+            "warn" : "answer > 200",
+            "crit" : "answer > 500 && previousAnswer > 500"
+        },
+        "Dequeue_count" : {
+            "prop_name" : "DequeueCount",
+            "display_name" : "Dequeue Count",
+            "monitor_flag" : 0,
+            "warn" : "answer > 4000",
+            "crit" : "answer > 8000"
+        }
+    }
+}
+

@@ -1,0 +1,245 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/common/cpu-watcher#65 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::MachineProductInfo;
+use ariba::monitor::CircularDB;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::monitor::misc;
+use ariba::monitor::OutageSchedule;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $debug = 0;
+
+    while(my $arg=shift(@ARGV)){
+        if($arg =~ /^-d/o){ $debug = 1; };
+        if($arg =~ /^-e/o){ $sendEmail = 1; };
+        if($arg =~ /^-p/o){ $sendPage = 1; };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+    my $ws = ($me->hostsForRoleInCluster("monserver", $cluster))[0];
+    my $port = $me->default("WebServerHTTPPort");
+
+    my $warn;
+    my $crit;
+
+    my $machineStatsDoc = "https://wiki.ariba.com:8443/display/ENGDPTS/Machinestats";
+
+    for my $datacenter ( @dataCenters ) {
+
+        my %matchDatacenter = (
+            status               => 'inservice',
+            datacenter           => $datacenter,
+            monitoringDatacenter => '',
+        );
+
+        my %matchMonitoringDatacenter = (
+            status                => 'inservice',
+            monitoringDatacenter  => $datacenter,
+        );
+
+        # VMs are marked as outofservice because they do not want cfengine to update them
+        my %matchVirtualMachinesInDatacenter = (
+            status      => 'outofservice',
+            datacenter  => $datacenter,
+            os          => 'redhat',
+            hardwareType    => 'VM',
+        );
+
+        my @machines = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+        push(@machines, ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+        push(@machines, ariba::Ops::Machine->machinesWithProperties(%matchVirtualMachinesInDatacenter));
+
+        my %queries = ();
+
+        for my $machine (@machines) {
+            next if ($machine->provides('consoleserver'));
+
+            my $hostname = $machine->hostname();
+            my $note;
+            my $severity;
+
+            my $url = ariba::monitor::misc::snmpGraphsUrl($hostname, "$ws:$port");
+
+            # average over 4 samples by default
+            my $samples = 4;
+            my $outage = undef;
+
+            my $has_hysteresis = 0;
+            if ($machine->provides('web')) {
+                $warn = 40;
+                $crit = 49;
+            # Stopgap until mon11.snv machine is upgraded to an
+            # AMD box.
+            } elsif ($machine->provides('mon')) {
+                $warn = 90;
+                $crit = 95;
+                # disable mon11 crit for CPU when start of month reporting runs
+                # which is spread over several days now
+                $outage = ariba::monitor::OutageSchedule->new('1 00:00-08:00', '3 00:00-08:00', '4 00:00-08:00', '15 03:00-08:00');
+            } elsif ($machine->provides('backup')) {
+                $warn = 85;
+                # disable crit for backup servers such as backup12.snv
+                $crit = 999;
+            } elsif ($machine->provides('db')) {
+                $severity = 1;
+                $warn = 85;
+                $crit = 92;
+            } elsif ($machine->provides('smtp')) {
+                $warn = 85;
+                $crit = 97;
+                $note = "Debugging: //ariba/services/operations/documentation/prodops/common/query_notes/snv-cpu-util13.txt";
+            } elsif ( $hostname =~ m|nfs12\.snv| ) {
+                # this is the window where backups happen.  See TMID:30155
+                $warn = 85;
+                $crit = 92;
+                $outage = ariba::monitor::OutageSchedule->new('sun 02:00-06:30');
+            } elsif ( $machine->os() eq "ontap" ) {
+                # Re-establishing Netapp CPU monitoring thresholds
+                # See TMID 137034
+                $warn = 85;
+                $crit = 92;
+                # but skip BOU
+                if ($datacenter eq 'bou') {
+                    $warn = 998;
+                    $crit = 999;
+                }
+                if ($datacenter eq 'us1') {
+                    $warn = 998;
+                    $crit = 999;
+                }
+            } else {
+                $warn = 85;
+                $crit = 92;
+                # Adding hysteresis for app servers to detect only pegged CPU
+                # tmid: 166839
+                $crit .= " and previousAnswer > $crit";
+                $has_hysteresis = 1
+            }
+
+            my $crit_threshold = $has_hysteresis ? (split(' ', $crit))[0] : $crit;
+            my $hysteresis_tag = $has_hysteresis ? "yes" : "no";
+           
+            # tmid:161074
+            if ($note) {
+                $note .= "\n<html>For CPU issues, see <a href=\"$machineStatsDoc\">$machineStatsDoc</a></html>";
+            }
+            else {
+                $note = "\n<html>For CPU issues, see <a href=\"$machineStatsDoc\">$machineStatsDoc</a></html>";
+            }
+
+            my $cdbName;
+
+            if ($machine->os() =~ /win/) {
+                $cdbName = "average(snmp/$hostname/Processor_Time, $samples)";
+            } else {
+                $cdbName = "average(snmp/$hostname/Percent_CPU_Usage, $samples)";
+                         
+                my $dbFile_idle = "snmp/$hostname/Total_CPU__Idle__Usage";
+                my $recordDB_idle = ariba::monitor::CircularDB->new($dbFile_idle);
+                my $value_idle = $recordDB_idle->aggregateUsingFunctionForRecords('average', $samples);
+                
+                my $dbFile_total = "snmp/$hostname/Total_CPU_Usage";
+                my $recordDB_total = ariba::monitor::CircularDB->new($dbFile_total);
+                my $value_total = $recordDB_total->aggregateUsingFunctionForRecords('average', $samples);
+                        
+                my $idlePercentage;
+                my $usagePercentage;
+                
+                if ($value_idle && $value_total) {
+                    $idlePercentage =  ($value_idle/$value_total)*100;
+                    $usagePercentage =  ( ($value_total-$value_idle) /$value_total)*100;
+                }
+                
+                my $warnUsage = 85;
+                my $critUsage = 95;
+                
+                $queries{qq!<html><a href="$url">$hostname</a></html> CPU_Usage_Percentage!} = {
+                    format => "%.1f%%\n",
+                    info => "answer > -1",
+                    warn => "answer eq '' or answer > $warnUsage",
+                    crit => "answer ne '' and answer > $critUsage",
+                    severity => $severity,
+                    note => $note,
+                    outageSchedule => $outage,
+                    perl           => sub { return $usagePercentage },
+                    recordMaxResults  => 13000,
+                    recordDataType    => 'gauge',
+                    inf_field => "cpu_usage_percentage",
+                    inf_tags => qq|cluster=$cluster,service=$service,hostname=$hostname,hysteresis=$hysteresis_tag|,
+                    inf_default => 0,
+                    group_by => "$datacenter,$hostname"
+                };
+                
+            }
+
+            $queries{qq!<html><a href="$url">$hostname</a></html> cpu!} = {
+                format => "%.1f%%\n",
+                info => "answer eq '' or answer > -1",
+                warn => "answer eq '' or answer > $warn",
+                crit => "answer ne '' and answer > $crit and answer <=100",
+                severity => $severity,
+                note => $note,
+                outageSchedule => $outage,
+                extractRecorded => $cdbName,
+                details => {
+                    "$hostname product roles" => {
+                        noRowCount => 1,
+                        perl => sub {
+                            return ariba::Ops::MachineProductInfo->topProductRolesForServiceAndHost($me->service(), $hostname);
+                        }, 
+                    }, 
+                }, 
+                inf_field => "cpu_avg_usage_percentage_sample4",
+                inf_tags => qq|cluster=$cluster,service=$service,hostname=$hostname,hysteresis=$hysteresis_tag|,
+                inf_default => 0,
+                group_by => "$datacenter,$hostname"
+            };
+
+            $queries{qq!$hostname cpu variable crit threshold!} = {
+                perl        => sub { return $crit_threshold },
+                inf_field   => "cpu_avg_usage_percentage_crit_threshold",
+                inf_tags    => qq|cluster=$cluster,service=$service,hostname=$hostname,hysteresis=$hysteresis_tag|,
+                inf_default => 95,
+                group_by    => "$datacenter,$hostname"
+            };
+
+            $queries{qq!$hostname cpu variable warn threshold!} = {
+                perl        => sub { return $warn },
+                inf_field   => "cpu_avg_usage_percentage_warn_threshold",
+                inf_tags    => qq|cluster=$cluster,service=$service,hostname=$hostname,hysteresis=$hysteresis_tag|,
+                inf_default => 85,
+                group_by    => "$datacenter,$hostname"
+            };
+
+        }
+
+        my $email = $me->default('notify.email');
+
+        $queries{influx_details} = {measurement => "dc_cpu_watcher"};
+        my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+        my $q = ariba::monitor::QueryManager->newWithDetails("cpu", $pn, $me->service(), $me->customer(), \%queries);
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+main();
+
+__END__
+

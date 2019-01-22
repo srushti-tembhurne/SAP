@@ -1,0 +1,162 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/hadoop/heap-usage#9 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use JSON;
+
+use ariba::monitor::Url;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 <product> [-e|-p|-d|-h]
+
+    product   Name of the Hadoop product
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode. 
+    -h        Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub debug { print "(debug) @_\n" if ($debug && @_); }
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $product;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg !~ /^-/o)   { $product = $arg; next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    usage('Product is required') unless ($product);
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled($product, $me->service()));
+    my $hadoop = ariba::rc::InstalledProduct->new($product, $me->service());
+
+    foreach my $cluster ( $hadoop->allClusters() ) {
+
+        my %queries;
+
+        foreach my $instance ($hadoop->appInstancesInCluster($cluster)) {
+
+            my $instanceName = $instance->instanceName(); 
+            my $appName = $instance->appName(); 
+            my $community = $instance->community(); 
+            my $jmxUrl = $instance->jmxUrlForHeapUsage();
+
+            unless ($jmxUrl) {
+                debug("Skipping $instanceName as there is no jmx url defined");
+                next;
+            }
+
+            my $maxHeapSize = $hadoop->default("Ops.JVM.$appName.MaxHeapSize") || 
+                $hadoop->default('Ops.JVM.MaxHeapSize') || 
+                $hadoop->default("JVM.$appName.MaxHeapSizeInMB") || 
+                $hadoop->default('JVM.MaxHeapSizeInMB');
+
+            # Convert MB/GB to KB
+            $maxHeapSize =~ s|M\s*$||i;
+            $maxHeapSize *= 1024 if ($maxHeapSize=~ s/G$//i);
+            $maxHeapSize *= 1024;
+
+            debug("MaxHeapSize for $instanceName: $maxHeapSize KB");
+
+            my $warnHeap = $maxHeapSize * 0.85;
+            my $critHeap = $maxHeapSize * 0.93;
+
+            # Disable for HbaseRegion as it seems to be within normal range to use up all the heap
+            my $critThreshold = ($appName eq 'HbaseRegion') ? undef : "defined(answer) && answer >= $critHeap";
+
+            my $vmHeapUsage = main::vmUsedHeap($jmxUrl, $appName);
+            my $warnCritFlag = 0;
+            $warnCritFlag = 1 if ( $vmHeapUsage >= $warnHeap );
+            $warnCritFlag = 2 if ( $appName ne 'HbaseRegion' && $vmHeapUsage >= $critHeap );
+
+            $queries{"$instanceName vm heap usage in KBytes"} = {
+                warn    => "defined(answer) && answer >= $warnHeap",
+                crit    => $critThreshold,
+                perl    => sub { $vmHeapUsage },
+                format  => "%d\n",
+                uiHint  => "community $community/$appName",
+                recordMaxResults    => 110000,
+                noCritOnError       => 1,
+                inf_field => "vm_heap_usage_in_KB",
+                inf_default => "none",
+                inf_tags => qq|intanceName="$instanceName"|,
+                group_by => $instanceName,
+            };
+            $queries{"$instanceName vm heap usage in KBytes warncrit flag"} = {
+                perl      => sub { $warnCritFlag },
+                inf_field => "vmhu_warncrit_flag",
+                inf_tags  => qq|intanceName="$instanceName"|,
+                group_by  => $instanceName,
+            };
+        }
+
+        my $email = $me->default('notify.email');
+        $queries{"influx_details"} = {measurement => "heap_usage"};
+
+        my $qm = ariba::monitor::QueryManager->newWithDetails('http-urls-status', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $cluster, \%queries);
+        $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub vmUsedHeap {
+    my $jmxUrl = shift; 
+    my $appName = shift;
+    my $self = $ariba::monitor::Query::_ourGlobalQuerySelf;
+        
+    my $url= ariba::monitor::Url->new($jmxUrl);     
+    my $response = $url->request(); 
+    my $usedHeap;
+
+    eval { 
+        die $url->error() if ($url->error()); 
+        die "Odd. No response from $jmxUrl" unless ($response); 
+
+        my $jmx = decode_json($response);
+        $usedHeap = $jmx->{'beans'}->[0]->{'HeapMemoryUsage'}->{'used'};
+
+        die "Missing 'beans->HeapMemoryUsage->used' element in jmx json: $response" unless (defined $usedHeap);
+
+        $usedHeap /= 1024; # Convert to KB
+    }; 
+
+    # Make exception for HbaseMaster if port is not open as only one HbaseMaster is actually up
+    # and there are at least two configured with the other one being a backup (no jmx running)
+    $self->setSkip(1) if ($appName eq 'HbaseMaster' && $@ =~ /connect\(\) Connection refused/); 
+
+    $self->setError($@) if ($@); 
+    undef $@;
+
+    return $self->error() || $usedHeap;
+    
+}
+
+main(@ARGV);
+
+__END__

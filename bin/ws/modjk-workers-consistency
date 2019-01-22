@@ -1,0 +1,274 @@
+#!/usr/local/bin/perl
+
+##########################################################################
+#   This executable works in a similar fashion to modjk-worker-status,   #
+#   but is targeted only for the buyer and s4 app - to monitor the       #
+#   workers as we restart apache with change in modjk config multiple    #
+#   times during the course of Rolling Upgrade and Rolling Restart       #
+#   The information is organized as follows:                             #
+#                                                                        #
+#   Modjk Workers Consistency                                            #
+#     Buyer                                                              #
+#        Ss Adminserver                                                  # 
+#           App184                                                       #
+#              Missing Appinstances for buyer on App184                  #
+#                  <AppinstanceX PhysicalName (Logical name)>            #  
+#                  <AppinstanceY PhysicalName (Logical name)>            # 
+#              Workers with error state for buyer on App184              #
+#                  <AppinstanceI PhysicalName (Logical name)>            # 
+#                  <AppinstanceJ PhysicalName (Logical name)>            # 
+#                  <AppinstanceK PhysicalName (Logical name)>            #
+#              Extra Workers for buyer on App184                         #
+#                  <WorkerA>                                             # 
+#                  <WorkerB>                                             #  
+#           3. % down (also includes missing appinstances) : XX %        #
+#                                                                        #
+#         Ss Webserver                                                   #
+#           Web19                                                        #
+#              Missing Appinstances for buyer on Web19                   #
+#                  <AppinstanceA PhysicalName (Logical name)>            #  
+#                  <AppinstanceB PhysicalName (Logical name)>            # 
+#              Workers with error state for buyer on Web19               #
+#                  <AppinstanceC PhysicalName (Logical name)>            # 
+#                  <AppinstanceD PhysicalName (Logical name)>            # 
+#                  <AppinstanceE PhysicalName (Logical name)>            #
+#              Extra Workers for buyer on Web19                          #
+#                  <WorkerF>                                             # 
+#                  <WorkerG>                                             #  
+#           3. % down (also includes missing appinstances) : YY %        #
+#                                                                        #
+#     S4                                                                 #
+#        Ss Adminserver                                                  # 
+#           App184                                                       #
+#              Missing Appinstances for buyer on App184                  #
+#                  <AppinstanceX PhysicalName (Logical name)>            #  
+#                  <AppinstanceY PhysicalName (Logical name)>            # 
+#              Workers with error state for buyer on App184              #
+#                       .                                                #
+#                       .                                                #
+#                       .                                                #
+##########################################################################
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use LWP::Simple;
+
+my $debug = 0;
+my $service;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-s$/o) { $service = $arg; next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new(); # for emailing
+    my $ssws = ariba::rc::InstalledProduct->new( "ssws", $service );
+    exit unless ( $ssws );
+    
+    my @productsWeNeedToMonitor = ariba::rc::InstalledProduct->installedProductsList($service);
+    my %webServers;
+    my @webserverHosts = $ssws->hostsForRoleInCluster("ss-webserver", "primary");  
+    $webServers{"ss-webserver"} =  \@webserverHosts;
+    my @adminServers = $ssws->hostsForRoleInCluster("ss-adminserver", "primary");
+    $webServers{"ss-adminserver"} = \@adminServers; 
+
+    my %queries;
+
+    for my $webserverType (keys %webServers) {
+        for my $webserverHost (@{$webServers{$webserverType}}) {
+            my $infoFromWebserver = getInfoFromWebserver($ssws, $webserverHost);
+            for my $product (@productsWeNeedToMonitor) {
+                my $productName = $product->name();
+                print " * * * " . $productName . " * * *\n" if ($debug > 1);
+                my @appInstancesToMonitor = $product->appInstancesVisibleViaRoleInCluster($webserverType);
+                my $totalAppinstanceCount = scalar(@appInstancesToMonitor);
+                next if ($totalAppinstanceCount == 0);
+                my ($numWorkersDown, $missingWorkersRef, $erroredWorkersRef, $extraWorkersRef) = parseAndUpdate($infoFromWebserver, $productName, \@appInstancesToMonitor);
+                
+                $queries{"Missing Workers for $productName on $webserverHost"} = {
+                    warn                            => "numrows > ($totalAppinstanceCount/4)",
+                    perl                            => sub { return scalar(@{$missingWorkersRef}); },
+                    uiHint                          => "$productName/$webserverType/$webserverHost",
+                    description                     => "This category lists all those appinstances for which there was no definition found in the modjk file.",
+                    inf_field                       => "missing_workers_cnt",
+                    inf_default                     => 0,
+                    inf_tags                        => qq(product="$productName",ws_type="$webserverType",host="$webserverHost"),
+                    group_by                        => qq($productName,$webserverType,$webserverHost),
+                };
+                
+                $queries{"Workers in error state for $productName on $webserverHost "} = {
+                    warn                            => "numrows > ($totalAppinstanceCount/4)",
+                    crit                            => "numrows > ($totalAppinstanceCount/2)",
+                    perl                            => sub { return scalar(@{$erroredWorkersRef}); },
+                    uiHint                          => "$productName/$webserverType/$webserverHost",
+                    description                     => "This category lists all the workers that are down (i.e. in error state with respect to modjk).",
+                    inf_field                       => "workers_in_error_state_cnt",
+                    inf_default                     => 0,
+                    inf_tags                        => qq(product="$productName",ws_type="$webserverType",host="$webserverHost"),
+                    group_by                        => qq($productName,$webserverType,$webserverHost),
+                };
+                
+                $queries{"Extra Workers for $productName on $webserverHost "} = {
+                    warn                            => "numrows > 0",
+                    crit                            => "numrows > ($totalAppinstanceCount/2)",
+                    perl                            => sub { return scalar(@{$extraWorkersRef}); },
+                    uiHint                          => "$productName/$webserverType/$webserverHost",
+                    description                     => "This category lists all those workers found in the modjk conf file for which a corresponding appinstance was not found.",
+                    inf_field                       => "extra_workers_cnt",
+                    inf_default                     => 0,
+                    inf_tags                        => qq(product="$productName",ws_type="$webserverType",host="$webserverHost"),
+                    group_by                        => qq($productName,$webserverType,$webserverHost),
+                };
+                
+                $queries{"Percentage down (workers in error state & missing workers) for $productName on $webserverHost "} = {
+                    warn                            => "defined(answer) && answer >= 15",
+                    format                          => "%.2f%%\n",
+                    perl                            => sub { return $numWorkersDown; },
+                    uiHint                          => "$productName/$webserverType/$webserverHost",
+                    description                     => "This category prints the percentage of workers that are down/missing with respect to all appinstances",
+                    inf_field                       => "percent_down",
+                    inf_default                     => 0,
+                    inf_tags                        => qq(product="$productName",ws_type="$webserverType",host="$webserverHost"),
+                    group_by                        => qq($productName,$webserverType,$webserverHost),
+                };
+            }
+        }
+    }
+
+    my $email = $mon->default('notify.email');
+    $queries{influx_details} = { measurement => 'ssws_modjk_workers' }; 
+    my $qm = ariba::monitor::QueryManager->newWithDetails('modjk-workers', $ssws->name(), $ssws->service(), $ssws->customer(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+
+#   The below method is resposible for getting the
+#   query information and storing it in a temporary
+#   file that is used by the query manager
+
+sub getInfoFromWebserver {
+    my ($ssws, $webserver) = @_;
+
+    my $port = $ssws->default( "WebServerHTTPPort" );
+
+    my $url = "http://$webserver:$port/jkstatus?mime=prop";
+    print "pinging URL: $url \n" if ($debug > 1);
+
+    my $content = LWP::Simple::get( $url );
+    print "content: $content \n" if ($debug > 1);
+    return $content;
+}
+
+# This sub will parse the modjk status content based on the appinstances
+sub parseAndUpdate {
+    my ($content, $productName, $appInstancesToMonitorRef) = @_;
+    my @lines = split( /\n/, $content );
+    my @answers;
+
+    # The status information is present in properties format - so create a hashmap out if it.   
+    chop (my %workerInfo = map { split /=/,$_,2 } @lines);
+
+    my @appInstancesToMonitor = @{$appInstancesToMonitorRef};
+    ############# calculation of missing and errored workers ###############
+    
+    my @missingWorkers;
+    my @erroredWorkers;
+    
+    # Initially, we use appinstances from the product as a source of truth and compute the missing and errored workers in modjk list
+    # based on each appinstance.
+    for my $instance (@appInstancesToMonitor) {
+        print "Monitoring " . $instance->workerName() . "(" . $instance->logicalName() . ")\n" if ($debug > 1);
+        # We look for the worker.<WorkerName>.state pattern in the modjk status response, if it isnt present or if the status is not OK,
+        # we report it as an error.
+        # sample patterns present in mojk status response:
+        # worker.Node1app416.state=OK/IDLE
+        # worker.Node8app257.state=ERR/REC
+        my $state = $workerInfo{"worker." . $instance->workerName() . ".state"};
+        if (!defined ($state) or $state eq "") {
+            push (@missingWorkers, $instance->logicalName() . " (" . $instance->workerName() . ")");
+        }
+        else {
+            push (@erroredWorkers, $instance->logicalName() . " (" . $instance->workerName() . ")") unless grep(/^OK/,$state);
+        }
+    }
+    
+    ################## calculation of extra workers ###################
+    
+    # Inorder to compute the extra workers, we need to get all the balanced workers defined for the product in modjk.
+    # This list is then used as the source of truth and matched against the appinstances.
+    # Following is a sample pattern we parse in the modjk status response:
+    # worker.buyer.balance_workers=Node7app416
+    # worker.buyer.balance_workers=Node16app446
+    
+    my $productBalancedWorkerKey = "worker." . lc($productName) . ".balance_workers";
+    my @allWorkersInBalancerRawList = grep(/$productBalancedWorkerKey/ , @lines);
+    print "All workers in balancer: @allWorkersInBalancerRawList" if ($debug > 1);
+    
+    my @allBalancedWorkers;
+    for my $balancedWorker (@allWorkersInBalancerRawList) {
+        my ($key, $value) = split (/=/, $balancedWorker);
+        push (@allBalancedWorkers, $value);
+    }
+    
+    print "Balanced workers calculated: @allBalancedWorkers" if ($debug > 1);
+    
+    # get those workers that are defined in modjk but dont have a corresponding appInstance definition.
+    my %allMonitoredAppinstancesHash = map {$_->workerName() => 1} @appInstancesToMonitor;
+    my @extraWorkers = grep(!defined $allMonitoredAppinstancesHash{$_}, @allBalancedWorkers);
+    
+    
+    ######### calculation of percentage of workers down for a given app #########
+    
+    my $numWorkersDown = ((scalar(@missingWorkers) + scalar(@erroredWorkers)) / scalar(@appInstancesToMonitor)) * 100;
+    
+    ############## Formatting response returned to the query ###################
+    
+    if ($debug > 1) {
+        push (@answers, "\n\n1. Missing Appinstances : \n");
+        push (@answers, sort(@missingWorkers));
+        push (@answers, "\n\n2. Extra Workers : \n");
+        push (@answers, sort(@extraWorkers));
+        push (@answers, "\n\n3. Workers in error state : \n");
+        push (@answers, sort(@erroredWorkers));
+        push (@answers, "\n\n3.% down (workers in error state & missing appinstances) : " . $numWorkersDown . "\n");
+        
+        print "\n\n returning answers: @answers";
+    }
+
+    return ($numWorkersDown, \@missingWorkers, \@erroredWorkers, \@extraWorkers);
+}
+
+main(@ARGV);
+
+__END__

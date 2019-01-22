@@ -1,0 +1,802 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/common/serviceguard-packages#21 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::NetworkDeviceManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::Startup::Common;
+use ariba::Ops::DatacenterController;
+
+
+use HTML::TreeBuilder;
+use JSON;
+use lib '/home/monload/lib';
+use ariba::rc::Utils;
+use CGI;
+use DBI;
+use Data::Dumper;
+use File::Path;
+use File::Basename;
+use dmail::LockLib;
+
+
+# keep about 5 year's worth of results, at 1 sample every 10 minutes
+my $MAX_RESULTS = 262800;
+
+
+sub wwnsDiffForInserv { 
+    my $inserv = shift; 
+
+    my @currentWwns = $inserv->machine->wwns(); 
+    my @newWwns = $inserv->portWwns();  
+    my %diff;
+    my @diff;
+
+    map { $diff{$_}--; } @currentWwns; 
+    map { $diff{$_}++; } @newWwns; 
+
+    while (my ($wwns, $diff) = each (%diff)) {
+        push(@diff, ($diff > 0 ? "+ " : "- ") . $wwns) if ($diff);
+    }
+
+    return join("\n", @diff);
+}
+
+sub main{
+
+    my $debug=0;
+    my $sendEmail=0;
+    my $sendPage=0;
+
+    while(my $arg=shift(@ARGV)){
+        if($arg =~ /^-d/o){ $debug=1; }
+        if($arg =~ /^-e/o){ $sendEmail=1; };
+        if($arg =~ /^-p/o){ $sendPage=1; };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+
+    # set this so that inserv logs to the right place
+    $ENV{'LOGSDIR'} = ariba::Ops::Startup::Common::logsDirForProduct($me);
+
+    #
+    # Find a load up the inserv machinedb entry
+    #
+
+    my @datacenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+    for my $datacenter (@datacenters) {
+
+        my %queries;
+        my $original_dc = $datacenter; 
+        
+        ## Cheking and Chnageing the Datacenter if  datacenter is sharing inserv devices 
+        
+        my $sharedDC = ariba::Ops::DatacenterController::switchDC($datacenter);
+        $datacenter = $sharedDC if ($sharedDC);
+        
+        my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+    
+        my @inservDevices = ariba::Ops::NetworkDeviceManager->newFromDatacenter($datacenter, 'inserv');
+
+        next unless scalar(@inservDevices);
+
+        my $lockFile = "/tmp/stratus-" . basename($0) . ".$datacenter";
+        die "can't grab lock\n" unless dmail::LockLib::requestlock($lockFile, 5);
+
+        for my $nm (@inservDevices) {
+
+            $nm->setLogResponses(0);
+            my $inservHostname = $nm->hostname();
+
+            ## us1 and us1-ms shared inserv devices but inserv3.us1 is only for us1 dc, so skipping inserv3.us1 
+            next if($inservHostname =~ /inserv3.us1/ && $original_dc =~ /us1-ms/ );
+            my ($space,$unit) = split(/\s+/, $nm->usableFreeNew());
+
+            # we can't mix datatypes in influxdb, so we have to normalize the numeric value of $space
+            if ( $space !~ /^\d+(\.\d+)?$/ ) {
+                # also, trigger warning by setting $space value midway between warn and crit
+                $space = 200;
+            }
+
+            $queries{"$inservHostname: Free Space on Fibre Channel Storage in $unit"} = {  
+                uiHint => "$inservHostname",
+                recordMaxResults => $MAX_RESULTS,
+                recordDataType => 'gauge',
+                info => "answer ne '' && answer > 300",
+                warn => "answer eq '' || answer !~ /^\\d+(\.\\d+)?\$/ || answer <= 300",
+                crit => "answer ne '' && answer <= 100",
+                perl => sub { return $space; },
+                inf_field => "GBFreeSpaceOnFibreChannelStorage",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                group_by  => "$datacenter,$inservHostname",
+                inf_default => 0
+            };
+
+            # Free space on Near Line Storage
+            #  crit means frame does not have enough space to accommodate 
+            #    all the CPGs growing one more time
+            #  warn means frame is within 15% of crit
+            my $totalIncrementSize = $nm->cpgTotalIncrementSize();
+            my $crit = $totalIncrementSize;
+            my $warn = 0.85 * $totalIncrementSize;      # this should probably be 1.15 instead of 0.85 (HOA-164217)
+
+            my ($nl_space,$nl_unit) = split(/\s+/, $nm->usableFreeNew(1));
+            # we can't mix datatypes in influxdb, so we have to normalize the numeric value of $nl_space
+            if ( $nl_space !~ /^\d+(\.\d+)?$/ ) {
+                # also, trigger warning by setting $nl_space value midway between warn and crit
+                # NOTE: since warn is probably buggy (HOA-164217) at the moment, this will trigger crit, too
+                $nl_space = $warn - abs( $warn - $crit );
+            }
+
+            $queries{"$inservHostname: Free Space on Near Line Storage in $nl_unit"} = {
+                uiHint => "$inservHostname",
+                recordMaxResults => $MAX_RESULTS,
+                recordDataType => 'gauge',
+                info => "answer ne '' && answer > $warn",
+                warn => "answer eq '' || answer !~ /^\\d+(\.\\d+)?\$/ || answer <= $warn",
+                crit => "answer ne '' && answer <= $crit",
+                perl => sub { return $nl_space },
+                inf_field => "GBFreeSpaceOnNearLineStorage",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                group_by  => "$datacenter,$inservHostname",
+                inf_default => 0,
+            };
+            $queries{"$inservHostname: Free Space on Near Line Storage in $nl_unit warn threshold"} = {
+                perl      => sub { $warn },
+                inf_field => "ls_warn_threshold",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                group_by  => "$datacenter,$inservHostname",
+            };
+            $queries{"$inservHostname: Free Space on Near Line Storage in $nl_unit crit threshold"} = {
+                perl      => sub { $crit },
+                inf_field => "ls_crit_threshold",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                group_by  => "$datacenter,$inservHostname",
+            };
+
+            # The following 6 queries report on 3par raw space.  We return total space, used space
+            # and spare space for both NL and FC drives.
+            $queries{"$inservHostname: FC total raw space in TB"} = {
+                uiHint => "$inservHostname",
+                recordMaxResults => $MAX_RESULTS,
+                recordDataType => 'gauge',
+                info => 1,
+                perl => sub { return $nm->totalRawSpace() },
+                inf_field => "TBFCTotalRawSpace",
+                inf_tags  => "datacenter=datacenter,hostname=$inservHostname",
+                group_by  => "$datacenter,$inservHostname",
+                inf_default => 0,
+            };
+
+            $queries{"$inservHostname: FC used raw space in TB"} = {
+                uiHint => "$inservHostname",
+                recordMaxResults => $MAX_RESULTS,
+                recordDataType => 'gauge',
+                info => 1,
+                perl => sub { return $nm->usedRawSpace() || 0 },
+                inf_field => "TBFCUsedRawSpace",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                group_by  => "$datacenter,$inservHostname",
+                inf_default => 0,
+                crit => "answer ne '' && answer <= 85",
+            };
+
+            $queries{"$inservHostname: FC spare space in TB"} = {
+                uiHint => "$inservHostname",
+                recordMaxResults => $MAX_RESULTS,
+                recordDataType => 'gauge',
+                info => 1,
+                perl => sub { return $nm->spareSpace() },
+                inf_field => "TBFCSpareSpace",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                group_by  => "$datacenter,$inservHostname",
+                inf_default => 0
+            };
+
+            $queries{"$inservHostname: NL total raw space in TB"} = {
+                uiHint => "$inservHostname",
+                recordMaxResults => $MAX_RESULTS,
+                recordDataType => 'gauge',
+                info => 1,
+                perl => sub { return $nm->totalRawSpace(1) },
+                inf_field => "TBNLTotalRawSpace",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                group_by  => "$datacenter,$inservHostname",
+                inf_default => 0
+            };
+
+            $queries{"$inservHostname: NL used raw space in TB"} = {
+                uiHint => "$inservHostname",
+                recordMaxResults => $MAX_RESULTS,
+                recordDataType => 'gauge',
+                info => 1,
+                perl => sub { return $nm->usedRawSpace(1) },
+                inf_field => "TBNLUsedRawSpace",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                group_by  => "$datacenter,$inservHostname",
+                inf_default => 0
+            };
+
+            $queries{"$inservHostname: NL spare space in TB"} = {
+                uiHint => "$inservHostname",
+                recordMaxResults => $MAX_RESULTS,
+                recordDataType => 'gauge',
+                info => 1,
+                perl => sub { return $nm->spareSpace(1) },
+                inf_field => "TBNLSpareSpace",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                group_by  => "$datacenter,$inservHostname",
+                inf_default => 0
+            };
+
+            my ( $iops, $maxIops ) = $nm->ioPerSecond("NL");
+            my $NLPercent;
+            if($maxIops) {
+                $NLPercent = int( (100*$iops) / $maxIops );
+            } else {
+                $NLPercent = 0;
+            }
+            $queries{"$inservHostname: rate for NL drives"} = {
+                uiHint => "$inservHostname",
+                recordMaxResults => $MAX_RESULTS,
+                info => 1,
+                perl => sub { return $NLPercent; },
+                format => "$iops/$maxIops iops per sec (answer%%)",
+                inf_field => "NLDriveRate",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                group_by  => "$datacenter,$inservHostname",
+                inf_default => 0
+            };
+
+            ( $iops, $maxIops ) = $nm->ioPerSecond("FC");
+            my $FCPercent;
+            if($maxIops) {
+                $FCPercent = int( (100*$iops) / $maxIops );
+            } else {
+                $FCPercent = 0;
+            }
+            $queries{"$inservHostname: rate for FC drives"} = {
+                uiHint => "$inservHostname",
+                recordMaxResults => $MAX_RESULTS,
+                info => 1,
+                perl => sub { return $FCPercent; },
+                format => "$iops/$maxIops iops per sec (answer%%)",
+                inf_field => "FCDriveRate",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                group_by  => "$datacenter,$inservHostname",
+                inf_default => 0
+            };
+
+            # We want to know about VV's with snapshot policies set to 'no_stale_ss' in prod.
+            # This type of policy will crash a database if the CPG associated with the VV fills up.
+            my $interestingPolicyType = 'no_stale_ss';
+
+            # In devlab/opslab we care more about the snapshot than the running database.
+            # We want to make sure none of our important snapshot backups go stale.
+            if ($datacenter eq 'opslab') {
+                $interestingPolicyType = 'stale_ss';
+            }
+
+            $queries{"$inservHostname: VVs with policy type of $interestingPolicyType"} = {
+                uiHint => "$inservHostname/Policies-$interestingPolicyType",
+                info => 1,
+                perl => sub {
+                    my @vvs = $nm->cmdShowVvsForPolicy($interestingPolicyType);
+
+                    # Ignore vvs from beta in bou. TMID:87597
+                    @vvs = grep(!/(?:\b|-)030[12356]-\d$/, @vvs) if ($datacenter eq 'bou');
+
+                    #return join("\n", sort { $a cmp $b } @vvs);
+                    return  scalar(@vvs);
+                },
+                warn => "answer ne ''",
+                inf_field => "VVsWithPolicyType",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname,policy_type=$interestingPolicyType",
+                group_by  => "$datacenter,$inservHostname,$interestingPolicyType",
+                inf_default => 0,
+            };
+
+            for my $cpgName ($nm->cpgNames()) {
+
+                # Make sure there is a growth limit set for data snap space
+                #   crit if data growth limit is not set
+                #
+                my $dataGrowthLimit = $nm->cpgDataGrowthLimit($cpgName) || 0;
+
+                $queries{"$inservHostname: $cpgName SD auto-grow limit"} = {
+                    uiHint => "$inservHostname/$cpgName",
+                    format => "%6.1f GB",
+                    info => "answer > 0",
+                    warn => "answer <= 0",
+                    crit => "previousAnswer <= 0 && answer <= 0",
+                    perl => sub { return $dataGrowthLimit },
+                    inf_field => "SDAutoGrowLimit",
+                    inf_tags  => "datacenter=$datacenter,hostname=$inservHostname,cpg_name=$cpgName",
+                    group_by  => "$datacenter,$inservHostname,$cpgName",
+                    inf_default => 0,
+                };
+
+                my $dataInc = $nm->cpgDataIncrementSize($cpgName);
+                $queries{"$inservHostname: $cpgName SD auto-grow size"} = {
+                    uiHint => "$inservHostname/$cpgName",
+                    format => "%6.1f GB",
+                    info => 1,
+                    perl => sub { return $dataInc; },
+                    inf_field => "SDAutoGrowSize",
+                    inf_tags  => "datacenter=$datacenter,hostname=$inservHostname,cpg_name=$cpgName",
+                    group_by  => "$datacenter,$inservHostname,$cpgName",
+                    inf_default => 0,
+                };
+
+                # Used data snap space
+                #   warn if used is over 75% of set hard limit (need to raise limit)
+                #   crit if used is over 85% of set hard limit
+                $queries{"$inservHostname: $cpgName SD Space Used"} = {
+                    uiHint => "$inservHostname/$cpgName",
+                    recordMaxResults => $MAX_RESULTS,
+                    recordDataType => 'gauge',
+                    format => "%6.1f%%",
+                    info => "answer ne '' && answer <  75",
+                    warn => "answer eq '' || answer >= 75",
+                    crit => "answer ne '' && answer >= 85",
+                    perl => sub { 
+                        if ( defined($dataGrowthLimit) && $dataGrowthLimit != 0 ) {
+                            return (100 * $nm->cpgUsedDataSnapSpace($cpgName)/$dataGrowthLimit);
+                        } else {
+                            return 0;
+                        }
+                    },
+                    inf_field => "SDSpaceUsed",
+                    inf_tags  => "datacenter=$datacenter,hostname=$inservHostname,cpg_name=$cpgName",
+                    group_by  => "$datacenter,$inservHostname,$cpgName",
+                    inf_default => 0
+                };
+
+                # snap space needed for next growth
+                #   warn if space needed for next growth is above 85% of limit
+                #   crit if space needed for next growth is above limit
+                $queries{"$inservHostname: $cpgName SD auto-grow status"} = {
+                    uiHint => "$inservHostname/$cpgName",
+                    format => "%s",
+                    info => "answer =~ /^ok to grow at least twice/",
+                    warn => "answer =~ /^ok to grow once|^not ok/",
+                    crit => $dataGrowthLimit ? "answer =~ /^not ok/" : 
+                    "previousAnswer =~ /^not ok/ && answer =~ /^not ok/",
+                    perl => sub { 
+                        my $usedSpace = $nm->cpgUsedDataSnapSpace($cpgName); 
+                        my $status;
+
+                        if ( ($usedSpace + 2*$dataInc) < $dataGrowthLimit) {
+                            $status = sprintf("ok to grow at least twice by %.1f GB", $dataInc);
+                        } elsif ( ($usedSpace + $dataInc) < $dataGrowthLimit) {
+                            $status = sprintf("ok to grow once by %.1f GB", $dataInc);
+                        } else {
+                            $status = sprintf("not ok to grow by %.1f GB", $dataInc);
+                        }
+                        return $status;
+                    },
+                    inf_field => "SDAutoGrowStatus",
+                    inf_tags  => "datacenter=$datacenter,hostname=$inservHostname,cpg_name=$cpgName",
+                    group_by  => "$datacenter,$inservHostname,$cpgName",
+                    inf_default => 0
+                };
+
+                $queries{"$inservHostname: $cpgName VVs associated with cpg (Name|SnapMB|userMB|% used of base)"} = {
+                    uiHint => "$inservHostname/$cpgName",
+                    info => 1,
+                    format => "%s\t%61.f GB\t%61.f GB\t%d%%",
+                    perl => sub {
+                        my @vvs = $nm->cmdShowBasevvForCpg($cpgName);
+                        my @results = ();
+                        for my $vv (@vvs) {
+                            push(@results, 
+                                join("\t", $vv->name(), $vv->snapMB()/1024, $vv->userMB()/1024, 
+                                    ($vv->snapMB()/$vv->userMB())*100) 
+                            );
+                        }
+                        #return join("\n", @results);
+                        return scalar(@results);
+                    },
+                    inf_field => "VVsAssociatedWithCpg",
+                    inf_tags  => "datacenter=$datacenter,hostname=$inservHostname,cpg_name=$cpgName\"",
+                    group_by  => "$datacenter,$inservHostname,$cpgName",
+                    inf_default => 0
+                }
+
+            }
+
+            #
+            # Go through all events and figure out if there were major,
+            # minor events that happened.
+            #
+            my @events;
+            my @times;
+            my $eventLevel = 0;
+            my @displayEvents;
+
+            @events = $nm->majorEvents(2*60); # 2 hours for major
+
+            if (@events) {
+                my $isCrit = 0;
+                for my $event (@events) {
+                    my $t = localtime($event->time());
+                    push(@displayEvents, "MAJOR: $t: ". $event->message());
+                    if (!($event->message() =~ /Total NL raw sp/)) {
+                        $isCrit = 1;
+                    }
+
+                    # We want to ignore 'Max allowable local CLI processes of 16 exceeded'
+                    # pages on Thursdays until the 3Par proxy is ready to be deployed in Prod
+                    # tmid: 154478
+                    my @dateString = split / /, $t;
+                    my $weekDay = shift @dateString;
+                    if (($weekDay eq 'Thu') && ($event->message() =~ /Max allowable local CLI processes of 16 exceeded/)) {
+                        $isCrit = 0;
+                    }
+
+                }
+                if ($isCrit) {
+                    $eventLevel = 3;
+                } else {
+                    $eventLevel = 4;
+                }
+            } else {
+                @events = $nm->minorAndDegradedEvents(60); # 1 hour
+
+                # We've decided to not warn on CLI errors.  These are seen
+                # when someone typo's a command or 3PAR's SP monitoring
+                # does some check which is not applicable to our environment.
+                # See TMID 71310.
+                #
+                # Time     : 2009-09-30 06:50:35 PDT
+                # Severity : Minor
+                # Type     : CLI command error 
+                # Message  : {3parsvc super all {{0 8}} 0 172.22.1.234 26570} {Command: getportdev ns 3:5:4 Error: Error: Unable to get device list on port 3:5:4} {}
+                @events = $nm->filterEventTypeFromEvents(\@events, 'CLI command error');
+
+                if (@events) {
+                    for my $event (@events) {
+                        my $t = localtime($event->time());
+                        push(@displayEvents, "Minor/Degraded: $t: ". $event->message());
+                    }
+                    $eventLevel = 2;
+                } else {
+                    @events = $nm->informationalEvents(45);
+
+                    my $isCrit = 0;
+                    my $servicemagLogModeCrit = 0;
+
+                    for my $event (@events) {
+                        my $t = localtime($event->time());
+
+                        # Page if disk was replaced with wrong drive type
+                        # Contact SAs and 3Par support immediately
+                        # tmid: 160087
+                        if ($event->message() =~ /disk has an unsupported drive type/) {
+                            $isCrit = 1;
+                            push(@displayEvents, "CRITICAL: $t: ". $event->message());
+                        } elsif ($event->message() =~ /servicemag start -log/) {
+                            # Page if the magazine is in log mode for more that 30min
+                            # tmid: 160087
+                            my $logModeCritTime = 1800;         # 30 min
+                            my $eventTime = $event->time();
+                            if (time() - $eventTime > $logModeCritTime) {
+                                $servicemagLogModeCrit = 1;
+                            }
+                            push(@displayEvents, "WARN: $t: ". $event->message());
+                        } elsif ($event->message() =~ /setservicemaglogclear/) {
+                            $servicemagLogModeCrit = 0;
+                            push(@displayEvents, "Info: $t: ". $event->message());
+                        } else {
+                            push(@displayEvents, "Info: $t: ". $event->message());
+                        }
+                    }
+                    if ($servicemagLogModeCrit) {
+                        $isCrit = 1;
+                    }
+                    if ($isCrit) {
+                        $eventLevel = 3;
+                    } else {
+                        $eventLevel = 1;
+                    }
+                }
+            }
+
+            # There is an "error" reported that HP has told us should be ignored.  This error relates to an SQLite DB problem, inserting
+            # values into a table named hires.vvspace.  There are at least 3 levels that could be used to do this:
+            #   1. Look for any "MAJOR.*SQLite error" and skip them all;
+            #   2. Look for "Major.*SQLite error.*INSERT INTO" to skip any/all 'INSERT' statements;
+            #   3. Look for "Major.*SQLite error.*INSERT INTO hires.vvspace" to skip only INSERTS into the 'hires.vvspace' table.
+            # Initially taking the most restrictive viewpoint (3), to limit what we don't see to only one item.
+            if (join (' ', @displayEvents) !~ /MAJOR.*SQLite error.*INSERT INTO hires.vvspace/)
+            {
+                $queries{"$inservHostname: EventLog messages"} = {
+                    uiHint => "$inservHostname",
+                    info => $eventLevel <= 1,
+                    warn => $eventLevel == 2,
+                    crit => $eventLevel == 3,
+                    ticketOnWarnOpenAfterMinutes => $eventLevel == 4,
+                    #perl => sub { return join("\n", @displayEvents); },
+                    perl => sub { return scalar(@displayEvents); },
+                    inf_field => "EventLogLevel",
+                    inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                    group_by  => "$datacenter,$inservHostname",
+                    inf_default => 0
+                };
+            }
+
+            my $alertLevel = 0;
+            my @critAlerts;
+            my @majorAlerts;
+            my @minorAndInformationalAlerts;
+            my @displayAlerts;
+
+            # Grab all the alerts
+            for my $alert ($nm->criticalAlerts()) {
+                my $details = $alert->details();
+                if ($details !~ m/Total NL raw space usage/) {              
+                    my $t = localtime($alert->time());
+                    push(@critAlerts, "CRITICAL: $t: ". $alert->id() . ": " . $alert->details());
+                }
+            }
+            for my $alert ($nm->majorAlerts(), $nm->degradedAlerts()) {
+                my $t = localtime($alert->time());
+                push(@majorAlerts, "Major: $t: ". $alert->id() . ": " . $alert->details());
+            }
+            for my $alert ($nm->informationalAlerts(), $nm->minorAlerts()) {
+                my $t = localtime($alert->time());
+                # 3par considers ECC informational but we should warn on them.
+                if ($alert->details() =~ /Correctable cluster memory error/) {
+                    push(@majorAlerts, "Major: $t: ". $alert->id() . ": " . $alert->details());
+                } else {
+                    push(@minorAndInformationalAlerts, "Informational: $t: ". $alert->id() . ": " . $alert->details());
+                }
+            }
+
+            # Only display one level of alerts starting with critical.
+            if (@critAlerts) {
+                @displayAlerts = @critAlerts;
+                $alertLevel = 3;
+            } elsif (@majorAlerts) {
+                @displayAlerts = @majorAlerts;
+                $alertLevel = 2;
+            } elsif (@minorAndInformationalAlerts) {
+                @displayAlerts = @minorAndInformationalAlerts;
+                $alertLevel = 1;
+            }
+
+            #pushing to Alert Dashboard
+
+            my @vals= ();
+            my($product,$env,$pgm,$idate,$itime,$mid,$status,$dest,$error,$val,$squelched,$dcent,$severity,$assignedTo) = ();
+            my $service = $me->service();
+            print "Current service : $service \n"if($debug);
+
+            if(($alertLevel == 3 ) && ($service =~/load/si)) {
+                print "Alert Level : $alertLevel \n displayAlerts : @displayAlerts \n" if($debug>1);
+
+                foreach my $displayAlert(@displayAlerts) {
+
+                    print "single display alert : $displayAlert \n" if($debug>1);
+
+                    #alert : CRITICAL: Mon Jul 21 03:47:09 2014: 1911: CPG fpc1_snp_cpg SD and/or user space has reached allocation limit of 2.048e+04G
+                    my @alertInfo = split(/:/,$displayAlert);
+                    print "Alert Originated date : $alertInfo[1]\n" if($debug>1);
+                    #my ($blank,$day,$mon,$date,$hour) = split(/\s+/,$alertInfo[1]);
+                    #my ($min,$sec,$year) = ($alertInfo[2],split(/\s+/,$alertInfo[3]));
+
+                    print "cpg alert info : $alertInfo[$#alertInfo] \n" if($debug>1);
+                    my $cpgAlertInfo=$alertInfo[$#alertInfo];
+
+                    my $cpg_name;
+                    if($cpgAlertInfo =~/^\s+CPG\s+(.*?)\s+/) {
+                        $cpg_name = $1;
+                        print "cpg name : $cpg_name \n" if($debug);
+                    }
+                    
+                    my @critical_cpg_to_monitor = qw(buyer_dev2_usr_cpg buyer_dev2_snp_cpg s4_dev2_usr_cpg s4_dev2_snp_cpg);
+
+                    next unless(grep(/$cpg_name/i,@critical_cpg_to_monitor));
+
+                    print "critical display cpg alert : $displayAlert \n" if($debug);
+                    #Fetch current time 
+                    my $current_date = `date`;
+                    my($day,$mon,$date,$time,$zone,$year) = split(/\s+/,$current_date);
+                    my($hour,$min,$sec) = split(/:/,$time);
+
+                    my $i = rand(100000);
+                    $mon = uc($mon);
+                    $year=substr($year,-2);
+
+                    print "date format $date-$mon-$year $hour:$min:$sec\n" if($debug);
+                    $idate="$date-$mon-$year $hour:$min:$sec";
+                    $itime="$hour:$min";
+
+                    $product = "pridc";
+                    $env=$service;
+                    $pgm=$0;
+                    $mid = "DEV_$i".$itime;
+                    $dest="SRE TEAM";
+                    $error="$inservHostname --> $displayAlert";
+                    $val="3par";
+                    $status="crit";
+                    $severity="crit";
+                    $assignedTo="SRE TEAM";
+                    $dcent="DEVLAB";
+
+                    print    "\n---$product|$env|$pgm|$idate|$itime|$mid|$status|$dest|$error:$val" if($debug);
+                    push @vals,   "$product|$env|$pgm|$idate|$itime|$mid|$status|$dest|$error:$val|$squelched|$dcent|$severity,$assignedTo";
+                }
+                unless($debug) {
+                    &dump_to_db(\@vals);
+                }
+            }
+
+
+            $queries{"$inservHostname: Alert messages"} = {
+                uiHint => "$inservHostname",
+                info => $alertLevel <= 1,
+                warn => $alertLevel == 2,
+                crit => $alertLevel == 3,
+                pageInServices => "load",
+                perl => sub { return $alertLevel; },
+                inf_field => "alertLevel",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                inf_default => 0,
+                group_by  => "$datacenter,$inservHostname",
+            };
+
+
+            # 3PAR port persona monitoring
+            #
+            # 0 Disk    -       -       -  Direct connect (DC)
+            # 1 Generic Generic Generic 0  Direct connect (DC)
+            # 2 Sun     SOC+    Generic 0  Direct connect (DC)
+            # 3 JNI     Generic Generic 0  Direct connect (DC)
+            # 4 Emulex  Generic Generic 0  Direct connect (DC)
+            # 5 HP      Generic HP UX   0  Direct connect (DC)
+            # 6 Unused  Unused  Unused  0  Unused
+            # 7 Generic Generic Generic 0  Fabric attached (FA)
+            # 8 HP      Generic HP_UX   0  Fabric attached (FA)
+            ##
+
+            my @badPorts = ();
+            my $portParameters = $nm->getPortParameters();
+
+            foreach my $port (values %$portParameters) {
+                my $persona = $port->persona();
+
+                # We only use 0 for disk shelf connections and 1 for redhat linux DB servers.
+                if ($persona !~ /^\([01]\)/) {
+                    my $errMsg = "Invalid persona [$persona] found on port " . $port->nsp();
+                    push( @badPorts, $errMsg );
+                }
+            }
+
+            $queries{"$inservHostname: invalid port personas"} = {
+                uiHint => "$inservHostname/Port Personas",
+                info => "numrows > -1",
+                warn => "numrows > 0",
+                #perl => sub { return join("\n", @badPorts); },
+                perl => sub { return scalar(@badPorts); },
+                inf_field => "invalidPortPersonasCount",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                group_by  => "$datacenter,$inservHostname",
+                inf_default => 0,
+            };
+
+			my @diff_arr = main::wwnsDiffForInserv($nm);
+
+            $queries{"$inservHostname: wwns diff vs machinedb"} = {
+                uiHint => $inservHostname,
+                info => 'numrows > -1', 
+                warn => 'numrows > 0', 
+                ticketOnWarnOpenAfterMinutes => 1, 
+                ticketOwner => "unassigned-sysadmin",
+                #perl => sub { main::wwnsDiffForInserv($nm); },
+                perl => sub { scalar @diff_arr ? ($diff_arr[0] =~ tr/\n//) + 1 : 0; },
+                inf_field => "wwnsDiffvsMachineDb",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                group_by  => "$datacenter,$inservHostname",
+                inf_default => 0,
+            };
+
+        }
+
+        my $email = $me->default('notify.email');
+
+		$queries{"influx_details"} = { 'measurement' => "3par_status"};
+        my $q = ariba::monitor::QueryManager->newWithDetails("3par-storage-health", $tab, $me->service(), $me->customer(), \%queries);
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+        dmail::LockLib::releaselock($lockFile);
+    }
+}
+
+
+sub dump_to_db {
+    my $ref = shift;
+    $ENV{'ORACLE_HOME'} = '/usr/local/oracle';
+
+    my $envName = sharedLibEnvName();
+
+    $ENV{$envName} = "$ENV{'ORACLE_HOME'}/lib";
+    $ENV{'PATH'} = "$ENV{'ORACLE_HOME'}/bin:$ENV{'PATH'}";
+    my $dbh = DBI->connect('dbi:Oracle:host=bevdb.lab1.ariba.com;sid=bevdb;port=1521',
+        'toolsdev', 't00lsdev', { RaiseError => 1, AutoCommit => 0 });
+
+    my $sql = qq~ BEGIN
+    PKG_MON_PAGE.CREATE_NEW_PAGE(:MPI_SYS_GEN_ID,:MPI_SEVERITY,to_date(:MPI_RECVD_TIME,'DD-MON-YY HH24:MI:SS'),:MPI_PRODUCT,:MPI_SERVICE,:MPI_HOST,
+    :MPI_DB_SERVICE,:MPI_SCRIPT_NAME,:MPI_PAGE_TEXT,:MPI_PAGE_DEST,:MPI_DATA_CENTER,:ERNO,:ERST);
+    END; ~;
+
+    my $stmt = $dbh->prepare($sql);
+    my $erno;
+    my $erst;
+    my $count = scalar @$ref;
+    foreach my $k(@$ref){
+        my ($product,$env,$pgm,$idate,$itime,$mid,$status,$dest,$content,$squelched, $dc,$severity,$assignedTo) = split /\|/, $k;
+        print qq~ pushed to db: $product,$env,$pgm,$idate,$itime,$mid,$status,$dest,$content,$squelched, $dc *** \n~;
+
+        $itime = $idate." ".$itime;
+        next if($itime !~ /\d+/);
+        $stmt->bind_param(":MPI_SYS_GEN_ID",$mid);
+        $stmt->bind_param(":MPI_SEVERITY",$status);
+        #$stmt->bind_param(":MPI_RECVD_TIME","to_date('".$idate."','HH24:MI:SS')");
+        $stmt->bind_param(":MPI_RECVD_TIME",$idate);
+        $stmt->bind_param(":MPI_PRODUCT",$product);
+        $stmt->bind_param(":MPI_SERVICE",$env);
+        $stmt->bind_param(":MPI_HOST",$squelched);
+        $stmt->bind_param(":MPI_DB_SERVICE",'');
+        $stmt->bind_param(":MPI_SCRIPT_NAME",$pgm);
+        $stmt->bind_param(":MPI_PAGE_TEXT",$content);
+        $stmt->bind_param(":MPI_PAGE_DEST",$dest);
+        $stmt->bind_param(":MPI_DATA_CENTER",$dc);
+        $stmt->bind_param_inout(":ERNO",\$erno,99);
+        $stmt->bind_param_inout(":ERST",\$erst,99);
+        $stmt->execute();
+        if($erst ne 'SUCCESS') {print "\n $erst";}
+    }
+    if($count) {
+        &runAllRules($dbh);
+    }
+    $stmt->finish();
+    $dbh->disconnect();
+    print "\n Loaded $count pages to DB";
+    print  "\n Loaded $count pages to DB";
+    print  "\n -----------\n";
+}
+
+sub runAllRules {
+    my($dbh) = @_;
+    my ($errNo,$errStr) = (0,"");
+    my $sql = qq~ BEGIN
+    PKG_MON_PAGE.PROCESS_INBOUND_PAGES(:IN_PRODUCT,:IN_CATEGORY,:IN_SUB_CATEGORY,:OUT_ERR_NO,:OUT_ERR_STR);
+    END; ~;
+    my $stmt = $dbh->prepare($sql);
+    if($stmt){
+        $stmt->bind_param(":IN_PRODUCT",undef);
+        $stmt->bind_param(":IN_CATEGORY",undef);
+        $stmt->bind_param(":IN_SUB_CATEGORY",undef);
+        $stmt->bind_param_inout(":OUT_ERR_NO",\$errNo,30);
+        $stmt->bind_param_inout(":OUT_ERR_STR",\$errStr,500);
+        $stmt->execute();
+        $stmt->finish();
+    }else{
+        return "ERROR";
+    }
+    if($DBI::errstr){
+        return "ERROR:$DBI::errstr";
+    }
+
+}
+
+main();

@@ -1,0 +1,187 @@
+#!/usr/local/bin/perl -w
+
+# This script displays all the routers interfaces and their throughput
+#
+#
+# $Id: //ariba/services/monitor/bin/network/switch-usage#7 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::NetworkUtils;
+use ariba::monitor::CircularDB;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::monitor::Query;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $debug = 0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; };
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+
+	my $cluster = $me->currentCluster();
+
+	my $warn;
+	my $crit;
+
+	my %queries = ();
+
+	for my $datacenter ( @dataCenters ) {
+		for my $deviceType ('router', 'switch', 'loadbalancer', 'firewall') {
+
+			my %matchDatacenter = (
+					status	 => 'inservice',
+					datacenter => $datacenter,
+					monitoringDatacenter => '',
+					providesServices => $deviceType,
+					);
+
+			my %matchMonitoringDatacenter = (
+					status	 => 'inservice',
+					monitoringDatacenter => $datacenter,
+					providesServices => $deviceType,
+					);
+
+			my @devices = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+			@devices = (@devices , ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+
+			for my $device (@devices) {
+				my $deviceName = $device->hostname();
+				
+				my $uiHint = "$deviceType";
+
+				# average over 5 samples by default
+				my $samples = 5;
+
+				# We cannot retrieve everything in one call or
+				# it would run out of files handles
+				my @toDisplay = qw(OutOctets InOctets);
+
+				if ($debug) {
+					print "working on $deviceType [$deviceName] in $datacenter\n";
+				}
+
+
+				for my $item (@toDisplay) {
+					my $cdbs	 = ariba::monitor::CircularDB->listDBs("snmp/$deviceName", $item);
+
+					for my $cdb (@$cdbs) {
+
+						my $cdbTrueName = $cdb->name(1);
+						$cdbTrueName =~ s/ /_/g;
+
+						# IOS reports IN/OUT statistics for VLAN. We only care about
+						# Physical interfaces. See TMID: 61199 and 60545
+						next unless ( $cdbTrueName !~ /VLAN/i);
+
+						# Ignoring internal data interfaces for firewalls See TMID: 115334
+						next if ($deviceType eq 'firewall' && $cdbTrueName =~ /Internal-Data/i);
+
+						my $query = ariba::monitor::Query->new("snmp/" . $cdbTrueName);
+
+						my $maxSpeed = 100;
+						if ($query->portSpeed()){
+							$maxSpeed = $query->portSpeed();
+						}
+
+						print "The maximum throughput is $maxSpeed Mb/s for interface " . $cdb->name() if ($debug);
+
+						$warn = 0.8 * $maxSpeed;
+						$crit = 0.9 * $maxSpeed;
+						my $critString = "answer ne '' and answer > $crit";
+						
+						# If it's a Gigabit interface
+						# The limit has to be updated
+						#
+						# Examples :
+						# c3640-n1-1.opslabdr.ariba.com/FastEthernet1:0 ifInOctets MBits
+						# c3750-n3-2.opslab.ariba.com/GigabitEthernet1:0:1 ifOutOctets MBits
+						#
+						my $intf = $cdb->name();
+						my $use_crit = 1;
+						if( $intf =~ m|backup10|)
+						{
+							$critString = undef;
+							$use_crit = 0;
+						}
+						
+						$intf =~ s/$deviceName\/(\S+).*/$1/;
+						print "Intf : [$intf]\n\n" if ($debug);
+
+						my $file = $cdb->fileName();
+
+						my $cdbName = "average($file, $samples)";
+
+
+						my $format = "%.1f of " . $maxSpeed . " Mbit/s\n";
+
+						my $metricDescription = $cdb->name();
+						# QueryManager doesn't like ',' and '=' in tags (lots of uninitialized warnings)
+						$metricDescription =~ tr/=,/__/;
+						$queries{$metricDescription} = {
+							uiHint => $uiHint,
+							format => $format,
+							info => "answer eq '' or answer > -1",
+							warn => "answer eq '' or answer > $warn",
+							crit => $critString,
+							hasErraticSchedule => 1,
+							extractRecorded => $cdbName,
+							inf_field => "usage",
+							inf_tags => qq|deviceType="$deviceType",deviceName="$deviceName",metricDescription="$metricDescription"|,
+							inf_default => 0,
+							group_by => "$datacenter,$deviceType,$deviceName,$metricDescription",
+						};
+						$queries{"$metricDescription warn threshold"} = {
+							perl      => sub { $warn },
+							inf_field => "usage_warn_threshold",
+							inf_tags  => qq|deviceType="$deviceType",deviceName="$deviceName",metricDescription="$metricDescription"|,
+							group_by  => "$datacenter,$deviceType,$deviceName,$metricDescription",
+						};
+						$queries{"$metricDescription crit threshold"} = {
+							perl      => sub { $crit },
+							inf_field => "usage_crit_threshold",
+							inf_tags  => qq|deviceType="$deviceType",deviceName="$deviceName",metricDescription="$metricDescription"|,
+							group_by  => "$datacenter,$deviceType,$deviceName,$metricDescription",
+						};
+						$queries{"$metricDescription use crit threshold"} = {
+							perl      => sub { $use_crit },
+							inf_field => "usage_use_crit_threshold",
+							inf_tags  => qq|deviceType="$deviceType",deviceName="$deviceName",metricDescription="$metricDescription"|,
+							group_by  => "$datacenter,$deviceType,$deviceName,$metricDescription",
+						};
+					}
+				}
+			}
+		}
+		next unless scalar(keys(%queries));
+
+		my $email = $me->default('notify.email');
+
+		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+		$queries{influx_details} = {measurement => "network-usage"};
+		my $q = ariba::monitor::QueryManager->newWithDetails("network-usage", $pn, $me->service(), $me->customer(), \%queries);
+
+		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+		# After each datacenter reinit queries hash.
+		%queries  = ();
+	}
+}
+
+main();
+
+__END__

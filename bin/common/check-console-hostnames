@@ -1,0 +1,179 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/check-console-hostnames#11 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::NetworkUtils;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use Net::Ping;
+
+my $ping = Net::Ping->new();
+my $debug = 0;
+
+sub main {
+
+	my $me        = ariba::rc::InstalledProduct->new();
+	my $sendPage  = 0;
+	my $sendEmail = 0;
+	my $email     = $me->default('notify.email');
+
+	while ( my $arg = shift(@ARGV) ) {
+		if ($arg =~ /^-h/io) { usage(); };
+		if ($arg =~ /^-d/io) { $debug = 1; };
+	}
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	for my $datacenter (ariba::Ops::ProductAPIExtensions::datacentersForProducts($me)) {
+		if ( $hostname !~ /\.$datacenter\./ ){
+			print "Datacenter $datacenter not belongs to running host $hostname\n" if ($debug);
+			next;
+		}
+		my %queries  = ();
+
+		my %match    = (
+			datacenter => $datacenter,
+			status     => 'inservice',
+		);
+
+		my @machines = ariba::Ops::Machine->machinesWithProperties(%match);
+
+		print "checking $#machines machines in $datacenter\n" if $debug;
+
+		next if scalar @machines <= 0;
+
+		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+		for my $machine (sort { $a->hostname() cmp $b->hostname() } @machines) {
+
+
+			#
+			my $consoleServerHost = $machine->consoleHostName();
+			
+			print "consoleServerHost : $consoleServerHost \n" if($debug);
+            		my $host = $consoleServerHost;
+
+             		print "\n Validating ping for $host...... " if($debug);
+
+            		my $ping_status = "down";
+                	if ($ping->ping($consoleServerHost)){
+                    		$ping_status = "up";
+                	}
+
+			if (!defined $consoleServerHost or $consoleServerHost =~ /^\s*$/) {
+
+				#printf("%s does not have a consoleServer defined.\n", $machine->hostname());
+				next;
+			}
+
+			if ($consoleServerHost =~ /no\s*console/i) {
+				next;
+			}
+
+			my $addr  = ariba::Ops::NetworkUtils::hostToAddr($consoleServerHost) || do {
+				#print "Couldn't lookup $consoleServerHost in DNS - the zone file should be updated.\n";
+				next;
+			};
+
+			my $cname = ariba::Ops::NetworkUtils::addrToHost($addr);
+			my $error = 0;
+			my @note  = ('<html>');
+
+			my ($consoleServerPort, $consoleServer);
+
+			# Were we able to get a cname?
+			if ($cname ne $addr) {
+
+				($consoleServerPort, $consoleServer) = split /\./, $cname, 2;
+
+				#push @note, "\tFound CNAME: $consoleServerHost => $cname";
+
+			} else {
+
+				push @note, "\tCouldn't resolve $consoleServerHost to a CNAME! Found $cname instead.";
+				$error = 1;
+			}
+            #Console server hostname and ports are verifying wtih machinedb
+			# console server hosts and ports are not applicable for machines using lom
+			if (!$machine->consoleServer()) {
+				push (@note, "\tconsoleServer property not set in MachineDB");
+				$error = 1;
+
+			} elsif ($machine->consoleServer() ne 'lom' and $machine->consoleServer() ne 'ipmi') {
+
+				#
+				if ($consoleServer && $consoleServer ne $machine->consoleServer()) {
+	
+					push @note, sprintf("\tconsoleServer: $consoleServer does not match MachineDB consoleServer: %s", 
+						$machine->consoleServer());
+					$error = 1;
+				}
+				if (!$machine->consoleServerPort()) { 
+					push (@note, "\tconsoleServerPort property not set in MachineDB");
+					$error = 1; 
+				} elsif ($consoleServerPort && $consoleServerPort ne $machine->consoleServerPort()) {
+	
+					push @note, sprintf(
+						"\tconsoleServerPort: $consoleServerPort does not match MachineDB consoleServerPort: %s", 
+						$machine->consoleServerPort()
+					);
+	
+					$error = 1;
+				}
+			}
+
+			my $answer;
+
+			my $errorString = "";
+			if ($error) {
+				$errorString = join("<br>", @note);
+				$answer = 'not ok!';
+			} else {
+				$answer = 'ok!';
+			}
+
+			$queries{sprintf("%s consoleServer DNS Entry", $machine->hostname)} = {
+				noRowCount => 1,
+				format => "<html>%s<br></td><td>queryError</html>",
+				error => $errorString,
+				useFormatOnError => 1,
+				info => "answer eq 'ok!'",
+				warn => "answer ne 'ok!'",
+				perl => "return '$answer'",
+                inf_field => "consoleServerDNSEntryStatus",
+                inf_tags => sprintf("datacenter=\"%s\",hostname=\"%s\",consolehostname=\"%s\"",
+                                    $datacenter, $machine->hostname, $consoleServerHost),
+                inf_default => 0,
+                group_by => sprintf("%s,%s,%s", $datacenter,$machine->hostname, $consoleServerHost),
+			};
+
+ 	        $queries{sprintf("%s -  Ping Status for %s", $machine->hostname,$consoleServerHost)} = {
+	            noRowCount => 1,
+	            info => "answer =~ /up/si",
+	            crit => "answer !~ /up/si",
+	            perl => "return '$ping_status'",
+                inf_field => "pingStatus",
+                inf_tags => sprintf("datacenter=\"%s\",hostname=\"%s\",consolehostname=\"%s\"",
+                                    $datacenter, $machine->hostname, $consoleServerHost),
+                inf_default => 0,
+                group_by => sprintf("%s,%s,%s", $datacenter, $machine->hostname, $consoleServerHost),
+	        };
+			
+		}
+        	$queries{influx_details} = {measurement => "console_hostname_check"}; 
+		my $q  = ariba::monitor::QueryManager->newWithDetails(
+			"check-console-hostnames", $pn, $me->service(), $me->customer(), \%queries
+		);
+		
+		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+main();
+
+__END__

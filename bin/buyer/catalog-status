@@ -1,0 +1,830 @@
+#!/usr/local/bin/perl
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::AQLConnection;
+use ariba::Ops::AQLClient;
+use ariba::monitor::OutageSchedule;
+
+my $maxResults = 35040;    # one year running 4 times an hour
+
+sub main
+{
+    my $debug       = 0;
+    my $quiet       = 0;
+    my $sendEmail   = 0;
+    my $sendPage    = 0;
+    my $productName = "buyer";
+
+    while (my $arg = shift (@ARGV))
+    {
+        print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+        if ($arg =~ /^-d/o)    {$debug       = 1;}
+        if ($arg =~ /^-e/o)    {$sendEmail   = 1;}
+        if ($arg =~ /^-p$/o)   {$sendPage    = 1;}
+        if ($arg =~ /^-prod/o) {$productName = shift (@ARGV); next;}
+    }
+
+    my $me      = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+    my $email   = $me->default('notify.email');
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+    unless (@products)
+    {
+        exit (0);
+    }
+
+    for my $product (@products)
+    {
+
+        my $skip    = 0;
+        my %queries = ();
+        my $outage  = ariba::monitor::OutageSchedule->new('daily 22:00-02:00');
+
+        for my $instance ($product->appInstancesInCluster($cluster))
+        {
+
+            my $instanceName = $instance->instanceName();
+            $instanceName .= " " . $instance->logicalName() if $instance->logicalName();
+            my $community   = $instance->community();
+            my $serverRoles = $instance->serverRoles();
+
+            my $instanceIsAdmin;
+            my $instanceIsSearch;
+            my $instanceIsUI;
+
+            if ($serverRoles =~ m|CatalogAdmin|)
+            {
+                $instanceIsAdmin = 1;
+            }
+            if ($serverRoles =~ m|CatalogSearch|)
+            {
+                $instanceIsSearch = 1;
+            }
+            if ($serverRoles =~ m|AribaUI|)
+            {
+                $instanceIsUI = 1;
+            }
+
+            unless ($instanceIsAdmin || $instanceIsSearch || $instanceIsUI)
+            {
+                next;
+            }
+
+            my $uiHint;
+            if ($product->isASPProduct())
+            {
+                $uiHint = $instance->appName();
+            }
+            else
+            {
+                if ($community)
+                {
+                    $community = "community $community";
+                }
+                else
+                {
+                    $community = "default community";
+                }
+                $uiHint = "$community/" . $instance->appName();
+            }
+
+            my $testAdminUrl        = $instance->catalogSelfTestAdminMonitorURL();
+            my $testRegistryUrl     = $instance->catalogSelfTestRegistryMonitorURL();
+            my $testSearchServerUrl = $instance->catalogSelfTestSearchServerMonitorURL();
+            my $testSearchClientUrl = $instance->catalogSearchClientStatusMonitorURL();
+
+            if ($instanceIsUI)
+            {
+                print "$instanceName (client search) = $testSearchClientUrl\n" if ($debug);
+                my $searchClientStatus = fetchUrl($testSearchClientUrl);
+
+                my ($indexSize, $queryTime, $slowQueries, $failedQueries, $queryTally, $queryTimeQualifier);
+
+                my $qt_warn_threshold = 2;
+                my $qt_crit_threshold = 5;
+                my $qt_error = '';
+                my $queryTimeInfo = "answer <= $qt_warn_threshold";
+                my $queryTimeWarn = "answer =~ /^Error/ || answer > $qt_warn_threshold";
+                my $queryTimeCrit = "answer !~ /^Error/ && answer > $qt_crit_threshold";
+
+                if ($searchClientStatus->error())
+                {
+                    my $urlError;
+                    my $error = $searchClientStatus->error();
+                    chomp ($error);
+                    if ($searchClientStatus->isDown())
+                    {
+                        #$urlError = "Error: This node is currently unreachable [$error]";
+                        $urlError = -1;
+                    }
+                    else
+                    {
+                        #$urlError = "Error: $error";
+                        $urlError = -1;
+                    }
+
+                    $indexSize     = $urlError;
+                    $queryTime     = $urlError;
+                    $slowQueries   = $urlError;
+                    $failedQueries = $urlError;
+                    $queryTally    = $urlError;
+                }
+                else
+                {
+                    $indexSize     = $searchClientStatus->indexSize();
+                    $slowQueries   = $searchClientStatus->slowQueryTally();
+                    $failedQueries = $searchClientStatus->failedQueryTally();
+                    $queryTally    = $searchClientStatus->queryTally();
+                    if (defined ($searchClientStatus->averageQueryTime()))
+                    {
+                        $queryTime          = $searchClientStatus->averageQueryTime();
+                        $queryTimeQualifier = "Average";
+                    }
+                    else
+                    {
+                        $queryTime          = $searchClientStatus->queryTime();
+                        $queryTimeQualifier = "90th_Percentile";
+                        $queryTimeInfo      = "1";
+                        $queryTimeWarn      = undef;
+                        $queryTimeCrit      = undef;
+                    }
+
+                    # save error separately (can't mix data types in Influx DB)
+                    if ( $queryTime =~ /^Error/ )
+                    {
+                        $qt_error = $queryTime;
+                        $queryTime = 0;
+                    }
+                }
+
+                $queries{"$instanceName Search Client Index Size"} = {
+                                                                      'uiHint'           => $uiHint,
+                                                                      'info'             => "answer <= 600000",
+                                                                      'warn'             => "answer =~ /^Error/ || answer > 600000",
+                                                                      'crit'             => "answer !~ /^Error/ && answer > 800000",
+                                                                      'perl'             => sub {$indexSize},
+                                                                      'recordMaxResults' => $maxResults,
+                                                                      'recordDataType'   => 'gauge',
+                                                                      'recordItem'       => 'answer',
+                                                                      'inf_field'        => 'index_size',
+                                                                      'inf_default'      => "none",
+                                                                      'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                                                                      'group_by'         => qq($uiHint,$instanceName),
+                                                                     };
+                if ( $queryTimeQualifier )
+                {
+                    $queries{"$instanceName Search Client $queryTimeQualifier Query Time"} = {
+                        'uiHint'           => $uiHint,
+                        'info'             => $queryTimeInfo,
+                        'warn'             => $queryTimeWarn,
+                        'crit'             => $queryTimeCrit,
+                        'perl'             => sub {$queryTime},
+                        'recordMaxResults' => $maxResults,
+                        'recordDataType'   => 'gauge',
+                        'recordItem'       => 'answer',
+                        'inf_field'        => $queryTimeQualifier,
+                        'inf_default'      => "none",
+                        'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                        'group_by'         => qq($uiHint,$instanceName),
+                    };
+                    $queries{"$instanceName Search Client $queryTimeQualifier Query Time warn threshold"} = {
+                        'perl'             => sub { $qt_warn_threshold },
+                        'inf_field'        => 'qt_warn_threshold',
+                        'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                        'group_by'         => qq($uiHint,$instanceName),
+                    };
+                    $queries{"$instanceName Search Client $queryTimeQualifier Query Time crit threshold"} = {
+                        'perl'             => sub { $qt_crit_threshold },
+                        'inf_field'        => 'qt_crit_threshold',
+                        'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                        'group_by'         => qq($uiHint,$instanceName),
+                    };
+                    $queries{"$instanceName Search Client $queryTimeQualifier Query Time error"} = {
+                        'perl'             => sub { $qt_error },
+                        'inf_field'        => 'qt_error',
+                        'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                        'group_by'         => qq($uiHint,$instanceName),
+                    };
+                };
+
+                # For slow queries (these are searches that took >5s), we have periodic
+                # monitoring in place based on perflogs that leads to CRs being raised.
+                # For prodops' monitoring we should use the %age of the total queries
+                # (TotalQueries metric) to determine warn and crit thresholds:
+                $queries{"$instanceName Search Client Percent Slow Queries"} = {
+                    'uiHint' => $uiHint,
+                    'info'   => 1,
+                    'warn'   => "answer =~ /^Error/ || answer > 3",
+                    'crit'   => "answer !~ /^Error/ && answer > 5",
+                    'format' => '%.2f%%',
+                    'perl'   => sub {
+                        if ($slowQueries =~ /^Error/)
+                        {
+                            $ariba::monitor::Query::_ourGlobalQuerySelf->setFormat(undef);
+                            return $slowQueries;
+                        }
+                        return $slowQueries if $slowQueries =~ /^Error/;
+                        return $queryTally  if $queryTally <= 0;
+                        return ($slowQueries / $queryTally);
+                    },
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType'   => 'gauge',
+                    'recordItem'       => 'answer',
+                    'recordDataUnits'  => 'precent',
+                    'inf_field'        => "slow_queries",
+                    'inf_default'      => "none",
+                    'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                    'group_by'         => qq($uiHint,$instanceName),
+                                                                               };
+
+                $queries{"$instanceName, $community, Search Client Failed Queries"} = {
+                                                                                       'uiHint'           => $uiHint,
+                                                                                       'info'             => 1,
+                                                                                       'warn'             => "answer =~ /^Error/ || answer > 10",
+                                                                                       'crit'             => "answer !~ /^Error/ && answer > 20",
+                                                                                       'perl'             => sub {$failedQueries},
+                                                                                       'recordMaxResults' => $maxResults,
+                                                                                       'recordDataType'   => 'gauge',
+                                                                                       'recordItem'       => 'answer',
+                                                                                       'inf_field'        => "failed_queries",
+                                                                                       'inf_default'      => "none",
+                                                                                       'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                                                                                       'group_by'         => qq($uiHint,$instanceName),
+                                                                                      };
+
+                $queries{"$instanceName Search Client Total Queries"} = {
+                                                                         'uiHint'           => $uiHint,
+                                                                         'info'             => 1,
+                                                                         'perl'             => sub {$queryTally},
+                                                                         'recordMaxResults' => $maxResults,
+                                                                         'recordDataType'   => 'gauge',
+                                                                         'recordItem'       => 'answer',
+                                                                         'inf_field'        => "total_queries",
+                                                                         'inf_default'      => "none",
+                                                                         'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                                                                         'group_by'         => qq($uiHint,$instanceName),
+                                                                        };
+
+            }
+
+            if ($instanceIsAdmin)
+            {
+                #
+                # adim/registry test should only be on system community
+                # admin node
+                #
+                next if ($community =~ m|^community|i);
+
+                print "$instanceName (admin) = $testAdminUrl\n" if ($debug);
+                my $adminStatus = fetchUrl($testAdminUrl);
+                my $severity;
+
+                my $publishRebuildState;
+
+                if (defined ($adminStatus->state()) || defined ($adminStatus->publisherStatus()))
+                {
+                    my ($numLogs, $waitTime, $adminHealth, $publishDuration, $lastPublishedTime, $realmsAwaitingPublish, $publishRetryCount);
+
+                    if ($adminStatus->error())
+                    {
+                        my $error = $adminStatus->error();
+                        chomp ($error);
+                        my $urlError;
+                        if ($adminStatus->isDown())
+                        {
+                            #$urlError = "Error: This node is currently unreachable [$error]";
+                            $urlError = -1;
+                        }
+                        else
+                        {
+                            #$urlError = "Error: $error";
+                            $urlError = -1;
+                        }
+
+                        $numLogs     = $urlError;
+                        $waitTime    = $urlError;
+                        $adminHealth = $urlError;
+                    }
+                    else
+                    {
+                        $numLogs  = $adminStatus->numLogs();
+                        $waitTime = $adminStatus->waitTime();
+                        my $adminConnectivity = $adminStatus->adminConnectivity();
+                        my $publisherStatus   = $adminStatus->state() || $adminStatus->publisherStatus();
+                        my $publisherErrors   = $adminStatus->publisherErrors();
+                        my $skippedRealms     = $adminStatus->skippedRealms();
+                        $publishDuration       = $adminStatus->publishDuration();
+                        $lastPublishedTime     = $adminStatus->lastPublishedTime();
+                        $realmsAwaitingPublish = $adminStatus->realmsAwaitingPublish();
+                        $publishRetryCount     = $adminStatus->publishRetryCount();
+                        $adminHealth           = "";
+
+                        if ($adminConnectivity && $adminConnectivity !~ /OK/i)
+                        {
+                            $adminHealth .= "Error: Admin Connectivity [$adminConnectivity]\n";
+                        }
+                        if ($publisherErrors && $publisherErrors !~ /false/i)
+                        {
+                            $adminHealth .= "Error: Publisher is in error state\n";
+                            $severity = 1;
+                        }
+                        if ($skippedRealms && $skippedRealms !~ /^\s*/)
+                        {
+                            $adminHealth .= "Warn: Skipping realms [$skippedRealms]\n";
+                        }
+                        if ($publisherStatus)
+                        {
+                            my $status = '';
+                            if ($publisherStatus =~ /PublishNodeDown|RebuildNodeDown|RebuildErrorRetry|CatalogSearchNodeDown/)
+                            {
+                                $status = 'Error: ';
+                            }
+                            elsif ($publisherStatus =~ /PublisherWaitingAfterFailedAttempt/)
+                            {
+                                $status = 'Warn: ';
+                            }
+                            $adminHealth .= "${status}Publisher Status [$publisherStatus]";
+
+                            $publishRebuildState = $publisherStatus;
+
+                        }
+                        else
+                        {
+                            $adminHealth .= "Publisher Status [not a publisher]";
+                            $numLogs = undef;
+                        }
+                    }
+
+                    $queries{"$instanceName Admin Health"} = {
+                                                              'uiHint'      => $uiHint,
+                                                              'noRowCount'  => 1,
+                                                              'info'        => "answer",
+                                                              'warn'        => "answer && (answer =~ /^Warn/i)",
+                                                              'crit'        => "!answer || (answer =~ /^Error/i && answer !~ /PublishErrorRetry/)",
+                                                              'severity'    => $severity,
+                                                              'perl'        => "return \"$adminHealth\";",
+                                                              'inf_field'   => 'admin_health',
+                                                              'inf_default' => "none",
+                                                              'inf_tags'    => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                                                              'group_by'    => qq($uiHint,$instanceName),
+                                                             };
+
+                    # Start tmid 177826
+                    # Set default values (for "publish in progress)"
+                    my $retryCountWarn = 4;
+                    my $retryCountCrit = 6;
+                    my $durationWarn   = 7200;     # 2-hours
+                    my $durationCrit   = 10800;    # 3-hours
+
+                    # Values for "rebuild in progress"
+                    if ($publishRebuildState =~ /RebuildInProgress/)
+                    {
+                        $retryCountWarn = 8;
+                        $retryCountCrit = 12;
+                        $durationWarn   = 21600;    # 6-hours
+                        $durationCrit   = 36000;    # 10-hours
+                    }
+
+                    $queries{"$instanceName Publish Retry Count "} = {
+                                                                      'warn'        => "answer > $retryCountWarn",
+                                                                      'crit'        => "answer > $retryCountCrit",
+                                                                      'uiHint'      => $uiHint,
+                                                                      'perl'        => "return $publishRetryCount;",
+                                                                      'inf_field'   => 'publish_retry_count',
+                                                                      'inf_default' => "none",
+                                                                      'inf_tags'    => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                                                                      'group_by'    => qq($uiHint,$instanceName),
+                                                                     };
+                    $queries{"$instanceName Publish Retry Count warn threshold"} = {
+                        'perl'      => sub { $retryCountWarn },
+                        'inf_field' => 'prc_warn_threshold',
+                        'inf_tags'  => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                        'group_by'  => qq($uiHint,$instanceName),
+                    };
+                    $queries{"$instanceName Publish Retry Count crit threshold"} = {
+                        'perl'      => sub { $retryCountCrit },
+                        'inf_field' => 'prc_crit_threshold',
+                        'inf_tags'  => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                        'group_by'  => qq($uiHint,$instanceName),
+                    };
+
+                    $queries{"$instanceName Publish Duration "} = {
+                                                                   'warn'        => "answer > $durationWarn",
+                                                                   'crit'        => "answer > $durationCrit",
+                                                                   'uiHint'      => $uiHint,
+                                                                   'perl'        => "return $publishDuration;",
+                                                                   'inf_field'   => 'publish_duration',
+                                                                   'inf_default' => "none",
+                                                                   'inf_tags'    => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                                                                   'group_by'    => qq($uiHint,$instanceName),
+                                                                  };
+                    $queries{"$instanceName Publish Duration warn threshold"} = {
+                        'perl'      => sub { $durationWarn },
+                        'inf_field' => 'pd_warn_threshold',
+                        'inf_tags'  => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                        'group_by'  => qq($uiHint,$instanceName),
+                    };
+                    $queries{"$instanceName Publish Duration crit threshold"} = {
+                        'perl'      => sub { $durationCrit },
+                        'inf_field' => 'pd_crit_threshold',
+                        'inf_tags'  => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                        'group_by'  => qq($uiHint,$instanceName),
+                    };
+
+                    # End tmid 177826
+
+                    $queries{"$instanceName Last Publish Time "} = {
+                                                                    'uiHint'      => $uiHint,
+                                                                    'noRowCount'  => 1,
+                                                                    'info'        => "answer",
+                                                                    'perl'        => "return \"$lastPublishedTime\";",
+                                                                    'inf_field'   => 'last_publish_time',
+                                                                    'inf_default' => "none",
+                                                                    'inf_tags'    => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                                                                    'group_by'    => qq($uiHint,$instanceName),
+                                                                   };
+
+                    $queries{"$instanceName Realms Awaiting Publish "} = {
+                                                                          'uiHint'      => $uiHint,
+                                                                          'noRowCount'  => 1,
+                                                                          'info'        => "answer",
+                                                                          'perl'        => "return \"$realmsAwaitingPublish\";",
+                                                                          'inf_field'   => 'realms_awaiting_publish',
+                                                                          'inf_default' => "none",
+                                                                          'inf_tags'    => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                                                                          'group_by'    => qq($uiHint,$instanceName),
+                                                                         };
+
+                    if (defined ($numLogs))
+                    {
+                        $queries{"$instanceName Admin Number of Logs Waiting for Publish"} = {
+                                                                                              'uiHint'           => $uiHint,
+                                                                                              'info'             => "1",
+                                                                                              'perl'             => $numLogs,
+                                                                                              'recordMaxResults' => $maxResults,
+                                                                                              'recordDataType'   => 'gauge',
+                                                                                              'recordItem'       => 'answer',
+                                                                                              'inf_field'        => 'admin_log_awaiting',
+                                                                                              'inf_default'      => "none",
+                                                                                              'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                                                                                              'group_by'         => qq($uiHint,$instanceName),
+                                                                                             };
+
+                        my $warnWait = 3 * 60 * 60;    # 3 hours in secs
+                        my $critWait = 6 * 60 * 60;    # 6 hours in secs
+
+                        # we can't mix data types in influxdb, so save possible string error in a separate field
+                        my $wt_error = '';
+                        if ( $waitTime =~ /^Error/ ) {
+                            $wt_error = $waitTime ;
+                            $waitTime = 0;
+
+                            $queries{"$instanceName Admin Oldest Log Wait Time for Publish error"} = {
+                                'perl'      => sub { $wt_error },
+                                'inf_field' => 'wait_time_error',
+                                'inf_tags'  => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                                'group_by'  => qq($uiHint,$instanceName),
+                            };
+                        }
+
+                        $queries{"$instanceName Admin Oldest Log Wait Time for Publish"} = {
+                                                                                            'uiHint'           => $uiHint,
+                                                                                            'info'             => "answer <= $warnWait",
+                                                                                            'warn'             => "answer =~ /^Error/ || answer > $warnWait",
+                                                                                            'crit'             => "answer !~ /^Error/ && answer > $critWait",
+                                                                                            'perl'             => sub {$waitTime},
+                                                                                            'recordMaxResults' => $maxResults,
+                                                                                            'recordDataType'   => 'gauge',
+                                                                                            'recordItem'       => 'answer',
+                                                                                            'inf_field'        => 'admin_oldest_log_awaiting',
+                                                                                            'inf_default'      => "none",
+                                                                                            'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                                                                                            'group_by'         => qq($uiHint,$instanceName),
+                                                                                           };
+                    }
+                }
+
+                print "$instanceName (registry) = $testRegistryUrl\n" if ($debug);
+                my $registryStatus = fetchUrl($testRegistryUrl);
+
+                $queries{"$instanceName Registry Health"} = {
+                                                             'uiHint'      => $uiHint,
+                                                             'noRowCount'  => 1,
+                                                             'info'        => 1,
+                                                             'warn'        => "answer && answer =~ /^Warn/i",
+                                                             'crit'        => "answer && answer =~ /^Error/i",
+                                                             'perl'        => sub {main::registryHealth($registryStatus);},
+                                                             'inf_field'   => 'registry_health',
+                                                             'inf_default' => "none",
+                                                             'inf_tags'    => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                                                             'group_by'    => qq($uiHint,$instanceName),
+                                                            };
+            }
+
+            if ($instanceIsSearch)
+            {
+                print "$instanceName (search) = $testSearchServerUrl\n" if ($debug);
+                my $searchStatus = fetchUrl($testSearchServerUrl);
+
+                my ($indexSize, $queryTime, $slowQueries, $failedQueries, $queryTally, $queryTimeQualifier);
+
+                my $qt_warn_threshold = 2;
+                my $qt_crit_threshold = 5;
+                my $qt_error = '';
+                my $queryTimeInfo = "answer <= $qt_warn_threshold";
+                my $queryTimeWarn = "answer =~ /^Error/ || answer > $qt_warn_threshold";
+                my $queryTimeCrit = "answer !~ /^Error/ && answer > $qt_crit_threshold";
+
+                if ($searchStatus->error())
+                {
+                    my $urlError;
+                    my $error = $searchStatus->error();
+                    chomp ($error);
+                    if ($searchStatus->isDown())
+                    {
+                        #$urlError = "Error: This node is currently unreachable [$error]";
+                        $urlError = -1;
+                    }
+                    else
+                    {
+                        #$urlError = "Error: $error";
+                        $urlError = -1;
+                    }
+
+                    $indexSize     = $urlError;
+                    $queryTime     = $urlError;
+                    $slowQueries   = $urlError;
+                    $failedQueries = $urlError;
+                    $queryTally    = $urlError;
+                }
+                else
+                {
+                    $indexSize     = $searchStatus->indexSize();
+                    $slowQueries   = $searchStatus->slowQueryTally();
+                    $failedQueries = $searchStatus->failedQueryTally();
+                    $queryTally    = $searchStatus->queryTally();
+                    if (defined ($searchStatus->averageQueryTime()))
+                    {
+                        $queryTime          = $searchStatus->averageQueryTime();
+                        $queryTimeQualifier = "Average";
+                    }
+                    else
+                    {
+                        $queryTime          = $searchStatus->queryTime();
+                        $queryTimeQualifier = "90th_Percentile";
+                        $queryTimeInfo      = "1";
+                        $queryTimeWarn      = undef;
+                        $queryTimeCrit      = undef;
+                    }
+
+                    # save error separately (can't mix data types in Influx DB)
+                    if ( $queryTime =~ /^Error/ )
+                    {
+                        $qt_error = $queryTime;
+                        $queryTime = 0;
+                    }
+                }
+
+                $queries{"$instanceName Search Client Index Size"} = {
+                                                                      'uiHint'           => $uiHint,
+                                                                      'info'             => "answer <= 6000000",
+                                                                      'warn'             => "answer =~ /^Error/ || answer > 6000000",
+                                                                      'crit'             => "answer !~ /^Error/ && answer > 8000000",
+                                                                      'perl'             => sub {qq("$indexSize")},
+                                                                      'recordMaxResults' => $maxResults,
+                                                                      'recordDataType'   => 'gauge',
+                                                                      'recordItem'       => 'answer',
+                                                                      'inf_field'        => 'index_size',
+                                                                      'inf_default'      => "none",
+                                                                      'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                                                                      'group_by'         => qq($uiHint,$instanceName),
+                                                                     };
+                if ( $queryTimeQualifier )
+                {
+                    $queries{"$instanceName Search Client $queryTimeQualifier Query Time"} = {
+                        'uiHint'           => $uiHint,
+                        'info'             => $queryTimeInfo,
+                        'warn'             => $queryTimeWarn,
+                        'crit'             => $queryTimeCrit,
+                        'perl'             => sub {$queryTime},
+                        'recordMaxResults' => $maxResults,
+                        'recordDataType'   => 'gauge',
+                        'recordItem'       => 'answer',
+                        'inf_field'        => $queryTimeQualifier,
+                        'inf_default'      => "none",
+                        'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                        'group_by'         => qq($uiHint,$instanceName),
+                    };
+                    $queries{"$instanceName Search Client $queryTimeQualifier Query Time warn threshold"} = {
+                        'perl'             => sub { $qt_warn_threshold },
+                        'inf_field'        => 'qt_warn_threshold',
+                        'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                        'group_by'         => qq($uiHint,$instanceName),
+                    };
+                    $queries{"$instanceName Search Client $queryTimeQualifier Query Time crit threshold"} = {
+                        'perl'             => sub { $qt_crit_threshold },
+                        'inf_field'        => 'qt_crit_threshold',
+                        'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                        'group_by'         => qq($uiHint,$instanceName),
+                    };
+                    $queries{"$instanceName Search Client $queryTimeQualifier Query Time error"} = {
+                        'perl'             => sub { $qt_error },
+                        'inf_field'        => 'qt_error',
+                        'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                        'group_by'         => qq($uiHint,$instanceName),
+                    };
+                };
+
+                # For slow queries (these are searches that took >5s), we have periodic
+                # monitoring in place based on perflogs that leads to CRs being raised.
+                # For prodops' monitoring we should use the %age of the total queries
+                # (TotalQueries metric) to determine warn and crit thresholds:
+                $queries{"$instanceName Search Client Percent Slow Queries"} = {
+                    'uiHint' => $uiHint,
+                    'info'   => 1,
+                    'warn'   => "answer =~ /^Error/ || answer > 10",
+                    'crit'   => "answer !~ /^Error/ && answer > 20",
+                    'format' => '%.2f%%',
+                    'perl'   => sub {
+                        if ($slowQueries =~ /^Error/)
+                        {
+                            $ariba::monitor::Query::_ourGlobalQuerySelf->setFormat(undef);
+                            return $slowQueries;
+                        }
+                        return $queryTally if $queryTally <= 0;
+                        return ($slowQueries / $queryTally);
+                    },
+                    'recordMaxResults' => $maxResults,
+                    'recordDataType'   => 'gauge',
+                    'recordItem'       => 'answer',
+                    'recordDataUnits'  => 'precent',
+                    'inf_field'        => "slow_queries",
+                    'inf_default'      => "none",
+                    'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                    'group_by'         => qq($uiHint,$instanceName),
+                                                                               };
+
+                $failedQueries = -1  if ( $failedQueries =~ /^Error/ );
+                $queries{"$instanceName, $community, Search Client Failed Queries"} = {
+                                                                                       'uiHint'           => $uiHint,
+                                                                                       'info'             => 1,
+                                                                                       'warn'             => "answer == -1 || answer > 30",
+                                                                                       'crit'             => "answer > 50 && previousAnswer > 50",
+                                                                                       'perl'             => sub {$failedQueries},
+                                                                                       'recordMaxResults' => $maxResults,
+                                                                                       'recordDataType'   => 'gauge',
+                                                                                       'recordItem'       => 'answer',
+                                                                                       'outageSchedule'   => $outage,
+                                                                                       'inf_field'        => "failed_queries",
+                                                                                       'inf_default'      => "none",
+                                                                                       'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                                                                                       'group_by'         => qq($uiHint,$instanceName),
+                                                                                      };
+
+                $queries{"$instanceName Search Client Total Queries"} = {
+                                                                         'uiHint'           => $uiHint,
+                                                                         'info'             => 1,
+                                                                         'perl'             => sub {$queryTally},
+                                                                         'recordMaxResults' => $maxResults,
+                                                                         'recordDataType'   => 'gauge',
+                                                                         'recordItem'       => 'answer',
+                                                                         'inf_field'        => "total_queries",
+                                                                         'inf_default'      => "none",
+                                                                         'inf_tags'         => qq(instance_name="$instanceName",uiHint="$uiHint"),
+                                                                         'group_by'         => qq($uiHint,$instanceName),
+                                                                        };
+
+            }
+        }
+
+        #$queries{ "search version" } = {
+        #    'format'    => "version %s, rebuild version %s, status %s",
+        #    'aql'       => "Select VersionName,RebuildVersionName,Status from SearchVersion",
+        #};
+
+        $queries{influx_details} = {measurement => 'buyer_catalog_status'};
+        my $q = ariba::monitor::QueryManager->newWithDetails("catalog-status", $product->name(), $service, $product->customer(), \%queries);
+
+        my $aqlConnection = ariba::Ops::AQLConnection->newFromProduct($product);
+        my $aqlClient     = ariba::Ops::AQLClient->newFromAQLConnection($aqlConnection);
+        $q->setAQLClient($aqlClient);
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub registryHealth
+{
+    my $monUrl = shift;
+    my @results;
+
+    my $error = $monUrl->error();
+    chomp ($error);
+
+    #<xml>
+    #<status>OK</status>
+    #</xml>
+    #
+    #It provides more information if an actual publish is in progress.   I
+    #care less about how you display this information.
+
+    if ($error)
+    {
+        if ($monUrl->isDown())
+        {
+            #push (@results, "This node is currently unreachable [$error]");
+            push (@results, -1);
+        }
+        else
+        {
+            #push (@results, "Error: $error");
+            push (@results, -1);
+        }
+    }
+    else
+    {
+        push (@results, $monUrl->status());
+    }
+
+    return (join ("\n", @results));
+}
+
+sub fetchUrl
+{
+    my $url = shift;
+    my $timeout = shift || 120;
+
+    my $monUrl = ariba::monitor::Url->new($url);
+    $monUrl->setTimeout($timeout);
+    my @results = $monUrl->request();
+
+    my $property;
+    my $value;
+
+    #
+    # Handle the case of url being down
+    #
+    my $error = $monUrl->error();
+    if ($error)
+    {
+        $monUrl->setIsDown(1);
+        return $monUrl;
+    }
+
+    $monUrl->setIsDown(0);
+    my $inError  = 0;
+    my $errorMsg = '';
+    for my $line (@results)
+    {
+
+        ## See: https://ops.ariba.com/cgi-bin/ticketmaster/entry?ticketId=192738
+        ## URL returns '<html><body><h3>Exception encountered.</h3></body></html>'
+        ## So we'll look for 'Exception encountered.'
+        if ($line =~ m/Exception encountered\./)
+        {
+            $errorMsg = 'Exception encountered.';
+            last;
+        }
+
+        if ($line eq '</Error>')
+        {
+            $inError = 0;
+        }
+        elsif ($line eq '<Error>')
+        {
+            $inError = 1;
+        }
+        elsif ($inError)
+        {
+            $errorMsg .= $line . ' ';
+        }
+        elsif ($line =~ m|<(\w+)>\s*(.*)\s*</(\w+)>|i)
+        {
+            next if ($1 ne $3);
+
+            $property = lcfirst ($1);
+            $value    = $2;
+
+            $monUrl->setAttribute($property, $value);
+        }
+        elsif ($line !~ m/<|>/)
+        {
+            chomp ($line);
+            $monUrl->setResults($line);
+        }
+    }
+    $monUrl->setError($errorMsg) if ($errorMsg);
+
+    return $monUrl;
+}
+
+main();

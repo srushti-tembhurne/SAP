@@ -1,0 +1,13 @@
+	<OWVar 
+		id=count
+	   value=*("a","b","c")*
+	   nodisplay=1
+	 />
+
+	Array elements are *ariba::Ops::OW::Var->new("count")->value()*
+
+	<OWVar id=count />
+
+	Try2: There are 
+	<OWVar value=*scalar(ariba::Ops::OW::Var->new("count")->value())* />
+	records in the array.

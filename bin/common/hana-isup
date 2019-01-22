@@ -1,0 +1,371 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/common/hana-isup#6 $
+
+use strict;
+use warnings;
+use Data::Dumper;
+use File::Basename;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::OutageSchedule;
+use ariba::Ops::DBConnection;
+use ariba::Ops::HanaClient;
+use dmail::LockLib;
+
+use constant { TRUE => 1, FALSE => 0 };
+
+# num secs to wait trying to obtain a db connection
+use constant CONNECT_TIMEOUT  =>  10;
+
+# num of tries to obtain a db connection
+use constant NUM_TRIES        =>   2;
+
+# the global watchdog timeout. Should typically be set to no greater than cron run interval - 1 minute.
+use constant WATCHDOG_TIMEOUT => 240;
+
+my $physicalDrOutage = ariba::monitor::OutageSchedule->new(
+    'daily 07:00-08:00',    # bcv-backup s4 snap
+    'daily 19:00-20:00',    # bcv-backup s4 snap
+    'thu 09:00-10:00',      # bcv-backup s4 incrementalPhysical
+);
+
+my $debug  = FALSE;
+my $wto    = WATCHDOG_TIMEOUT;
+my $cto    = CONNECT_TIMEOUT;
+my $ntries = NUM_TRIES;
+
+my $prog = basename($0);
+my $LOCKFILE = "/tmp/stratus-$prog";
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+
+Usage: $0 [-c N|-n N|-w N|-e|-p|-d|-h]
+
+    -c    connect timeout in secs.  (default: @{[CONNECT_TIMEOUT()]})
+    -n    num tries to connect.     (default: @{[NUM_TRIES()]})
+    -w    watchdog timeout in secs. (default: @{[WATCHDOG_TIMEOUT()]})
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode.
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n\n" if ($error);
+    exit();
+}
+
+sub main {
+    my $sendEmail = FALSE;
+    my $sendPage  = FALSE;
+    while(my $arg = shift) {
+        if($arg eq '-h') { usage();            next; }
+        if($arg eq '-d') { $debug++;           next; }
+        if($arg eq '-e') { $sendEmail = TRUE;  next; }
+        if($arg eq '-p') { $sendPage  = TRUE;  next; }
+        if($arg eq '-c') { $cto       = shift; next; }
+        if($arg eq '-w') { $wto       = shift; next; }
+        if($arg eq '-n') { $ntries    = shift; next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    usage("'-w' must be positive integer") unless $wto    =~ /^\d+$/;
+    usage("'-t' must be positive integer") unless $cto    =~ /^\d+$/;
+    usage("'-c' must be positive integer") unless $ntries =~ /^\d+$/;
+
+    print "watchdog timeout: $wto secs ; connect timeout: $cto secs ; num tries: $ntries\n" if $debug;
+
+    unless(dmail::LockLib::requestlock($LOCKFILE, 5)) {
+         warn "can't grab lock\n";
+         exit(-1);
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $email = $me->default('notify.email');
+    my @products = ariba::rc::InstalledProduct->installedProductsList($me->service());
+
+    my $dbuser = $me->default( "dbainfo.hana.system.username" );
+    my $dbpass = $me->default( "dbainfo.hana.system.password" );
+    my $isProdMsServce = 0;
+    if (ariba::Ops::ServiceController::isProductionMsServicesOnly($me->service())){
+        $isProdMsServce = 1;
+    }
+
+    my (%kids, %parent_queries);
+    foreach my $product (@products) {
+        my $pname = lc($product->name());
+        my $subDirPName = $me->name();
+        if ($isProdMsServce || ($pname eq 'srs') ){
+            undef %parent_queries;
+            $subDirPName = $product->name();
+        }
+
+        # ebs does not use hana, but for some reason pulls the hana info from AN's configs.  Skip it.
+        next if $pname eq 'ebs';
+
+        my @all_dbcs = ariba::Ops::DBConnection->connectionsFromProducts($product);
+        my @unique_dbcs = ariba::Ops::DBConnection->uniqueConnectionsByHostAndPort(@all_dbcs);
+
+        for my $dbc (@unique_dbcs) {
+            # we can't query the DR cluster 'cuz it's in 'standby' mode and is only responsive to data replication.
+            next if $dbc->isDR() || $dbc->dbServerType() ne ariba::Ops::DBConnection->hanaDBServerType();
+
+            my $host      =  $dbc->host();
+            $host         =~ s/:\d+//; # strip port
+            my $dbsid     =  uc($dbc->sid());
+            $dbsid        =~ s/^([^.]+).*/$1/;
+            my $dbname    =  uc($dbc->dbname()) || $dbsid;
+            my $port      =  $dbc->port();
+            my $hanaHosts =  [ sort(@{$dbc->hanaHosts()}) ]; # sort to minimize frivolous standby connect errors
+            my $qm_index  = "$host:$port:$dbsid:$dbname";
+
+            # note that by the current logic we'll never be in "outage" mode, but I'm leaving it commented-out
+            # here just in case we ever have the need to really fix and exercise this feature...
+            #my $isPhysicalDr = $dbc->isDR()  && $dbc->isPhysicalReplication();
+            #my $outage       = $isPhysicalDr && $physicalDrOutage->isInScheduledOutage();
+            my $outage = FALSE;
+
+            # DBAs want us to indicate, for each cluster, whether it's an MDC tenant or not.
+            # We add this to the hostIndex hash key in the child, after a successful connect().
+            #
+            # But in the case of child timeout, there's no way to know this, but we still want to
+            # show a status and trigger an alert on the cluster connect failure.
+            #
+            # watchdog section now handles and creates corresponding timeout entries in influx. 
+
+            my $hostIndex = "($pname) [$qm_index]";
+
+            my $kid = fork();
+            if($kid == 0) {
+                my %queries;
+                my $hanaClient = ariba::Ops::HanaClient->new($dbuser, $dbpass, $host, $port, $hanaHosts);
+                $hanaClient->setDebug($debug > 1); # enable low-level hanaClient debug only if more than one "-d" supplied
+
+                my $clusterConnectStatus = $hanaClient->connect($cto, $ntries) || 0;
+
+                # is this an MDC tenant?
+                my $tenant    =  do_sysdb_query(\%queries, $dbsid, $dbuser, $dbpass, $hanaClient, $clusterConnectStatus, $outage, $host, $port);
+                my $hostIndex = "($pname) " . ( $tenant ? "MDC tenant" : "" ) . " [$qm_index]";
+
+                # If this query-object returns crit it means we failed to connect to the cluster at all
+                $queries{"Hana ISUP: _cluster connection $hostIndex"} = {
+                    # retain 1 year of results: 12 runs/hr x 24 hrs/day * 365 days = 105120
+                    recordDataUnits => '1 = up, 0 = down',
+                    recordMaxResults => 110000,
+                    noCritOnError => $outage,
+                    perl => sub { return $clusterConnectStatus; },
+                    inf_field   => "cluster_connection_status",
+                    inf_default => 0,
+                    inf_tags    => qq(product="$pname",dbhost=$host,dbport=$port,sid=$dbsid,dbname=$dbname),
+                    group_by    => "$pname,$host,$port"
+                };
+
+                $queries{"Hana ISUP: _cluster connection $hostIndex : MDC Tenant Info"} = {
+                    # retain 1 year of results: 12 runs/hr x 24 hrs/day * 365 days = 105120
+                    recordDataUnits => '1 = up, 0 = down',
+                    recordMaxResults => 110000,
+                    noCritOnError => $outage,
+                    perl => sub { return $tenant; },
+                    inf_field   => "mdc_tenant",
+                    inf_default => 0,
+                    inf_tags    => qq(product="$pname",dbhost=$host,dbport=$port,sid=$dbsid,dbname=$dbname),
+                    group_by    => "$pname,$host,$port"
+                };
+
+                $queries{"Hana ISUP: _cluster connection $hostIndex - error string"} = {
+                    # retain 1 year of results: 12 runs/hr x 24 hrs/day * 365 days = 105120
+                    recordDataUnits => '1 = up, 0 = down',
+                    recordMaxResults => 110000,
+                    noCritOnError => $outage,
+                    perl => sub { return $hanaClient->error(); },
+                    inf_field   => "cluster_connection_err_str",
+                    inf_tags    => qq(product="$pname",dbhost=$host,dbport=$port,sid=$dbsid,dbname=$dbname),
+                    group_by    => "$pname,$host,$port"
+                } unless $clusterConnectStatus;
+
+                $queries{"influx_details"} = { measurement => "hana_isup" };
+                 
+                # short-circuit the standby queries
+                do_standby_queries(\%queries, $dbsid, $hanaClient);
+
+                # loop over all hosts for the cluster.  Establish a connection to the host an run sql
+                # to see if it's up.
+                #
+                # If we could not establish a connection to the cluster (above) then set the isup status
+                # to warn for each host.  An alert for the general connection failure will be sent.
+                # No need to alert for each host in that case.
+                foreach my $hanaHost (@{$hanaClient->hanaHosts()}) {
+                    $hostIndex = "($pname)$tenant [$hanaHost:$port:$dbsid:$dbname]";
+                    my $title  = "Hana ISUP: host connection $hostIndex";
+
+                    my $hana_host = "$tenant $hanaHost:$port:$dbsid:$dbname";
+
+                    my $hanaHostClient = ariba::Ops::HanaClient->new($dbuser, $dbpass, $hanaHost, $port, undef, undef);
+                    $hanaHostClient->setDebug($debug > 1);
+
+                    my $connectStatus = $hanaHostClient->connect($cto, $ntries) || 0;
+
+                    $queries{$title} = {
+                        # see comments in _cluster query above for details.
+                        recordDataUnits => '1 = up, 0 = down',
+                        recordMaxResults => 110000,
+                        perl => sub { return $clusterConnectStatus ? $connectStatus : 0; },
+                        noCritOnError => $outage,
+                        inf_field    => "host_connection_status",
+                        inf_default  => 0,
+                        inf_tags     => qq(product="$pname",dbhost=$host,dbport=$port,sid=$dbsid,dbname=$dbname,hana_dbhost="$hanaHost"),
+                        group_by     => "$pname,$host,$port,$hanaHost"
+                    };
+
+                    $queries{"$title - error string"} = {
+                        # see comments in _cluster query above for details.
+                        perl => sub { return $clusterConnectStatus ? $hanaHostClient->error() : 'Could not connect to cluster'; },
+                        noCritOnError => $outage,
+                        inf_field    => "host_connection_err_str",
+                        inf_tags     => qq(product="$pname",dbhost=$host,dbport=$port,sid=$dbsid,dbname=$dbname,hana_dbhost="$hanaHost"),
+                        group_by     => "$pname,$host,$port,$hanaHost"
+                    } unless ( $clusterConnectStatus && $connectStatus );
+                }
+
+                # need to utilize the "subDir" param here so that the multiple parallel hana-isup QM objects don't clobber each other.
+                my $qm = ariba::monitor::QueryManager->newWithDetails('hana-isup', $subDirPName, $me->service(), $me->customer(), \%queries, undef, $qm_index);
+                $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+                exit;
+            }
+            elsif(! $kid) {
+                print "fork() failed: $!";
+            }
+            else {
+                print "main: successfully forked pid $kid\n" if $debug;
+                $kids{$kid} = { product => $pname, dbhost => $host, dbport => $port };
+            }
+        }
+        # dont think we need this anymore - commenting them out. 
+        #if ( $isProdMsServce && %parent_queries ){
+        #    my $qm = ariba::monitor::QueryManager->newWithDetails('hana-isup', $product->name(), $me->service(), $me->customer(), \%parent_queries);
+        #    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+        #}
+    }
+
+    # watchdog
+    eval {
+        local $SIG{ALRM} = sub { die "timeout" };
+        alarm $wto;
+        while((my $kid = wait()) > 0) {
+            print "harvested child pid $kid\n" if $debug;
+            delete $kids{$kid};
+        }
+        alarm 0;
+    };
+
+    if($@ && $@ =~ /timeout/) {
+        print "timed out waiting for child pids: ", (join ' ', keys %kids), "\n" if $debug;
+        for my $kid (keys %kids) {
+            kill 'TERM', $kid; sleep 2; kill 'KILL', $kid;
+            my $product = $kids{$kid}->{product};
+            my $dbhost = $kids{$kid}->{dbhost};
+            my $dbport = $kids{$kid}->{dbport};
+
+            $parent_queries{"Hana ISUP: _cluster connection ($product) $dbhost:$dbport - timeout"} = {
+                # retain 1 year of results: 12 runs/hr x 24 hrs/day * 365 days = 105120
+                recordDataUnits => '1 = up, 0 = down',
+                recordMaxResults => 110000,
+                perl => sub { return 0; },
+                inf_field   => "cluster_connection_status",
+                inf_default => 0,
+                inf_tags    => qq(product=$product,dbhost=$dbhost,dbport=$dbport),
+                group_by    => "$product,$dbhost,$dbport"
+            };
+
+            $parent_queries{"error string for cluster connection timeout ($product) $dbhost:$dbport"} = {
+                # retain 1 year of results: 12 runs/hr x 24 hrs/day * 365 days = 105120
+                recordDataUnits => '1 = up, 0 = down',
+                recordMaxResults => 110000,
+                perl => sub { return "timeout"; },
+                inf_field   => "cluster_connection_err_str",
+                inf_tags    => qq(product=$product,dbhost=$dbhost,dbport=$dbport),
+                group_by    => "$dbhost,$dbport"
+            };
+
+            $parent_queries{"influx_details"} = { measurement => "hana_isup" };
+        }
+    }
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('hana-isup', $me->name(), $me->service(), $me->customer(), \%parent_queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    dmail::LockLib::releaselock($LOCKFILE);
+}
+
+# sysdb is cluster-wide (SID scope) and only runs on the cluster master node,
+# so no point showing product name. dbname is always SYSTEMDB. A future
+# enhancement could be to show all products/dbnames using this host/SID.
+sub do_sysdb_query {
+    my ($queries, $dbsid, $dbuser, $dbpass, $hanaClient, $clusterConnectStatus, $outage, $dbhost, $dbport) = @_;
+
+    return 0 unless (my $sysdb_host = $hanaClient->sysdb_host()); # not an MDC tenant
+
+    my $dbname     = "SYSTEMDB";
+    my $sysdb_port = $hanaClient->sysdb_port();
+    my $hostIndex  = "$sysdb_host:$sysdb_port:$dbsid:$dbname";
+    my $title      = "Hana ISUP: host connection (MDC master) $hostIndex";
+
+    $hostIndex = "(MDC master) $hostIndex";
+    unless($queries->{$title}) { # only if we didn't already do a sysdb query for this host
+        my $hanaSysdbClient = ariba::Ops::HanaClient->new($dbuser, $dbpass, $sysdb_host, $sysdb_port, undef, undef);
+        $hanaSysdbClient->setDebug($debug > 1);
+        my $sysdbConnectStatus = $hanaSysdbClient->connect($cto, $ntries) || 0;
+        
+        $queries->{$title} = {
+            description => 'the system db connection status for this MDC cluster',
+            perl => sub { return $clusterConnectStatus ? $sysdbConnectStatus : 0; },
+            noCritOnError => $outage,
+            inf_field  => "system_db_connection_status",
+            inf_default => 0,
+            inf_tags   => qq(dbhost=$dbhost,dbport=$dbport,system_dbhost=$sysdb_host,system_dbport=$sysdb_port),
+            group_by   => "$dbhost,$dbport,$sysdb_host,$sysdb_port"
+        };
+
+        $queries->{"$title - error string"} = {
+            description => 'the error string for system db query for this MDC cluster',
+            perl => sub { return $clusterConnectStatus ? $hanaSysdbClient->error() : 'Could not connect to cluster'; },
+            noCritOnError => $outage,
+            inf_field  => "system_db_err_str",
+            inf_tags   => qq(dbhost=$dbhost,dbport=$dbport,system_dbhost=$sysdb_host,system_dbport=$sysdb_port),
+            group_by   => "$dbhost,$dbport,$sysdb_host,$sysdb_port"
+        } unless ( $clusterConnectStatus && $sysdbConnectStatus );
+
+    }
+    return 1; #MDC tenant
+}
+
+# standby hosts are cluster-wide (SID scope), so no point
+# showing dbname, port, nor product name. A future enhancement
+# could be to show all products/dbnames using this host/SID.
+sub do_standby_queries {
+    my ($queries, $dbsid, $hanaClient) = @_;
+
+    for my $standbyHost (@{$hanaClient->standbys()}) {
+        my $hostIndex = "$standbyHost:$dbsid";
+
+        $queries->{"Hana ISUP: host $hostIndex"} = {
+            perl => sub { return 1; },
+            inf_field => "standby_status",
+            inf_tags  => qq(standby_host="$hostIndex"),
+            group_by  => "$hostIndex"
+        };
+    }
+}
+
+main(@ARGV);
+
+__END__

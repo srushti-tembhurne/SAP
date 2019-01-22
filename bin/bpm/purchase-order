@@ -1,0 +1,309 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/bpm/purchase-order#12 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::Url;
+use ariba::monitor::Bpm;
+use Data::Dumper;
+
+our $debug = 0;
+
+sub usage
+{
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode.
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit ();
+}
+
+sub main
+{
+    my %raw_fields = (stuck_mins => '',
+                      threshold_status => '');
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while (my $arg = shift)
+    {
+        if ($arg =~ /^-h/o) {usage();  next;}
+        if ($arg =~ /^-d/o) {$debug++; next;}
+        if ($arg =~ /^-e/o) {$sendEmail = 1; next;}
+        if ($arg =~ /^-p/o) {$sendPage  = 1; next;}
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me  = ariba::rc::InstalledProduct->new();
+    my $tab = ariba::monitor::StatusPage::businessProcessProduct();
+    my %queries;
+    my %queries_count;
+
+    if (ariba::rc::InstalledProduct->isInstalled('an', $me->service()))
+    {
+        my $an = ariba::rc::InstalledProduct->new('an', $me->service());
+        my @communities = grep {$_ % 2 == 0} $an->communityIdsForProduct();
+        my $url = ariba::monitor::Bpm::urlForANApp($an, 'ANBusinessProcessMonitor');
+        my $processedPayloadIds = {};
+        my @poResults;
+
+        foreach my $community (@communities)
+        {
+            my $params = {BusinessObject => 'PurchaseOrder', MetricType => 'CXMLTransmitFailure'};
+            my $urls = ariba::monitor::Bpm::communityUrlsForUrlAndCommunities($url, $community);
+            my $responses = ariba::monitor::Bpm::getResponsesForUrlsAndParams($urls, $params, 1);
+            @poResults = ariba::monitor::Bpm::processResultsFromResponses($responses, $processedPayloadIds);
+
+            $queries_count{"Delivery time threshold exceeded - Unable to transmit from AN to Supplier over cXML Channel for an community $community"} = {
+                info => 1,
+
+                #warn   => 'answer =~ /status: warn/i',
+                #crit   => 'answer =~ /status: crit/i',
+                crit              => '(answer =~ /time.*out.*after/ && previousAnswer =~ /time.*out.*after/)',
+                uiHint            => 'Unable to transmit from AN to Supplier over cXML Channel',
+                perl              => sub {return scalar (@poResults);},
+                correctiveActions => [
+                                      Support => 'Notify the supplier of the issue but Ariba can\'t do anything to fix it',
+                                      Ops     => 'No action required',
+                                     ],
+                description      => 'This metric lists any Purchase Orders that have exceeded the delivery time threshold, and are currently waiting in AN for delivery to the Supplier over an integrated cXML channel.',
+                recordItem       => 'numrows',
+                recordMaxResults => 40000,
+                inf_field        => 'count',
+                inf_tags         => qq(type="unable to transmit from AN to Supplier over cXML Channel",community="$community"),
+                inf_default      => 0,
+                group_by         => "AN_Supplier_Over_cXML_Channel,$community",
+            };
+            my $i = 1;
+
+            foreach my $row (@poResults)
+            {
+              if ($row =~ /http request error/i) {
+                $queries{"detail an to supplier over cXML $community $i"} = {
+                                                        perl        => sub {return $row},
+                                                        inf_field   => "error",
+                                                        inf_tags    => qq(type="unable to transmit from AN to Supplier over cXML Channel",community="$community",row_id=$i),
+                                                        inf_default => 0,
+                                                        group_by    => "AN_Supplier_Over_cXML_Channel,$community,$i",
+                                                       };
+              } elsif ($row =~ /\|\|/) {
+                my @cols = split (/\|\|/, $row);
+                foreach my $col (@cols)
+                {
+                    my ($field, $value) = split (/=/, $col);
+                    my $inf_field_type = ( !exists($raw_fields{$field}) ) ? $ariba::monitor::QueryManager::inf_field_type_string : undef;
+
+                    $queries{"detail an to supplier over cXML $field $i"} = {
+                                             perl        => sub {return $value},
+                                             inf_field   => $field,
+                                             inf_field_type => $inf_field_type,
+                                             inf_tags    => qq(type="unable to transmit from AN to Supplier over cXML Channel",community="$community",row_id=$i),
+                                             inf_default => 0,
+                                             group_by    => "AN_Supplier_Over_cXML_Channel,$community,$i",
+                                            };
+                }
+              }
+              $i++;
+            }
+#
+         $params = {BusinessObject => 'PurchaseOrder', MetricType => 'EDITransmitFailure'};
+         $url = ariba::monitor::Bpm::urlForANApp($an, 'EDIBusinessProcessMonitor');
+         $urls = ariba::monitor::Bpm::communityUrlsForUrlAndCommunities($url, 'default');
+         $responses = ariba::monitor::Bpm::getResponsesForUrlsAndParams($urls, $params);
+#
+         my @edi_transmit_failure = ariba::monitor::Bpm::processResultsFromResponses($responses, $processedPayloadIds);
+         $queries_count{"Delivery time threshold exceeded - Unable to transmit from EDI Gateway to Supplier"} = {
+             info => 1,
+#
+             crit              => '(answer =~ /time.*out.*after/ && previousAnswer =~ /time.*out.*after/)',
+             uiHint            => 'Unable to Transmit from EDI Gateway to Supplier',
+             perl              => sub {return scalar (@edi_transmit_failure);},
+             correctiveActions => [
+                                   Support => ' Go through the list of documents and see if these are issues with the customer document or functional issues. File CR for functional issues, follow CIRS if necessary',
+                                   Ops     => 'No action required',
+                                  ],
+             description      => 'This metric lists any Purchase Orders that have exceeded the delivery time threshold, and are currently waiting in the EDI gateway for delivery to the Supplier EDI endpoint.',
+             recordItem       => 'numrows',
+             recordMaxResults => 40000,
+             inf_field        => 'count',
+             inf_tags         => qq(type="unable to transmit from EDI Gateway to Supplier",community="$community"),
+             inf_default      => 0,
+             group_by         => "edi_gateway_to_supplier,$community",
+                                                                                                          };
+         $i = 1;
+           foreach my $row (@edi_transmit_failure)
+           {
+             if ($row =~ /http request error/i) {
+               $queries{"detail EDI Gateway to Supplier $community $i"} = {
+                                                       perl        => sub {return $row},
+                                                       inf_field   => "error",
+                                                       inf_tags    => qq(type="unable to transmit from EDI Gateway to Supplier",community="$community",row_id=$i),
+                                                       inf_default => 0,
+                                                       group_by    => "edi_gateway_to_supplier,$community,$i",
+                                                      };
+             } elsif ($row =~ /\|\|/) {
+               my @cols = split (/\|\|/, $row);
+               foreach my $col (@cols)
+               {
+                   my ($field, $value) = split (/=/, $col);
+                   my $inf_field_type = ( !exists($raw_fields{$field}) ) ? $ariba::monitor::QueryManager::inf_field_type_string : undef;
+                   $queries{"detail EDI Gateway to Supplier $field $i"} = {
+                                            perl        => sub {return $value},
+                                            inf_field   => $field,
+                                            inf_field_type => $inf_field_type,
+                                            inf_tags    => qq(type="unable to transmit from EDI Gateway to Supplier",community="$community",row_id=$i),
+                                            inf_default => 0,
+                                            group_by    => "edi_gateway_to_supplier,$community,$i",
+                                           };
+               }
+           }
+           $i++;
+       }
+      }
+    }
+
+    if (ariba::rc::InstalledProduct->isInstalled('buyer', $me->service()))
+    {
+        my $buyer = ariba::rc::InstalledProduct->new('buyer', $me->service());
+        my $params = {BusinessObject => 'DirectOrder', MetricType => 'ExceededDeliveryTime'};
+        my $urls = ariba::monitor::Bpm::communityUrlsForProductAndAppName($buyer, 'UI');
+
+        foreach my $community (keys (%$urls))
+        {
+            my $communityUrl = {$community => $urls->{$community}};
+            my $responses = ariba::monitor::Bpm::getResponsesForUrlsAndParams($communityUrl, $params);
+            my ($responsesFor4xx, $responsesForNon4xx) = ariba::monitor::Bpm::splitResponsesBetween4xxAndNon4xx($responses);
+
+            my @awaiting_ssp_to_an = ariba::monitor::Bpm::processResultsFromResponses($responsesForNon4xx);
+            $queries_count{"Delivery time threshold exceeded - Currently waiting for delivery from SSP Buyer to AN (communication error) for buyer community $community"} = {
+                                                                  uiHint                       => 'Currently waiting for delivery from SSP Buyer to AN (Communication Error)',
+                                                                  perl                         => sub {return scalar (@awaiting_ssp_to_an);},
+                                                                  description => 'This metric lists any Purchase Orders in the Buyer/SSP application that have exceeded the delivery time threshold due to communication errors encountered while attempting to send the Order to AN over the cXML channel.',
+                                                                  recordItem  => 'numrows',
+                                                                  recordMaxResults => 40000,
+                                                                  inf_field        => 'count',
+                                                                  inf_tags         => qq(type="awaiting ssp buyer to an communication error",community="$community"),
+                                                                  inf_default      => 0,
+                                                                  group_by         => "awaiting_ssp_to_an,$community",
+             };
+            my $i = 1;
+            foreach my $row (@awaiting_ssp_to_an)
+            {
+
+                if ($row =~ /http request error/i)
+                {
+                    $queries{"SSP Buyer to AN comm error $community $i"} = {
+                                                            perl        => sub {return $row},
+                                                            inf_field   => "error",
+                                                            inf_tags    => qq(type="awaiting ssp buyer to an communication error",community="$community",row_id=$i),
+                                                            inf_default => 0,
+                                                            group_by    => "awaiting_ssp_to_an,$community,$i",
+                                                           };
+                }
+                elsif ($row =~ /\|\|/)
+                {
+                    my @cols = split (/\|\|/, $row);
+                    foreach my $col (@cols)
+                    {
+                        my ($field, $value) = split (/=/, $col);
+                        my $inf_field_type = ( !exists($raw_fields{$field}) ) ? $ariba::monitor::QueryManager::inf_field_type_string : undef;
+                        $queries{"SSP Buyer to AN comm $field $i"} = {
+                                                 perl        => sub {return $value},
+                                                 inf_field   => $field,
+                                                 inf_tags    => qq(type="awaiting ssp buyer to an communication error",community="$community",row_id=$i),
+                                                 inf_default => 0,
+                                                 group_by    => "awaiting_ssp_to_an,$community,$i",
+                                                };
+                    }
+                }
+                $i++;
+            }
+
+
+            my @awaiting_ssp_to_an_config_issues = ariba::monitor::Bpm::processResultsFromResponses($responsesFor4xx);
+            $queries_count{"Delivery time threshold exceeded - Currently waiting for delivery from SSP Buyer to AN (configuration issue) for buyer community $community"} = {
+                uiHint            => 'Currently waiting for delivery from SSP Buyer to AN (Configuration Issue)',
+                perl              => sub {return scalar (@awaiting_ssp_to_an_config_issues);},
+                description      => 'This metric lists any Purchase Orders in the Buyer/SSP application that have exceeded the delivery time threshold due to configuration issues encountered while attempting to send the Order to AN over the cXML channel.',
+                recordItem       => 'numrows',
+                recordMaxResults => 40000,
+                inf_field        => 'count',
+                inf_tags         => qq(type="awaiting ssp buyer to an config issue",community="$community"),
+                inf_default      => 0,
+                group_by         => "awaiting_ssp_to_an_config_issue,$community",
+                  };
+            $i = 1;
+            foreach my $row (@awaiting_ssp_to_an_config_issues)
+            {
+                if ($row =~ /http request error/i)
+                {
+                    $queries{"SSP Buyer to AN error config issue $community $i"} = {
+                            perl        => sub {return $row},
+                            inf_field   => "error",
+                            inf_tags    => qq(type="awaiting ssp buyer to an config issue",community="$community",row_id=$i),
+                            inf_default => 0,
+                            group_by    => "awaiting_ssp_to_an_config_issue,$community,$i",
+                     };
+                }
+                else
+                {
+                    my @cols = split (/\|\|/, $row);
+                    foreach my $col (@cols)
+                    {
+                        my ($field, $value) = split (/=/, $col);
+                        my $inf_field_type = ( !exists($raw_fields{$field}) ) ? $ariba::monitor::QueryManager::inf_field_type_string : undef;
+                        $queries{"SSP Buyer to AN config $field $i"} = {
+                                                 perl        => sub {return $value},
+                                                 inf_field   => $field,
+                                                 inf_field_type => $inf_field_type,
+                                                 inf_tags    => qq(type="awaiting ssp buyer to an config issue",community="$community",row_id=$i),
+                                                 inf_default => 0,
+                                                 group_by    => "awaiting_ssp_to_an_config_issue,$community,$i",
+                                                };
+                    }
+                    $i++;
+                }
+            }
+        }
+    }
+
+    my $email = $me->default('notify.email');
+
+    if (%queries_count)
+    {
+        $queries_count{influx_details} = {measurement => "bpm_po_exceeded_delivery_time_counts"};
+        my $qm_counts = ariba::monitor::QueryManager->newWithDetails('PO-has-exceeded-delivery-time-threshold', $tab, $me->service(), $me->customer(), \%queries_count);
+        $qm_counts->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+
+    if (%queries)
+    {
+        $queries{influx_details} = {measurement => "bpm_po_exceeded_delivery_time"};
+        my $qm = ariba::monitor::QueryManager->newWithDetails('PO-has-exceeded-delivery-time-threshold', $tab, $me->service(), $me->customer(), \%queries);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+
+}
+
+main(@ARGV);
+
+__END__

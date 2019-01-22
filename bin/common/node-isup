@@ -1,0 +1,211 @@
+#!/usr/local/bin/perl -w
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Url;
+use XML::XPath;
+use XML::XPath::XMLParser;
+
+use POSIX qw{ strftime };
+
+my $debug = 0;
+
+sub usage
+{
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-prod <product> -e|-p|-d|-h]
+    -prod product
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit ();
+}
+
+sub main
+{
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $productName;
+
+    while (my $arg = shift (@ARGV))
+    {
+        if ($arg =~ /^-h$/o) {usage();  next;}
+        if ($arg =~ /^-d$/o) {$debug++; next;}
+        if ($arg =~ /^-e$/o) {$sendEmail = 1; next;}
+        if ($arg =~ /^-p$/o) {$sendPage  = 1; next;}
+        if ($arg =~ /^-prod/o) {$productName = shift (@ARGV);}
+    }
+
+    my $me      = ariba::rc::InstalledProduct->new();
+    my $service = $me->service();
+    my $cluster = $me->currentCluster();
+
+    unless (ariba::rc::InstalledProduct->isInstalled($productName, $service))
+    {
+        exit (0);
+    }
+
+    my $product = ariba::rc::InstalledProduct->new($productName, $service);
+
+    my %queries;
+
+    my %communities = ();
+    my %allReqs     = ();
+
+    for my $instance ($product->appInstancesInCluster($cluster))
+    {
+        my $instanceName = $instance->instanceName();
+        next unless $instance->isTomcatApp();
+
+        if ($instance->appName() =~ /^TaskCXML/)
+        {
+            my $reqUrl;
+            my $community = $instance->community();
+
+            unless (exists $communities{$community})
+            {
+                $communities{$community} = '1';
+                $reqUrl = $instance->requisitionsRealmURL();
+
+                print "checking url:$reqUrl\n" if $debug;
+
+                my ($error, $xp) = processUrl($reqUrl);
+                my $realmStatusSet = $xp->find("//realm") unless $error;
+
+                unless ($error)
+                {
+                    foreach my $node ($realmStatusSet->get_nodelist)
+                    {
+                        my $id = $node->getAttribute('id');
+                        #
+                        # Direct action only returns non-zero results so by default set all values to 0
+                        #
+                        foreach my $s (qw(Approved Composing Submitted))
+                        {
+                            $allReqs{$id}{$s} = 0;
+                        }
+                        my $reqStatusSet = $xp->find("//realm[\@id='" . $id . "']/*") unless $error;
+
+                        foreach my $s ($reqStatusSet->get_nodelist)
+                        {
+                            my $status = $s->getName;
+                            my $value  = $s->string_value;
+                            $allReqs{$id}{$status} = $value;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    my $date     = strftime("%Y-%m-%d", localtime ());
+    my $datetime = localtime ();
+    my $logFile  = "/tmp/$service/mon/realms-status-$date.csv";
+
+    open (LOG, ">", $logFile) || die "Could not open $logFile, $!\n";
+
+    for my $realm (keys %allReqs)
+    {
+        for my $status (keys %{$allReqs{$realm}})
+        {
+            my $results = $allReqs{$realm}{$status};
+            print LOG "$realm,$status,$results,$datetime\n";
+
+            $queries{"Requisitions for $realm - $status"} = {
+                                                             recordDataType   => "gauge",
+                                                             recordMaxResults => 500,
+                                                             perl             => sub {return $results;},
+                                                             uiHint           => "Requistions By Realm/$realm",
+                                                             description      => "Requisitions breakup counts by realm",
+                                                             inf_field        => $status,
+                                                             inf_default      => 0,
+                                                             inf_tags         => qq(realm=$realm),
+                                                             group_by         => $realm,
+                                                            };
+        }
+    }
+    close (LOG);
+
+    my $email = $me->default('notify.email');
+    $queries{influx_details} = {measurement => "buyer_usage_status"};
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails("usage-status", $product->name(), $service, $product->customer(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+# sample xml
+# qa service: http://app171.ariba.com:23022/Buyer/Main/ad/reqCount/BuyerMonitorActions?awpwd=awpwd
+#<xml>
+#   <realm id="p2pTeSg-28">
+#       <Composing>16</Composing>
+#       <Submitted>4</Submitted>
+#       <Approved>16</Approved>
+#   </realm>
+#   <realm id="p2pTeSg-19">
+#       <Submitted>4</Submitted>
+#       <Approved>2</Approved>
+#   </realm>
+#   <realm id="p2pTeOra">
+#       <Approved>2</Approved>
+#   </realm>
+#   <realm id="apcAippSg">
+#       <Composing>4</Composing>
+#   </realm>
+#</xml>
+
+sub processUrl
+{
+    my $thisReqUrl = shift;
+    my $xp;
+    my $eMessage;
+
+    my $requisitionStatus = ariba::monitor::Url->new($thisReqUrl);
+    $requisitionStatus->setUseOutOfBandErrors(1);
+
+    if (defined $requisitionStatus->error())
+    {
+        $eMessage = "ERROR: $requisitionStatus->error()\n";
+
+        return ($eMessage, $xp);
+    }
+
+    my $xmlString = $requisitionStatus->request();
+    $xp = XML::XPath->new(xml => $xmlString);
+
+    eval {
+        my $parseThis = new XML::Parser;
+        $parseThis->parse($xmlString);
+    };
+
+    if ($@)
+    {
+        $eMessage = "ERROR: XML Parsing failed\n";
+    }
+    else
+    {
+        $eMessage = "ERROR: Invalid xml data as realm is missing: $xmlString\n" unless ($xmlString =~ m/realm/);
+    }
+
+    print "$eMessage\n" if $debug && $eMessage;
+
+    return ($eMessage, $xp);
+}
+
+main(@ARGV);
+
+__END__
+

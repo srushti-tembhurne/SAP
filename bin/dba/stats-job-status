@@ -1,0 +1,253 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/dba/stats-job-status#5 $
+#
+# Monitor stats jobs
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Machine;
+use ariba::monitor::StatusPage;
+use ariba::monitor::QueryManager;
+
+my $debug     = 0;
+my $sendEmail = 0;
+my $sendPage  = 0;
+
+sub main {
+    my (@productNames);
+
+    while ( my $arg = shift(@ARGV) ) {
+        if ( $arg =~ m/^-product/o ) {
+            push( @productNames, shift(@ARGV) );
+            next;
+        }
+        if ( $arg =~ m/^-d/o ) { $debug++; next; }
+        if ( $arg =~ m/^-e/o ) { $sendEmail = 1; next; }
+        if ( $arg =~ m/^-p/o ) { $sendPage  = 1; next; }
+        usage("Unknown arg: $arg");
+    }
+
+    my $me    = ariba::rc::InstalledProduct->new();
+    my $email = $me->default('notify.dba');
+    my $user  = "system";
+    my $pass  = $me->default("dbainfo.$user.password");
+
+    my $hostname   = ariba::Ops::NetworkUtils::hostname();
+    my $machine    = ariba::Ops::Machine->new($hostname);
+    my $datacenter = $machine->datacenter();
+    my $tab =
+      ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+    my @products = ();
+    my ($version, $state, $status, $startdate, $duration, $errors );
+
+    if (@productNames) {
+        for my $productName (@productNames) {
+            push(
+                @products,
+                ariba::rc::InstalledProduct->installedProductsList(
+                    $me->service(), $productName
+                )
+            );
+        }
+    }
+    else {
+        push(
+            @products,
+            ariba::rc::InstalledProduct->installedProductsList(
+                $me->service()
+            )
+        );
+    }
+
+    my %queries;
+    my %seen;
+    my $jobStatus =
+"<html><blockquote><table style='text-align:left'><tr><th width=100>SID</th><th width=100>HOST</th><th width=100>VERSION</th><th width=100>STATE</th><th width=100>STATUS</th><th width=70>ERRORS</th><th width=180>STARTDATE</th><th width=100>DURATION</th></tr>";
+
+    for my $product (@products) {
+        my @dbcs = ariba::Ops::DBConnection->connectionsFromProducts($product);
+        for my $dbc (
+            ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbcs) )
+        {
+            next if $dbc->isDR();
+            my $crit_flag = 0;
+
+            # skip if not oracle
+            if ( $dbc->dbServerType() ne
+                ariba::Ops::DBConnection->oracleDBServerType() )
+            {
+                next;
+            }
+            my $virtualHost = $dbc->host();
+            my $sid         = uc( $dbc->sid() );
+            next if ( $seen{ $virtualHost . $sid } );
+            my $roo = $dbc->{product}->{parameters}->{'_dictionary'}->{'System'}
+              ->{'Databases'};
+            my $svflag   = 0;
+            my $prodname = $product->{prodname};
+            if ( $product->{prodname} eq 's4' ) {
+
+                foreach my $ke ( keys %$roo ) {
+                    if (    ( $ke =~ /^star/i )
+                        and ( $roo->{$ke}->{'AribaDBServer'} eq $sid ) )
+                    {
+                        $svflag = 1;
+                        last;
+                    }
+                }
+            }
+            $seen{ $virtualHost . $sid } = 1;
+            next if ($svflag);
+            my @results;
+            my $rojo = "SID: $sid \n VHost:  $virtualHost ";
+            my $oc =
+              ariba::Ops::OracleClient->new( $user, $pass, $sid, $virtualHost );
+            $oc->connect();
+            if ( $oc->error() ) {
+                $crit_flag++;
+                $rojo .= "\n Connect: " . $oc->error();
+            }
+            my $versionSql = 'select version from v$instance';
+            $oc->executeSqlWithTimeout( $versionSql, 120, \@results );
+            if ( $oc->error() ) {
+                $crit_flag++;
+                $rojo .= "\n Version: " . $oc->error();
+            }
+            $version = $results[0]->{VERSION};
+            $rojo .= "\nVersion: $version";
+            if ( $version =~ m/^10/ ) {
+                my $stateSql =
+"select state from dba_scheduler_jobs where job_name='GATHER_STATS_JOB';";
+                $oc->executeSqlWithTimeout( $stateSql, 120, \@results );
+                if ( $oc->error() ) {
+                    $crit_flag++;
+                    $rojo .= "\nState: " . $oc->error();
+                }
+                $state = $results[0]->{STATE};
+                $rojo .= "\n State:  $state ";
+                my $detailsSql =
+"select status, error# ERRORS, to_char(actual_start_date, 'MM/DD/YY, HH:MI:SS AM') STARTDATE, substr(run_duration, 2) DURATION from dba_scheduler_job_run_details where job_name='GATHER_STATS_JOB' and log_id = (select max(log_id) from dba_scheduler_job_run_details where job_name='GATHER_STATS_JOB');";
+
+                $oc->executeSqlWithTimeout( $detailsSql, 120, \@results );
+                if ( $oc->error() ) {
+                    $crit_flag++;
+                    $rojo .= "\n Details: " . $oc->error();
+                }
+                ( $status, $errors, $startdate, $duration ) = ($results[0]->{STATUS},$results[0]->{ERRORS},$results[0]->{STARTDATE},$results[0]->{DURATION} );
+                $rojo .=
+"\nStatus: $status \n Errors:  $errors \n StartDate: $startdate \n Duration: $duration";
+            }
+            elsif ( $version =~ m/^11/ ) {
+                my $sql =
+"select a.status, b.job_status, to_char(b.job_start_time, 'MM/DD/YY, HH:MI:SS AM') startDate, substr(b.job_duration, 2) duration, b.job_error from dba_autotask_client a, dba_autotask_job_history b where a.client_name = 'auto optimizer stats collection' and a.client_name = b.client_name and b.job_start_time = (select max(job_start_time) from dba_autotask_job_history where client_name = 'auto optimizer stats collection');";
+                $oc->executeSqlWithTimeout( $sql, 120, \@results );
+                if ( $oc->error() ) {
+                    $crit_flag++;
+                    $rojo .= "\nState: " . $oc->error();
+                }
+                ( $state, $status, $startdate, $duration, $errors ) = ($results[0]->{STATUS},$results[0]->{JOB_STATUS},$results[0]->{STARTDATE},$results[0]->{DURATION},$results[0]->{JOB_ERROR});
+                $rojo .= "\n State: $state";
+                $rojo .=
+"\nStatus: $status \n Errors:  $errors \n StartDate: $startdate \n Duration: $duration";
+            }
+            (my $semicolon_rojo = $rojo) =~ s/\n/;/g;
+            $queries{"$prodname:$sid:state"} = {
+                perl => sub { return $state },
+                uiHint    => "Stats/$prodname/$sid",
+                inf_field => "state",
+                inf_tags => "productName=$prodname,sid=$sid",
+                group_by    => "$datacenter,$prodname,$sid",
+            };
+            $queries{"$prodname:$sid:status"} = {
+                perl => sub { return $status; },
+                uiHint    => "Stats/$prodname/$sid",
+                inf_field => "status",
+                inf_tags => "productName=$prodname,sid=$sid",
+                group_by    => "$datacenter,$prodname,$sid",
+            };
+            $queries{"$prodname:$sid:error"} = {
+                perl => sub { return $errors; },
+                uiHint    => "Stats/$prodname/$sid",
+                inf_field => "errors",
+                inf_tags => "productName=$prodname,sid=$sid",
+                inf_default => "",
+                group_by    => "$datacenter,$prodname,$sid",
+            };
+            $queries{"$prodname:$sid:startdate"} = {
+                perl => sub { return $startdate; },
+                uiHint    => "Stats/$prodname/$sid",
+                inf_field => "startDate",
+                inf_tags => "productName=$prodname,sid=$sid",
+                inf_default => "",
+                group_by    => "$datacenter,$prodname,$sid",
+            };
+            $queries{"$prodname:$sid:duration"} = {
+                perl => sub { return $duration; },
+                uiHint    => "Stats/$prodname/$sid",
+                inf_field => "duration",
+                inf_tags => "productName=$prodname,sid=$sid",
+                inf_default => 0,
+                group_by    => "$datacenter,$prodname,$sid",
+            };
+            $queries{"$prodname:$sid:Vhost"} = {
+                perl => sub { return $virtualHost; },
+                uiHint    => "Stats/$prodname/$sid",
+                inf_field => "virtualHost",
+                inf_tags => "productName=$prodname,sid=$sid",
+                inf_default => "",
+                group_by    => "$datacenter,$prodname,$sid",
+            };
+            $queries{"$prodname:$sid:version"} = {
+                perl => sub { return $version; },
+                uiHint    => "Stats/$prodname/$sid",
+                inf_field => "version",
+                inf_tags => "productName=$prodname,sid=$sid",
+                inf_default => "",
+                group_by    => "$datacenter,$prodname,$sid",
+            };
+
+            if ($crit_flag) {
+                $queries{"$prodname:$sid:stats_job"}->{'crit'} = 1;
+            }
+
+            $queries{"$prodname:$sid:crit_threshold"} = {
+                perl => sub {return $crit_flag},
+                inf_field => "crit_threshold",
+                inf_default => 0,
+                inf_tags => "productName=$prodname,sid=$sid",
+                group_by    => "$datacenter,$prodname,$sid",  
+            };
+
+        }
+
+    }
+
+    $queries{influx_details} = { measurement => "dba_stats_job_status" };
+    my $qm = ariba::monitor::QueryManager->newWithDetails( "dba", $tab,
+        $me->service(), $me->customer(), \%queries );
+
+    $qm->processQueries( $debug, $email, $sendEmail, $sendPage );
+}
+
+sub usage {
+    my $error = shift;
+
+    print "ERROR: $error\n" if $error;
+    print "stats-job-status [-product <product>] [-d]\n";
+    print "  -product <product>   Run for this product (can be repeated)\n";
+    print "  -d                   Debug mode\n";
+    print "  -e                   Send email\n";
+    print "  -p                   Send page\n";
+}
+
+main();

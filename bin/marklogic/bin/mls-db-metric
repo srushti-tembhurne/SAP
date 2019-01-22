@@ -1,0 +1,83 @@
+#!/usr/local/bin/perl
+use strict;
+use warnings;
+use Data::Dumper;
+
+use FindBin;
+use lib ("$FindBin::Bin/../lib", "$FindBin::Bin/../lib/perl");
+use ariba::Ops::MarkLogic::MLS;
+
+
+sub usage {
+    my $msg = shift;
+    my $help;
+    print "Usage error: $msg\n\n" if $msg;
+
+    ($help = <<"    EOF") =~ s/^\t//gm;
+     Options:
+        -h      # this help
+        -d      # run in debug mode.  A third -d option will turn on dry-run mode.
+        -p      # product name
+        -s      # service name
+
+    EOF
+
+    print $help;
+    exit(1);
+}
+
+sub main {
+
+    my ($product,$service,$debug);
+
+    while (my $arg = shift(@ARGV)) {
+
+        if ( $arg eq "-h" ) { usage(); exit;}
+        if ( $arg eq "-p" ) { $product = shift(@ARGV); next; }
+        if ( $arg eq "-s" ) { $service = shift(@ARGV); next; }
+        if ( $arg eq "-d" ) { $debug = shift(@ARGV); next; }
+        
+    }
+
+    if (! $product || ! $service){
+        usage(); exit;
+    }
+
+    my $mls = ariba::Ops::MarkLogic::MLS->new($product,$service);
+
+    #print Dumper($mls);exit;
+###DB Metric
+    if ($product){
+        my @dbs = $mls->getDBsforProduct($product);
+
+        for my $db (@dbs){
+            my $DBhash = $mls->getDBStatus($db);
+            $mls->influxit($DBhash,$db);
+
+            my $forestHash = $mls->getForestStatus($db);
+            $mls->influxit($forestHash,$db);
+        }
+    }
+
+###Host Metrics
+    my @hosts = $mls->getHostsForCluster();
+
+    for my $host(@hosts){
+        my $hostHash = $mls->getHostStatus($host);
+        $mls->influxit($hostHash,$host);
+    }
+
+###Cluster Metrics
+    my $clusterHash = $mls->getClusterStatus();
+    $mls->influxit($clusterHash,$mls->{CLUSTER});
+
+
+###Database Host, server count for cluster
+    for my $type('databases','hosts','servers'){
+        my $hash = $mls->getCountfor($type);
+        $mls->influxit($hash,$mls->{CLUSTER});
+    }
+}
+
+main();
+

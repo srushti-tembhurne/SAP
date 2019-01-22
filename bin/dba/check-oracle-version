@@ -1,0 +1,104 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/dba/check-oracle-version#3 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::DBConnection;
+
+my $debug = 0;
+
+sub usage {
+	my $error = shift;
+
+	print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+	-e    Enables sending of email for monitor query.
+	-p    Enables sending of pages for monitor query.
+	-d    Turns on debug mode.
+	-h    Shows this help.
+
+USAGE
+
+	print "(error) $error\n" if ($error);
+
+	exit();
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while (my $arg = shift) {
+		if ($arg =~ /^-h$/o) { usage();		next; }
+		if ($arg =~ /^-d$/o) { $debug++;	next; }
+		if ($arg =~ /^-e$/o) { $sendEmail = 1; 	next; }
+		if ($arg =~ /^-p$/o) { $sendPage = 1; 	next; }
+
+		usage("Invalid argument: $arg");
+	}
+
+	my $me			= ariba::rc::InstalledProduct->new();
+	my $service		= $me->service();
+	my $hostname	= ariba::Ops::NetworkUtils::hostname();
+	my $machine		= ariba::Ops::Machine->new($hostname);
+	my $datacenter	= $machine->datacenter();
+	my $tab			= ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+	my $prodname	= $me->name();
+
+	my @p = ariba::rc::InstalledProduct->installedProductsList($service,$prodname);
+	my @dbcs = ariba::Ops::DBConnection->connectionsFromProducts(@p);
+
+	recordOracleVersions($me, $tab, $hostname, $debug, $datacenter);
+
+}
+
+sub recordOracleVersions {
+	my $me = shift;
+	my $tab = shift;
+	my $hostname = shift; 
+	my $dryrun = shift;
+    my $datacenter = shift;
+	my $q;
+
+	open(F,"< /etc/oratab") || return;
+	while(my $line = <F>) {
+		chomp $line;
+		next if($line =~ /^\s*#/ || $line =~ /^\s*$/);
+		my ($sid, $path, @jnk) = split(/:/, $line);
+		my $version;
+		if($path =~ m|/([^/]+)$|) {
+			$version = $1;
+		} else {
+			next;
+		}
+
+		print "Checking Oracle Version for hostname: $hostname, sid: $sid => version: $version\n" if $debug;
+		$q->{"Oracle Version for $sid on $hostname"} = {
+			info => 1,
+			perl => sub { return $version; },
+			uiHint => "version/$hostname",
+            inf_field => "OracleVersion",
+            inf_tags => qq|datacenter="$datacenter",uiHint="version/$hostname",hostname="$hostname",sid="$sid"|,
+            inf_default => 0,
+            group_by => "$datacenter,$hostname",
+		};
+	}
+	close(F);
+
+	return unless(scalar(keys(%$q)));
+
+    $q->{"influx_details"} = {measurement => "dba"};
+	my $qm = ariba::monitor::QueryManager->newWithDetails("dba", $tab, $me->service(), undef, $q);
+	$qm->processQueriesUsingServer($dryrun, undef, 0, 0);
+}
+
+main(@ARGV);
+
+__END__

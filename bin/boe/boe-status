@@ -1,0 +1,161 @@
+#!/usr/local/bin/perl
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use Data::Dumper;
+use HTTP::Status; # Used to get English descriptions of HTTP error codes.
+use Getopt::Long qw(:config bundling no_ignore_case_always no_getopt_compat require_order);
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Url;
+use ariba::monitor::QueryManager;
+use ariba::monitor::BusinessObjects;
+
+# Initialize firsts 4 to zero, last is undef.
+my ($debug, $sendEmail, $sendPage, $test, $cluster) = (0,0,0,0);
+
+GetOptions  (
+                'debug|d'      => \$debug,
+                'sendemail|e'  => \$sendEmail,
+                'sendpage|p'   => \$sendPage,
+                'test|t'       => \$test,      # NOTE:  primarily useful for dev work, as it does not make connection to query manager.
+                'cluster|c'    => \$cluster,
+            );
+
+# Business Objects is a "special" product, not existing as an Ariba installable system.  Info about it has been added to the monitoring
+# product config files, so monitoring can extract the info it needs to connect with and log in to the BOE server.  All the details are
+# hidden in the module used here.
+my $boe = ariba::monitor::BusinessObjects->new;
+my @boeURLs = @{$boe->getURLs};
+
+my $name = 'boe';
+my $monprod = $boe->getMonProduct();
+my $service = $monprod->service;
+my $customer = $monprod->customer;
+my $email = $monprod->default ('businessobjects.boeemail');
+
+print Dumper (@boeURLs) if $test;
+
+my %queries;
+my $description = 'Business Objects direct action monitoring via front door URL.';
+my $action = "SRE to contact Business Objects owners:  DL Ariba Cloud Analytics Team ($email)";
+
+# This are set to sort of track with the HTTP::Status breakdown of error codes from the HTTP server.
+my ($info, $warn, $crit) = (0, 300, 500);
+
+foreach my $url (@boeURLs)
+{
+    # Use 'curl' and the url to touch the server and retrieve data.  Use back quotes to capture the output, including error out.  The
+    # curl options cause it to not display the progress meter, while still reporting error messages.
+    my $result = `curl --silent --insecure --show-error $url 2>&1`; # And redirect possible errors to stdout so they are also captured.
+    # Example error:  curl: (35) Unknown SSL protocol error in connection to analytics.ariba.com:443
+
+    # And look for the various messages in the returned string.  The normal output looks like the stuff after the __END__ marker, but
+    # is not formatted.  Errors also may look like:  curl: (56) Received HTTP code 503 from proxy after CONNECT
+    # I am going to assume, until told otherwise, that the only "successful" connection is the one where the return contains info from
+    # the Business Objects login page.  Any other "connection" will have warning status, since they all indicate the host is up but
+    # there is a configuration problem of some sort that prevents actually connecting to the BOE application.  Any other item will be
+    # a critical status.
+    my $status;
+    if ($result =~ /(InfoView.(logon|custom)|Log On to the Data Services Management Console|\Qdocument.forms[0].submit\E)/)
+    {
+        $status = 1;
+        $result = 'OK:  host application is alive';
+    }
+    elsif ($result =~ /Test Page/)
+    {
+        $status = 10 + $warn;
+        $result = 'WARNING:  host is alive but web server is not configured (web host served the "Test Page")';
+    }
+    elsif ($result =~ /Received HTTP code (\d+)/)
+    {
+        # There is an error of some sort, add the human readable string for the error to the description.
+        $status = $1;
+        # Check the status, if >= $crit the message begins differently.
+        $result = ($status >= $crit ? 'ERROR:  ' : 'WARNING:  ') .  status_message ($status) . " ($status).";
+        # Now check the status, be sure it is between $warn and $crit, if not set it so it is.  The result value is set up as a note
+        # so it will show the 'true' HTTP code, in case it gets changed.
+        ($status < $warn) && ($status = $warn); # force the value to the 'warning' level.
+    }
+    elsif ($result =~ /curl: \(60\) SSL certificate problem, verify that the CA cert is OK./) # The parens must be literal here.
+    {
+        $status = 60 + $warn;
+        $result = 'WARNING:  host is alive but an SSL certificate problem was detected.';
+    }
+    elsif ($result =~ /curl: \(7\) couldn't connect to host/) # The parens again must be literal here.
+    {
+        $status = $crit; # This one is a real error, likely indicates the host is down.
+        $result = "ERROR:  could not connect to host '$url'.";
+    }
+    elsif ($result =~ /curl:\s+\((\d+)\)\s+Unknown SSL/) # The parens again must be literal here, with capturing parens inside to retrieve the number.
+    {
+        $status = $1;
+        $result = ($status >= $crit ? 'ERROR:  ' : 'WARNING:  ') . 'host is alive, unknown SSL error detected after connecting.';
+        ($status < $warn) && ($status = $warn); # force the value to the 'warning' level.
+    }
+    elsif ($result =~ /curl:\s+\((\d+)\)/) # The parens again must be literal, with capturing parens inside to retrieve the number.
+    {
+        $status = $1;
+        $result = ($status >= $crit ? 'ERROR:  ' : 'WARNING:  ') . 'host is alive (other unknown error after connecting)';
+        ($status < $warn) && ($status = $warn); # force the value to the 'warning' level.
+    }
+    elsif ($result =~ /[Cc]onnection [Rr]efused/) # host is active but port is closed.
+    {
+        $status = $warn + 20; # Info level, but there are problems with the port.
+        $result = ($status >= $crit ? 'ERROR:  ' : 'WARNING:  ') . "host is alive (possible port problem:  connection refused)";
+        ($status < $warn) && ($status = $warn); # force the value to the 'warning' level.
+    }
+    else
+    {
+        # This is an unknown/unhandled condition, report as critical.
+        $status = $crit + 100;
+        $result = "ERROR:  $result";
+    }
+
+    # Create a simple query for each url test.
+    $queries{"$url"} = {
+                        crit              => "answer >= $crit and previousAnswer >= $crit",
+                        warn              => "answer >= $warn",
+                        info              => "answer >= $info",
+                        perl              => sub {return $status},
+                        description       => $description,
+                        note              => $result,
+                        correctiveActions => [
+                                              Ops => $action,
+                                             ],
+                        inf_field         => "code",
+                        inf_tags          => qq(url="$url"),
+                        group_by          => $url,
+                       };
+}
+
+print Dumper (\%queries) if $test;
+unless ($test)
+{
+    $queries{'influx_details'} = { 'measurement' => 'boe_boestatus' };
+    my $q = ariba::monitor::QueryManager->newWithDetails("business-objects-status", $name, $service, $customer, $cluster, \%queries);
+    $q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+__END__
+
+<html>
+    <head>
+        <meta http-equiv="X-UA-Compatible" content="IE=EmulateIE8,requiresActiveX=true"/>
+        <script type="text/javascript">
+        </script>
+    </head>
+    <body style='overflow: hidden;' marginwidth="0" marginheight="0" topmargin="0" leftmargin="0" rightmargin="0" bottommargin="0">
+        <form action="CMC/1509251639/admin/logon.faces" method="post" target="servletBridgeIframe" style='display:none;'>
+        </form>
+        <iframe name="servletBridgeIframe" style="height:100%; width:100%; border:0;" frameborder='0'>
+        </iframe>
+        <script type="text/javascript">
+            document.forms[0].submit();
+        </script>
+    </body>
+</html>

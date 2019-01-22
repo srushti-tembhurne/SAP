@@ -1,0 +1,451 @@
+#!/usr/local/bin/perl
+
+# machine-watcher 97-04-02 Dan Grillo <grio@280.com>
+# $Id: //ariba/services/monitor/bin/common/machine-watcher#49 $
+#
+# Based on an idea in a program orginally by Bryce Jasmer
+
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::MachineHelper;
+use ariba::monitor::misc;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::MachineProductInfo;
+use ariba::rc::InstalledProduct;
+use ariba::SNMP::Session;
+use ariba::Ops::PageUtils; # To find a monitoring host name.
+
+use Net::Ping;
+use Parallel::ForkManager;
+use dmail::LockLib;
+
+# Should build in a max number of machines per bucket, to keep this from exceeding the number that can be
+# handled in the assigned crontab time slot of running every 6 minutes.  This max must be empirically
+# determined and looks to be about 70.  But it only applies when all hosts are up and snmpd is running.  If
+# hosts are down, the response is subject to timeout periods, which can get very long.  So I'm reducing this
+# to 50.
+use constant MAXMACHINES => 50; # Max machines per bucket.
+use constant MINMACHINES => 40; # Min machines per bucket.
+# The difference of 10 machines, over the MINPROCS, below, gives space for 350 more hosts before needing to
+# increase the number of processes or the queue size.  Which one to do needs to be determined through analysis
+# of the runtime impact of more processes.
+
+# Based on the above number of machines per bucket, and that the largest datacenter, lab1, has 1627 hosts, to
+# maintain a queue size of 50 means running at least 32 sub-processes, which I will arbitrarily set to 35.
+# After testing, found there are 1425 inservice/spare hosts, and the queue size hits 41/40 (25/10 hosts).
+use constant MINPROCS => 35;
+
+my $debug = 0;
+
+# 5 minutes
+my $hysteresis = 5 * 60;
+
+my $pingObj;
+
+sub main {
+
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $email;
+    my $hostname;
+    
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-p/o) { $sendPage = 1; }
+        if ($arg =~ /^-d/o) { $debug = 1; }
+        if ($arg =~ /^-host/o) { $hostname = shift(@ARGV); }
+    }
+
+    my $me          = ariba::rc::InstalledProduct->new();
+    my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+    my $pager       = $me->default('notify.email');
+    my $qmName      = 'machine-watcher-stratus';
+    my $progName    = $0;
+
+    # Set unbuffered output if running in debug, try to keep writes working nicer in multi-process environment.
+    $| = 1 if $debug;
+
+    my $lockFile = "/tmp/$qmName";
+
+    if (!dmail::LockLib::requestlock($lockFile,10)) {
+        die "can't grab lock\n";
+    }
+
+    ariba::monitor::MachineHelper::setDebug($debug);
+    my $monserver = ariba::Ops::PageUtils::monitorServer ();
+
+    print "DEBUG:  start time is:  ", scalar(localtime), "\n" if $debug;
+    for my $datacenter (@dataCenters) {
+        my (%matchDatacenter, %matchMonitoringDatacenter, %matchVirtualMachinesInDatacenter, @machines);
+        if ($hostname)
+        {
+            # This limits the test to the hostname supplied on the command line, which _should_ be the *primary* mon host.
+            # This is used by the mon host in *secondary* dc to monitor the primary dc mon host.
+            %matchDatacenter = (
+                status               => 'inservice,spare',
+                datacenter           => $datacenter,
+                monitoringDatacenter => '',
+                hostname             => $hostname,
+            );
+            @machines = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+        }
+        else
+        {
+            %matchDatacenter = (
+                status               => 'inservice,spare',
+                datacenter           => $datacenter,
+                monitoringDatacenter => '',
+            );
+
+            %matchMonitoringDatacenter = (
+                status               => 'inservice,spare',
+                monitoringDatacenter => $datacenter,
+            );
+
+            # VMs are marked as outofservice because they do not want cfengine to update them
+            %matchVirtualMachinesInDatacenter = (
+                status          => 'outofservice',
+                datacenter      => $datacenter,
+                os              => 'redhat',
+                hardwareType    => 'VM',
+            );
+
+            @machines = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+            push(@machines, ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+            push(@machines, ariba::Ops::Machine->machinesWithProperties(%matchVirtualMachinesInDatacenter));
+            # Check the machine names list and remove the host if it matches the monitoring server name.  Must be done
+            # here, so we *do not* remove the primary mon host name when monitoring it from the secondary mon host.
+            @machines = grep {$_->hostname !~ /$monserver/} @machines;
+        }
+
+        next unless(@machines);
+
+        print "Checking ", scalar(@machines), " machines in $datacenter\n" if $debug;
+
+        my %queries = ();
+        my $warn;
+        my $crit;
+
+        # Loop runs while there are machines to process.  We need a count of instances to create unique child query manager
+        # objects within the script, that remain constant between script runs.  In other words, the child qm name
+        # 'machine-watcher1' will be different from 'machine-watcher2' and so on, but the next time this runs, these names
+        # will be recreated, so there will only be a fixed set of qm names under qm-storage.
+
+        my $childNumber = 0;
+
+        # There were problems with parallelization, where a few machines would come back with different ordering in the array, and so
+        # would end up in different subsets in the loop below.  To try and avoid/fix this, force a sort based on the hostname of
+        # each machine, for the entire @machines array (removed from the child processing of array subsets).  Hopefully this will
+        # force a consistent set of subsets between runs of the script.
+        @machines = sort {$a->hostname() cmp $b->hostname()} @machines;
+
+        my @buckets = createBuckets (MINPROCS, @machines);
+        my $result = 'OK';
+        if (@{$buckets[0]} > MAXMACHINES)
+        {
+            $result = 'NOT OK';
+        }
+
+        # And create a query to track the queue size, to let us know when it reaches the defined max.  Determine 
+        # the current number of machines in $buckets[0] compared to the max number of machines in the queue.
+        $queries {"$datacenter  machine-watcher max queue size"} =   {
+                                                                        info   => "answer eq 'OK'",
+                                                                        crit   => "answer ne 'OK'",
+                                                                        uiHint => 'Max Queue Size Check',
+                                                                        perl   => sub {
+                                                                                          return $result;
+                                                                                      },
+                                                                        correctiveActions => [
+                                                                                                Ops => 'Perform load analysis on the mon host while '.
+                                                                                                       'script is running.  Edit script and increase '.
+                                                                                                       'the MAXMACHINES and/or MINPROCS constants, '.
+                                                                                                       'determine load impact on mon host.  Discuss '.
+                                                                                                       'with SA, tools regarding options available.',
+                                                                                             ],
+                                                                        note   => "Max queue size reports whether the number of machines in a queue " .
+                                                                                  "for machine-watcher exceeds the maximum number permitted, " .
+                                                                                  "currently '" .  MAXMACHINES . "'.",
+                                                                        inf_tags   => qq|datacenter=$datacenter|,
+                                                                        inf_field  => "mw_max_queue_size_status"
+                                                                     };
+        $queries{influx_details} = {measurement => "machine_watcher"};
+        my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+        my $uiManagerName = $qmName . '2';
+        my $qm = ariba::monitor::QueryManager->newWithDetails("$uiManagerName-$datacenter", $pn, $me->service(), $me->customer(), \%queries);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+        $qm->setUiManager ($uiManagerName);
+        $qm->run();
+        if ($debug)
+        {
+            $qm->displayToStdout();
+        }
+        else
+        {
+            if (defined $monserver)
+            {
+                $qm->checkStatus();
+                if (my $ret = $qm->appendToServer($monserver) != 0)
+                {
+                    warn "WARNING:  Failed to append to server with return value '$ret'\n";
+                }
+                else
+                {
+                    $qm->archiveResults();
+                }
+                $qm->displayToLog();
+            }
+            else
+            {
+                warn "WARNING:  Couldn't find a monitor server!\n";
+            }
+        }
+
+        %queries = ();
+
+        my $forkMgr = Parallel::ForkManager->new (MINPROCS);
+
+        while (@buckets)
+        {
+            my $subMachines = shift @buckets;
+
+            print "DEBUG:  total for child = ", scalar (@$subMachines), "\n"
+                if $debug;
+
+            # Increment here so it can be used in both branches of the 'if' without getting out of sequence.
+            $childNumber++;
+            if ($forkMgr->start) # If true (> 0), this is the parent.
+            {
+                if ($debug)
+                {
+                    open my $LOG, '>>', "parent_log_$$" or die "Could not open log file!  $!\n";
+                    print $LOG "Child:  $childNumber:  total for child = ", scalar (@$subMachines), "\n";
+                    close $LOG;
+                }
+                next;
+            }
+            else # It is 0, this is the child.
+            {
+                if ($debug)
+                {
+                    open my $LOG, '>', "child_log_$$" or die "Could not open log file!  $!\n";
+                    print $LOG "Machines to process:  ", scalar (@$subMachines), "\n";
+                    close $LOG;
+                }
+
+                for my $machine (@$subMachines) { # CHILD
+
+                    my $severity;
+
+                    print "  Checking ", $machine->hostname(), "\n" if $debug;
+
+                    my $status = $machine->status();
+                    if ($status eq "inservice") {
+                        $warn = "answer eq 'sick'";
+                        $crit = "answer eq 'down'";
+                    } elsif ($status eq "spare") {
+                        $warn = "answer =~ /sick/ || answer =~ /down/";
+                        $crit = 0;
+                    }
+
+                    if ($machine->provides('safeguard')) {
+                        $severity = 0;
+                    }
+
+                    # We don't want to page for console servers being down.
+                    # TMID: 71271 
+                    if (grep { $_ eq 'consoleserver' } $machine->providesServices()) {
+                        $warn = "answer =~ /sick/ || answer =~ /down/";
+                        $crit = 0;
+                    }
+
+                    my $hostname = $machine->hostname(); 
+                    my $pageInServices;
+                    my $openTicketInServices;
+                    my $path = "http://ops.ariba.com/documentation/prodops/common/bring_up_dummynet_devlab.txt";
+                    my $note;
+                    my $devlabMonitor = ariba::Ops::Constants->serviceForDatacenterMonitoring();
+
+                    if ($machine->provides('dummynet') && $me->service() eq $devlabMonitor) {
+                        $pageInServices = $devlabMonitor;
+                        $openTicketInServices = $devlabMonitor;
+                        $note = "For initial debugging refer to $path";
+                    }
+
+                    # The query names are modified to differentiate from the original query names, to prevent colision related errors.
+                    # The string 'mw2' is being appended to the hostname, which will hopefully keep the names as viewed consistent with
+                    # the old ones, making visibility work better.
+                    $queries{"${hostname}_mw2"} = {
+                        noRowCount                   => 1,
+                        uiHint                       => $status . '2',
+                        format                       => "</td><td>%s</td><td>scaledStatusChangeTime\n",
+                        info                         => "answer =~ /up/",
+                        warn                         => $warn,
+                        crit                         => $crit,
+                        severity                     => $severity,
+                        pageInServices               => $pageInServices,
+                        openTicketInServices         => $openTicketInServices,
+                        ticketOnWarnOpenAfterMinutes => 1,
+                        note                         => $note,
+                        perl                         => sub { main::checkMachine($machine) },
+                        processAnswer => sub { 
+                            ariba::monitor::MachineHelper::computeStatusChange($machine, $hysteresis)
+                        },
+                        inf_field     => "status",
+                        inf_tags      => qq|datacenter=$datacenter,hostname=$hostname,mdbstatus=$status|,
+                        inf_default   => "NA",
+                        group_by      => "$datacenter,$status"
+                      # It turns out this is the source of the double query display on the mon web page, as well as the many UP alerts.
+                      # I do not understand this well enough yet to know why.  And I do not know the basic intent of this construct or
+                      # what it was expected to look like.  Commenting this may be breaking something somewhere, but no idea what.  It
+                      # is kept in place as a reminder to try and figure all this out.  Tracked in HOA-104112.
+                      # details => {
+                      #     "$hostname product roles" => {
+                      #         noRowCount    => 1, 
+                      #         perl          => sub {
+                      #             return ariba::Ops::MachineProductInfo->topProductRolesForServiceAndHost($me->service(), $hostname);
+                      #         },
+                      #     },
+                      # },
+                    };
+                }
+
+                # We need unique qmNames for each child process, which will then be merged into a final UI Manager name.  This final name will
+                # be what $qmName is to begin with, and the munged unique names will not be seen.  NOTE:  a sugestion by Greg Rogers, to fix
+                # the colisions problems caused by reusing the query manager name, is to rename the qm as well as the query names.  The qm
+                # names are being modified by adding '2', such that machine-watcher becomes machine-watcher2.  THIS IS NOT a change in the
+                # script name, which will still be 'machine-watcher'.  This removes the need to change any of the startup-hooks.
+                $qmName .= '2_' . $childNumber;
+
+                $queries{influx_details} = {measurement => "machine_watcher"};
+                my $qm = ariba::monitor::QueryManager->newWithDetails($qmName, $pn, $me->service(), $me->customer(), \%queries);
+                $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+                $qm->setUiManager ($uiManagerName);
+
+                $qm->run();
+
+                if ($debug)
+                {
+                    $qm->displayToStdout();
+                }
+                else
+                {
+                    if (defined $monserver)
+                    {
+                        $qm->checkStatus();
+                        if (my $ret = $qm->appendToServer($monserver) != 0)
+                        {
+                            warn "WARNING:  Failed to append to server with return value '$ret'\n";
+                        }
+                        else
+                        {
+                            $qm->archiveResults();
+                        }
+                        $qm->displayToLog();
+                        ariba::monitor::MachineHelper::notifyPeople($me, $progName, $pager, $sendPage, $subMachines);
+                    }
+                    else
+                    {
+                        warn "WARNING:  Couldn't find a monitor server!\n";
+                    }
+                }
+                $forkMgr->finish;
+            }
+        }
+        $forkMgr->wait_all_children;
+    }
+
+    print "DEBUG:  end time is:  ", scalar(localtime), "\n" if $debug;
+
+    dmail::LockLib::releaselock($lockFile);
+
+    exit 0;
+}
+
+# The first arg is the current number of processes, aka buckets, to create; the subsequent arguments define the list
+# of machines being processed.
+sub createBuckets
+{
+    my $procCount = shift;
+    # This will still use the array of machines to manage the loop, which creates a new array, containing buckets (or
+    # arrays) of machine objects, distributed in round robin fasion across the min set of processes.
+    my @buckets; # holds the buckets, from MINPROCS, up to MAXPROCS.
+    my $bucket = 0; # The index used into @buckets.
+    for my $count (0 .. $#_)
+    {
+        push @{$buckets[$bucket++]}, $_[$count];
+
+        # This is reset to zero when the full set of buckets is created ($procCount in this case).
+        if ($bucket == $procCount)
+        {
+            $bucket = 0;
+        }
+    }
+    return @buckets;
+}
+
+# The addition of the ping processing should reduce the effects of snmp timeout issues when hosts are down, since ping
+# timeouts are much faster.
+sub checkMachine {
+    my $machine = shift;
+    unless ($pingObj)
+    {
+        $pingObj = Net::Ping->new;
+        # It turns out some network devices don't seem to have the standard 'echo' port opne, so force using the
+        # ssh port, which is basically guaranteed to be open, else how would you admin it, securely?
+        $pingObj->{port_num} = getservbyname ('ssh', 'tcp');
+    }
+    # If the ping is successful, do the snmp processing.
+    my ($upTime, $snmp);
+    if ($pingObj->ping ($machine->hostname))
+    {
+        $snmp = ariba::SNMP::Session->newFromMachine($machine);
+
+        if ($snmp) {
+
+            if ($machine->os() eq 'sunos' || $machine->os() eq 'redhat' || $machine->os() eq 'suse') {
+                $upTime = $snmp->valueForOidExpr("hrSystemUptime.0");
+            } else {
+                $upTime = $snmp->valueForOidExpr("sysUpTime.0");
+            }
+
+            # Though documentation says the raw SNMP is in milliseconds, it looks like the value is actually off by a factor of
+            # 10, meaning the following division actually returns a value that compares correctly with the 'uptime' command.
+            $upTime /= 100 if $upTime; # convert to secs.
+        }
+
+    }
+
+    # If snmp worked and we got an uptime, the first part is done.  The branch will be used if uptime was not found OR if
+    # the ping failed.
+    if ($upTime) {
+        $machine->setNewStatus("up");
+        $machine->setNewTime($upTime);
+    } else {
+        # I think the logic for setting the time is incorrect, by using the value of 'time()'.  What that does is set the
+        # 'uptime' to a value equal to the amount of time since the epoch (Jan. 1, 1970).  It would make more sense, I
+        # think, for it to be set to 0 (zero) instead.  But need to check what setNewTime does and what the SNMP uptime
+        # values actually are.
+        $machine->setNewStatus("down");
+        $machine->setNewTime(time());
+    }
+
+    ariba::SNMP::Session->_removeObjectFromCache($snmp) if $snmp;
+
+    return $machine->newStatus();
+}
+
+main();
+
+__END__
+
+crontab for app1023:
+0,3,6,9,12,15,18,21,24,27,30,33,36,39,42,45,48,51,54,57
+
+crontab for app1305:
+1,4,7,10,13,16,19,22,25,28,31,34,37,40,43,46,49,52,55,58

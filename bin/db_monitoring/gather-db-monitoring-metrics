@@ -1,0 +1,50 @@
+#!/usr/local/bin/perl
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use ariba::monitor::StratusDbUtils;
+
+use Getopt::Long;
+
+my ($dbType,$metricCfg,$service,$prodName,$debug, $bucket_number, $bucket_total);
+
+GetOptions (	"dbType=s" => \$dbType, 
+		"metricCFG=s" => \$metricCfg,
+		"service=s" => \$service,
+		"prodName=s" => \$prodName,
+		"debug=s" => \$debug,
+                "bucket_number=s" => \$bucket_number,
+                "bucket_total=s" => \$bucket_total,
+);
+
+help() unless (defined($dbType) && defined($metricCfg) && defined($service));
+
+my $db_user = 'system';
+if($dbType =~ /hana/) {
+    my $mon  = ariba::rc::InstalledProduct->new();
+    $db_user = $mon->default("dbainfo.hana.system.username")
+}
+
+my $u = ariba::monitor::StratusDbUtils->new({dbCfg => $dbType, metricsCfg => $metricCfg, db_user => $db_user, debug => $debug, bucket_number => $bucket_number, bucket_total => $bucket_total});
+$u->runQueryForAllConnections({service => $service, prodName => $prodName});
+
+if ($dbType =~ /oracle/)
+{
+    (my $sys_metricCfg = $metricCfg) =~ s/oracle_metrics/sys_active_oracle_metrics/;
+    my $u2 = ariba::monitor::StratusDbUtils->new({dbCfg => $dbType, metricsCfg => $sys_metricCfg, db_user => 'sys', use_active_host => 1, bucket_number => $bucket_number, bucket_total => $bucket_total});
+    $u2->runQueryForAllConnections({service => $service, prodName => $prodName});
+}
+
+exit 0;
+
+sub help
+{
+    print "Usage:\n";
+    print qq|/home/mon<<SERVICE>>/stratus/bin/db_monitoring/gather-db-monitoring-metrics \n--dbType db_oracle \n--metricCFG /home/mon<<SERVICE>>/stratus/config/oracle_metrics.cfg \n--service <<SERVICE>> \n--prodName an [--bucket_total 5 --bucket_number 2]|;
+    print "\nOptions: \nbucket_total: the total number of buckets to split the number of connections into\n";
+    print "bucket_number: select the bucket to be run (range from 1-bucket_total)\n";
+    print "debug = 2: show debug messages including all the connections but doesn't execute any query\n";
+    print "debug = 1 (or anything else): runs like normal while also shows debug messages\n";
+    exit 0;
+}

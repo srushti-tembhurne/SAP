@@ -1,0 +1,114 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+
+use FindBin;
+use lib (
+    "$FindBin::Bin/../lib/perl",
+    "$FindBin::Bin/../../lib/perl",
+    "$FindBin::Bin/../lib",
+    "$FindBin::Bin/../../lib",
+    "$FindBin::Bin/../../tools/lib/perl",
+    "$FindBin::Bin/../../../tools/lib/perl",
+    "$FindBin::Bin/../../tools/lib",
+    "$FindBin::Bin/../../../tools/lib",
+);
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::DateTime;
+use ariba::Ops::Constants;
+use ariba::Ops::Utils;
+
+#
+# to get this out on a tight time frame, we're sharing a syslog channel
+#
+# in the long run, I'd actually like to build a better scheme for all of fyst
+# reporting.
+#
+my $logfile = "/var/log/kr-events";
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $debug = 0;
+    my $openError;
+
+    while(my $arg = shift) {
+        if($arg =~ /^-d$/i) { $debug++; }
+        if($arg =~ /^-e$/i)  { $sendEmail=1; }
+        if($arg =~ /^-p$/i)  { $sendPage=1; }
+    }
+
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my $machine = ariba::Ops::Machine->new($hostname);
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my @products = ariba::rc::InstalledProduct->installedProductsList();
+    my $email = $me->default('notify.email');
+
+    unless( grep /^syslog$/, $machine->providesServices() ) {
+        print "This script must run on the loghost server.\n";
+        exit;
+    }
+
+    my $now = time();
+    my $oneDayAgo = $now - (60*60*24);
+    my @errors;
+
+    if(open(LOG, "< $logfile")) {
+        while(my $line = <LOG>) {
+            chomp $line;
+
+            next unless ($line =~ m/fyst: (.*)$/);
+            my $error = $1;
+            next unless ($line =~ /^(\w+\s+\d+\s+\d+:\d\d:\d\d)/);
+            my $date = $1;
+            my $datestamp = ariba::Ops::DateTime::syslogToTimestamp($date);
+
+            next unless( $datestamp > $oneDayAgo );
+
+            push(@errors, $error);
+        }
+        close(LOG);
+    } else {
+        $openError = $!;
+    }
+
+    my %q;
+    my $error_index=0;
+    my $answer = '';
+
+    foreach my $err (@errors)
+    {
+        $answer = $err;
+        $error_index += 1;
+
+        $q{"Critical fyst changes in the last 24 hours line $error_index"} = {
+            "info" => 1,
+            "warn" => "answer ne ''",
+            "perl" => sub { return $answer; },
+            "inf_field" => "fyst_change_error",
+            "inf_tags" => "error_index=$error_index",
+        };
+
+    }
+    if ($error_index == 0)
+    {
+        $q{"Critical fyst changes in the last 24 hours"} = {
+            "info" => 1,
+            "warn" => "answer ne ''",
+            "perl" => sub { return $answer; },
+            "inf_field" => "fyst_change_error",
+            "inf_tags" => "error_index=$error_index",
+        }
+    }
+
+    $q{influx_details} = {measurement => "fyst_status"};
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails("fyst-status", $me->name(), $me->service(), undef, \%q);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);

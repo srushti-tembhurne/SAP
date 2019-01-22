@@ -1,0 +1,279 @@
+#!/usr/local/bin/perl -w
+
+# To validate this:
+# 1.  Run this script on mon11.opslab:  while true; do $0 -o volume -i buyerlab -c nfs_read_latency -b nfs_read_ops; done
+# 2.  On nfs16.opslab run: stats show -i 5 volume:buyerlab:nfs_read_latency volume:buyerlab:nfs_read_ops
+# 3.  Generate a read workload on app29.opslab:	 e.g. "cat /fs/buyerlab/logs/* 2>&1 > /dev/null"
+#	  Be aware of caching at the filesystem level and on the Netapp.  It will skew your results.
+#     For the client side you can drop the cache:  "sync; echo 3 > /proc/sys/vm/drop_caches"
+#     The Netapp side will be harder, you'll probably need to blow out the cache with a different workload larger than the cache itself.
+# 4.  Observe the latencies reported by #1 and #2, they should be similar.
+##
+
+my $VERSION = '1.0';	# Controls the SDK release.
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/Netapp";
+use NaServer;
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+
+my $debug = 0;
+
+sub usage {
+	my $error = shift;
+
+	print <<USAGE;
+	Usage: $0 [-e|-p|-d|-h] -i <netapp instance hostname>
+	Example: $0 -i nfs16.opslab.ariba.com
+
+	-e    Enables sending of email for monitor query.
+	-p    Enables sending of pages for monitor query.
+	-d    Turns on debug mode.
+	-h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+	
+	my $host;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e$/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p$/o) { $sendPage  = 1; };
+		if ($arg =~ /^-d$/o) { $debug     = 1; };
+		if ($arg =~ /^-i$/o) { $host = shift @ARGV; next; }
+		if ($arg =~ /^-h$/o) { usage(); }
+	}
+
+	# usage() unless ($host);
+
+	my $me    = ariba::rc::InstalledProduct->new();
+	my $email = $me->default('notify.email');
+	my $username = $me->default('Ops.Netapp.username');
+	my $password = $me->default('Ops.Netapp.password');
+
+	my @machines = ();
+	for my $dataCenter ( ariba::Ops::ProductAPIExtensions::datacentersForProducts($me) ) {
+		my %match = (
+			status         => 'inservice',
+			datacenter     => $dataCenter,
+			hardwareVendor => 'netapp'
+		);
+		@machines = map { $_->hostname() }  ariba::Ops::Machine->machinesWithProperties(%match);
+	}
+
+	foreach my $host (@machines) {
+		my $machine    = ariba::Ops::Machine->new($host);
+
+		my $osVersion  = $machine->osVersion();
+		my @fullVersion = split('\.', $osVersion);
+		my $majorVersion = $fullVersion[0];
+
+		my $dataCenter = $machine->datacenter();
+		my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($dataCenter);
+
+		my %queries  = ();
+
+		my $session = connectToFiler($host, $username, $password);
+
+		# Get the volumes list
+		my $volumes_list = $session->invoke('volume-list-info');
+		my $volumes_info = $volumes_list->child_get('volumes');
+		my @volumes = $volumes_info->children_get() if $volumes_info;
+		my @volume_names;
+
+		for my $volume (@volumes) {
+			push @volume_names, $volume->child_get_string('name');
+		}
+
+		# For average based counters Netapp requires 2 data points.
+		# We'll collect 2 samples for each volume 5 seconds apart.
+		my (@results1, @results2);
+
+		my $perf_out = getPerfMetrics($session);    # get current performance metrics
+
+		for my $volume_name (@volume_names) {
+			push @results1, checkStatus($perf_out, $volume_name);
+		}
+
+		sleep 5;
+
+		$perf_out = getPerfMetrics($session);    # get current performance metrics
+	
+		for my $volume_name (@volume_names) {
+			push @results2, checkStatus($perf_out, $volume_name);
+		}
+
+		for my $volume_name (@volume_names) {
+			my @metrics = qw/read write other/;	# check read, write and other latency
+			next if($volume_name =~/estoreprod64/si);#As per jira HOA-59282 
+
+			for my $metric (@metrics) {
+				my $counter1 = shift @results1;
+				my $baseCounter1 = shift @results1;
+				my $counter2 = shift @results2;
+				my $baseCounter2 = shift @results2;
+
+				my $latency = diff_result($counter1, $counter2, $baseCounter1, $baseCounter2);
+
+				# new Netapps report in microseconds and not milliseconds
+				# tmid: 153271
+				if ($majorVersion > 7) {
+					$latency = $latency / 1000;
+				}
+
+				my $avgLatency = getAvgLatency($tab, $host, $volume_name, $metric) || 0;
+
+				$queries{"$host : $volume_name $metric latency"} = {
+					"recordMaxResults" => 110000,
+					"recordDataType" => "gauge",
+					info => "",
+					warn => "answer > 15 and $avgLatency > 15",
+					crit => "answer > 25 and $avgLatency > 25",
+					ticketOnWarnOpenAfterMinutes  => 1,
+					format => "%d ms\n",
+					perl => "return $latency",
+					inf_field => "$metric",
+					inf_tags => qq|datacenter="$dataCenter",hostname="$host",volumeName="$volume_name"|,
+					inf_default => 0,
+					group_by => "$dataCenter,$host,$volume_name",
+				};
+
+				$queries{"$host : $volume_name $metric latency"} = {
+					perl        => sub { $avgLatency },
+					inf_field   => "avg_latency",
+					inf_tags    => qq|datacenter="$dataCenter",hostname="$host",volumeName="$volume_name"|,
+					inf_default => 0,
+					group_by    => "$dataCenter,$host,$volume_name",
+				};
+			}
+
+		}
+
+		$queries{influx_details} = {measurement => "netapp-latency"};
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+					  'netapp-latency', $tab, $me->service(), $me->customer(), \%queries);
+		$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+sub getAvgLatency() {
+
+	my ($tab, $host, $volume_name, $metric) = @_;
+
+	my $avgLatency;	
+	my $latencyQuery = "${tab}/${host}_:_${volume_name}_${metric}_latency";
+	if (ariba::monitor::Query->objectWithNameExists($latencyQuery)) {
+		my $query = ariba::monitor::Query->new($latencyQuery);
+		my $diskCdb = $query->cdb();
+		$avgLatency = int($diskCdb->aggregateUsingFunctionForRecords('average', '+3'));
+	}
+
+	return $avgLatency;
+}
+
+sub getPerfMetrics {
+    my $session = shift;
+
+    # get the Performance metrics from Netapp
+    my $in = NaElement->new("perf-object-get-instances");
+    $in->child_add_string("objectname", "volume");  # get data per volume
+    my $perf_out = $session->invoke_elem($in);
+
+    if ($perf_out->results_status() eq "failed") {
+        warn $perf_out->results_reason();
+        return 0;
+    }
+
+    return $perf_out;
+}
+
+sub checkStatus {
+	my ($perf_out, $volume_name) = @_;
+
+	# nfs_read_latency per nfs_read_ops
+	# nfs_write_latency per nfs_write_ops
+	# nfs_other_latency per nfs_other_ops
+	
+	my @results;
+
+	push @results, fetchData($perf_out, $volume_name, 'nfs_read_latency', 'nfs_read_ops');
+	push @results, fetchData($perf_out, $volume_name, 'nfs_write_latency', 'nfs_write_ops');
+	push @results, fetchData($perf_out, $volume_name, 'nfs_other_latency', 'nfs_other_ops');
+	
+	return @results;
+}
+
+sub diff_result {
+	my ($counter1, $counter2, $baseCounter1, $baseCounter2) = @_;
+	my $counterDiff = $counter2 - $counter1;
+	my $baseCounterDiff = $baseCounter2 - $baseCounter1;
+	my $result;
+
+	if ($baseCounterDiff > 0) {
+		$result = $counterDiff / $baseCounterDiff;
+	} else { # No change in baseCounters
+		$result = 0;
+	}
+
+	return $result;
+}
+	
+sub connectToFiler {
+	my ($filer, $user, $password) = @_;
+	my $s = NaServer->new($filer, 1, 1);
+	$s->set_admin_user($user, $password);
+	return $s;
+}
+
+sub fetchData {
+	my $perf_out = shift;
+	my $inst = shift;
+	my $ct = shift;
+	my $baseCounter = shift;
+
+	# COUNTER: nfs_latency
+	# Desc: Average time for NFS reads to the volume
+	# Type: 
+	# Unit: millisec
+	# base: nfs_ops
+	# label: 
+	# prop: average
+	
+	my ($val1, $val2);
+	my $instanceInfo = $perf_out->child_get("instances");
+	my @results = $instanceInfo->children_get("instance-data");
+	foreach my $instance (@results) {
+		if ($instance->child_get_string("name") eq $inst) {
+			my $counters = $instance->child_get("counters");
+			my @counterData = $counters->children_get();
+			foreach my $counter (@counterData) {
+				if ($counter->child_get_string("name") eq $ct) {
+					$val1 = $counter->child_get_string("value");
+				} elsif ($counter->child_get_string("name") eq $baseCounter) {
+					$val2 = $counter->child_get_string("value");
+				}
+			}
+		}
+	}
+
+	# val1 contains counter information
+	# val2 contains base counter information
+	return ($val1, $val2);
+}
+
+main();

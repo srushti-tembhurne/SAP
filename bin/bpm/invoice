@@ -1,0 +1,377 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/bpm/invoice#14 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::Url;
+use ariba::monitor::Bpm;
+use Data::Dumper;
+
+our $debug = 0;
+
+sub usage
+{
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode.
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit ();
+}
+
+sub main
+{
+    my %raw_fields = (stuck_mins => '',
+                      threshold_status => '');
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while (my $arg = shift)
+    {
+        if ($arg =~ /^-h/o) {usage();  next;}
+        if ($arg =~ /^-d/o) {$debug++; next;}
+        if ($arg =~ /^-e/o) {$sendEmail = 1; next;}
+        if ($arg =~ /^-p/o) {$sendPage  = 1; next;}
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+
+    my $tab = ariba::monitor::StatusPage::businessProcessProduct();
+    my %queries;
+    my %queries_count;
+
+    if (ariba::rc::InstalledProduct->isInstalled('an', $me->service()))
+    {
+        my $an = ariba::rc::InstalledProduct->new('an', $me->service());
+        my @communities = grep {$_ % 2 != 0} $an->communityIdsForProduct();
+        my $url = ariba::monitor::Bpm::urlForANApp($an, 'ANBusinessProcessMonitor');
+        my $processedPayloadIds = {};
+        foreach my $community (@communities)
+        {
+            my $params = {BusinessObject => 'InvoiceDetailRequest', MetricType => 'ERPTransmitFailure'};
+            my $urls = ariba::monitor::Bpm::communityUrlsForUrlAndCommunities($url, $community);
+            my $responses = ariba::monitor::Bpm::getResponsesForUrlsAndParams($urls, $params, 1);
+            my @invoice_detail_req = ariba::monitor::Bpm::processResultsFromResponses($responses, $processedPayloadIds);
+            $queries_count{"Invoices not retrieved from AN by ERP for an community $community"} = {
+                info => 1,
+                #warn   => 'answer =~ /status: warn/i',
+                #crit   => 'answer =~ /status: crit/i',
+                crit              => '(answer =~ /time.*out.*after/ && previousAnswer =~ /time.*out.*after/)',
+                uiHint            => 'Invoices not retrieved from AN by ERP',
+                perl              => sub {return scalar (@invoice_detail_req)},
+                correctiveActions => [
+                                      Support => 'File S2 SR, contact buyer and/or supplier based on error message',
+                                      Ops     => 'No action required',
+                                     ],
+                recordItem       => 'numrows',
+                recordMaxResults => 40000,
+                inf_field        => 'count',
+                inf_default      => 0,
+                inf_tags         => qq(type="invoices not retrieved from AN by ERP",community="$community"),
+                group_by         => "invoice_not_retrieved_from AN,$community",
+            };
+            my $i = 1;
+            foreach my $row (@invoice_detail_req)
+            {
+                if ($row =~ /http request error/i)
+                {
+                    $queries{"detail req $community $i"} = {
+                                                            perl        => sub {return $row},
+                                                            inf_field   => "error",
+                                                            inf_tags    => qq(type="invoices not retrieved from AN by ERP",community="$community",row_id=$i),
+                                                            inf_default => 0,
+                                                            group_by    => "invoice_not_retrieved_from AN,$community,$i",
+                                                           };
+                }
+                else
+                {
+                    my @cols = split (/\|\|/, $row);
+                    foreach my $col (@cols)
+                    {
+                        my ($field, $value) = split (/=/, $col);
+                        my $inf_field_type = ( !exists($raw_fields{$field}) ) ? $ariba::monitor::QueryManager::inf_field_type_string : undef;
+                        $queries{"$field $i"} = {
+                                                 perl        => sub {return $value},
+                                                 inf_field   => $field,
+                                                 inf_field_type => $inf_field_type,
+                                                 inf_tags    => qq(type="invoices not retrieved from AN by ERP",community="$community",row_id=$i),
+                                                 inf_default => 0,
+                                                 group_by    => "invoice_not_retrieved_from AN,$community,$i",
+                                                };
+                    }
+                }
+                $i++;
+            }
+            $params = {BusinessObject => 'InvoiceDetailRequest', MetricType => 'SSPTransmitFailure'};
+            $urls = ariba::monitor::Bpm::communityUrlsForUrlAndCommunities($url, $community);
+            $responses = ariba::monitor::Bpm::getResponsesForUrlsAndParams($urls, $params, 1);
+            my @ssp_transmit_failure = ariba::monitor::Bpm::processResultsFromResponses($responses, $processedPayloadIds);
+            $queries_count{"Unable to transmit from AN to SSP Buyer for an community $community"} =
+                {
+                     info                         => 1,
+                     warn                         => 'answer =~ /status: warn/i',
+                     crit                         => '(answer =~ /status: crit/i && previousAnswer =~ /status: crit/i) || (answer =~ /time.*out.*after/ && previousAnswer =~ /time.*out.*after/)',
+                     severity                     => 1,
+                     uiHint                       => 'Unable to transmit from AN to SSP Buyer',
+                     perl                         => sub {return scalar (@ssp_transmit_failure)},
+                     recordItem                   => 'numrows',
+                     recordMaxResults             => 40000,
+                     ticketOnWarnOpenAfterMinutes => 60,
+                     ticketDueInDays              => 'today',
+                     correctiveActions            => [
+                                           Support => 'No action required',
+                                           Ops     => 'File CR, follow CIRS if necessary',
+                                          ],
+                     inf_field   => 'count',
+                     inf_default => 0,
+                     inf_tags    => qq(type="unable to transmit from AN to SSP Buyer",community="$community"),
+                     group_by    => "ssp_transmit_failure,$community",
+                };
+            $i = 1;
+            foreach my $row (@ssp_transmit_failure)
+            {
+                if ($row =~ /http request error/i)
+                {
+                    $queries{"ssp transmit failure $community $i"} = {
+                                                                      perl        => sub {return $row},
+                                                                      inf_field   => "error",
+                                                                      inf_tags    => qq(type="unable to transmit from AN to SSP Buyer",community="$community",row_id=$i),
+                                                                      inf_default => 0,
+                                                                      group_by    => "ssp_transmit_failure,$community,$i",
+                                                                     };
+                }
+                else
+                {
+                    my @cols = split (/\|\|/, $row);
+                    foreach my $col (@cols)
+                    {
+                        my ($field, $value) = split (/=/, $col);
+                        my $inf_field_type = ( !exists($raw_fields{$field}) ) ? $ariba::monitor::QueryManager::inf_field_type_string : undef;
+                        $queries{"$field $i"} = {
+                                                 perl        => sub {return $value},
+                                                 inf_field   => $field,
+                                                 inf_field_type => $inf_field_type,
+                                                 inf_tags    => qq(type="unable to transmit from AN to SSP Buyer",community="$community",row_id=$i),
+                                                 inf_default => 0,
+                                                 group_by    => "ssp_transmit_failure,$community,$i",
+                                                };
+                    }
+                }
+                $i++;
+            }
+            $params = {BusinessObject => 'InvoiceDetailRequest', MetricType => 'BuyerTransmitFailure'};
+            $urls = ariba::monitor::Bpm::communityUrlsForUrlAndCommunities($url, $community);
+            $responses = ariba::monitor::Bpm::getResponsesForUrlsAndParams($urls, $params, 1);
+            my @buyer_transmit_failure = ariba::monitor::Bpm::processResultsFromResponses($responses, $processedPayloadIds);
+            $queries_count{"Invoices not retrieved from AN by CD Buyer for an community $community"} = {
+                info => 1,
+                #warn   => 'answer =~ /status: warn/i',
+                #crit   => 'answer =~ /status: crit/i',
+                crit              => '(answer =~ /time.*out.*after/ && previousAnswer =~ /time.*out.*after/)',
+                uiHint            => 'Invoices not retrieved from AN by CD Buyer',
+                perl              => sub {scalar (@buyer_transmit_failure);},
+                recordItem        => 'numrows',
+                recordMaxResults  => 40000,
+                correctiveActions => [
+                                      Support => 'File S2 SR, contact buyer and/or supplier based on error message',
+                                      Ops     => 'No action required',
+                                     ],
+                inf_field   => 'count',
+                inf_default => 0,
+                inf_tags    => qq(type="Invoices not retrieved from AN by CD Buyer",community="$community"),
+                group_by    => "inv_not_retrieved,$community",
+                                                                                                 };
+            $i = 1;
+            foreach my $row (@buyer_transmit_failure)
+            {
+                if ($row =~ /http request error/i)
+                {
+                    $queries{"buyer transmit failure $community $i"} = {
+                                                                        perl        => sub {return $row},
+                                                                        inf_field   => "error",
+                                                                        inf_tags    => qq(type="Invoices not retrieved from AN by CD Buyer",community="$community",row_id=$i),
+                                                                        inf_default => 0,
+                                                                        group_by    => "invoice_not_retrieved_by_CD,$community,$i",
+                                                                       };
+                }
+                else
+                {
+                    my @cols = split (/\|\|/, $row);
+                    foreach my $col (@cols)
+                    {
+                        my ($field, $value) = split (/=/, $col);
+                        my $inf_field_type = ( !exists($raw_fields{$field}) ) ? $ariba::monitor::QueryManager::inf_field_type_string : undef;
+                        $queries{"$field $i"} = {
+                                                 perl        => sub {return $value},
+                                                 inf_field   => $field,
+                                                 inf_field_type => $inf_field_type,
+                                                 inf_tags    => qq(type="Invoices not retrieved from AN by CD Buyer",community="$community",row_id=$i),
+                                                 inf_default => 0,
+                                                 group_by    => "invoices_not_retrieved_by_CD,$community,$i",
+                                                };
+                    }
+                }
+                $i++;
+            }
+            $params = {BusinessObject => 'InvoiceDetailRequest', MetricType => 'EDITransmitFailure'};
+            my $edi_url = ariba::monitor::Bpm::urlForANApp($an, 'EDIBusinessProcessMonitor');
+            $urls = ariba::monitor::Bpm::communityUrlsForUrlAndCommunities($edi_url, 'default');
+            $responses = ariba::monitor::Bpm::getResponsesForUrlsAndParams($urls, $params);
+            my @edi_transmit_failure = ariba::monitor::Bpm::processResultsFromResponses($responses, $processedPayloadIds);
+            $queries_count{"Unable to transmit from EDI Gateway to AN"} = {
+                                                                     info                         => 1,
+                                                                     warn                         => 'answer =~ /status: warn/i',
+                                                                     severity                     => 1,
+                                                                     uiHint                       => 'Unable to transmit from EDI Gateway to AN',
+                                                                     perl                         => sub {return scalar (@edi_transmit_failure);},
+                                                                     recordItem                   => 'numrows',
+                                                                     recordMaxResults             => 40000,
+                                                                     ticketOnWarnOpenAfterMinutes => 60,
+                                                                     ticketDueInDays              => 'today',
+                                                                     correctiveActions            => [
+                                                                                           Support => 'No action required',
+                                                                                           Ops     => 'Go through the list of documents and see if these are issues with the customer document or functional issues. File CR for functional issues, follow CIRS if necessary',
+                                                                                          ],
+                                                                     inf_field   => 'count',
+                                                                     inf_default => 0,
+                                                                     inf_tags    => qq(type="Unable to transmit from EDI Gateway to AN"),
+                                                                     group_by    => "unable_transmit_from_edi",
+                                                                    };
+            $i = 1;
+            foreach my $row (@edi_transmit_failure)
+            {
+                if ($row =~ /http request error/i)
+                {
+                    $queries{"edi transmit failure $i"} = {
+                                                           perl      => sub {return $row},
+                                                           inf_field => "error",
+                                                           inf_tags  => qq(type="Unable to transmit from EDI Gateway to AN",row_id=$i),
+                                                           group_by  => "unable_transmit_from_edi",
+                                                          };
+                }
+                else
+                {
+                    my @cols = split (/\|\|/, $row);
+                    foreach my $col (@cols)
+                    {
+                        my ($field, $value) = split (/=/, $col);
+                        my $inf_field_type = ( !exists($raw_fields{$field}) ) ? $ariba::monitor::QueryManager::inf_field_type_string : undef;
+                        $queries{"$field $i"} = {
+                                                 perl        => sub {return $value},
+                                                 inf_field   => $field,
+                                                 inf_field_type => $inf_field_type,
+                                                 inf_tags    => qq(type="Unable to transmit from EDI Gateway to AN",row_id=$i),
+                                                 inf_default => 0,
+                                                 group_by    => "unable_transmit_from_edi",
+                                                };
+                    }
+                }
+            }
+        }
+    }
+
+    if (ariba::rc::InstalledProduct->isInstalled('buyer', $me->service()))
+    {
+        my $buyer = ariba::rc::InstalledProduct->new('buyer', $me->service());
+        my $urls = ariba::monitor::Bpm::communityUrlsForProductAndAppName($buyer, 'UI');
+
+        foreach my $community (keys (%$urls))
+        {
+            my $communityUrl = {$community => $urls->{$community}};
+
+            my $params = {BusinessObject => 'Invoice', MetricType => 'ExceededDeliveryTime'};
+            my $responses = ariba::monitor::Bpm::getResponsesForUrlsAndParams($communityUrl, $params);
+            my @inv_delayed_buyer = ariba::monitor::Bpm::processResultsFromResponses($responses);
+            $queries_count{"Invoice delayed in Buyer for unknown reason for buyer community $community"} = {
+                                                              info        => 1,
+                                                              warn        => 'answer =~ /status: warn/i',
+                                                              crit        => '(answer =~ /status: crit/i && (previousAnswer =~ /status: crit/i)) || (answer =~ /time.*out.*after/i && previousAnswer =~ /time.*out.*after/i)',
+                                                              severity    => 1,
+                                                              uiHint      => 'Invoice delayed in Buyer for unknown reason',
+                                                              perl        => sub {return scalar (@inv_delayed_buyer);},
+                                                              description => 'This metric lists any Invoices in the Buyer application that have exceeded the delivery time threshold, but are not yet available to the user, and for which we have no detailed information about the reason for the delay.',
+                                                              recordItem  => 'numrows',
+                                                              recordMaxResults             => 40000,
+                                                              ticketOnWarnOpenAfterMinutes => 60,
+                                                              ticketDueInDays              => 'today',
+                                                              correctiveActions            => [
+                                                                                    Support => 'No action required',
+                                                                                    Ops     => 'File CR, follow CIRS if necessary',
+                                                                                   ],
+                                                              inf_field   => 'count',
+                                                              inf_default => 0,
+                                                              inf_tags    => qq(type="Invoice delayed in Buyer for unknown reason",community="$community"),
+                                                              group_by    => "inv_delayed_in_buyer,$community",
+            };
+            my $i = 1;
+            foreach my $row (@inv_delayed_buyer)
+            {
+
+                if ($row =~ /http request error/i)
+                {
+
+                    $queries{"inv_delayed_buyer $community $i"} = {
+                                                        perl      => sub {return $row},
+                                                        inf_field => "error",
+                                                        inf_tags  => qq(type="Invoice delayed in Buyer for unknown reason",community="$community",row_id=$i),
+                                                        group_by  => "inv_delayed_in_buyer,$community,$i",
+                                                       };
+                }
+                else
+                {
+                    my @cols = split (/\|\|/, $row);
+                    foreach my $col (@cols)
+                    {
+                        my ($field, $value) = split (/=/, $col);
+                        my $inf_field_type = ( !exists($raw_fields{$field}) ) ? $ariba::monitor::QueryManager::inf_field_type_string : undef;
+                        $queries{"$field $i"} = {
+                                                 perl      => sub {return $value},
+                                                 inf_field_type => $inf_field_type,
+                                                 inf_field => $field,
+                                                 inf_tags  => qq(type="Invoice delayed in Buyer for unknown reason",community="$community,"row_id=$i),
+                                                 group_by  => "inv_delayed_in_buyer,$community,$i",
+                                                };
+                    }
+                }
+            }
+        }
+    }
+
+    my $email = $me->default('notify.email');
+
+    if (%queries_count)
+    {
+        $queries_count{influx_details} = {measurement => "bpm_invoice_exceeded_delivery_threshold_counts"};
+        my $qm_counts = ariba::monitor::QueryManager->newWithDetails('Invoice-has-exceeded-delivery-time-threshold-counts', $tab, $me->service(), $me->customer(), \%queries_count);
+        $qm_counts->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+    if (%queries)
+    {
+        $queries{influx_details} = {measurement => "bpm_invoice_exceeded_delivery_threshold"};
+        my $qm = ariba::monitor::QueryManager->newWithDetails('Invoice-has-exceeded-delivery-time-threshold', $tab, $me->service(), $me->customer(), \%queries);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+main(@ARGV);
+
+__END__

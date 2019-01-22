@@ -1,0 +1,79 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/conversational-api-status#2 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub usage
+{
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h|-product <product>]
+
+    -product <product> Run for a specified product
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit ();
+}
+
+sub main
+{
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $productName;
+
+    while (my $arg = shift)
+    {
+        if ($arg =~ /^-h$/o) {usage();  next;}
+        if ($arg =~ /^-d$/o) {$debug++; next;}
+        if ($arg =~ /^-e$/o)       {$sendEmail   = 1;        next;}
+        if ($arg =~ /^-p$/o)       {$sendPage    = 1;        next;}
+        if ($arg =~ /^-product$/o) {$productName = shift (); next;}
+
+        usage("Invalid argument: $arg");
+    }
+
+    usage("Product required") unless $productName;
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $product = ariba::rc::InstalledProduct->new($productName, $me->service());
+    exit 0 unless $product;
+
+    my %queries;
+
+    $queries{'Current active Conversational API sessions'} = {
+        format   => "%d\n",
+        uiHint   => 'Conversational API',
+        warn     => 'answer > 20',
+        crit     => 'answer > 200',
+        sql      => 'SELECT NVL(CONVS_NEWSESSIONSSTARTED,0) as convs_api_sessions FROM ConvSessionStatusMonitorTab a where a.CONVS_HOURID = to_char(sysdate, \'HH24\')',
+    };
+
+    my $email = $me->default('notify.email');
+    $queries{influx_details} = {measurement => "current_activity"};
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('current-activity', $product->name(), $product->service(), $product->customer(), \%queries);
+    $qm->setSQLConnectInfo($product->connectInfoForOracleClient());
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);
+
+__END__
+

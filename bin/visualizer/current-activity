@@ -1,0 +1,89 @@
+#!/usr/local/bin/perl 
+
+# $Id: //ariba/services/monitor/bin/visualizer/current-activity#2 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+Monitors the current activities happening in visualizer
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $me = ariba::rc::InstalledProduct->new('arecibo', $mon->service());
+    my %queries;
+
+    $queries{'Number of supplier address fetches'} = {
+        warn    => '!defined(answer) || answer == 0',
+        crit    => 'defined(answer) && answer > 130',
+        perl    => sub { return main::numOfSupplierAddressFetches($me); },
+        severity    => 1,
+        description => 'Monitors the the number of supplier address fetches from AN every 10 minutes. If too many fetches are done, it may affect AN performance.', 
+        correctiveActions => [
+            Ops => 'If warn, Visualizer has stopped polling AN for data, please escalate to Engr for them to review. ' . 
+                   'If crit, Visualizer is polling AN too often and may cause AN performance issues, run control-deployment stop on arecibo and escalate to Platform.', 
+        ],
+        inf_field   => "supplier_address_fetch_cnt",
+        inf_default => 0,
+    };
+
+    my $email = $mon->default('notify.email');
+    $queries{'influx_details'} = {measurement => 'arecibo_current_activity'};
+    my $qm = ariba::monitor::QueryManager->newWithDetails('current-activity', $me->name(), $me->service(), $me->customer(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+sub numOfSupplierAddressFetches {
+    my $me = shift; 
+
+    my @appInstances = $me->appInstances(); 
+    foreach my $instance ( @appInstances ) { 
+        my $monitorStats = ariba::monitor::AppInstanceStats->newFromAppInstance($instance);
+        print 'Fetching mon stats from ', $monitorStats->instance(), "\n" if ( $debug );
+        $monitorStats->fetch();
+
+        return $monitorStats->anpolls() if ( defined($monitorStats->anpolls()) );
+    }
+
+    return undef;
+}
+
+main(@ARGV);
+
+__END__

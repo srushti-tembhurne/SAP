@@ -1,0 +1,278 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/common/query-frequency#3 $
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::CircularDB;
+
+use Data::Dumper;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h|-g|-q]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode.
+    -h    Shows this help.
+    -g    Returns powergraph frequency 
+    -q    Returns Query frequency
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $graphFrequency = 0;
+    my $queryFrequency = 0;
+    my $product = '';
+    
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-g$/o) { $graphFrequency = 1;   next; }
+        if ($arg =~ /^-q$/o) { $queryFrequency = 1;   next; }
+        if ($arg =~ /^-product$/o) { $product = shift;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $service = $mon->service();
+    my %queries;
+    my $powerGraph = 0;
+    my $errorPowerGraph = 0; #Error Reading Power graph
+    my $queryFreq = 0;
+    my $errorQuery = 0; #Error Reading Query File
+    my $processedQueries = 0;
+    my $processedPowerGraphs = 0;
+    print "MON The value of the service is $service\n"; 
+    if( $graphFrequency ) {
+        ($powerGraph, $errorPowerGraph, $processedPowerGraphs) = getPowerGraphFrequency($product);
+    }
+    elsif ( $queryFrequency ) {
+        ($queryFreq, $errorQuery, $processedQueries) = showActiveQueryObjects($product, $service);
+    }
+    else {
+        ($powerGraph, $errorPowerGraph, $processedPowerGraphs) = getPowerGraphFrequency($product);
+        ($queryFreq, $errorQuery, $processedQueries) = showActiveQueryObjects($product,$service);
+        $graphFrequency = 1;
+        $queryFrequency = 1;
+
+    }
+   
+    my %listOfQueries =  ('Updating Power Graphs Per Second (Frequency)' => $powerGraph, 
+                          'Number of Processed Power Graphs File' => $processedPowerGraphs,
+                          'Number of Processed Queries File' => $processedQueries,
+                          'Unable to Read PowerGraph Files' => $errorPowerGraph, 
+                          'Updating Queries Per Second (Frequency)' => $queryFreq,
+                          'Unable to Read Query Files' => $errorQuery );
+    my %NamesOfQueries =  ('Updating Power Graphs Per Second (Frequency)' => powerGraph, 
+                          'Number of Processed Power Graphs File' => processedPowerGraphs,
+                          'Number of Processed Queries File' => processedQueries,
+                          'Unable to Read PowerGraph Files' => errorPowerGraph, 
+                          'Updating Queries Per Second (Frequency)' => queryFreq,
+                          'Unable to Read Query Files' => errorQuery );
+
+    foreach my $query ( keys %listOfQueries ){
+        next if ( ( ($query =~ /Quer/) && ($queryFrequency == 0 ) ) || ( ($query =~ /Power/) && ($graphFrequency == 0) ) ); 
+        my $query_name = $NamesOfQueries{$query};
+        $queries{$query} = {
+            recordMaxResults => 8760,
+            warn    => 'answer eq "b" or numrows > 10',
+            crit    => 'answer eq "c" or numrows > 20',
+            perl    =>  "$listOfQueries{$query}",
+            format  => "%d \n",
+            ticketOnWarnOpenAfterMinutes    => 1,
+            ticketOwner => 'unassigned-sysadmin',
+            severity    => 1,
+            description => '',
+            correctiveActions => [
+                Ops => '',
+                Engr => '',
+                Tools => '',
+            ],
+            inf_field => "frequency",
+            inf_tags => "query_name=\"$query_name\"",
+        };
+    }   
+
+
+    my $email = $mon->default('notify.email');
+
+    $queries{influx_details} = {measurement => "query_frequency"};
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('Frequency of Query', $mon->name(), $mon->service(), $mon->customer(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+
+sub showActiveQueryObjects {
+    my $product = shift;
+    my $service = shift;
+    my $totalFrequency = 0; 
+    my $totalQuery = 0;
+    my $unReadQueryFile = 0;
+    my $processedQueries = 0;
+
+    my @productNames = $product ? $product : ariba::monitor::StatusPage::monitoredProductNames($service);
+    
+    if ($debug){
+        open CTORPCT, ">/var/tmp/checkorprechecktime.txt" || die "Could not Open the File\n"; ## List of file(s) which do not have checkTime and/or previousCheckTime
+        open DIFF0, ">/var/tmp/timediff0.txt" || die "Could not Open the File\n"; ##List of File(s) for which difference between checkTime and previousCheckTime is zero
+    }
+
+    print "Calculating for ", join (" ", @productNames), "\n";
+
+    for my $productName (@productNames) {
+        my $plocation = "/var/mon/query-storage/$productName";
+        next unless (-d $plocation);
+        my $actualQueries = `find $plocation -name "*.query" | wc -l`;
+        chomp($actualQueries);
+ 
+        print "Total # of Query Object for $productName product is ", $actualQueries, "\n", if $debug;
+
+        my $prodQueries  = 0; 
+
+        my @queryMgrs = ariba::monitor::QueryManager->instancesForProduct($productName);
+
+        for my $qm (@queryMgrs) {
+            my $qmName = $qm->name();
+
+            my @queries = $qm->queries();
+            foreach my $query (@queries) {
+                $totalQuery += 1;
+                $prodQueries += 1;
+                
+                my $queryName = $query->queryName();
+                my $checkTime = $query->checkTime();
+                my $bs   = $query->_backingStore();
+                #my $lastMod = (stat $bs)[9];
+                my $previousCheckTime = $query->previousCheckTime();
+                
+                unless ($checkTime && $checkTime > 0 && $previousCheckTime && $previousCheckTime > 0) {
+                    print CTORPCT $bs, "\n", if $debug;
+                    $unReadQueryFile += 1;
+                    next; 
+                }
+ 
+                my $runBefore = ($checkTime - $previousCheckTime);
+
+                my $chkTime = localtime($checkTime);
+                my $PrechkTime = localtime($previousCheckTime);
+                my $lastMod = localtime((stat $bs)[9]);
+
+                unless ( $runBefore > 0 ) {
+                    ##We are not getting Consistant list for this, may be Bug 
+                    print DIFF0 "$bs \t $lastMod \n", if $debug ; 
+                    $unReadQueryFile += 1;
+                    next ; 
+                }
+
+                my $frequency = 1/$runBefore;
+                $totalFrequency += $frequency; 
+                $processedQueries +=1; 
+               
+            }
+        }
+        my $diff = $actualQueries - $prodQueries;
+        print "Actual Queries for $productName is $actualQueries whereas run queries are $prodQueries Difference: $diff \n";  
+    }
+    $totalFrequency = sprintf ("%d", $totalFrequency);
+    return  ($totalFrequency, $unReadQueryFile, $processedQueries);
+}
+
+sub getPowerGraphFrequency {
+    my $product =  shift;
+
+    my $cdbs     = ariba::monitor::CircularDB->listDBs($product);
+    my $powerGraphs = scalar @{$cdbs};
+
+
+    print "Total # of Powergraphs is ", scalar @{$cdbs}, "\n", if ($debug);
+
+    my $problem;
+
+    if ($debug) {
+        open  PGL, ">/var/tmp/unabletoReadPowerGraph.txt" or die "Could not Open /var/tmp/unabletoReadPowerGraph.txt file to write\n";  
+        open  PGD, ">/var/tmp/datamissMatchReadPowerGraph.txt" or die "Could not Open /var/tmp/datamissMatchReadPowerGraph.txt file to write\n";  
+    }
+
+    my $processedPowerGraphs = 0;
+    my $graphFrequency = 0;
+    my $unReadPowerGraphs = 0;
+
+    foreach my $cdb (@{$cdbs}){
+        my $fileName  = $cdb->fileName();
+        my  @records = $cdb->readRecords(undef, undef, 10); 
+
+        if ( ( scalar @records < 2 ) && ($debug) ) {
+            print PGL "Found Only ", scalar @records , " Records for $fileName \n", if ( ( scalar @records < 2 ) && ($debug) );
+            $unReadPowerGraphs += 1;
+            next;
+        }
+    
+        for (my $i = 0 ; $i <= $#records ; $i++) {
+            my $next = $i + 1;  
+            my $diff = 0;
+ 
+            if ( (defined $records[$next][0] ) && (defined $records[$i][0]) && $records[$next][0] > $records[$i][0] ){
+                #print "IF $records[$next][0] and $records[$i][0]\n";
+                $diff = ($records[$next][0] - $records[$i][0]); 
+            }
+
+            elsif ( (defined $records[$next][0] ) && (defined $records[$next+1][0]) && $records[$next+1][0] > $records[$next][0]){
+                    #print "ELSIF $records[$next][0] and $records[$next+1][0]\n";
+                    $diff = ($records[$next+1][0] - $records[$next][0]); 
+            }
+
+              
+           if ( $diff && $diff > 0 ) {
+                my $freq = 1/$diff; 
+                $graphFrequency += $freq;
+                $processedPowerGraphs += 1;
+           }
+
+           else {
+                print PGD "Records = ", scalar @records, " Problem Reading $fileName\n", if $debug;  
+                print "Records = ", scalar @records , " $fileName $records[$next+1][0] $records[$next][0] $records[$i][0] \n", if $debug;
+                $unReadPowerGraphs += 1; 
+           } 
+
+           last if ( (defined $diff && $diff > 0) || ($next == $#records) ); 
+       }
+     
+       ##Somehow CircularDB.pm unable to close the file so we are explicitly undefineing file handle here. 
+       $cdb->{_fileHandle} = undef;
+    }
+
+    $graphFrequency = sprintf("%d", $graphFrequency);  
+   
+    print "Problem Reading $unReadPowerGraphs Powergraphs", if $debug; 
+    print "The Power Graph Frequency for $processedPowerGraphs powergraph is ", $graphFrequency, " for total ", $powerGraphs, "\n", if $debug ;
+    return ($graphFrequency, $unReadPowerGraphs, $processedPowerGraphs);
+}
+
+
+
+
+main(@ARGV);

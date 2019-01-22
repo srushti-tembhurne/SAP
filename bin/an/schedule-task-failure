@@ -1,0 +1,264 @@
+#!/usr/local/bin/perl 
+
+###############################################################################
+# $Id: //ariba/services/monitor/bin/an/schedule-task-failure#4 $
+# $HeadURL:$
+#
+# Copyright (c) 2014 Ariba
+#
+# schedule-task-failure - Monitor failed schedule tasks 
+#
+###############################################################################
+
+=head1 NAME
+
+schedule-task-failure - Monitor failed schedule tasks
+
+=head1 SYNOPSIS
+
+schedule-task-failure [Options]
+
+=head1 OPTIONS
+
+=over
+
+=item B<-help|-h>
+
+Print this usage information and exit.
+
+=item B<-debug|-d>
+
+Enable debugging output / dryrun
+
+=item B<-e>
+
+Enable sending of emails
+
+=item B<-p>
+
+Enable sending of pages
+
+=back
+
+=head1 DESCRIPTION
+
+C<schedule-task-failure> - Monitor failed schedule tasks
+
+=cut
+
+=author
+
+Chaitanya Valaparla C<< <chaitanya.valaparla@sap.com> >>
+
+=head1 LICENSE
+
+Copyright 2014 Ariba
+
+=cut
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use Pod::Usage;
+use Getopt::Long;
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    GetOptions(
+        "help|h" => sub { pod2usage(1); },
+        "debug|d+" => \$debug,
+        "e" => \$sendEmail,
+        "p" => \$sendPage,
+    );
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $an = ariba::rc::InstalledProduct->new("an", $mon->service());
+    my $email = $mon->default('notify.email');
+    
+    my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+    my $communitiesList = join(", ", ( grep { ( $_ % 2 ) == 1 } @communityIds ) );
+
+    my %queries = ();
+
+    $queries{"Failed SMIUsageTask"} = {
+        info    => "numrows == 0",
+        crit    => "numrows > 0",
+        description => 'To identify whether SMIUsageTask has failed', 
+        severity => 2,
+        runForCommunities => $communitiesList,
+        sql => q`SELECT destination0 as destination,schedule_time as schedule_time, status as status, dispatcher as dispatcher
+                 FROM st_disp_queue WHERE
+                 item IN (SELECT id FROM schedule_tasks WHERE
+                 name IN('SMIUsageTask')) AND status NOT IN(1, 2)`,
+        correctiveActions => [
+                 Ops => "Please notify AN, PSTF And Support team : DL FT_AN_SMP, DL ARB IT_Apps_Psft_Fin, DL Technical Support-Network Global",
+        ],
+        inf_tags => qq(type="Failed SMI Usage Task"),
+        group_by => 'Failed SMI Usage Task'
+    };
+
+    $queries{"Failed SMIUsageStatusTask"} = {
+        crit    => "numrows > 0",
+        description => 'To identify whether SMIUsageStatusTask has failed',
+        severity => 2,
+        runForCommunities => $communitiesList,
+        sql => q`SELECT destination0 as destination,schedule_time as schedule_time, status as status , dispatcher as dispatcher
+                 FROM st_disp_queue WHERE
+                 item IN (SELECT id FROM schedule_tasks WHERE
+                 name IN('SMIUsageStatusTask')) AND status NOT IN(1, 2)`,
+        correctiveActions => [
+                 Ops => "Please notify AN, PSTF and Support team : DL FT_AN_SMP, DL ARB IT_Apps_Psft_Fin, DL Technical Support-Network Global",
+        ],
+        inf_tags => qq(type="Failed SMI Usage Status Task"),
+        group_by => 'Failed SMI Usage Status Task'
+    };
+    
+    $queries{"Failed SMIInvoiceGeneratorTask"} = {
+        crit    => "numrows > 0",
+        description => 'To identify whether SMIInvoiceGeneratorTask has failed',
+        severity => 2,
+        runForCommunities => $communitiesList,
+        sql => q`SELECT destination0 as destination,schedule_time as schedule_time, status as status, dispatcher as dispatcher
+                 FROM st_disp_queue WHERE
+                 item IN (SELECT id FROM schedule_tasks WHERE
+                 name IN('SMIInvoiceGeneratorTask')) AND status NOT IN(1, 2)`,
+        correctiveActions => [
+                 Ops => "Please notify AN, PSTF and Support team : DL FT_AN_SMP, DL ARB IT_Apps_Psft_Fin, DL Technical Support-Network Global",
+        ],
+        inf_tags => qq(type="Failed SMI Invoice Generator Task"),
+        group_by => 'Failed SMI Invoice Generator Task' ,
+    };
+   
+    $queries{"Failed SMIBillingTask"} = {
+        crit    => "numrows > 0",
+        description => 'To identify whether SMIBillingTask has failed',
+        severity => 2,
+        runForCommunities => $communitiesList,
+        sql => q`SELECT destination0 as destination,schedule_time as schedule_time, status as status, dispatcher as dispatcher
+                 FROM st_disp_queue WHERE
+                 item IN (SELECT id FROM schedule_tasks WHERE
+                 name IN('SMIBillingTask')) AND status NOT IN(1, 2)`,
+        correctiveActions => [
+                 Ops => "Please notify AN, PSTF and Support team : DL FT_AN_SMP, DL ARB IT_Apps_Psft_Fin, DL Technical Support-Network Global",
+        ],
+        inf_tags => qq(type="Failed SMI Billing Task"),
+        group_by => 'Failed SMI Billing Task',
+    };
+
+    $queries{"Failed SMIMarkRenewalTask"} = {
+        crit    => "numrows > 0",
+        description => 'To identify whether SMIMarkRenewalTask has failed',
+        severity => 2,
+        runForCommunities => $communitiesList,
+        sql => q`SELECT destination0 destination,schedule_time as schedule_time, status as status , dispatcher as dispatcher
+                 FROM st_disp_queue WHERE
+                 item IN (SELECT id FROM schedule_tasks WHERE
+                 name IN('SMIMarkRenewalTask')) AND status NOT IN(1, 2)`,
+        correctiveActions => [
+                 Ops => "Please notify AN, PSTF and Support team : DL FT_AN_SMP, DL ARB IT_Apps_Psft_Fin, DL Technical Support-Network Global",
+        ],
+        inf_tags => qq(type="Failed SMI Mark Renewal Task"),
+        group_by => 'Failed SMI Mark Renewal Task',
+    };
+
+    $queries{"Failed SMIChargingTask"} = {
+        crit    => "numrows > 0",
+        description => 'To identify whether SMIChargingTask has failed',
+        severity => 2,
+        runForCommunities => $communitiesList,
+        sql => q`SELECT destination0 as destination,schedule_time as schedule_time, status as status, dispatcher as dispatcher
+                 FROM st_disp_queue WHERE
+                 item IN (SELECT id FROM schedule_tasks WHERE
+                 name IN('SMIChargingTask')) AND status NOT IN(1, 2)`,
+        correctiveActions => [
+                 Ops => "Please notify AN, PSTF and Support team : DL FT_AN_SMP, DL ARB IT_Apps_Psft_Fin, DL Technical Support-Network Global",
+        ],
+        inf_tags => qq(type="failed SMI Charging Task"),
+        group_by => "failed SMI Charging Task"
+    };
+
+    $queries{"Failed SMIEnforcementTask"} = {
+        crit    => "numrows > 0",
+        description => 'To identify whether SMIEnforcementTask has failed',
+        severity => 2,
+        runForCommunities => $communitiesList,
+        sql => q`SELECT destination0 as destination,schedule_time as schedule_time, status as status, dispatcher as dispatcher
+                 FROM st_disp_queue WHERE
+                 item IN (SELECT id FROM schedule_tasks WHERE
+                 name IN('SMIEnforcementTask')) AND status NOT IN(1, 2)`,
+        correctiveActions => [
+                 Ops => "Please notify AN, PSTF and Support team : DL FT_AN_SMP, DL ARB IT_Apps_Psft_Fin, DL Technical Support-Network Global",
+        ],
+        inf_tags => qq(type="Failed SMI Enforcement Task"),
+        group_by => 'Failed SMI Enforcement Task',
+    };
+
+    $queries{"Failed PSFTInvoiceDetailReport"} = {
+        crit    => "numrows > 0",
+        description => 'To identify whether PSFTInvoiceDetailReport has failed',
+        severity => 2,
+        runForCommunities => 1,
+        sql => q`SELECT destination0 as destination,schedule_time as schedule_time, status as status, dispatcher as dispatcher
+                 FROM st_disp_queue WHERE
+                 item = (SELECT id FROM schedule_tasks WHERE
+                 unique_name = 'PSFT_INVOICE_DETAILS_1') AND status NOT IN(1,2,3)`,
+        correctiveActions => [
+                 Ops => "Please notify AN, PSTF and Support team : DL FT_AN_SMP, DL ARB IT_Apps_Psft_Fin, DL Technical Support-Network Global",
+        ],
+        inf_tags => qq(type="Failed PSFT Invoice Detail Report"),
+        group_by => 'Failed PSFT Invoice Detail Report',
+    };
+
+    $queries{"Failed InvoicedCustomerReport"} = {
+        crit    => "numrows > 0",
+        description => 'To identify whether InvoicedCustomerReport has failed',
+        severity => 2,
+        runForCommunities => 1,
+        sql => q`SELECT destination0 as destination,schedule_time as schedule_time, status as status, dispatcher as dispatcher
+                 FROM st_disp_queue WHERE
+                 item = (SELECT id FROM schedule_tasks WHERE
+                 unique_name = 'INVOICED_CUSTOMER_DETAILS_1') AND status NOT IN(1,2,3)`,
+        correctiveActions => [
+                 Ops => "Please notify AN, PSTF and Support team : DL FT_AN_SMP, DL ARB IT_Apps_Psft_Fin, DL Technical Support-Network Global",
+        ],
+        inf_tags => qq(type="Failed Invoiced Customer Report"),
+        group_by => "Failed Invoiced Customer Report"
+    };
+
+    $queries{"Failed PSFTRelationshipReport"} = {
+        crit    => "numrows > 0",
+        description => 'To identify whether PSFTRelationshipReport has failed',
+        severity => 2,
+        runForCommunities => 1,
+        sql => q`SELECT destination0 as destination,schedule_time as schedule_time, status as status, dispatcher as dispatcher
+                 FROM st_disp_queue WHERE
+                 item = (SELECT id FROM schedule_tasks WHERE
+                 unique_name = 'PSFT_RELATIONSHIP_DETAILS_2') AND status NOT IN(1,2,3)`,
+        correctiveActions => [
+                 Ops => "Please notify AN, PSTF and Support team : DL FT_AN_SMP, DL ARB IT_Apps_Psft_Fin, DL Technical Support-Network Global",
+        ],
+        inf_tags => qq(type="Failed PSFT Relationship Report"),
+        group_by => "Failed PSFT Relationship Report"
+    }; 
+
+    $queries{influx_details} = { measurement=> 'an_schedule_task_failure'};
+    my $qm = ariba::monitor::QueryManager->newWithDetails('schedule-task-failure', $an->name(), $mon->service(), undef, \%queries);
+    $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);
+
+__END__
+

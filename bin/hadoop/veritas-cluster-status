@@ -1,0 +1,124 @@
+#!/usr/local/bin/perl -w 
+
+use strict;
+use FindBin; 
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::monitor::QueryManager;
+
+our $quiet = 1; # Suppresses prints in ariba::Ops::Startup::Common.pm
+my $debug = 0;
+
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+Sends veritas cluster status information to monitoring
+
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode. 
+    -h        Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub debug {
+    my $msg = shift; 
+
+    print "(debug) $msg\n" if ($debug);
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $runFsck;
+
+    while (my $arg = shift) {
+        if ( $arg =~ /^-h$/o ) { usage();         next; }
+        if ( $arg =~ /^-d$/o ) { $debug++;        next; }
+        if ( $arg =~ /^-e$/o ) { $sendEmail = 1;  next; }
+        if ( $arg =~ /^-p$/o ) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled('hadoop', $me->service()));
+    my $hadoop = ariba::rc::InstalledProduct->new('hadoop', $me->service());
+    my $cluster = $hadoop->currentCluster();
+
+    unless ( $hadoop->default('Ops.VeritasControlEnabled') && 
+         $hadoop->default('Ops.VeritasControlEnabled') eq 'true' ) {
+        debug('Veritas cluster is not setup for this hadoop build'); 
+        exit(0);
+    }
+
+    my ($virtualHost) = $hadoop->rolesManager()->virtualHostsForRoleInCluster('hadoop-name', $cluster);
+    if ( $virtualHost ) {
+        my $activeHost = $hadoop->activeHostForVirtualHostInCluster($virtualHost, $cluster);
+        my $host = ariba::Ops::NetworkUtils::hostname();
+        debug("Current Host: $host / Active Host: $activeHost / Virtual Host: $virtualHost");   
+        if ( $host ne $activeHost ) {
+            debug("Exiting as current host is not the active host");
+            exit(0);
+        }
+    }
+
+    my %queries;
+
+    my @nodes = qw(Name JobTracker); 
+
+    foreach my $node ( @nodes ) { 
+        my $nodeName= $node; 
+        $nodeName .= 'Node' if ( $node eq 'Name' );
+
+        $queries{'veritas cluster status for ' . $nodeName} = {
+            warn    => 'answer !~ /ONLINE/ || answer =~ /FAULTED/',
+            crit    => 'previousAnswer !~ /ONLINE/ && answer !~ /ONLINE/',
+            perl    => sub { return main::veritasClusterStatusForNode($node, $hadoop); },
+            noRowCount  => 1,
+            ticketOnWarnOpenAfterMinutes => 60,
+            description         => qq`Run veritas command 'hagrp -state $node' to check the status of the
+                veritas cluster for $nodeName. If it is not online for two consecutive checks, crit is raised.`,
+            correctiveActions   => [
+                Ops => 'Troubleshoot based on the status. If it is FAULTED, look at the app logs to see what happened, ' . 
+                    'or try to start the node with hadoop-daemon command manually. Otherwise, escalate to Tools',
+                Tools => qq`Debug based on the error`,
+            ],
+            inf_field => "status",
+            inf_default => "none",
+            inf_tags => qq|node="$nodeName"|,
+            group_by => $nodeName,
+        };
+    }
+
+    my $email = $me->default('notify.email');
+    $queries{influx_details} = {measurement => "verritas_cluster_status" };
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('veritas-cluster-status', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+} 
+
+sub veritasClusterStatusForNode {
+    my $node = shift;
+    my $me = shift;
+
+    my $veritasGroup = $me->default("Ops.VeritasControlledNodes.$node.Group");
+    return "No veritas group defined for $node" unless ( $veritasGroup );  
+
+    my $status = `/opt/VRTS/bin/hagrp -state $veritasGroup`; 
+
+    return $status;
+}
+
+
+main(@ARGV);

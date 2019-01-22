@@ -1,0 +1,969 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+use Data::Dumper;
+use Date::Parse;
+use Storable;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::rc::CipherStore;
+use ariba::monitor::QueryManager;
+use ariba::Ops::Sybase::Utils qw(get_rs_ticket submit_rs_ticket disk_space who_is_down ra_status license_monitoring);
+
+my @programArgs = @ARGV;
+
+sub myInfo;
+my $staticConfigs = {
+    ticketSleepTime => 20,
+
+    #    ticketSleepTime => 2, #testing value, so I don't have to wait around
+    globalTimeout    => 50,
+    queryManagerName => 'srs-status',
+    productName      => 'an',
+                    };
+
+my $checkSpecificConfigs = {
+    self_check => {
+                   queryNameTemplate => 'Self Check',
+                   queryOverrides    => {
+                                      severity => 0,
+                                      uiHint   => 'Self Check',
+                                     }
+                  },
+    ra_status => {
+                  infoRegex         => qr/\s+replicating\s+/is,
+                  queryNameTemplate => '$args{instanceName}\@$args{hostname} - RA Status',
+                  queryOverrides    => {
+                                     uiHint => 'Rep Agent Status',
+                                    }
+                 },
+    submitTickets => {
+                      infoRegex         => qr/\nsuccessful\n/is,
+                      queryNameTemplate => '$args{instanceName}\@$args{hostname} - Submit Ticket',
+                      queryOverrides    => {
+                                         uiHint => 'Rep Agent Submit Ticket',
+                                        }
+                     },
+    license_monitoring => {
+                           infoRegex         => qr/\nsuccessful\n/is,
+                           queryNameTemplate => '$args{hostname} ',
+                           queryOverrides    => {
+                                              uiHint => 'Rep Server License Monitoring',
+                                             }
+                          },
+    disk_space => {
+                   infoRegex         => qr/--------------------/s,
+                   queryNameTemplate => '$args{instanceName}\@$args{hostname} - Disk Space',
+                   queryOverrides    => {
+                                      uiHint => 'Rep Server Disk Space',
+                                     }
+                  },
+    who_is_down => {
+        infoRegex            => qr/--------------------/s,
+        forbiddenStringField => 'dsiname',                                #the value of the 'dsiname' field must also NOT exist in the return string for us to be at info
+        queryNameTemplate    => '$args{instanceName}\@$args{hostname}',
+        CritRegex            => 'PROD_S3LIVETX',                          ##Constant for all AN Replication
+        queryOverrides => {
+                           uiHint => 'Rep Server Who Is Down',
+                          }
+                   },
+    who_is_down_rep => {
+                        queryNameTemplate => '$args{instanceName}\@$args{hostname} - Memory',
+                        warnThreshold     => 26,
+                        critThreshold     => 30,
+                        queryOverrides    => {
+                                           uiHint            => 'Rep Agent Memory',
+                                           correctiveActions => [ Ops => 'Create Ops Ticket for Warn/Crit Assign it to DBA', ],
+                                           description => 'Rep Agent Memory for $args{hostname}',
+                                           inf_field   => "memory",
+                                           inf_default => 0,
+                                          }
+                       },
+    error_rep_agent => {
+                        queryNameTemplate => '$args{instanceName}\@$args{hostname} - Error',
+                        queryOverrides    => {
+                                           uiHint            => 'Rep Agent Error',
+                                           correctiveActions => [ Ops => 'Create Ops Ticket for Warn/Crit Assign it to DBA', ],
+                                           description => 'Rep Agent Error for $args{hostname}',
+                                          }
+                       },
+    get_rs_ticket => {
+        requiredField     => 'cnt',                                                  #basic sanity check; make sure the SQL returns something in the 'cnt' field
+        warnLatency       => 100,                                                    #how many min of latency gives us a warning,
+        critLatency       => 240,                                                    #how many min of latency gives us a crit,
+        queryNameTemplate => '$args{userid}\@$args{hostname} ($args{serverType})',
+        queryOverrides    => {
+                           severity => 0,
+                           uiHint   => 'Rep Server Ticket Status',
+                          }
+                     }
+};
+
+my $debug = 0;
+
+sub usage
+{
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -s    Service
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode.
+    -h    Shows this help.
+
+Debug-level output always writes to /var/log/tools/an-on-hana.log, whether -d is specified or not.
+USAGE
+
+    print "(error) $error\n" if ($error);
+    myInfo 'usage() called';
+    myInfo 'ending';
+    exit ();
+}
+
+myInfo 'starting';
+main();
+myInfo 'ending';
+
+sub main
+{
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $service;
+
+    while (my $arg = shift @programArgs)
+    {
+        if ($arg =~ /^-h$/o) {usage();  next;}
+        if ($arg =~ /^-d$/o) {$debug++; next;}
+        if ($arg =~ /^-e$/o) {$sendEmail = 1;                  next;}
+        if ($arg =~ /^-p$/o) {$sendPage  = 1;                  next;}
+        if ($arg =~ /^-s$/o) {$service   = shift @programArgs; next;}
+
+        usage("Invalid argument: $arg");
+    }
+    if ($< != 0)
+    {
+        usage('Must be run as root');
+    }
+    my $productName   = $staticConfigs->{productName};
+    my @checkWarnings = ();
+    my $me;
+    my $monhost;
+    my $mon;
+    my @allResults = eval {
+        local $SIG{ALRM} = sub {die "timed out\n";};
+        alarm $staticConfigs->{globalTimeout};
+
+        my @ret      = ();
+        my $hostname = ariba::Ops::NetworkUtils::hostname()
+          or die "failed to find localhostname via ariba::Ops::NetworkUtils::hostname()";
+
+        $me = ariba::rc::InstalledProduct->new($productName, $service);
+        die "failed to ariba::rc::InstalledProduct->new(\$productName, \$service) on $hostname where \$productName=$productName \$service=$service"
+          unless $me->{configDir};
+        my $cluster = $me->currentCluster() or die "failed to \$me->currentCluster()";
+        my @monhosts = $me->hostsForRoleInCluster('monitor', $cluster) or die 'failed to find any monhosts';
+        die "Error reading mon host for $service ...\n" unless (scalar @monhosts);
+        $monhost = $monhosts[0];
+
+        $mon = ariba::rc::InstalledProduct->new('mon', $service);
+        die "failed to ariba::rc::InstalledProduct->new('mon', \$service) on $hostname where \$service=$service" unless $mon->{configDir};
+
+        my $hanaCredentials = eval {return getHanaCredentials($me);};
+        push @checkWarnings, $@ if $@;
+
+        my $allDSIConnections = eval {return getAllDSIConnections($me);};
+        push @checkWarnings, $@ if $@;
+
+        my $allAgents = eval {return getAllSRSAgents($me);};
+        push @checkWarnings, $@ if $@;
+
+        my $allServers = eval {return getAllSRSServers($me);};
+        push @checkWarnings, $@ if $@;
+
+        if ($allAgents)
+        {
+            myInfo 'beginning submitTickets';
+            push @ret, eval {return submitTickets($allAgents);};
+            push @checkWarnings, $@ if $@;
+        }
+        my $ticketsSubmittedAt = time;
+
+        if ($allAgents)
+        {
+            myInfo 'beginning all_ra_status';
+            push @ret, eval {return all_ra_status($allAgents);};
+            push @checkWarnings, $@ if $@;
+        }
+
+        if ($allServers)
+        {
+            myInfo 'beginning all_who_is_down';
+            push @ret, eval {return all_who_is_down($allServers, $service);};
+            push @checkWarnings, $@ if $@;
+        }
+        if ($allServers)
+        {
+            myInfo 'beginning all_disk_space';
+            push @ret, eval {return all_disk_space($allServers);};
+            push @checkWarnings, $@ if $@;
+        }
+        if ($allServers)
+        {
+            myInfo 'beginning all_license_monitoring';
+            push @ret, eval {return all_license_monitoring($allServers, $service, $hostname);};
+            push @checkWarnings, $@ if $@;
+        }
+
+        #give the tickets some time to propagate if needed
+        if (time - $ticketsSubmittedAt < $staticConfigs->{ticketSleepTime})
+        {
+            my $sleepTime = $staticConfigs->{ticketSleepTime} - (time - $ticketsSubmittedAt);
+            myInfo "giving tickets some time to propagate. \$sleepTime=$sleepTime \$ticketsSubmittedAt=$ticketsSubmittedAt \$staticConfigs->{ticketSleepTime}=$staticConfigs->{ticketSleepTime}";
+            sleep $sleepTime;
+        }
+        if ($allServers and $hanaCredentials)
+        {
+            myInfo 'beginning get_rs_tickets';
+            push @ret, eval {return get_rs_tickets($allServers, $hanaCredentials, $allDSIConnections);};
+            push @checkWarnings, $@ if $@;
+        }
+
+        return @ret;
+    };
+    alarm 0;
+    my @checkFatals = ();
+    push @checkFatals, $@ if $@;
+
+    #the check itself
+    {
+        my $checkStatus = 'STATUS-info';
+        my $answers     = '';
+        if (scalar @checkWarnings)
+        {
+            foreach my $warning (@checkWarnings)
+            {
+                myInfo "checkWarnings: $warning";
+                $answers .= " $warning";
+            }
+            $checkStatus = 'STATUS-warn';
+        }
+        if (scalar @checkFatals)
+        {
+            foreach my $fatal (@checkFatals)
+            {
+                myInfo "checkFatal: $fatal";
+                $answers .= " $fatal";
+            }
+            $checkStatus = 'STATUS-crit';
+        }
+        push @allResults,
+          {
+            checkName => 'self_check',
+            answer    => "$answers $checkStatus",
+          };
+    }
+    my %queries;
+
+    #process results
+    my $queryProto = {
+                      crit              => 'answer =~ /STATUS-crit$/',
+                      warn              => 'answer =~ /STATUS-warn$/',
+                      info              => 'answer =~ /STATUS-info$/',
+                      ticketOwner       => 'unassigned-sre',
+                      severity          => 1,
+                      description       => 'undefined',
+                      correctiveActions => [Ops => 'undefined'],
+                      uiHint            => 'undefined',
+                     };
+
+    foreach my $result (@allResults)
+    {
+        next unless $result;
+        my $query = Storable::dclone($queryProto);
+        next unless $result->{checkName};
+        next unless my $config = $checkSpecificConfigs->{$result->{checkName}};
+        next unless my $template = $config->{queryNameTemplate};
+        if ($config->{queryOverrides})
+        {
+            while (my ($key, $value) = each %{$config->{queryOverrides}})
+            {
+                $query->{$key} = $value;
+            }
+        }
+        my $queryName = eval {return _resolveTemplate($template, $result);};
+        if ($@)
+        {
+            print STDERR "Exception in _resolveTemplate(\$template, \$result): $@  \$template=$template \$result = " . Data::Dumper::Dumper $result;
+            next;
+        }
+        my $answer = $result->{answer};
+        $query->{perl} = sub {return "$answer";};
+        $query->{inf_tags} = qq(uiHint="$query->{uiHint}",host="$queryName"); 
+        $query->{group_by} = qq($query->{uiHint},$queryName);
+        $queries{$queryName} = $query;
+    }
+    _dumpResults(\%queries);
+    my $email = $mon->default('notify.email');
+    $queries{influx_details} = {measurement => 'an_srs_status'};
+    my $qm = ariba::monitor::QueryManager->newWithDetails($staticConfigs->{queryManagerName}, $me->name(), $me->service(), $me->customer(), \%queries);
+    myInfo "beginning processQueries \$monhost = $monhost \$sendPage = $sendPage \$sendEmail = $sendEmail \$debug = $debug  \$staticConfigs->{queryManagerName} = $staticConfigs->{queryManagerName} \$me->name() = ", $me->name(), " \$me->service() = ", $me->service(), "\$me->customer() = ",
+      $me->customer();
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage, $monhost);
+}
+
+sub _dumpResults
+{
+    my $queries = shift;
+    my @out     = ();
+    while (my ($queryName, $query) = each %$queries)
+    {
+        my $answer = $query->{perl}->();
+        my $uiHint = $query->{uiHint};
+        push @out, "Srs Status -> $uiHint -> $queryName -> $answer\n";
+    }
+    @out = sort @out;
+    open my $fh, '>', '/tmp/stratus-an-on-hana.dump';
+    my $now = scalar localtime;
+    print $fh "$now\n";
+    foreach my $line (@out)
+    {
+        print $fh $line;
+        chomp $line;
+        myInfo "OUTPUT: $line";
+    }
+    close $fh;
+}
+
+sub getHanaCredentials
+{
+    my $me = shift;
+    my $ret = {
+               supplier => {
+                            hostname => $me->default('HANADBs.DBSupplier.hostname'),
+                            password => $me->default('HANADBs.DBSupplier.password'),
+                           },
+               directory => {
+                             hostname => $me->default('HANADBs.DBDirectory.hostname'),
+                             password => $me->default('HANADBs.DBDirectory.password'),
+                            }
+              };
+    eval {
+        die "Hana hostname for Supplier not found in AN DeploymentDefaults.xml XML PATH HANADBs.DBSupplier.hostname\n"
+          if not $ret->{supplier}->{hostname};
+        die "Hana password for Supplier not found in AN DeploymentDefaults.xml XML PATH HANADBs.DBSupplier.password\n"
+          if not $ret->{supplier}->{password};
+        die "Hana hostname for Directory not found in AN DeploymentDefaults.xml XML PATH HANADBs.DBDirectory.hostname\n"
+          if not $ret->{directory}->{hostname};
+        die "Hana password for Directory not found in AN DeploymentDefaults.xml XML PATH HANADBs.DBDirectory.password\n"
+          if not $ret->{directory}->{password};
+    };
+    if (my $err = $@)
+    {
+        chomp $err;
+        my $hostname = ariba::Ops::NetworkUtils::hostname();
+        die "getHanaCredentials: $err found on $hostname.  This caused me not to run one sub-check: get_rs_tickets\n";
+    }
+    return $ret;
+}
+
+sub getAllDSIConnections
+{
+    my $me = shift;
+    my $ret;
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my $savedServerPass;
+    foreach my $baseName ('SRSServer-Dir', 'SRSServer-Sup')
+    {
+        foreach my $postfix ('', 1 .. 100)
+        {
+            my $serverName  = $baseName . $postfix;
+            my $serverPass  = $me->default("lumira.monitoring.dsiconnections.$serverName.password");
+            my $dsiusername = $me->default("lumira.monitoring.dsiconnections.$serverName.dsiusername");
+            $savedServerPass = $serverPass if defined $serverPass;
+            next unless $dsiusername;
+
+            $ret->{$serverName} = {
+                                   instanceName   => $me->default("lumira.monitoring.dsiconnections.$serverName.instanceName"),
+                                   targetUserName => $me->default("lumira.monitoring.dsiconnections.$serverName.targetusername"),
+                                   srshostname    => $me->default("lumira.monitoring.dsiconnections.$serverName.srshostname"),
+                                   dsiname        => $me->default("lumira.monitoring.dsiconnections.$serverName.dsiname"),
+                                   dsiUserName    => $me->default("lumira.monitoring.dsiconnections.$serverName.dsiusername"),
+                                   dsiUserPass    => $savedServerPass,
+                                  };
+
+        }
+    }
+
+    return $ret;
+}
+
+sub getAllSRSServers
+{
+    my $me         = shift;
+    my $hostname   = ariba::Ops::NetworkUtils::hostname();
+    my @allServers = ();
+    my $savedServerPass;
+    foreach my $baseName ('SRSServer-Dir', 'SRSServer-Sup')
+    {
+        foreach my $postfix ('', 1 .. 100)
+        {
+            my $serverName = $baseName . $postfix;
+            my $serverPass = $me->default("lumira.monitoring.srsservers.$serverName.password");
+            $savedServerPass = $serverPass if defined $serverPass;
+            my $ret = {
+                       serverName     => $serverName,
+                       serverType     => $me->default("lumira.monitoring.srsservers.$serverName.type"),
+                       instanceName   => $me->default("lumira.monitoring.srsservers.$serverName.instanceName"),
+                       targetUserName => $me->default("lumira.monitoring.srsservers.$serverName.targetusername"),
+                       srshostname    => $me->default("lumira.monitoring.srsservers.$serverName.srshostname"),
+                       dsiname        => $me->default("lumira.monitoring.srsservers.$serverName.dsiname"),
+                       dsiusername    => $me->default("lumira.monitoring.srsservers.$serverName.dsiusername"),
+                      };
+            next unless $ret->{instanceName};
+            foreach my $fieldNameRec (['serverType' => 'type'], ['instanceName' => 'instanceName'], ['targetUserName' => 'targetusername'], ['srshostname' => 'srshostname'], ['dsiname' => 'dsiname'], ['dsiusername' => 'dsiusername'])
+            {
+                my $fieldName = $fieldNameRec->[0];
+                my $XMLPath   = $fieldNameRec->[1];
+                die
+"getAllSRSServers: required field '$fieldName' not found in DeploymentDefaults.xml XML PATH 'lumira.monitoring.srsservers.$serverName.$XMLPath' on $hostname for \$serverName '$serverName'.  This caused me to not run three sub-checks: all_who_is_down, all_disk_space and get_rs_tickets.\n"
+                  unless $ret->{$fieldName};
+            }
+            push @allServers, $ret;
+        }
+    }
+    die
+"getAllSRSServers: unable to locate a password for any SRS Servers.  I looked in DeploymentDefaults.xml XML PATH lumira.monitoring.srsservers.\$serverName.password on $hostname for various values of \$serverName: 'SRSServer-Dir', 'SRSServer-SupN' for N = 1 .. 100.  This caused me to not run two sub-checks: all_who_is_down and get_rs_tickets.\n"
+      unless $savedServerPass;
+    foreach my $server (@allServers)
+    {
+        $server->{serverPass} = $savedServerPass;
+    }
+    return \@allServers;
+}
+
+sub getAllSRSAgents
+{
+    my $me        = shift;
+    my $hostname  = ariba::Ops::NetworkUtils::hostname();
+    my @allAgents = ();
+    my $savedAgentPass;
+    foreach my $baseName ('SRSAgent-Dir', 'SRSAgent-Sup')
+    {
+        foreach my $postfix ('', 1 .. 100)
+        {
+            my $agentName = $baseName . $postfix;
+            my $agentPass = $me->default("lumira.monitoring.srsagents.$agentName.password");
+            $savedAgentPass = $agentPass if defined $agentPass;
+            my $ret = {
+                       agentName    => $agentName,
+                       agentType    => $me->default("lumira.monitoring.srsagents.$agentName.type"),
+                       instanceName => $me->default("lumira.monitoring.srsagents.$agentName.instancename"),
+                       agentUname   => $me->default("lumira.monitoring.srsagents.$agentName.targetusername"),
+                       srshostname  => $me->default("lumira.monitoring.srsagents.$agentName.srshostname"),
+                      };
+            next unless $ret->{instanceName};
+            foreach my $fieldNameRec (['agentType' => 'type'], ['instanceName' => 'instancename'], ['agentUname' => 'targetusername'], ['srshostname' => 'srshostname'])
+            {
+                my $fieldName = $fieldNameRec->[0];
+                my $XMLPath   = $fieldNameRec->[1];
+                die "getAllSRSAgents: required field '$fieldName' not found in DeploymentDefaults.xml XML PATH 'lumira.monitoring.srsagents.$XMLPath' on $hostname for \$agentName '$agentName'.  This caused me to not run two sub-checks: all_ra_status and submitTickets.\n"
+                  unless $ret->{$fieldName};
+            }
+            push @allAgents, $ret;
+        }
+    }
+    die
+"getAllSRSAgents: unable to locate a password for any SRS Agents.  I looked in DeploymentDefaults.xml XML PATH lumira.monitoring.srsagents.\$agentName.password on $hostname for various values of \$agentName: 'SRSAgent-Dir', 'SRSAgent-SupN' for N = 1 .. 100.  This caused me to not run two sub-checks: all_ra_status and submitTickets.\n"
+      unless $savedAgentPass;
+    foreach my $agent (@allAgents)
+    {
+        $agent->{agentPass} = $savedAgentPass;
+    }
+    return \@allAgents;
+}
+
+sub get_rs_tickets
+{
+    my $allServers        = shift;
+    my $hanaCredentials   = shift;
+    my $allDSIConnections = shift;
+    my @ret               = ();
+    my $config            = $checkSpecificConfigs->{get_rs_ticket};
+    foreach my $server (@$allServers)
+    {
+        my %args = (
+                    userid      => $server->{dsiusername},
+                    serverType  => $server->{serverType},
+                    hostname    => $hanaCredentials->{$server->{serverType}}->{hostname},
+                    password    => $allDSIConnections->{$server->{serverName}}->{dsiUserPass},
+                    checkName   => 'get_rs_ticket',
+                    errorString => '',
+                   );
+        myInfo "Starting get_rs_ticket() for hostname=$args{hostname} userid=$args{userid}";
+        my $retString = get_rs_ticket(%args);
+        $args{password}  = 'password';
+        $args{retString} = $retString;
+        if ($@)
+        {
+            $args{errorString} = $@;
+            $args{answer}      = "error: $@ STATUS-crit";
+            push @ret, \%args;
+            next;    #bail out early on errors so the main logic isn't indented
+        }
+
+        #this is what I'm getting back in retString:
+        #28572\t17/10/12\t03:02:47\t2017-10-12 03:02:53.4020000\t12.716666
+        ($args{cnt}, $args{h1}, $args{h2}, $args{rdb_t}, $args{ticketApproximateEndToEndLatency}) = split /\t/, $args{retString};
+
+        if (not $args{$config->{requiredField}})
+        {
+            $args{answer} = "error: required field ($config->{requiredField}) not found STATUS-crit";
+            push @ret, \%args;
+            next;
+        }
+        if (not $args{ticketApproximateEndToEndLatency})
+        {
+            $args{answer} = "Unable to determine latency. Where SQL Returns $args{retString} STATUS-crit";
+            push @ret, \%args;
+            next;
+        }
+        if ($args{ticketApproximateEndToEndLatency} > $config->{critLatency})
+        {
+            $args{answer} = "Approximate end to end latecy is $args{ticketApproximateEndToEndLatency} min, which is above the configured value of $config->{critLatency} min.  STATUS-crit";
+            push @ret, \%args;
+            next;
+        }
+        if ($args{ticketApproximateEndToEndLatency} > $config->{warnLatency})
+        {
+            $args{answer} = "Approximate end to end latecy is $args{ticketApproximateEndToEndLatency} min, which is above the configured value of $config->{warnLatency} min.  STATUS-warn";
+            push @ret, \%args;
+            next;
+        }
+        $args{answer} = "Approximate end to end latecy is $args{ticketApproximateEndToEndLatency} min, which is below the configured warning value of $config->{warnLatency} min.  STATUS-info";
+        push @ret, \%args;
+    }
+    return @ret;
+}
+
+sub submitTickets
+{
+    my $allAgents = shift;
+    my @ret       = ();
+    my $config    = $checkSpecificConfigs->{submitTickets};
+    my $h1        = time;
+    my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime (time);
+
+    my $h2 = sprintf ("%04d/%02d/%02d", $year + 1900, $mon + 1, $mday,);
+
+    foreach my $agent (@$allAgents)
+    {
+        my %args = (
+                    instanceName => $agent->{instanceName},
+                    userid       => $agent->{agentUname},
+                    password     => $agent->{agentPass},
+                    hostname     => $agent->{srshostname},
+                    h1           => $h1,
+                    h2           => $h2,
+                    checkName    => 'submitTickets',
+                    errorString  => '',
+                   );
+        my $retString = eval {
+            myInfo "Starting submit_rs_ticket() for hostname=$args{hostname} userid=$args{userid} instanceName=$args{instanceName}";
+            return submit_rs_ticket(%args);
+        };
+        $args{password}  = 'password';
+        $args{retString} = $retString;
+        if ($@)
+        {
+            $args{errorString} = $@;
+            $args{answer}      = "error: $@ STATUS-crit";
+            push @ret, \%args;
+            next;    #bail out early on errors so the main logic isn't indented
+        }
+
+        #main logic
+        if ($args{retString} =~ $config->{infoRegex})
+        {
+            $args{answer} = 'STATUS-info';
+        }
+        else
+        {
+            $args{answer} = 'STATUS-crit';
+        }
+        push @ret, \%args;
+    }
+    return @ret;
+}
+
+sub all_ra_status
+{
+    my $allAgents = shift;
+    my @ret       = ();
+    my $config    = $checkSpecificConfigs->{ra_status};
+    foreach my $agent (@$allAgents)
+    {
+        my %args = (
+                    instanceName => $agent->{instanceName},
+                    userid       => $agent->{agentUname},
+                    password     => $agent->{agentPass},
+                    hostname     => $agent->{srshostname},
+                    checkName    => 'ra_status',
+                    errorString  => '',
+                   );
+        myInfo "Starting ra_status() for instanceName=$args{instanceName} hostname=$args{hostname} userid=$args{userid}";
+        my $retString = ra_status(%args);
+        $args{password}  = 'password';
+        $args{retString} = $retString;
+        if ($@)
+        {
+            $args{errorString} = $@;
+            $args{answer}      = "error: $@ STATUS-crit";
+            push @ret, \%args;
+            next;    #bail out early on errors so the main logic isn't indented
+        }
+
+        #main logic
+        if ($args{retString} =~ $config->{infoRegex})
+        {
+            $args{answer} = 'STATUS-info';
+        }
+        else
+        {
+            $args{answer} = 'STATUS-crit';
+        }
+        push @ret, \%args;
+    }
+    return @ret;
+}
+
+sub all_license_monitoring
+{
+    my $allServers = shift;
+    my $service    = shift;
+    my $hostname   = shift;
+    my $user       = "mon$service";
+    my $cipher     = ariba::rc::CipherStore->new($service);
+    my $password   = $cipher->valueForName($user);
+
+    my @ret    = ();
+    my $config = $checkSpecificConfigs->{license_monitoring};
+    foreach my $server (@$allServers)
+    {
+        my %args = (
+                    userid      => $user,
+                    password    => $password,
+                    hostname    => $server->{srshostname},
+                    dsiname     => $server->{dsiname},
+                    checkName   => 'license_monitoring',
+                    errorString => '',
+                   );
+
+        myInfo "Starting license_monitoring() for hostname=$args{hostname} userid=$args{userid}";
+        my $retString = license_monitoring($debug, %args);
+        $args{password}  = 'password';
+        $args{retString} = $retString;
+
+        print "Return String is \n", $retString, "\n", if $debug;
+
+        if ($@)
+        {
+            $args{errorString} = $@;
+            $args{answer}      = "error: $@ STATUS-crit";
+            push @ret, \%args;
+            next;    #bail out early on errors so the main logic isn't indented
+        }
+
+        #main logic
+        if (
+            $args{retString} =~ $config->{infoRegex}
+            and
+
+            $args{retString} =~ /Crit/
+           )
+        {
+            $args{answer} = "$args{retString} STATUS-crit";
+        }
+        elsif ($args{retString} =~ /Warn/)
+        {
+            $args{answer} = "$args{retString} STATUS-warn";
+        }
+        elsif ($args{retString} !~ /Warn|Crit/)
+        {
+            $args{answer} = "$args{retString} STATUS-info";
+        }
+
+        push @ret, \%args;
+    }
+    return @ret;
+}
+
+sub all_disk_space
+{
+    my $allServers = shift;
+    my @ret        = ();
+    my $config     = $checkSpecificConfigs->{disk_space};
+    foreach my $server (@$allServers)
+    {
+        my %args = (
+                    instanceName => $server->{instanceName},
+                    userid       => $server->{targetUserName},
+                    password     => $server->{serverPass},
+                    hostname     => $server->{srshostname},
+                    dsiname      => $server->{dsiname},
+                    checkName    => 'disk_space',
+                    errorString  => '',
+                   );
+        myInfo "Starting disk_space() for hostname=$args{hostname} userid=$args{userid} instanceName=$args{instanceName}";
+        my $retString = disk_space(%args);
+        $args{password}  = 'password';
+        $args{retString} = $retString;
+
+        my @content = check_disk_space($args{retString});
+
+        my $totalSpace     = 0;
+        my $totalUsedSpace = 0;
+
+        foreach my $partition (@content)
+        {
+            my @checkPartition = split /\s+/, $partition;
+            my $usedSegment = $checkPartition[-2];
+            $totalUsedSpace += $usedSegment;
+            my $totalSegment = $checkPartition[-3];
+            $totalSpace += $totalSegment;
+        }
+
+        unless (defined $totalUsedSpace and defined $totalSpace)
+        {
+            my $message = "Seems disk_space command failed!!";
+            $args{answer} = "error: $message  STATUS-crit";
+            push @ret, \%args;
+            next;    #bail out early on errors so the main logic isn't indented
+        }
+
+        my $disk_usage = sprintf ("%.2f", ($totalUsedSpace / $totalSpace) * 100);
+
+        if ($@)
+        {
+            $args{errorString} = $@;
+            $args{answer}      = "error: $@ STATUS-crit";
+            push @ret, \%args;
+            next;    #bail out early on errors so the main logic isn't indented
+        }
+
+        #main logic
+        if ($disk_usage and $disk_usage < 5)
+        {
+            $args{answer} = "$disk_usage % STATUS-info";
+
+        }
+        elsif ($disk_usage and $disk_usage > 5 and $disk_usage < 10)
+        {
+            $args{answer} = "$disk_usage % STATUS-warn";
+
+        }
+        elsif ($disk_usage and $disk_usage > 10)
+        {
+            $args{answer} = "$disk_usage % STATUS-crit";
+        }
+
+        push @ret, \%args;
+    }
+    return @ret;
+}
+
+sub all_who_is_down
+{
+    my $allServers = shift;
+    my $service    = shift;
+    my @ret        = ();
+    my $config     = $checkSpecificConfigs->{who_is_down};
+    foreach my $server (@$allServers)
+    {
+        my %args = (
+                    instanceName => $server->{instanceName},
+                    userid       => $server->{targetUserName},
+                    password     => $server->{serverPass},
+                    hostname     => $server->{srshostname},
+                    dsiname      => $server->{dsiname},
+                    checkName    => 'who_is_down',
+                    errorString  => '',
+                   );
+        my %repServer = repServerMemory($service, %args);
+        my %errorRepAgent = repAgentErrormonitor($service, %args);
+
+        #print "FOR SERVER ARGUMETN $server->{srshostname}", Dumper(\%args), "\n";
+        myInfo "Starting who_is_down() for hostname=$args{hostname} userid=$args{userid} instanceName=$args{instanceName}";
+        my $retString = who_is_down(%args);
+        $args{password}  = 'password';
+        $args{retString} = $retString;
+
+        if ($@)
+        {
+            $args{errorString} = $@;
+            $args{answer}      = "error: $@ STATUS-crit";
+            push @ret, \%args;
+            next;    #bail out early on errors so the main logic isn't indented
+        }
+
+        #main logic
+        if ($args{retString} =~ qr/$config->{CritRegex}/i)
+        {
+            $args{answer} = 'STATUS-crit';
+        }
+        else
+        {
+            $args{answer} = 'STATUS-info';
+        }
+
+        push @ret, \%args;
+        push @ret, \%repServer;
+        push @ret, \%errorRepAgent;
+    }
+
+    return @ret;
+}
+
+sub repServerMemory
+{
+    my $service = shift;
+    my %args    = @_;
+
+    $args{checkName} = 'who_is_down_rep';
+    my $user     = "mon$service";
+    my $cipher   = ariba::rc::CipherStore->new($service);
+    my $password = $cipher->valueForName($user);
+    $args{password} = 'password';
+
+    my $config = $checkSpecificConfigs->{$args{checkName}};
+
+    my $host_info = "$user\@$args{hostname}";
+    my $command   = "ssh -t $host_info 'ps -elf | grep -i rax |grep futex_|grep -v grep'";
+    print "COMMAND IS ", $command, "\n";
+
+    my @output;
+    my $status = ariba::rc::Utils::executeRemoteCommand($command, $password, 0, undef, undef, \@output);
+    $args{password} = 'password';
+
+    if (!$status || $#output < 0)
+    {
+        $args{answer} = "Error: error in executing command $command on $host_info STATUS-crit";
+        return %args;
+    }
+
+    my @line = split (' ', $output[0]);
+    my $size = sprintf ("%.2f", $line[9] / (1024 * 1024));
+    if ($size >= $config->{critThreshold})
+    {
+        $args{answer} = $size . ' GB STATUS-crit';
+    }
+    elsif ($size >= $config->{warnThreshold})
+    {
+        $args{answer} = $size . ' GB STATUS-warn';
+    }
+    else
+    {
+        $args{answer} = $size . ' GB STATUS-info';
+    }
+
+    return %args;
+}
+
+sub repAgentErrormonitor
+{
+    my $service = shift;
+    my %args    = @_;
+
+    $args{checkName} = 'error_rep_agent';
+    my $user     = "mon$service";
+    my $cipher   = ariba::rc::CipherStore->new($service);
+    my $password = $cipher->valueForName($user);
+    $args{password} = 'password';
+
+    my $config = $checkSpecificConfigs->{$args{checkName}};
+
+    my $host_info = "$user $args{hostname}";
+    my $command   = "ssh -l $host_info 'sudo su -c \"grep ^E /opt/sybase/rao/RAX*/LUNA2_*/log/LUNA2_RA[A-Z][0-9][0-9].log|grep RB_INVALID_ROLLBACK_ID\"'";
+    print "COMMAND IS ", $command, "\n";
+
+    my @output;
+    my $status = ariba::rc::Utils::executeRemoteCommand($command, $password, 0, undef, undef, \@output);
+    $args{password} = 'password';
+
+    my @result;
+    ##get errors for last 15 min
+    my $time15Minback = strftime("%Y%m%d%H%M%S", localtime (time () - 15 * 60));
+    for my $line (@output)
+    {
+        next unless ($line);
+        my ($errorTime) = $line =~ /E.*?(\d+.*?)\.\d+/i;
+        $errorTime =~ s/(\/|:|\s+)//g;
+        if ($errorTime > $time15Minback)
+        {
+            push (@result, $line);
+        }
+    }
+    unless (@result)
+    {
+        $args{answer} = 'None STATUS-info';
+        return %args;
+    }
+
+    $args{answer} = join ("\n", @result) . " STATUS-crit";
+    return %args;
+}
+
+sub myInfo
+{
+    my $infoStr     = shift;
+    my $now         = scalar localtime;
+    my $logFileName = '/var/log/tools/an-on-hana.log';
+    eval {
+        print STDERR "[DEBUG]: $infoStr\n" if $debug;
+        local $SIG{ALRM} = sub {die "timed out\n";};
+        alarm 1;
+        open my $fh, '>>', $logFileName or die;
+        print $fh "$now: [INFO]: $infoStr\n" or die;
+        close $fh or die;
+        my $bytes = (stat ($logFileName))[7];
+        if ($bytes > 100000000)
+        {
+            open my $fh, '>', $logFileName;
+            close $fh;
+        }
+    };
+    alarm 0;
+}
+
+sub _resolveTemplate
+{
+    my $template = shift;
+    my $args     = shift;
+    my %args     = %$args;
+    my $ret      = eval "return \"$template\"";
+    die $@ if $@;
+    return $ret;
+}
+
+sub check_disk_space
+{
+
+    my $data = shift;
+    my @dataString = split /\n/, $data;
+    my @content;
+    foreach my $part (@dataString)
+    {
+        $part =~ s/^\s+|\s+$//g;
+        next if ($part !~ /partition|new_partition/);
+        print "Pushing $part\n", if $debug > 1;
+        push @content, $part;
+    }
+    print "Returning CONTENT \n", Dumper @content, "\n", if $debug;
+    return @content;
+
+}

@@ -1,0 +1,444 @@
+#!/usr/local/bin/perl
+
+# $Id$
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::CircularDB;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::monitor::misc;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $debug = 0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug = 1; };
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+
+	my $cluster = $me->currentCluster();
+	my $ws = ($me->hostsForRoleInCluster("monserver", $cluster))[0];
+	my $port = $me->default("WebServerHTTPPort");
+
+	my $warn;
+	my $crit;
+
+	# tmid:161074
+	my $machineStatsDoc = "https://wiki.ariba.com:8443/display/ENGDPTS/Machinestats";
+	my $note = "\n<html>For memory issues, see <a href=\"$machineStatsDoc\">$machineStatsDoc</a></html>";
+
+	for my $datacenter ( @dataCenters ) {
+
+		my %matchDatacenter = (
+			status => 'inservice',
+			datacenter => $datacenter,
+			monitoringDatacenter => '',
+		);
+
+		my %matchMonitoringDatacenter = (
+			status => 'inservice',
+			monitoringDatacenter => $datacenter,
+		);
+
+		# VMs are marked as outofservice because they do not want cfengine to update them
+		my %matchVirtualMachinesInDatacenter = (
+			status		=> 'outofservice',
+			datacenter	=> $datacenter,
+			os			=> 'redhat',
+			hardwareType	=> 'VM',
+		);
+
+		my @machines = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+		push(@machines, ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+		push(@machines, ariba::Ops::Machine->machinesWithProperties(%matchVirtualMachinesInDatacenter));
+
+		my %queries = ();
+		my %networkQueries = ();
+
+		for my $machine (@machines) {
+			my $hostname = $machine->hostname();
+			my $severity;
+
+			my $url = ariba::monitor::misc::snmpGraphsUrl($hostname, "$ws:$port");
+			my $qMemKey = qq!<html><a href="$url">$hostname</a></html> mem!;
+			my $qSwapKey = qq!<html><a href="$url">$hostname</a></html> swap!;
+			my $memWarnCritFlag = 0;
+			my $swapWarnCritFlag = 0;
+
+
+			# Value Variable
+			my ($swapValue,$realValue,$procMem,$ioMem,$procFrag,$ioFrag);
+
+			# QueryNames
+			my ($swapQueryName, $memQueryName, $procMemQueryName, $ioMemQueryName, $procFragQueryName, $ioFragQueryName);
+
+			# Devices running ios have different memory monitoring needs.
+			if ( $machine->os() =~ /ios/i ) {
+
+				$procMemQueryName = "snmp/$hostname/Percent_Proc_Mem_Usage";
+
+				if (ariba::monitor::Query->objectWithNameExists($procMemQueryName)) {
+					my $query = ariba::monitor::Query->new($procMemQueryName);
+					my $memCdb = $query->cdb();
+					$procMem = int($memCdb->aggregateUsingFunctionForRecords('average', '+2'));
+				}
+
+				$procFragQueryName = "snmp/$hostname/Percent_Proc_Mem_Fragmentation";
+
+				if (ariba::monitor::Query->objectWithNameExists($procFragQueryName)) {
+					my $query = ariba::monitor::Query->new($procFragQueryName);
+					my $memCdb = $query->cdb();
+					$procFrag = int($memCdb->aggregateUsingFunctionForRecords('average', '+2'));
+				}
+
+				$ioMemQueryName = "snmp/$hostname/Percent_IO_Mem_Usage";
+
+				if (ariba::monitor::Query->objectWithNameExists($ioMemQueryName)) {
+					my $query = ariba::monitor::Query->new($ioMemQueryName);
+					my $memCdb = $query->cdb();
+					$ioMem = int($memCdb->aggregateUsingFunctionForRecords('average', '+2'));
+				}
+
+				$ioFragQueryName = "snmp/$hostname/Percent_IO_Mem_Fragmentation";
+
+				if (ariba::monitor::Query->objectWithNameExists($ioFragQueryName)) {
+					my $query = ariba::monitor::Query->new($ioFragQueryName);
+					my $memCdb = $query->cdb();
+					$ioFrag = int($memCdb->aggregateUsingFunctionForRecords('average', '+2'));
+				}
+
+			} else {
+
+				# cheat and call this directly so that we can go crit
+				# only when both swap and real ram are high.
+
+				$memQueryName = "snmp/$hostname/Percent_Mem_Usage";
+
+				if (ariba::monitor::Query->objectWithNameExists($memQueryName)) {
+					my $query = ariba::monitor::Query->new($memQueryName);
+					my $memCdb = $query->cdb();
+					$realValue = int($memCdb->aggregateUsingFunctionForRecords('average', '+2'));
+				}
+
+				$swapQueryName = "snmp/$hostname/Percent_Swap_Usage";
+
+				if (ariba::monitor::Query->objectWithNameExists($swapQueryName)) {
+					my $query = ariba::monitor::Query->new($swapQueryName);
+					my $swapCdb = $query->cdb();
+					$swapValue = int($swapCdb->aggregateUsingFunctionForRecords('average', '+2'));
+				}
+			}
+
+			if ($machine->provides('db')) {
+				$severity = 1;
+			}
+
+			# RedHat memory management works a lot different than solaris so we need to warn
+			# and crit on different conditions.  For Solaris, using all of physical memory is
+			# a normal and healthy so we have to take swap usage into account.  For RedHat
+			# swap is only used when the system starts to run low on physical memory.  Also,
+			# for redhat db servers, we're switching the degree of "swappiness" to always prefer
+			# to use physical memory.  See TMID:46593 for more information
+
+			if ( $machine->os() =~ /ios/i ) {
+
+				my $warnValue = 85;
+				my $critValue = 95;
+
+				my $procFragWarnValue = 60;
+				my $procFragCritValue = 80;
+				my $ioFragWarnValue = 60;
+				my $ioFragCritValue = 80;
+
+				if (defined ($procMem)) {
+					my $graphLink = $procMemQueryName;
+					if (defined ($procFrag)) {
+						$graphLink .= ",$procFragQueryName";
+					}
+					$networkQueries{qq!<html><a href="$url">$hostname</a></html> Processor Memory!} = {
+						format => "%d%%\n",
+						showGraphLink => $graphLink,
+						info => "answer eq '' or  answer > -1",
+						warn => "answer eq '' or  answer > $warnValue",
+						crit => "answer ne '' and answer > $critValue",
+						note => $note,
+						perl => "$procMem",
+						inf_field => "processorMemory",
+						inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
+						inf_default => 0,
+						group_by => "$datacenter,$hostname",
+					};
+				}
+
+				if (defined ($procFrag)) {
+					$networkQueries{qq!<html><a href="$url">$hostname</a></html> Processor Memory Fragmentation!} = {
+						format => "%d%%\n",
+						showGraphLink => "$procMemQueryName,$procFragQueryName",
+						info => "answer eq '' or  answer > -1",
+						warn => "answer eq '' or  answer > $procFragWarnValue",
+						crit => "answer ne '' and answer > $procFragCritValue",
+						note => $note,
+						perl => "$procFrag",
+						inf_field => "processorMemoryFragmentation",
+						inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
+						inf_default => 0,
+						group_by => "$datacenter,$hostname",
+					};
+				}
+
+				if (defined ($ioMem)) {
+					my $graphLink = $ioMemQueryName;
+					if (defined ($ioFrag)) {
+						$graphLink .= ",$ioFragQueryName";
+					}
+					$networkQueries{qq!<html><a href="$url">$hostname</a></html> IO Memory!} = {
+						format => "%d%%\n",
+						showGraphLink => $graphLink,
+						info => "answer eq '' or  answer > -1",
+						warn => "answer eq '' or  answer > $warnValue",
+						crit => "answer ne '' and answer > $critValue",
+						note => $note,
+						perl => "$ioMem",
+						inf_field => "IOMemory",
+						inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
+						inf_default => 0,
+						group_by => "$datacenter,$hostname",
+					};
+				}
+
+				if (defined ($ioFrag)) {
+					$networkQueries{qq!<html><a href="$url">$hostname</a></html> IO Memory Fragmentation!} = {
+						format => "%d%%\n",
+						showGraphLink => "$ioMemQueryName,$ioFragQueryName",
+						info => "answer eq '' or  answer > -1",
+						warn => "answer eq '' or  answer > $ioFragWarnValue",
+						crit => "answer ne '' and answer > $ioFragCritValue",
+						note => $note,
+						perl => "$ioFrag",
+						inf_field => "IOMemoryFragmentation",
+						inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
+						inf_default => 0,
+						group_by => "$datacenter,$hostname",
+					};
+				}
+
+			# Move all network memory monitoring to network queries.
+			} elsif ( $machine->os() eq "bigip" ) {
+
+				my $warnValue = 75;
+				my $graphLink = $memQueryName;
+
+				if (defined ($realValue)) {
+					$networkQueries{$qMemKey} = {
+						format => "%d%%\n",
+						showGraphLink => $graphLink,
+						info => "answer eq '' or  answer > -1",
+						warn => "answer eq '' or  answer > $warnValue",
+						note => $note,
+						perl => "$realValue",
+						inf_field => "Memory",
+						inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
+						inf_default => 0,
+						group_by => "$datacenter,$hostname",
+					};
+					$memWarnCritFlag = 0;
+					$memWarnCritFlag = 1  if ( $realValue eq '' or $realValue > $warnValue );
+				}
+
+			} elsif ( $machine->os() eq "pix" || $machine->os() eq "css" ) {
+
+				my $warnValue = 75;
+				my $critValue = 85;
+
+				my $graphLink = $memQueryName;
+
+				if (defined ($realValue)) {
+					$networkQueries{$qMemKey} = {
+						format => "%d%%\n",
+						showGraphLink => $graphLink,
+						info => "answer eq '' or  answer > -1",
+						warn => "answer eq '' or  answer > $warnValue",
+						crit => "answer ne '' and answer > $critValue",
+						note => $note,
+						perl => "$realValue",
+						inf_field => "Memory",
+						inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
+						inf_default => 0,
+						group_by => "$datacenter,$hostname",
+					};
+					$memWarnCritFlag =
+						  ( $realValue > $critValue ) ? 2
+						: ( $realValue eq '' or $realValue > $warnValue ) ? 1
+						: 0;
+				}
+
+			} elsif ( $machine->os() ne "sunos" ) {
+
+				my $warnValue = 85;
+				my $critValue = 95;
+
+				my $swapWarnValue = 50;
+				my $swapCritValue = 70;
+
+				# For db servers, we want a little more headroom for memory problems
+			 	if ( grep (/^db$/, $machine->providesServices()) ) {
+					$warnValue = 75;
+					$critValue = 80;
+
+					$swapWarnValue = 5;
+					$swapCritValue = 10;
+				}
+
+				# We want to set different thresholds for S4 SV sids
+				if ( grep (/^s4sv$/, $machine->providesServices()) ) {
+					$warnValue = 85;
+					$critValue = 90;
+
+					$swapWarnValue = 5;
+					$swapCritValue = 10;
+				}
+
+				# Our backup servers use a lot of memory caching nfs inodes which is fine.
+			 	if ( grep (/^backup$/, $machine->providesServices()) ) {
+					$warnValue = 95;
+					$critValue = 98;
+				}
+
+				if (defined ($realValue)) {
+					my $graphLink = $memQueryName;
+					if (defined ($swapValue)) {
+						$graphLink .= ",$swapQueryName";
+					}
+
+					$queries{$qMemKey} = {
+						format => "%d%%\n",
+						showGraphLink => $graphLink,
+						info => "answer eq '' or  answer > -1",
+						warn => "answer eq '' or  answer > $warnValue",
+						crit => "answer ne '' and answer > $critValue",
+						note => $note,
+						severity => $severity,
+						perl => "$realValue",
+					};
+
+					$memWarnCritFlag =
+						  ( $realValue > $critValue ) ? 2
+						: ( $realValue eq '' or $realValue > $warnValue ) ? 1
+						: 0;
+				}
+
+				if (defined ($swapValue)) {
+					$queries{$qSwapKey} = {
+						format => "%d%%\n",
+						showGraphLink => "$memQueryName,$swapQueryName",
+						info => "answer eq '' or  answer > -1",
+						warn => "answer eq '' or  answer > $swapWarnValue",
+						crit => "answer ne '' and answer > $swapCritValue",
+						note => $note,
+						perl => "$swapValue",
+					};
+
+					$swapWarnCritFlag =
+						  ( $swapValue > $swapCritValue ) ? 2
+						: ( $swapValue eq '' or $swapValue > $swapWarnValue ) ? 1
+						: 0;
+				}
+
+			} else {
+
+				next unless defined $realValue && defined $swapValue;
+
+				my $totalMemUsage = $realValue + $swapValue;
+				my $totalCritValue = 110;
+				my $memWarnValue = 90;
+				my $swapWarnValue = 50;
+
+				$queries{$qMemKey} = {
+					format => "%d%%\n",
+					showGraphLink => "$memQueryName,$swapQueryName",
+					info => "answer eq '' or answer > -1",
+					warn => "answer eq '' or ( answer > $memWarnValue && $swapValue > 0 ) ",
+					crit => "answer ne '' and $totalMemUsage > $totalCritValue",
+					note => $note,
+					severity => $severity,
+					perl => "$realValue",
+				};
+				$memWarnCritFlag =
+					  ( $realValue ne '' and $totalMemUsage > $totalCritValue ) ? 2
+					: ( $realValue eq '' or ( $realValue > $memWarnValue and $swapValue > 0 ) ) ? 1
+					: 0;
+
+				$queries{$qSwapKey} = {
+					format => "%d%%\n",
+					showGraphLink => "$memQueryName,$swapQueryName",
+					info => "answer eq '' or answer > -1",
+					warn => "answer eq '' or answer > $swapWarnValue",
+					crit => "answer ne '' and $totalMemUsage > $totalCritValue",
+					note => $note,
+					perl => "$swapValue",
+				};
+
+				$swapWarnCritFlag =
+					  ( $swapValue ne '' and $totalMemUsage > $totalCritValue ) ? 2
+					: ( $swapValue eq '' or $swapValue > $swapWarnValue ) ? 1
+					: 0;
+			}
+
+			if (defined $queries{$qMemKey}) {
+				$queries{$qMemKey}{inf_field} = "Memory";
+				$queries{$qMemKey}{inf_tags} = qq|datacenter="$datacenter",hostname="$hostname"|;
+				$queries{$qMemKey}{inf_default} = 0;
+				$queries{$qMemKey}{group_by} = "$datacenter,$hostname";
+
+				$queries{qq!$hostname mem warncrit flag!} = {
+					perl      => sub { $memWarnCritFlag },
+					inf_field => "mem_warncrit_flag",
+					inf_tags  => qq|datacenter="$datacenter",hostname="$hostname"|,
+					group_by  => "$datacenter,$hostname"
+				};
+			}
+
+			if (defined $queries{$qSwapKey}) {
+				$queries{$qSwapKey}{inf_field} = "Swap";
+				$queries{$qSwapKey}{inf_tags} = qq|datacenter="$datacenter",hostname="$hostname"|;
+				$queries{$qSwapKey}{inf_default} = 0;
+				$queries{$qSwapKey}{group_by} = "$datacenter,$hostname";
+
+				$queries{qq!$hostname swap warncrit flag!} = {
+					perl      => sub { $swapWarnCritFlag },
+					inf_field => "swap_warncrit_flag",
+					inf_tags  => qq|datacenter="$datacenter",hostname="$hostname"|,
+					group_by  => "$datacenter,$hostname"
+				};
+			}
+		}
+
+		my $email = $me->default('notify.email');
+
+		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+
+		$queries{influx_details} = {measurement => "memory"};
+		my $q = ariba::monitor::QueryManager->newWithDetails("memory", $pn, $me->service(),$me->customer(), \%queries);
+		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+		# Create Network Memory QueryManager
+		$networkQueries{influx_details} = {measurement => "network_memory"};
+		$q = ariba::monitor::QueryManager->newWithDetails("Network Memory" , $pn, $me->service(),$me->customer(), \%networkQueries);
+		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+main();

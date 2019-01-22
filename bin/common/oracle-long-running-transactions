@@ -1,0 +1,159 @@
+#!/usr/local/bin/perl -w
+#
+use strict;
+use File::Slurp;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+use ariba::rc::InstalledProduct;
+use dmail::LockLib;
+use Data::Dumper;
+
+my $LOCKFILE = '/tmp/stratus-oracle-long-running-transactions';
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h|-daily] -product <product>
+
+        -e                   Enables sending of email for monitor query.
+        -p                   Enables sending of pages for monitor query.
+        -d                   Turns on debug mode.
+        -h                   Shows this help.
+        -product <product>   Run for specified product name
+
+USAGE
+
+    print "(error) $error\n" if $error;
+
+    exit();
+}
+
+my $debug               = 0;
+my $quiet               = 0;
+my $sendEmail           = 0;
+my $sendPage            = 0;
+my $runDailyQueriesOnly = 0;
+
+my $me      = ariba::rc::InstalledProduct->new();
+my $service = $me->service();
+
+sub main{
+
+    my $productName;
+    while ( my $arg = shift(@ARGV) )
+    {
+        print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+        if ( $arg =~ m/^-h$/o ) { usage(); next; }
+        if ( $arg =~ m/^-d$/o )       { $debug               = 1;            next; }
+        if ( $arg =~ m/^-e$/o )       { $sendEmail           = 1;            next; }
+        if ( $arg =~ m/^-p$/o )       { $sendPage            = 1;            next; }
+        if ( $arg =~ m/^-product$/o ) { $productName         = shift(@ARGV); next; }
+        usage("Unknown arg: $arg");
+    }
+
+    usage("Must specify product as an") if( !$productName || $productName ne "an" );
+
+    $| = 1;
+
+    my $scriptLock = "$LOCKFILE-" . $productName;
+    unless ( dmail::LockLib::requestlock( $scriptLock, 5 ) ) {
+        die "can't grab lock\n";
+    }
+
+    my $product = ariba::rc::InstalledProduct->new( $productName,$service );
+
+    my $expando = "oracle-long-running-transactions";
+
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my $machine = ariba::Ops::Machine->new($hostname);
+    my $datacenter = $machine->datacenter();
+
+    my $dbuser = "system";
+    my $dbpass = $me->default("dbainfo.$dbuser.password");
+    my $email  = $me->default('notify.email');
+
+    my @connections = ariba::Ops::DBConnection->connectionsFromProducts($product);
+    my @connectionsByHostAndSid = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid( @connections );
+    my %sidQueries;
+    for my $dbc (@connectionsByHostAndSid){
+
+        my $host  = $dbc->host();
+        my $dbsid = $dbc->sid();
+        my $type  = $dbc->type();
+        my $port  = $dbc->port();
+
+        ###Don't monitor anpro2q as per HOA-118956
+        next if($host !~ /$datacenter/ || $dbsid eq 'anpro2q');
+        if ($host =~ /^hana/i ){
+                print "DB type is Hana no action required\n" if $debug;
+                next;
+        }
+
+        my $logger_prefix = qq($host/$dbsid/$type);
+        print "Running Transaction Query for $host, $dbsid, ".$product->name(). ", ".$product->service()."\n" if $debug;
+
+        my $sql = "select t.start_time, to_char(s.sid),to_char(s.serial#),s.username,s.status,s.schemaname, s.osuser,s.process,s.machine, s.terminal,s.program,s.module, to_char(s.logon_time,'DD/MON/YY HH24:MI:SS') logon_time from v\$transaction t, v\$session s where s.saddr = t.ses_addr and t.start_date < sysdate-1";
+
+        my $oc = ariba::Ops::OracleClient->new( $dbuser, $dbpass, $dbsid, $host );
+        unless ($oc->connect( 20, 4 )){
+            print "failed to connect DB: $dbuser, $dbsid and $host\n";
+            next;
+        }
+        my @results = $oc->executeSql($sql);
+
+        my $long_running_transaction_count = scalar(@results);
+		my $long_running_transactions;
+		if ($long_running_transaction_count) {
+			for (my $i = 0; $i < $long_running_transaction_count; $i++) {
+				$long_running_transactions .= "|";
+				$long_running_transactions .= join('|', values(%{$results[$i]}));
+				$long_running_transactions .= "|";
+			}
+		} else {
+			$long_running_transactions = "none";
+		}
+        $dbsid = uc($dbsid);
+
+        $sidQueries{"[$dbsid](Transaction Start,SID,Serial#,Username,Status,Schemaname,OsUser,Process,Machine,Terminals,Program,Module,Logon Time)" } = {
+            'info'          => "answer",
+            'crit'          => "answer != 0",
+            'uiHint'        => "$dbsid",
+            'description'   => "This shows Long Running Trasaction details for $dbsid",
+            'perl'          => sub { return $long_running_transaction_count }, 
+            correctiveActions => [
+                Ops => 'Report to AN team',
+            ],
+            'inf_field' => "long_running_transaction_count",
+            'inf_tags'  => "sid=$dbsid,dbhost=$host",
+            'inf_default' => 0,
+            'group_by' => $dbsid
+        };
+
+        $sidQueries{"[$dbsid]"} = {
+            'info'          => "answer",
+            'crit'          => "answer != 0",
+            'uiHint'        => "$dbsid",
+            'description'   => "This shows Long Running Trasaction details for $dbsid",
+            'perl'          => sub {return $long_running_transactions}, 
+            correctiveActions => [
+                Ops => 'Report to AN team',
+            ],
+            'inf_field' => "long_running_transactions",
+            'inf_tags'  => "sid=$dbsid,dbhost=$host",
+            'group_by' => $dbsid
+        };
+    }
+    $sidQueries{"influx_details"} = { 'measurement' => "oracle_long_running_transactions"};
+    my $query = ariba::monitor::QueryManager->newWithDetails(
+        "$expando",$product->name(), $product->service(), undef,\%sidQueries);
+    $query->processQueries( $debug, $email, $sendEmail, $sendPage );
+
+    dmail::LockLib::releaselock($scriptLock);
+}
+
+main();

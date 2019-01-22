@@ -1,0 +1,80 @@
+[
+    {
+        "script":"/bin/echo",
+        "parameters":[
+            {
+                "parameter_name":"",
+                "parameter_value":"",
+                "default_arg":"\"Beginning tests...\""
+            }
+        ],
+        "validate_on":"expected_value",
+        "expected_value":"QmVnaW5uaW5nIHRlc3RzLi4uCg==",
+        "secondary_command":""
+    },
+    {
+        "script":"/bin/ls",
+        "parameters":[
+            {
+                "parameter_name":"-t",
+                "parameter_value":"",
+                "default_arg":""
+            },
+            {
+                "parameter_name":"-r",
+                "parameter_value":"",
+                "default_arg":""
+            },
+            {
+                "parameter_name":"",
+                "parameter_value":"",
+                "default_arg":"/etc/telegraf/telegraf.conf"
+            }
+        ],
+        "validate_on":"exit_code",
+        "expected_value" : "",
+        "secondary_command":""
+    },
+    {
+        "script":"/bin/echo",
+        "parameters":[
+            {
+                "parameter_name":"",
+                "parameter_value":"",
+                "default_arg":"\"Sample secondary command...\""
+            }
+        ],
+        "validate_on":"secondary_command_exit_code",
+        "expected_value" : "",
+        "secondary_command":"ls /etc/telegraf/telegraf.conf"
+    },
+    {
+        "script":"/bin/echo",
+        "parameters":[
+            {
+                "parameter_name":"",
+                "parameter_value":"",
+                "default_arg":"Hola"
+            }
+        ],
+        "validate_on":"exit_code",
+        "expected_value" : "",
+        "secondary_command":""
+    },
+    {
+        "script":"sleep 5 && test `pgrep telegraf` -eq `cat /var/run/telegraf/telegraf.pid`",
+        "parameters":[
+        ],
+        "validate_on":"exit_code",
+        "expected_value" : "",
+        "secondary_command":""
+    },
+    {
+        "script":"sleep 10 && ps axl | grep stratus | awk '$10 ~ /D/'",
+        "parameters":[
+        ],
+        "validate_on":"expected_value",
+        "expected_value" : "Cg==",
+        "secondary_command":""
+    }
+]

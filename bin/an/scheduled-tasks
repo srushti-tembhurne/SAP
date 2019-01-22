@@ -1,0 +1,287 @@
+#!/usr/local/bin/perl
+#
+# monitor scheduled tasks
+#
+# $Id: //ariba/services/monitor/bin/an/scheduled-tasks#20 $
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Query;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DBConnection;
+use Data::Dumper;
+
+my @critTasks = (
+                 "BulkRegCleanup",
+                 "FXFetchTask",
+                 "RfxNotification",
+                 "MoveRfxToPendingAwardTask",
+                 "PaymentBatch",
+                 "TextIndexMaintenance",
+                 "SMITempANIdGenerator",
+                 "SMIBillingTask",
+                 "SMIChargingTask",
+                 "SMIMarkRenewalTask",
+                 "SMIEnforcementTask",
+                 "SMIUsageTask",
+                 "SMIUsageStatusTask",
+                 "SMIInvoiceGeneratorTask",
+                 "InvoicingTask",
+                 "PSFTInvoiceUpdateTask",
+                 "DocumentCount",
+                 "ANCurrencyConversionTask",
+                 "ANMetricsTask",
+                 "ANMetricsIntegrationTask",
+                );
+
+sub checkForCritTasks
+{
+    my $query   = $ariba::monitor::Query::_ourGlobalQuerySelf;
+    my @results = ();
+    my @crits   = ();
+
+    # if the query has an error (probably SQL error), don't do the processing
+    # just return the original results
+    return $query->results() if $query->error();
+
+    for my $result ($query->results())
+    {
+        my @fields = split (/\t/, $result);
+        my $taskname = $fields[0];
+        if (grep /$taskname/, @critTasks)
+        {
+            push @crits, $taskname;
+        }
+        push @results, $result;
+    }
+
+    if (@crits)
+    {
+        $query->setCrit(1);
+        $query->setCritTasks(join (",", @crits));
+    }
+    else
+    {
+        $query->setCritTasks(undef);
+        $query->setCrit(undef);
+    }
+
+    return join ("\n", @results);
+}
+
+sub main
+{
+    my $debug           = 0;
+    my $sendEmail       = 0;
+    my $sendPage        = 0;
+    my $queries         = {};
+    my $queries_count   = {};
+    my $productName;
+
+    while (my $arg = shift (@ARGV))
+    {
+        if ($arg =~ m/^-d/o) {$debug       = 1;}
+        if ($arg =~ m/^-e/o) {$sendEmail   = 1;}
+        if ($arg =~ m/^-p/o) {$sendPage    = 1;}
+        if ($arg !~ m/^-/o)  {$productName = $arg;}
+    }
+
+    die "Need product name" unless $productName;
+
+    my $me          = ariba::rc::InstalledProduct->new();
+    my $service     = $me->service();
+    my $customer    = $me->customer();
+    my $realProduct = $productName;
+
+    # Annoying hack since edi is merged with an, but with separate db
+    # These values will get used to change things later
+    if ($productName eq "an-edi")
+    {
+        $productName = "an";
+        $realProduct = "edi";
+    }
+
+    unless (ariba::rc::InstalledProduct->isInstalled($productName, $service))
+    {
+        exit (0);
+    }
+    my $product = ariba::rc::InstalledProduct->new($productName, $service);
+    my $communityList = join (", ", ariba::Ops::ProductAPIExtensions::communityIdsForProduct($product));
+
+    # starting with AN46, status column strings changed to numeric values.
+    # The mappings are done in the app code, so these are duplicates.
+
+    my $QUEUED     = 1;
+    my $PROCESSING = 2;
+    my $PROCESSED  = 3;
+    my $FAILED     = 4;
+    my $EXPIRED    = 5;
+    my $STOPPED    = 6;
+
+    my @statusStrings = ('unknown', 'Queued', 'Processing', 'Processed', 'Failed', 'Expired', 'Stopped',);
+
+    my $decodeStatusString = "decode(stdq.status, $QUEUED, '" . $statusStrings[$QUEUED] . "'," . "decode(stdq.status, $PROCESSING, '"
+      . $statusStrings[$PROCESSING] . "'," . "decode(stdq.status, $PROCESSED, '" . $statusStrings[$PROCESSED] . "'," . "decode(stdq.status, $FAILED, '"
+      . $statusStrings[$FAILED] . "'," . "decode(stdq.status, $EXPIRED, '" . $statusStrings[$EXPIRED] . "'," . "decode(stdq.status, $STOPPED, '"
+      . $statusStrings[$STOPPED] . "'," . "'uknown-status'))))))";
+
+    my $taskDispatcherQueue = "st_dispatcher_queue";
+
+    my $statusColumn                  = "stdq.status as status";
+    my $additionalWhereConditions     = "";
+    my $olderThanFourHoursWhereClause = "and (sysdate - stdq.status_changed) * 24 > 4";
+    my $processingWhereClause         = "stdq.status = 'Processing'";
+    my $statusChangedHoursColumn      = "ROUND((sysdate - stdq.status_changed) * 24)";
+    if ($realProduct eq 'an')
+    {
+        $additionalWhereConditions = qq`
+            st.id not in (select report_task from REPORT_DEFINITION)
+            and st.name != 'Archive' and
+        `;
+        $olderThanFourHoursWhereClause = "and ((to_number(sysdate - to_date('01-JAN-1970','DD-MON-YYYY')) * 24) - stdq.status_changed/(1000 * 60 * 60)) > (4 * 24)";
+        $processingWhereClause         = "stdq.status = $PROCESSING";
+        $taskDispatcherQueue           = "st_disp_queue";
+        $statusChangedHoursColumn      = "ROUND((to_number(sysdate - to_date('01-JAN-1970','DD-MON-YYYY')) * 24 ) - stdq.status_changed/(1000 * 60 *60)) as status_changed_hrs";
+
+    }
+
+    $queries_count->{"$realProduct Scheduled tasks stuck in processing count"} = {
+        format  => "%s task id %s stuck in %s for %d hours\n",
+        timeout => 30,
+        sql     => qq`
+            SELECT
+                count(*) as stuck_count
+                FROM
+                        schedule_tasks st,
+                        $taskDispatcherQueue stdq
+                    WHERE
+                        $additionalWhereConditions
+                        $processingWhereClause
+                        $olderThanFourHoursWhereClause
+                        and st.id = stdq.item
+        `,
+    };
+
+    $queries->{"$realProduct Scheduled tasks stuck in processing"} = {
+        info            => "numrows == 0",
+        warn            => "numrows > 0",
+        ticketOnWarnOpenAfterMinutes => 1,
+        format          => "%s task id %s stuck in %s for %d hours\n",
+        timeout         => 30,
+        sql         => qq`
+            SELECT
+                st.name as name,
+                stdq.id as id,
+                $statusColumn,
+                $statusChangedHoursColumn
+        FROM
+                schedule_tasks st,
+                $taskDispatcherQueue stdq
+            WHERE
+                $additionalWhereConditions
+                $processingWhereClause
+                $olderThanFourHoursWhereClause
+                and st.id = stdq.item
+        `,
+    };
+
+    if ($realProduct eq 'an')
+    {
+        $queries_count->{"$realProduct Archive jobs over time limit count"} = {
+            info    => "numrows == 0",
+            crit    => "numrows > 0",
+            format  => "Archive job started at %d, %d minutes expected run time, %d minutes current run time\n",
+            timeout => 30,
+            sql     => qq`
+            SELECT
+                     count(*) as archive_jobs_count 
+             FROM
+                     schedule_tasks st,
+                     archive_parameter ap
+             WHERE
+                     st.name='Archive'
+                     and ap.name='Throttle.Duration'
+                     and ((sysdate - st.next_run) * 24 * 60) > ap.value
+                     and exists (select id from st_disp_queue sdq where sdq.item = st.id)
+                `,
+        };
+        $queries->{"$realProduct Archive jobs over time limit"} = {
+            info            => "numrows == 0",
+            crit            => "numrows > 0",
+            format          => "Archive job started at %d, %d minutes expected run time, %d minutes current run time\n",
+            timeout         => 30,
+            sql         => qq`
+                SELECT
+                    to_char(st.next_run,'DD-MON-YY HH24:MI:SS') as "starttime",
+                    ap.value as "duration",
+                    ((sysdate - st.next_run) * 24 * 60) as "minutes_ran"
+                FROM
+                    schedule_tasks st,
+                    archive_parameter ap
+                WHERE
+                    st.name='Archive'
+                    and ap.name='Throttle.Duration'
+                    and ((sysdate - st.next_run) * 24 * 60) > ap.value
+                    and exists (select id from st_disp_queue sdq where sdq.item = st.id)
+                `,
+        };
+    }
+
+    if ($realProduct eq 'an')
+    {
+        foreach my $query (values %$queries)
+        {
+            $query->{'runForCommunities'} = $communityList;
+        }
+
+        foreach my $query (values %$queries_count)
+        {
+            $query->{'runForCommunities'} = $communityList;
+        }
+    }
+    my $email = $me->default('notify.email');
+
+    my $q;
+    if ($productName eq $realProduct)
+    {
+        $queries_count->{influx_details} = {measurement => 'an_scheduled_tasks_count'};
+        $q = ariba::monitor::QueryManager->newWithDetails('scheduled-tasks', $product->name(), $service, $customer, $queries_count);
+        $q->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($product));
+        ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($product, $q);
+    }
+    else
+    {
+        $queries_count->{influx_details} = {measurement => 'an_edi_scheduled_tasks_count'};
+        $q = ariba::monitor::QueryManager->newWithDetails('edi-scheduled-tasks', $product->name(), $service, $customer, $queries_count);
+        my $ediDbc = ariba::Ops::DBConnection->connectionsForProductOfDBType($product, ariba::Ops::DBConnection::typeMainEdi());
+        $q->setSQLConnectInfoFromDBConnection($ediDbc);
+    }
+    $q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+    my $q2;
+    if ($productName eq $realProduct)
+    {
+        $queries->{influx_details} = {measurement => 'an_scheduled_tasks'};
+        $q2 = ariba::monitor::QueryManager->newWithDetails('scheduled-tasks', $product->name(), $service, $customer, $queries);
+        $q2->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($product));
+        ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($product, $q2);
+    } 
+    else 
+    {
+        $queries->{influx_details} = {measurement => 'an_edi_scheduled_tasks'};
+        $q2 = ariba::monitor::QueryManager->newWithDetails('edi-scheduled-tasks', $product->name(), $service, $customer, $queries);
+        my $ediDbc = ariba::Ops::DBConnection->connectionsForProductOfDBType($product, ariba::Ops::DBConnection::typeMainEdi());
+        $q2->setSQLConnectInfoFromDBConnection($ediDbc);
+    }
+
+    $q2->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();
+

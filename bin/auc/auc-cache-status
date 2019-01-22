@@ -1,0 +1,114 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/etc/monitor-query-template#6 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $me = ariba::rc::InstalledProduct->new('community', $mon->service());
+    my %queries;
+
+    my $twentyfourHours = 60 * 60 * 24;
+    my $fortyeightHours = 2 * $twentyfourHours;
+
+    $queries{'AUC Cache Learning Status'} = {
+    # tmid 182437, temporarily disable alerts
+#        warn    => "answer >= $twentyfourHours && answer < $fortyeightHours",
+#        crit    => "answer >= $fortyeightHours",
+        info    => "answer < $twentyfourHours",
+        ## select (to_number(to_date(to_char(systimestamp AT TIME ZONE 'UTC','DD-MM-YYYY HH24:MI:SS'),'DD-MM-YYYY HH24:MI:SS') - TO_DATE('01-01-1970 00:00:00', 'DD-MM-YYYY HH24:MI:SS')) * (86400)) - max(judie) from junk
+        sql     => "select (to_number(to_date(to_char(systimestamp AT TIME ZONE 'UTC','DD-MM-YYYY HH24:MI:SS'),'DD-MM-YYYY HH24:MI:SS') - TO_DATE('01-01-1970 00:00:00', 'DD-MM-YYYY HH24:MI:SS')) * (86400)) - max(created) as learning_status from cache_ariba_learning",
+#        sql     => "select max(created) from cache_ariba_learning",
+        ticketOwner => 'unassigned-sre',
+        severity    => 1,
+        description => 'Check AUC custom cache',
+        correctiveActions => [
+            Ops => 'Open a CR and assign to AUC dev team.',
+        ],
+    };
+
+    $queries{'AUC Misc Status'} = {
+        sql   => "select count(*) as misc_status from users where \"UID\" = 0",
+        crit    => "answer != 1",
+        info    => "answer == 1",
+        description => 'Check AUC user 0',
+        correctiveActions => [
+            Ops => 'Open a CR and assign to AUC dev team.',
+        ],
+    };
+
+    $queries{'AUC Import Status - Last Created'} = {
+        sql   => "select max(created) as import_status_last_created from node",
+        description => 'Check AUC Content Import Status',
+        correctiveActions => [
+            Ops => 'Open a CR and assign to AUC dev team.',
+        ],
+    };
+
+    $queries{'AUC Import Status - Last Updated'} = {
+        sql   => "select max(changed) as import_status_last_updated from node",
+        description => 'Check AUC Content Update Status',
+        correctiveActions => [
+            Ops => 'Open a CR and assign to AUC dev team.',
+        ],
+    };
+
+    my $email = $me->default('notify.email');
+    $queries{'influx_details'} = { measurement => 'community_cache_status'};
+    my $qm = ariba::monitor::QueryManager->newWithDetails('cache-status', $me->name(), $me->service(), $me->customer(), \%queries);
+    $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($me));
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+sub checkStatus {
+    my $me = shift; 
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+    my @results = `ls`;
+    
+    return join("\n", @results);
+}
+
+main(@ARGV);
+
+__END__

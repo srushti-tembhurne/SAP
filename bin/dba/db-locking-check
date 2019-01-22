@@ -1,0 +1,173 @@
+#!/usr/local/bin/perl -w
+#
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::OutageSchedule;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+use Data::Dumper;
+
+my $debug = 0;
+
+sub main
+{
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $productName;
+
+    while (my $arg = shift (@ARGV))
+    {
+        print STDERR "parsing arg $arg\n" if $debug;
+        if ($arg =~ m/^-h$/o) {usage(); next;}
+        if ($arg =~ m/^-d$/o)    {$debug       = 1;             next;}
+        if ($arg =~ m/^-e$/o)    {$sendEmail   = 1;             next;}
+        if ($arg =~ m/^-p$/o)    {$sendPage    = 1;             next;}
+        if ($arg =~ m/^-prod$/o) {$productName = shift (@ARGV); next;}
+        usage("Unknown arg: $arg");
+    }
+    my $me       = ariba::rc::InstalledProduct->new();
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my $cluster  = $me->currentCluster();
+    my $email    = $me->default('notify.email');
+    my $service  = $me->service();
+    my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+
+    foreach my $product (@products)
+    {
+        my @dbconnections = ariba::Ops::DBConnection->connectionsFromProducts($product);
+        for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbconnections))
+        {
+            next if $dbc->isDR();    # skip DRs
+
+            my $type = $dbc->type();
+            next if $type =~ /star/;
+
+            my $product     = $dbc->product();
+            my $prodName    = $product->name();
+            my $service     = $product->service();
+            my $virtualHost = $dbc->host();
+            my $activeHost  = $product->activeHostForVirtualHostInCluster($virtualHost, $cluster);
+            my $instance = my $sid = uc ($dbc->sid());
+            unless ($activeHost)
+            {
+                #forcing n/a data to stratus for oracle summary dashboard
+                my %queries = ();
+                $queries{"$virtualHost locking"} = {
+                                                               inf_field => "locking",
+                                                               perl => sub {return 0},
+                                                               inf_tags    => qq(sid=$instance,host=$virtualHost),
+                                                               inf_default => 0,
+                                                               group_by    => qq($instance,$virtualHost),
+                                                              };
+
+                $queries{" [$instance] on $virtualHost no of blocking count "} = {
+                                                                             crit        => "numrows > 0",
+                                                                             perl        => sub {return 0},
+                                                                             inf_field   => "no_of_blocking_count",
+                                                                             inf_default => 0,
+                                                                             inf_tags    => qq(sid=$instance,host=$virtualHost),
+                                                                             group_by    => qq($instance,$virtualHost),
+                                                                            };
+
+                $queries{" [$instance] on $virtualHost no of blocking"} = {
+                                                                      perl        => sub {return "none"},
+                                                                      inf_field   => "no_of_blocking",
+                                                                      inf_default => "none",
+                                                                      inf_tags    => qq(sid=$instance,host=$virtualHost),
+                                                                      group_by    => qq($instance,$virtualHost),
+                                                                     };
+                $queries{influx_details} = {measurement => 'dba_db_locking'};
+                my $qm = ariba::monitor::QueryManager->newWithDetails("dba", $product->name(), $product->service(), undef, \%queries);
+
+                $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+                next;
+            }
+
+            next if $instance =~ /HANA/;          # skip hana SIDs
+            next if $instance =~ /(MON|RMAN)/;    # skip MON and RMAN SIDs
+            next if $activeHost =~ /hana/i;       # skip hana Hosts
+
+            my $user = "sys";
+            my $pass = $me->default("dbainfo.$user.password");
+            my $oc   = ariba::Ops::OracleClient->new($user, $pass, $sid, $virtualHost);
+            $oc->connect();
+            my @results;
+            my $no_of_blocking_count = 0;
+            my @massaged_data;
+            unless ($oc->error())
+            {
+                my $sql =
+q(select B.USERNAME ||' ('||B.SID||','||B.SERIAL#||','||B.CLIENT_IDENTIFIER||','||B.SQL_ID||','||B.PREV_SQL_ID||') is Currently '||B.STATUS||' for last '||W.LAST_CALL_ET||' Sec and it''s BLOCKING user '|| W.USERNAME|| ' ('||W.SID||','||W.SERIAL#||','||W.CLIENT_IDENTIFIER||','||W.sql_id||','||W.prev_sql_id||')' from (select SID,SERIAL#,USERNAME,STATUS,BLOCKING_SESSION,LAST_CALL_ET,sql_id,prev_sql_id,CLIENT_IDENTIFIER from v$session where BLOCKING_SESSION >0 and type <> 'BACKGROUND' and event like '%enq%' and last_call_et > 180) W, (select SID,SERIAL#,USERNAME,STATUS,LAST_CALL_ET,sql_id,prev_sql_id,CLIENT_IDENTIFIER from v$session where type <> 'BACKGROUND' and sid in (select blocking_session from v$session where blocking_session >0)) B where W.BLOCKING_SESSION=B.SID union select B.USERNAME ||' ('||B.SID||','||B.SERIAL#||','||B.CLIENT_IDENTIFIER||','||B.SQL_ID||','||B.PREV_SQL_ID||') is Currently '||B.STATUS||' for last '||W.LAST_CALL_ET||' Sec and it''s BLOCKING user '|| W.USERNAME|| ' ('||W.SID||','||W.SERIAL#||','||W.CLIENT_IDENTIFIER||','||W.sql_id||','||W.prev_sql_id||')' from (select SID,SERIAL#,USERNAME,STATUS,BLOCKING_SESSION,LAST_CALL_ET,sql_id,prev_sql_id,CLIENT_IDENTIFIER from v$session where BLOCKING_SESSION >0 and type <> 'BACKGROUND' and last_call_et > 90 and event like '%enq%') W, (select SID,SERIAL#,USERNAME,STATUS,LAST_CALL_ET,sql_id,prev_sql_id,CLIENT_IDENTIFIER from v$session where sid in (select blocking_session from v$session where blocking_session >0 group by blocking_session having count(*) > 10) and type <> 'BACKGROUND') B where W.BLOCKING_SESSION=B.SID);
+                $oc->executeSqlWithTimeout($sql, 400, \@results);
+                $no_of_blocking_count = scalar (@results);
+                if ($no_of_blocking_count)
+                {
+                    foreach my $hash (@results)
+                    {
+                        foreach my $key (keys %{$hash})
+                        {
+                            push (@massaged_data, $hash->{$key});
+                        }
+                    }
+                }
+            }
+            my $data_str = join (";", @massaged_data);
+
+            my %queries = ();
+
+            my $time_interval = 30;    # we want to have different time intervals for TX and SV sids
+            $time_interval = 180 if ($dbc->isStarSchema());
+
+            $queries{" [$instance] on $activeHost locking"} = {
+                                                               info              => 'answer = 0',
+                                                               sql               => "select db_wait_monitor($time_interval,20,360) as locking from dual",
+                                                               format            => "<html>%s<br></td><td>queryError</html>",
+                                                               timeout           => 400,
+                                                               recordMaxResults  => 110000,
+                                                               uiHint            => 'Locking',
+                                                               description       => 'This query detects locking on the database. Call DBA immediately if paged.',
+                                                               correctiveActions => [
+                                                                                     Ops => 'If crit, escalate to DBA',
+                                                                                    ],
+                                                               inf_tags    => qq(sid=$instance,host=$activeHost),
+                                                               inf_default => 0,
+                                                               group_by    => qq($instance,$activeHost),
+                                                              };
+            $queries{" [$instance] on $activeHost no of blocking count "} = {
+                                                                             crit        => "numrows > 0",
+                                                                             perl        => $no_of_blocking_count,
+                                                                             inf_field   => "no_of_blocking_count",
+                                                                             inf_default => 0,
+                                                                             inf_tags    => qq(sid=$instance,host=$activeHost),
+                                                                             group_by    => qq($instance,$activeHost),
+                                                                            };
+
+            $queries{" [$instance] on $activeHost no of blocking"} = {
+                                                                      perl        => sub {return $data_str},
+                                                                      inf_field   => "no_of_blocking",
+                                                                      inf_default => "none",
+                                                                      inf_tags    => qq(sid=$instance,host=$activeHost),
+                                                                      group_by    => qq($instance,$activeHost),
+                                                                     };
+
+            $queries{influx_details} = {measurement => 'dba_db_locking'};
+            my $qm = ariba::monitor::QueryManager->newWithDetails("dba", $product->name(), $product->service(), undef, \%queries);
+
+            $qm->setSQLConnectInfo($user, $pass, $instance, $activeHost);
+            $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+        }
+    }
+}
+
+main();
+
+__END__

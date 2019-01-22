@@ -1,0 +1,540 @@
+<html xmlns:v="urn:schemas-microsoft-com:vml"
+xmlns:o="urn:schemas-microsoft-com:office:office"
+xmlns:x="urn:schemas-microsoft-com:office:excel"
+xmlns:dt="uuid:C2F41010-65B3-11d1-A29F-00AA00C14882"
+xmlns="http://www.w3.org/TR/REC-html40">
+
+<head>
+<meta http-equiv=Content-Type content="text/html; charset=windows-1252">
+<meta name=ProgId content=Excel.Sheet>
+<meta name=Generator content="Microsoft Excel 9">
+<!--[if !mso]>
+<style>
+v\:* {behavior:url(#default#VML);}
+o\:* {behavior:url(#default#VML);}
+x\:* {behavior:url(#default#VML);}
+.shape {behavior:url(#default#VML);}
+</style>
+<![endif]-->
+
+<OWVar 
+	id=title
+	value=ASN UpTime
+	nodisplay=1 
+/>
+
+<OWVar 
+	id=column-header
+	value=3
+	nodisplay=1 
+/>
+
+<OWVar 
+	id=num-records
+	value=*scalar(ariba::monitor::CircularDB->new("an/business-metrics/uptime/sla")->readRecords())*
+	nodisplay=1 
+/>
+
+<OWVar 
+	id=first-row
+	value=4
+	nodisplay=1 
+/>
+
+<OWVar 
+	id=last-row
+	value=*ariba::Ops::OW::Var->new("first-row")->value()+ariba::Ops::OW::Var->new("num-records")->value()-1*
+	nodisplay=1 
+/>
+
+<!--[if gte mso 9]><xml>
+ <o:DocumentProperties>
+  <o:Author>AN Operations</o:Author>
+  <o:LastAuthor>Employee of</o:LastAuthor>
+  <o:LastPrinted>2003-04-08T01:11:30Z</o:LastPrinted>
+  <o:Created>2001-01-23T06:35:27Z</o:Created>
+  <o:LastSaved>2003-04-23T18:39:57Z</o:LastSaved>
+  <o:Version>9.4402</o:Version>
+ </o:DocumentProperties>
+ <o:CustomDocumentProperties>
+  <o:_AdHocReviewCycleID dt:dt="float">-439820206</o:_AdHocReviewCycleID>
+  <o:_EmailSubject dt:dt="string">*ariba::Ops::OW::Var->new("title")->value()* Stats</o:_EmailSubject>
+  <o:_AuthorEmail dt:dt="string">an_ops@ariba.com</o:_AuthorEmail>
+  <o:_AuthorEmailDisplayName dt:dt="string">AN Operations</o:_AuthorEmailDisplayName>
+  <o:_ReviewingToolsShownOnce dt:dt="string"></o:_ReviewingToolsShownOnce>
+ </o:CustomDocumentProperties>
+ <o:OfficeDocumentSettings>
+  <o:DownloadComponents/>
+ </o:OfficeDocumentSettings>
+</xml><![endif]-->
+
+<style>
+<!--table
+	{mso-displayed-decimal-separator:"\.";
+	mso-displayed-thousand-separator:"\,";}
+@page
+	{margin:1.0in .75in 1.0in .75in;
+	mso-header-margin:.5in;
+	mso-footer-margin:.5in;}
+.font7
+	{color:black;
+	font-size:8.0pt;
+	font-weight:400;
+	font-style:normal;
+	text-decoration:none;
+	font-family:Tahoma;
+	mso-generic-font-family:auto;
+	mso-font-charset:0;}
+.font9
+	{color:black;
+	font-size:8.0pt;
+	font-weight:700;
+	font-style:normal;
+	text-decoration:none;
+	font-family:Tahoma;
+	mso-generic-font-family:auto;
+	mso-font-charset:0;}
+tr
+	{mso-height-source:auto;}
+col
+	{mso-width-source:auto;}
+br
+	{mso-data-placement:same-cell;}
+.style0
+	{mso-number-format:General;
+	text-align:general;
+	vertical-align:bottom;
+	white-space:nowrap;
+	mso-rotate:0;
+	mso-background-source:auto;
+	mso-pattern:auto;
+	color:windowtext;
+	font-size:10.0pt;
+	font-weight:400;
+	font-style:normal;
+	text-decoration:none;
+	font-family:Arial;
+	mso-generic-font-family:auto;
+	mso-font-charset:0;
+	border:none;
+	mso-protection:locked visible;
+	mso-style-name:Normal;
+	mso-style-id:0;}
+td
+	{mso-style-parent:style0;
+	padding:0px;
+	mso-ignore:padding;
+	color:windowtext;
+	font-size:10.0pt;
+	font-weight:400;
+	font-style:normal;
+	text-decoration:none;
+	font-family:Arial;
+	mso-generic-font-family:auto;
+	mso-font-charset:0;
+	mso-number-format:General;
+	text-align:general;
+	vertical-align:bottom;
+	border:none;
+	mso-background-source:auto;
+	mso-pattern:auto;
+	mso-protection:locked visible;
+	white-space:nowrap;
+	mso-rotate:0;}
+.xl24
+	{mso-style-parent:style0;
+	font-weight:700;
+	font-family:Arial, sans-serif;
+	mso-font-charset:0;}
+.xl25
+	{mso-style-parent:style0;
+	mso-number-format:"mmm\\-yy";}
+.xl26
+	{mso-style-parent:style0;
+	font-weight:700;
+	font-family:Arial, sans-serif;
+	mso-font-charset:0;
+	text-align:center;}
+.xl27
+	{mso-style-parent:style0;
+	font-weight:700;
+	font-style:italic;
+	font-family:Arial, sans-serif;
+	mso-font-charset:0;}
+.xl28
+	{mso-style-parent:style0;
+	font-family:Arial, sans-serif;
+	mso-font-charset:0;}
+.xl29
+	{mso-style-parent:style0;
+	font-weight:700;
+	font-family:Arial, sans-serif;
+	mso-font-charset:0;
+	mso-number-format:Fixed;}
+-->
+</style>
+<![if !supportAnnotations]><style id="dynCom" type="text/css"><!-- --></style>
+
+<![endif]>
+
+<!--[if gte mso 9]><xml>
+ <x:ExcelWorkbook>
+  <x:ExcelWorksheets>
+   <x:ExcelWorksheet>
+    <x:Name>*ariba::Ops::OW::Var->new("title")->value()*</x:Name>
+    <x:WorksheetOptions>
+     <x:Selected/>
+     <x:ProtectContents>False</x:ProtectContents>
+     <x:ProtectObjects>False</x:ProtectObjects>
+     <x:ProtectScenarios>False</x:ProtectScenarios>
+    </x:WorksheetOptions>
+   </x:ExcelWorksheet>
+  </x:ExcelWorksheets>
+  <x:WindowHeight>8730</x:WindowHeight>
+  <x:WindowWidth>13035</x:WindowWidth>
+  <x:WindowTopX>120</x:WindowTopX>
+  <x:WindowTopY>90</x:WindowTopY>
+  <x:TabRatio>757</x:TabRatio>
+  <x:ProtectStructure>False</x:ProtectStructure>
+  <x:ProtectWindows>False</x:ProtectWindows>
+ </x:ExcelWorkbook>
+</xml><![endif]-->
+
+<!--[if gte mso 9]><xml>
+ <o:shapedefaults v:ext="edit" spidmax="21505"/>
+</xml><![endif]-->
+
+<!--[if gte mso 9]><xml>
+ <o:shapelayout v:ext="edit">
+  <o:idmap v:ext="edit" data="18"/>
+ </o:shapelayout></xml><![endif]-->
+</head>
+
+<body link=blue vlink=purple>
+
+<table x:str>
+
+ <col width=64 span=3 style='width:48pt'>
+ <col width=76 style='mso-width-source:userset;mso-width-alt:2779;width:57pt'>
+ <col width=64 span=13 style='width:48pt'>
+
+ <tr>
+  <td class=xl24 style='mso-ignore:colspan'>*ariba::Ops::OW::Var->new("title")->value()*</td>
+ </tr>
+ <tr>
+  <td colspan=5></td>
+  <td style='mso-ignore:colspan-rowspan;height:440pt;width:500pt'>
+
+  <!--[if gte vml 1]>
+  <v:shape id="_x0000_s18436"
+     type="#_x0000_t201"
+	 style='position:absolute;
+     margin-left:0;margin-top:0;width:530pt;height:400pt;z-index:4'
+     fillcolor="window [78]"
+	 strokecolor="windowText [77]"
+	 strokeweight="1emu"
+     o:insetmode="auto">
+
+  <v:fill color2="windowText [77]"/>
+  <o:lock v:ext="edit" rotation="t" text="t"/>
+
+
+   <x:ClientData ObjectType="Chart">
+    <x:WebChart>
+     <x:Scaling>
+      <x:ScaleID>0</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>1</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+      <x:Minimum>97</x:Minimum>
+      <x:Maximum>100</x:Maximum>
+     </x:Scaling>
+     <x:Chart>
+      <x:Name>Chart 4</x:Name>
+      <x:Title>
+       <x:Caption>
+        <x:DataSource>-1</x:DataSource>
+        <x:Data>&quot;<x:B>*ariba::Ops::OW::Var->new("title")->value()* %</x:B>&quot;</x:Data>
+       </x:Caption>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>18.75</x:Size>
+        <x:B/>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Border>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Interior>
+      </x:Title>
+      <x:Options>
+       <x:SizeWithWindow/>
+      </x:Options>
+      <x:PageSetup>
+       <x:ChartSize>FullPage</x:ChartSize>
+      </x:PageSetup>
+      <x:Font>
+       <x:FontName>Arial</x:FontName>
+       <x:Size>15.75</x:Size>
+       <x:AutoScale/>
+      </x:Font>
+      <x:Left>0</x:Left>
+      <x:Top>0</x:Top>
+      <x:Width>11444.9853515625</x:Width>
+      <x:Height>9569.99267578125</x:Height>
+      <x:ChartGrowth>
+       <x:HorzGrowth>1</x:HorzGrowth>
+       <x:VertGrowth>1</x:VertGrowth>
+      </x:ChartGrowth>
+      <x:PlotArea>
+       <x:Border>
+        <x:ColorIndex>15</x:ColorIndex>
+        <x:LineStyle>Solid</x:LineStyle>
+        <x:Weight>Narrow</x:Weight>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Interior>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>15.75</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>0</x:ScaleID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:Series>
+         <x:Index>0</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$B$*ariba::Ops::OW::Var->new("column-header")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>SLA</x:Name>
+         <x:Line>
+          <x:ColorIndex>24</x:ColorIndex>
+          <x:LineStyle>Solid</x:LineStyle>
+          <x:Weight>Wide</x:Weight>
+         </x:Line>
+         <x:Category>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$A$*ariba::Ops::OW::Var->new("first-row")->value()*:$A$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Category>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$B$*ariba::Ops::OW::Var->new("first-row")->value()*:$B$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:Series>
+         <x:Index>1</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$C$*ariba::Ops::OW::Var->new("column-header")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>All</x:Name>
+         <x:Line>
+          <x:ColorIndex>2</x:ColorIndex>
+          <x:LineStyle>Solid</x:LineStyle>
+          <x:Weight>Wide</x:Weight>
+         </x:Line>
+         <x:Marker>
+          <x:Symbol>Square</x:Symbol>
+          <x:Size>9</x:Size>
+          <x:Border>
+           <x:ColorIndex>2</x:ColorIndex>
+          </x:Border>
+          <x:Interior>
+           <x:ColorIndex>2</x:ColorIndex>
+          </x:Interior>
+         </x:Marker>
+         <x:Category>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$A$*ariba::Ops::OW::Var->new("first-row")->value()*:$A$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Category>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$C$*ariba::Ops::OW::Var->new("first-row")->value()*:$C$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:Series>
+         <x:Index>2</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$D$*ariba::Ops::OW::Var->new("column-header")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>Unplanned</x:Name>
+         <x:Line>
+          <x:ColorIndex>49</x:ColorIndex>
+          <x:LineStyle>Dot</x:LineStyle>
+          <x:Weight>Wide</x:Weight>
+         </x:Line>
+         <x:Marker>
+          <x:Symbol>Triangle</x:Symbol>
+          <x:Size>5</x:Size>
+          <x:Border>
+           <x:ColorIndex>49</x:ColorIndex>
+          </x:Border>
+          <x:Interior>
+           <x:ColorIndex>49</x:ColorIndex>
+          </x:Interior>
+         </x:Marker>
+         <x:Category>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$A$*ariba::Ops::OW::Var->new("first-row")->value()*:$A$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Category>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$D$*ariba::Ops::OW::Var->new("first-row")->value()*:$D$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Axis>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>0</x:AxisID>
+        <x:ScaleID>0</x:ScaleID>
+        <x:CrossingAxis>1</x:CrossingAxis>
+        <x:CrossesAt>97</x:CrossesAt>
+        <x:Alignment>
+         <x:Rotation>90</x:Rotation>
+        </x:Alignment>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>14</x:Size>
+         <x:B/>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:FormatString>mmm\-yy</x:FormatString>
+        </x:Number>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>1</x:AxisID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:MajorGridlines/>
+        <x:CrossingAxis>0</x:CrossingAxis>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>15.75</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:BuiltInFormat>0</x:BuiltInFormat>
+        </x:Number>
+        <x:Type>Value</x:Type>
+       </x:Axis>
+      </x:PlotArea>
+      <x:Legend>
+       <x:Placement>Bottom</x:Placement>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>15.75</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+      </x:Legend>
+     </x:Chart>
+    </x:WebChart>
+   </x:ClientData>
+  </v:shape><![endif]--><![if !vml]><span style='mso-ignore:vglayout'>
+  <table cellpadding=0 cellspacing=0>
+   <tr>
+    <td width=1 height=0></td>
+   </tr>
+   <tr>
+   </tr>
+   <tr>
+    <td height=7></td>
+   </tr>
+  </table>
+  </span><![endif]><!--[if !mso & vml]><span style='width:576.0pt;height:484.5pt'></span><![endif]--></td>
+ </tr>
+
+
+ <tr>
+  <td class=xl26>Month</td>
+  <td class=xl26>SLA</td>
+  <td class=xl26>All</td>
+  <td class=xl26>Unplanned</td>
+  <td></td>
+ </tr>
+
+ <OWParallelRepetition
+	list0=*ariba::monitor::CircularDB->new("an/business-metrics/uptime/sla")->readRecords()*
+	list1=*ariba::monitor::CircularDB->new("an/business-metrics/uptime/all")->readRecords()*
+	list2=*ariba::monitor::CircularDB->new("an/business-metrics/uptime/unplanned")->readRecords()*>
+
+  <tr>
+	<td x:str>*POSIX::strftime('%b-%y',localtime($$currentItem0[0]-2332800))*</td>
+	<td x:num>*$$currentItem0[1]*</td>
+	<td x:num>*$$currentItem1[1]*</td>
+	<td x:num>*$$currentItem2[1]*</td>
+  </tr>
+ </OWParallelRepetition>
+
+
+ <tr></tr>
+ <tr></tr>
+ <tr></tr>
+ <tr></tr>
+
+ <tr>
+  <td colspan=5></td>
+  <td width=42></td>
+  <td width=42></td>
+  <td width=42></td>
+  <td width=42></td>
+  <td></td>
+ </tr>
+
+ <tr>
+  <td colspan=5></td>
+  <td class=xl24>Averages</td>
+  <td class=xl29 align=right x:num x:fmla="=AVERAGE(B*ariba::Ops::OW::Var->new("first-row")->value()*:B*ariba::Ops::OW::Var->new("last-row")->value()*)"></td>
+  <td class=xl29 align=right x:num x:fmla="=AVERAGE(C*ariba::Ops::OW::Var->new("first-row")->value()*:C*ariba::Ops::OW::Var->new("last-row")->value()*)"></td>
+  <td class=xl29 align=right x:num x:fmla="=AVERAGE(D*ariba::Ops::OW::Var->new("first-row")->value()*:D*ariba::Ops::OW::Var->new("last-row")->value()*)"></td>
+  <td></td>
+ </tr>
+
+ <tr>
+  <td colspan=5></td>
+  <td class=xl24>2001 Avg</td>
+  <td class=xl29 align=right x:num x:fmla="=AVERAGE(B7:B18)"></td>
+  <td class=xl29 align=right x:num x:fmla="=AVERAGE(C7:C18)"></td>
+  <td class=xl29 align=right x:num x:fmla="=AVERAGE(D7:D18)"></td>
+  <td></td>
+ </tr>
+
+ <tr>
+  <td colspan=5></td>
+  <td class=xl24>2002 Avg</td>
+  <td class=xl29 align=right x:num x:fmla="=AVERAGE(B19:B30)"></td>
+  <td class=xl29 align=right x:num x:fmla="=AVERAGE(C19:C30)"></td>
+  <td class=xl29 align=right x:num x:fmla="=AVERAGE(D19:D30)"></td>
+  <td></td>
+ </tr>
+
+ <tr>
+  <td colspan=5></td>
+  <td class=xl24>2003 Avg</td>
+  <td class=xl29 align=right x:num x:fmla="=AVERAGE(B31:B*ariba::Ops::OW::Var->new("last-row")->value()*)"></td>
+  <td class=xl29 align=right x:num x:fmla="=AVERAGE(C31:C*ariba::Ops::OW::Var->new("last-row")->value()*)"></td>
+  <td class=xl29 align=right x:num x:fmla="=AVERAGE(D31:D*ariba::Ops::OW::Var->new("last-row")->value()*)"></td>
+  <td></td>
+ </tr>
+
+</table>
+
+</body>
+
+</html>

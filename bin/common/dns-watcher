@@ -1,0 +1,231 @@
+#!/usr/local/bin/perl -w
+
+# machine-watcher 97-04-02 Dan Grillo <grio@280.com>
+# $Id: //ariba/services/monitor/bin/common/dns-watcher#23 $
+#
+# Based on an idea in a program orginally by Bryce Jasmer
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::MachineHelper;
+use ariba::monitor::misc;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use dmail::LockLib;
+use Net::DNS;
+
+my $debug = 0;
+
+# 5 minutes
+my $hysteresis = 5 * 60;
+my $res	       = Net::DNS::Resolver->new();
+
+sub main {
+
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $email;
+	my $dnsRecordFile;
+	$res->tcp_timeout(15);
+	$res->udp_timeout(15);
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-p/o) { $sendPage = 1; };
+		if ($arg =~ /^-d/o) { $debug = 1; };
+		if($arg !~ /^-/o){ $dnsRecordFile = $arg; };
+	}
+
+	my $me          = ariba::rc::InstalledProduct->new();
+	my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+	my $pager       = $me->default('notify.email');
+	my $qmName	= 'dns-watcher-stratus';
+	my $progName	= $0;
+
+	my $lockFile = "/tmp/$qmName";
+
+	if (!dmail::LockLib::requestlock($lockFile,10)) {
+		die "can't grab lock\n";
+	}
+
+	#
+	ariba::monitor::MachineHelper::setDebug($debug);
+
+	# The config file can modify our resolver behavior.
+	my @otherDnsRecords = ();
+	my $dnsServer = readConfigFile($dnsRecordFile, \@otherDnsRecords) if $dnsRecordFile;
+
+	my @allServerList = $res->nameservers();
+
+	my ($goodListRef, $badListRef) = getGoodList(@allServerList);
+
+	my @goodList = @$goodListRef;
+	my @badList = @$badListRef;
+
+	$res->nameservers(@goodList) if @goodList;
+
+	for my $datacenter (@dataCenters) {
+
+		my %match = (
+			datacenter => $datacenter,
+			status     => 'inservice',
+		);
+
+		my @machines = sort { $a->hostname() cmp $b->hostname() } (
+			ariba::Ops::Machine->machinesWithProperties(%match),
+			@otherDnsRecords,
+		);
+
+		next unless(@machines);
+
+		print "checking $#machines machines in $datacenter\n" if $debug;
+
+		my %queries = ();
+		my $badListString;
+		my $badCount = 0;
+
+		unless(@badList) {
+			$badListString = "ok";
+		} else {
+			$badListString = join(', ', @badList);
+			$badCount = scalar(@badList);
+		}
+
+		$queries{"Invalid DNS servers"} = {
+			noRowCount => 1,
+			format     => "</td><td colspan=2>%s",
+			info       => 1,
+			crit       => "answer ne 'ok'",
+			perl       => sub { return $badListString },
+            inf_field => "invalidDNSServers",
+            inf_default => "ok",
+            inf_tag => qq(datacenter="$datacenter"),
+            group_by => "$datacenter",
+		};
+
+		$queries{"Invalid DNS servers count"} = {
+			noRowCount => 1,
+			format     => "</td><td colspan=2>%s",
+			info       => 1,
+			crit       => "answer > 0",
+			perl       => sub { return $badCount },
+			inf_field => "invalidDNSServersCount",
+			inf_default => 0,
+			inf_tag => qq(datacenter="$datacenter"),
+			group_by => "$datacenter",
+		};
+
+		if (@goodList) {
+			for my $machine (@machines) {
+				$queries{sprintf("%s dns entry", $machine->hostname())} = {
+					noRowCount => 1,
+					format     => "</td><td>%s</td><td>scaledStatusChangeTime\n",
+					info       => "answer eq '0'", # up
+					warn       => "answer eq '1'", # sick
+					crit       => "answer eq '2'", # down
+					perl       => sub { main::checkDNS($machine) },
+                    inf_field  => "DNSStaus",
+                    inf_tags   => qq|hostname="|.$machine->hostname().qq|"|,
+                    inf_default => 0,
+                    group_by => "$datacenter".$machine->hostname(),
+				};
+			}
+		}
+
+        $queries{influx_details} = {measurement => "dns_watcher"};
+		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			$qmName, $pn, $me->service(), $me->customer(), \%queries
+		);
+
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+	}
+
+	dmail::LockLib::releaselock($lockFile);
+
+	exit 0;
+}
+
+sub readConfigFile {
+	my ($file, $dnsRecords) = @_;
+
+	my $dnsServer = "";
+
+	print "readConfigFile($file)\n" if $debug;
+
+	open(CONFIG, $file) || return $dnsServer;
+	while (<CONFIG>) {
+
+		next if /^#/o;
+		next if /^;/o;
+		chomp;
+		next if /^\s*$/o;
+
+		if (/=/ && s/^set\s*//o) {
+
+			my ($key, $value) = split(/\s*=\s*/o,$_,2);
+
+			if ($key eq "server" || $key eq "dns-server") {
+				$dnsServer = $value;
+			}
+
+		} else {
+
+			my ($host)  = split(':');
+			my $machine = ariba::Ops::Machine->new($host);
+
+			$machine->setHostname($host);
+
+			push(@$dnsRecords, $machine);
+		}
+	}
+
+	close(CONFIG);
+	print "using dnsserver = $dnsServer, specified in $file\n" if $debug;
+
+	return $dnsServer;
+}
+
+sub checkDNS {
+	my $machine = shift;
+
+	my $query = $res->search( $machine->hostname() );
+
+	$machine->setNewTime(time());
+
+	unless ($query) {
+		$machine->setNewStatus(2);
+		$machine->setNewError($res->errorstring());
+	} else {
+		$machine->setNewStatus(0);
+	}
+
+	return $machine->newStatus();
+}
+
+sub getGoodList {
+	my @thisServerList = @_;
+	my @thisGoodList;
+	my @thisBadList;
+
+	for my $ns (@thisServerList) {
+		$res->nameservers($ns) if $ns;
+
+		unless ($res->search($ns)) {
+			push(@thisBadList, $ns);
+		} else {
+			push(@thisGoodList, $ns);
+		}
+	}
+
+	$res->nameservers(@thisServerList);
+
+	return (\@thisGoodList, \@thisBadList);
+}
+
+main();

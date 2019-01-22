@@ -1,0 +1,456 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/common/cds-health#12 $
+#
+# Monitoring for health of CDS connectivity
+#
+#
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::Url;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+use XML::Simple;
+use Data::Dumper;
+
+# 
+# Yes, you can, because each node has its own local cache with Peer
+# information.
+# 
+# Do i have to need to hit it on multiple nodes or just one node?
+# I think one node is enough, but here is how we update each node's cache:
+# 
+# We have some "master" nodes pinging the peer side every 1mn. The master
+# nodes are the Admin Nodes + the first node joining the Cluster. When
+# these nodes detect a change on the peer site, they notify the rest of
+# the nodes which will trigger a cxml request to get the latest peer
+# information.
+# 
+# So if you had to pick one node, it would be an admin node.
+# 
+# 
+# How often can i hit it and how long does it take to respond?
+# 
+# Since we update the peer service cache every minute, I guess you should
+# hit the node on the same time basis. The response should be very quick
+# since it is based on cached information.
+# 
+# 
+# 
+# Here is the name of the Direct Action for CDS Ops Monitoring:
+# CdsActivity
+# 
+# You can find more details on this direct action here:
+# https://rc.ariba.com/cgi-bin/change-info?change=1060418
+#
+
+sub main {
+    my $debug = 0;
+    my $quiet = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $productName;
+
+    while(my $arg=shift(@ARGV)){
+            print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+            if($arg =~ /^-d/o){ ++$debug; }
+            if($arg =~ /^-e/o){ $sendEmail=1; };
+            if($arg =~ /^-p$/o){ $sendPage=1; };
+            if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+    my $email = $me->default('notify.email');
+
+    my @products;
+
+    my $isAspProduct = 0;
+    if (ariba::rc::Globals::isASPProduct($productName)) {
+        @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+        $isAspProduct = 1;
+
+    } else {
+        unless (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
+            exit(0);
+        }
+
+        @products = (ariba::rc::InstalledProduct->new($productName, $service));
+        my $product = $products[0];
+
+    }
+
+    for my $product (@products) {
+        my $skip = 0;
+
+        my %queries  = ();
+        my %communitiesDone;
+        my $incremental_pull_status = 0;
+        
+        for my $instance ($product->appInstancesInCluster($cluster)) {
+
+            my $community = $instance->community();
+            if ($community) {
+                $community = "community $community";
+            } else {
+                $community = "default community";
+            }
+
+            next if ($communitiesDone{$community});
+            $communitiesDone{$community} = 1;
+
+            my ($uiHint, $communityString);
+            if ($isAspProduct) {
+                $uiHint = undef;
+                $communityString = "";
+            } else {
+                $uiHint = $community;
+                $communityString = "in $community";
+            }
+
+            my $url = $instance->cdsActivityURL();
+            next unless $url;
+
+            print "url = $url\n" if ($debug);
+
+            my $cdsActivity = ariba::monitor::Url->new($url);
+
+            my @results = $cdsActivity->request(45);
+
+            print "\n---\n", join("", @results), "\n---\n" if ($debug > 1);
+
+            my ($peerProductStatus, $workingRealmsRef, $errorRealmsRef, $taskErrorsRef, $error) = parseCdsActivityDetails(\@results);
+
+            #
+            # Note the peer products health
+            #
+            $queries{"CDS peer product status $communityString"} = {
+
+                'info' => 1,
+                'skip' => $skip,
+                'warn' => "!defined(answer) || answer !~ /OK/",
+                'error' => $error,
+                'note' => $error,
+                'uiHint' => $uiHint,
+                'perl' => sub { return $peerProductStatus},
+                'inf_field' => "peer_prod_status",
+                'inf_default' => "none",
+                'inf_tags' =>  qq(community="$community"),
+                'group_by' =>  "$community"
+            };
+
+            #
+            # working cds integrated realms
+            #
+            $queries{"CDS integrated realms with working peer connection $communityString"} = {
+
+                'info' => 1,
+                'skip' => $skip,
+                'uiHint' => $uiHint,
+                'error' => $error,
+                'note' => $error,
+                'perl' => sub { return join("\n", @$workingRealmsRef); },
+                'inf_field' => "integrated_realms_with_working_peer",
+                'inf_default' => "none",
+                'inf_tags' =>  "community=\"$community\"",
+                'group_by' =>  "$community"
+            };
+
+            $queries{"CDS integrated realms with working peer connection count $communityString"} = {
+
+                'info' => 1,
+                'skip' => $skip,
+                'uiHint' => $uiHint,
+                'error' => $error,
+                'note' => $error,
+                'perl' => sub { return scalar(@$workingRealmsRef); },
+                'inf_field' => "integrated_realms_with_working_peer_cnt",
+                'inf_default' => 0,
+                'inf_tags' =>  qq(community="$community"),
+                'group_by' =>  "$community"
+            };
+
+            #
+            # cds integrated realms that have problems
+            #
+            $queries{"CDS integrated realms with peer connection in error $communityString"} = {
+
+                'info' => 1,
+                'warn' => "numrows > 1",
+                'crit' => "numrows > 5 and previousAnswer > 5",
+                'skip' => $skip,
+                'uiHint' => $uiHint,
+                'note' => $error,
+                'perl' => sub { return join("\n", @$errorRealmsRef); },
+                'inf_field' => "integrated_realms_with_peer_error",
+                'inf_default' => "none",
+                'inf_tags' =>  "community=\"$community\"",
+                'group_by' =>  "$community"
+            };
+
+            $queries{"CDS integrated realms with peer connection in error cnt $communityString"} = {
+
+                'info' => 1,
+                'warn' => "numrows > 1",
+                'crit' => "numrows > 5 and previousAnswer > 5",
+                'skip' => $skip,
+                'uiHint' => $uiHint,
+                'note' => $error,
+                'perl' => sub { return scalar(@$errorRealmsRef); },
+                'inf_field' => "integrated_realms_with_peer_error_cnt",
+                'inf_default' => 0,
+                'inf_tags' =>  qq(community="$community"),
+                'group_by' =>  "$community"
+            };
+            #
+            # tasks that had errors
+            $queries{"CDS tasks with errors $communityString"} = {
+                'info' => 1,
+                'warn' => "numrows > 0",
+                #'ticketOnWarnOpenAfterMinutes' => 10,
+                'error' => $error,
+                'note' => $error,
+                'uiHint' => $uiHint,
+                'skip' => $skip,
+                'perl' => sub { return join("\n", @$taskErrorsRef); },
+                'inf_field' => "tasks_with_errors",
+                'inf_default' => "none",
+                'inf_tags' =>  "community=\"$community\"",
+                'group_by' =>  "$community"
+            };
+
+    
+            #
+            #ForMasterDataPullErrors
+            #
+            #skipping if DA is parsed already .For first time $incremental_pull_status is set as zero.Next it is set as 1
+            unless( $incremental_pull_status ) {
+                my $pull_url = $instance->incrementalPullStatusURL();
+                next unless $pull_url;
+                print "url = $pull_url\n" if ($debug);
+    
+                my $incrementalPullStatus = ariba::monitor::Url->new($pull_url);
+                my $xml_results = $incrementalPullStatus->request(45);
+                print "\n---\n", join("", $xml_results), "\n---\n" if ($debug > 4);
+                my ($xml_ref) = parseIncrementalPullStatusDetails($xml_results);
+    
+                if($xml_ref) {  
+                    
+                    print Dumper($xml_ref) if( $debug > 1);
+                    my $pull_status;
+                    foreach my $realm_id( keys( %{$xml_ref->{realm}} ) ) {
+                    
+                        my $failure_count = $xml_ref->{realm}->{$realm_id}->{'failure_count'};
+                        my $pull_error = Dumper($xml_ref->{realm}->{$realm_id}->{'message'});
+                        print "realm_id:$realm_id,failure_count:$failure_count,errors:$pull_error\n" if($debug >1);
+                    
+                        my ($pull_note,$pull_severity);
+                        if($failure_count > 20 ) {
+                            $pull_severity = 1;
+                            $pull_note = "Notify Dinesh Kumar";
+                            $pull_status .= "CRITICAL realm $realm_id: $failure_count\n";
+                        }elsif($failure_count > 10 ) {
+                            $pull_note = "Notify Dinesh Kumar, Raghavendra Rao, Namrata Sarada";#This will be replaced with team-specific DL
+                            $pull_status .= "Warning  realm $realm_id: $failure_count\n";
+                        }
+                
+                        $queries{"Master Data Pull Error Failure Count "} = {
+                            'warn' => "answer =~/Warning/si",
+                            'crit' => "answer =~/Critical/si",
+                            'url'  => $pull_url,
+                            'correctiveActions' => "$pull_note",
+                            'severity' => $pull_severity,
+                            'perl' => sub { return "$pull_status"; },
+                            inf_field => "master_data_pull_error_cnt",
+                            inf_default  => 0,
+                        };
+                    }
+                }
+                $incremental_pull_status = 1;
+            }
+        }
+
+            $queries{"influx_details"} = { 'measurement' => "cds_health"  };
+        my $q = ariba::monitor::QueryManager->newWithDetails( "cds-health", $product->name(), $service, $product->customer(), \%queries);
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+
+}
+
+
+#
+# Can you also include some sample 'everything is good' and 'something is
+# bad' output?
+# 
+# Here are the different responses you can get:
+# 
+# No Suite Integrated realms detected in the system
+# --------------------------------------------------
+# 
+# <?xml version="1.0" ?>
+# <Realms />
+# 
+# 
+# Everything is good:
+# -------------------
+# 
+# <?xml version="1.0" ?>
+# <Realms>
+# <Realm name="realm_1" Status="Peer Connected" />
+# <Realm name="realm_3" Status="Peer Connected" />
+# </Realms>
+# 
+# 
+# Something is bad (realm_1 is disconnected ie not online):
+# ----------------------------------------------------------
+# 
+# <?xml version="1.0" ?>
+# <Realms>
+# <Realm name="realm_1" Status="Peer Disconnected" />
+# <Realm name="realm_3" Status="Peer Connected" />
+# </Realms>
+# 
+# 
+# Something is bad (realm_1 has more than 1 realm with same ANID
+# on the peer side):
+# ----------------------------------------------------------------
+# 
+# <?xml version="1.0" ?>
+# <Realms>
+# <Realm name="realm_1" Status=" Multiple Peers with same ANID" />
+# <Realm name="realm_3" Status="Peer Connected" />
+# </Realms>
+# 
+# The peer service is down
+# ------------------------
+# 
+# <?xml version="1.0" ?>
+# <Realms>Cannot connect to Peer Service</Realms>
+#
+# problem with CDS Task(s)
+#-------------------------------------
+#<Realm name="Horizon Blue Cross Blue Shield of NJ -T" Status="Peer Connected" >
+#<Task Name="CDSPullTask">
+#<Scheduler Name="CoreServer-prealm_318">
+#<Node Name="TaskCXML7010390" />
+#<Status status="error" />
+#<StatusCode code="2" />
+#<StartTime starttime="Fri May 07 12:24:36 PDT 2010" />
+#<EndTime endtime="Fri May 07 12:25:16 PDT 2010" />
+#</Scheduler>
+#</Task>
+#<Task Name="CDSPullTask">
+#<Scheduler Name="ApplicationAdapter-prealm_318">
+#<Node Name="TaskCXML7010390" />
+#<Status status="error" />
+#<StatusCode code="2" />
+#<StartTime starttime="Fri May 07 12:24:36 PDT 2010" />
+#<EndTime endtime="Fri May 07 12:25:16 PDT 2010" />
+#</Scheduler>
+#</Task>
+#</Realm>
+#<Realm>
+
+#
+# see realmConnectivity and getCDSTaskStatus in 
+# //ariba/platform/app/release/coreui/7.51.1+/ariba/htmlui/coreui/MonitorActions.java
+# this xml is pretty hacky (it's hard-coded to only have one
+# scheduler per task).
+#
+# Since this is the case, and since it's not really valid
+# XML, this parsing is going to be hacky as well.
+
+sub parseCdsActivityDetails {
+    my $results = shift;
+    my @output;
+    my $peerProductStatus = "OK";
+    my @workingRealms = ();
+    my @errorRealms = ();
+    my @taskErrors = ();
+    my %taskErrorsForRealm = ();
+
+    my $error = undef;
+
+    if (!@$results || $results->[0] !~ m!^<\?xml version="[^"]+"\?>!i) {
+        $error = "Error: cds direct action failed\n" . join("", @$results) . "\n";
+        $peerProductStatus = "Uknown";
+    }
+    
+    while (my $line = shift(@$results) ) {
+
+        my $realmName = "";
+
+        if ($line =~ m|^<Realms>(.*)</Realms>|i) {
+            $peerProductStatus = "Error: $1";
+            next;
+        }
+        if ($line =~ m!(Cannot connect to Peer Service)\s*<\s*/Realms\s*>!) {
+            $peerProductStatus = "Error: $1";
+            next;
+        }
+        if ($line =~ m!<Realm\s+name="\s*([^"]*)\s*"\s*Status="\s*([^"]*)\s*"\s*/?>!i) {
+            $realmName = $1;
+            my $status = $2;
+
+            #
+            # peer connected realms are code, all others are in
+            # error
+            #
+            if ($status =~ m!peer connected!i) {
+                push(@workingRealms, $realmName);
+            } else {
+                push(@errorRealms, "$realmName: $status");
+            }
+            next;
+        }
+
+        if ($line =~ m!<Task\s+name="([^"]*)"\s*>!i) {
+            my $taskName = $1;
+            my $taskError = "$realmName $taskName ";
+            while ($line = shift (@$results)) {
+
+            if ($line =~ m!</(\S+)\s*>!) {
+                    if ($1 =~ /Task/) {
+                        push(@taskErrors, $taskError);
+                        last;
+                    } else {
+                        next;
+                    }
+                }
+
+                my ($name, $param, $value) = $line =~ m!<(\S+)\s+(\S+)\s*=\s*"([^"]+)"\s*/?>!i;
+                next unless ($name and $param);
+                $taskError .= " $name=$value";
+                $taskErrorsForRealm{$realmName} = $taskError;
+            }
+        }
+    }
+
+    return ($peerProductStatus, \@workingRealms, \@errorRealms, \@taskErrors, $error);
+}
+
+sub parseIncrementalPullStatusDetails {
+
+    my ($xml_content) = @_;
+    
+    my $xml_href;
+    eval {
+        $xml_href = XMLin($xml_content,ForceArray => 1);
+    };
+
+    if( $@ or ref($xml_href) !~/Hash/si ) {
+        return undef;
+    }
+
+    return($xml_href);
+
+}
+
+
+main();
+

@@ -1,0 +1,282 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/an/intermedia-status#15 $
+
+use strict;
+use Data::Dumper;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use Date::Parse;
+
+my $badChars   = '`~!@#$%^&*()-+=[{]}\|;:\'\'",<.>/?';
+my $whiteSpace = ' ' x length($badChars);
+
+sub main {
+	my $debug = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $queries = {};
+	my $queries_summary = {};
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ m/^-d/o) { $debug = 1; }
+		if ($arg =~ m/^-e/o) { $sendEmail = 1; }
+		if ($arg =~ m/^-p/o) { $sendPage = 1; }
+	}
+
+	my $me  = ariba::rc::InstalledProduct->new();
+	my $an  = ariba::rc::InstalledProduct->new('an', $me->service());
+
+	my $dbc = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndInCommunity(
+		$an, ariba::Ops::DBConnection->typeMain(), ""
+	);
+
+	my $oc = createOracleClient($dbc);
+
+	for my $column (qw(name main_email_address)) {
+
+		my @results     = ();
+		my $validitySQL = '';
+
+		unless($oc->executeSqlWithTimeout("select /*+ index_desc(o IND_1B298_2CB3EEFD) */ 
+			id, substr(trim(translate($column, '$badChars', '$whiteSpace')), 1,
+			decode(instr(trim(translate($column, '$badChars', '$whiteSpace')), ' '), 0,
+			length(trim(translate($column, '$badChars', '$whiteSpace'))), 
+			instr(trim(translate($column, '$badChars', '$whiteSpace')), ' ')-1)) word
+			from org o where dbupdated < sysdate - 1.05 and
+				length(substr(trim(translate($column, '$badChars', '$whiteSpace')), 1,
+				decode(instr(trim(translate($column, '$badChars', '$whiteSpace')), ' '), 0,
+				length(trim(translate($column, '$badChars', '$whiteSpace'))), 
+				instr(trim(translate($column, '$badChars', '$whiteSpace')), ' ')-1))) > 1
+				and convert(substr($column, 1, decode(instr($column, ' '), 0,
+				length($column), instr($column, ' ')-1)), 'US7ASCII') =
+				substr($column, 1, decode(instr($column, ' '), 0,
+				length($column), instr($column, ' ')-1))
+				and not exists (select 1 from ctx_stopwords where spw_word = 
+				lower(to_char(substr(trim(translate($column, '$badChars', '$whiteSpace')), 1,
+				decode(instr(trim(translate($column, '$badChars', '$whiteSpace')), ' '), 0,
+				length(trim(translate($column, '$badChars', '$whiteSpace'))), 
+				instr(trim(translate($column, '$badChars', '$whiteSpace')), ' ')-1)))) ) 
+			and rownum <= 1
+		", 3*60, \@results)) {
+			$oc->disconnect();
+			$oc = createOracleClient($dbc);
+		} else {
+
+			my ($id, $word) = ($results[0]->{'ID'}, $results[0]->{'WORD'});
+
+			# This should never be NULL, but we saw it, and want to catch
+			# it in case it is - from Todd.
+			if ($word && $word ne 'NULL') {
+
+				# words aren't SQL friendly.
+				$word = $oc->handle()->quote($word);
+
+				# remove the quotes that we get, because we're going to escape it again.
+				$word =~ s/^'(.+?)'$/$1/;
+
+				$validitySQL = "select count(1) as sv_$column from org where id = $id and contains($column, '{$word}') > 0";
+
+			} else {
+
+				$validitySQL = "select 0 as sv_$column from dual";
+				$id = 'NULL' unless defined $id;
+				$word = 'NULL';
+			}
+
+			#- to verify a search of that word using results from the first query (1 means success, 0 means failure):
+			$queries_summary->{"Search validity for org.$column"} = {
+				note	=> "1 means success, 0 means failure (searched for id: [$id] word: [$word]",
+				info	=> "answer == 1",
+				crit	=> "answer == 0 and previousAnswer == 0",
+				sql	=> $validitySQL,
+				inf_tags	=> "id=$id,word=$word",
+				group_by	=> "$id,$word",
+			};
+		}
+	}
+
+	my @results     = ();
+	my $rfxCountSQL = '';
+
+	unless($oc->executeSqlWithTimeout("select
+		id, to_char(substr(keywords, 1, decode(instr(keywords,' '),0,length(keywords),instr(keywords,' '))-1)) word 
+		from rfx_event where
+			created < sysdate - 1.05 and length(keywords) > 0 and
+			instr(convert(to_char(substr(keywords, 1, decode(instr(keywords,' '),0,
+				length(keywords),instr(keywords,' ')-1))),'US7ASCII'),'?') = 0
+				and not exists (select 1 from ctx_stopwords where spw_word =
+				lower(to_char(substr(keywords, 1, decode(instr(keywords, ' '), 0,
+				length(keywords), instr(keywords, ' ')-1)))))
+		order by created desc
+	", 3*60, \@results)) {
+		$oc->disconnect();
+		$oc = createOracleClient($dbc);
+	} else {
+ 		my ($id, $word) = ($results[0]->{'ID'}, $results[0]->{'WORD'});
+
+		# From Todd - this can be a null value and it's ok. Work around that fact.
+		if ($word && $word ne 'NULL') {
+
+			# words aren't SQL friendly.
+			$word = $oc->handle()->quote($word);
+
+			# remove the quotes that we get, because we're going to escape it again.
+			$word =~ s/^'(.+?)'$/$1/;
+
+			$rfxCountSQL = "select count(1) as rfx_event from rfx_event where id = $id and contains(keywords, '{$word}') > 0";
+
+		} else {
+
+			$rfxCountSQL = "select count(1) from dual";
+			$id = 'NULL' unless defined $id;
+			$word = 'NULL';
+		}
+
+		# - to verify a search of that word using results from the first query (1 means success, 0 means failure):
+		$queries_summary->{"Search validity for rfx_event"} = {
+			note	=> "1 means success, 0 means failure (NULL/empty is ok) (searched for id: [$id] word: [$word]",
+			info	=> "answer == 1",
+			crit	=> "answer == 0 and previousAnswer == 0",
+			sql	    => $rfxCountSQL,
+			inf_field => "rfx_event",
+			inf_tags	=> "id=$id,word=$word",
+			group_by	=> "$id,$word",
+			inf_default => 0,
+		};
+	}
+
+	###############################################################################################################
+	my @indexRows = ();
+
+	unless($oc->executeSqlWithTimeout(
+		"select index_name, synchronize_interval, last_synchronized, optimize_interval, last_optimized from text_index",
+	3*60, \@indexRows)) {
+		$oc->disconnect();
+		$oc = createOracleClient($dbc);
+	} else {
+
+		my $now = time();
+
+		for my $row (@indexRows) {
+
+            my $indexName           = $row->{'INDEX_NAME'};
+            my $synchronizeInterval = $row->{'SYNCHRONIZE_INTERVAL'};
+            my $lastSynchronized    = $row->{'LAST_SYNCHRONIZED'};
+            my $optimizeInterval    = $row->{'OPTIMIZE_INTERVAL'};
+            my $lastOptimized       = $row->{'LAST_OPTIMIZED'};
+
+			$lastSynchronized = str2time($lastSynchronized);
+			$lastOptimized    = str2time($lastOptimized);
+
+			# if these are negative, the index is in a maintanence state,
+			# and we can skip them. this should never happen in production
+			# - from todd.
+			next if $synchronizeInterval < 0;
+			next if $optimizeInterval < 0;
+
+			# these come out of the database in minutes.
+			$synchronizeInterval *= 60;
+			$optimizeInterval    *= 60;
+
+			# So there would be a problem if last_synchronized +
+			# synchronize_interval + some acceptable delay > current date
+
+			# timeliness monitoring
+			$queries->{"$indexName last synchronize"} = {
+				format  => "localtime(answer)\n",
+				info	=> "($now - answer) <= ($synchronizeInterval + ($synchronizeInterval * 1.5))",
+				warn	=> "($now - answer) >  ($synchronizeInterval + ($synchronizeInterval * 1.5))",
+				crit	=> "($now - answer) >  ($synchronizeInterval + ($synchronizeInterval * 2.0))",
+				perl	=> "return $lastSynchronized",
+				inf_field => "last_sync",
+				inf_tags => qq(index_name="$indexName"),
+				inf_default => 0,
+				group_by => $indexName,
+			};
+			$queries->{"$indexName last synchronize warn/crit flag"} = {
+				perl =>
+					sub {
+						my $delta = $now - $lastSynchronized;
+						return ( $delta > $synchronizeInterval * 3   ) ? 2
+						     : ( $delta > $synchronizeInterval * 2.5 ) ? 1
+						     : 0;
+					},
+				inf_field => "last_sync_warn_crit_flag",
+				inf_tags  => qq(index_name="$indexName"),
+				group_by  => $indexName,
+			};
+
+			# optimize monitoring
+			$queries->{"$indexName last optimize"} = {
+				format  => "localtime(answer)\n",
+				info	=> "($now - answer) <= ($optimizeInterval + ($optimizeInterval * 1.5))",
+				warn	=> "($now - answer) >  ($optimizeInterval + ($optimizeInterval * 1.5))",
+				crit	=> "($now - answer) >  ($optimizeInterval + ($optimizeInterval * 2.0))",
+				perl	=> "return $lastOptimized",
+				inf_field =>  "last_optimize",
+				inf_tags => qq(index_name="$indexName"),
+				inf_default => 0,
+				group_by => $indexName,
+			};
+			$queries->{"$indexName last optimize warn/crit flag"} = {
+				perl =>
+					sub {
+						my $delta = $now - $lastOptimized;
+						return ( $delta > $optimizeInterval * 3   ) ? 2
+						     : ( $delta > $optimizeInterval * 2.5 ) ? 1
+						     : 0;
+					},
+				inf_field => "last_optimize_warn_crit_flag",
+				inf_tags  => qq(index_name="$indexName"),
+				group_by  => $indexName,
+			};
+		}
+	}
+
+	##############################################3
+	for my $type (qw(SYNCHRONIZE OPTIMIZE)) {
+
+		# these have different thresholds
+		$queries_summary->{"Max duration of $type in minutes"} = {
+			info    => $type eq 'OPTIMIZE' ? "answer <= 30" : "answer <= 15",
+			warn    => $type eq 'OPTIMIZE' ? "answer >  30" : "answer >  15",
+			crit    => $type eq 'OPTIMIZE' ? "answer >= 60" : "answer >= 30",
+			sql	=> "select max(round((maintenance_end - maintenance_start)*24*60,2)) as duration_$type
+				from ndr_text_index_log where maintenance_type = '$type'",
+		};
+	}
+
+	##############################################3
+    $queries->{influx_details} = { measurement => "intermedia_status" };
+    $queries_summary->{influx_details} = { measurement => "intermedia_status_summary" };
+
+    my $q  = ariba::monitor::QueryManager->newWithDetails('intermedia-status', 'an', $me->service(), $me->customer(), $queries);
+    $q->setSQLConnectInfoFromOracleClient($oc);
+    $q->processQueries($debug, $me->default('notify.email'), $sendEmail, $sendPage);
+
+
+    my $qs = ariba::monitor::QueryManager->newWithDetails('intermedia-status', 'an', $me->service(), $me->customer(), $queries_summary);
+    $qs->setSQLConnectInfoFromOracleClient($oc);
+    $qs->processQueries($debug, $me->default('notify.email'), $sendEmail, $sendPage);
+}
+
+sub createOracleClient {
+	my $dbc = shift;
+
+	my $oc  = ariba::Ops::OracleClient->newFromDBConnection($dbc);
+
+	$oc->connect() || die "Can't connect to Oracle: [$!]\n";
+
+	$oc->handle()->do(qq{alter session set nls_date_format = 'YYYY-MM-DD:HH24:MI:SS'}) or warn $oc->handle()->errstr();
+
+	return $oc;
+}
+
+main();

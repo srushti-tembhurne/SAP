@@ -1,0 +1,274 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/arches/search-index#16 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Url;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode. 
+    -h        Shows this help.
+    -prod     arches product name.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub debug {
+    print "(debug) @_\n" if ($debug);
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $prodname = 'arches';
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-prod$/o) { $prodname = shift;   next; }
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled($prodname, $me->service()));
+    my $arches = ariba::rc::InstalledProduct->new($prodname, $me->service());
+
+    foreach my $cluster ( $arches->allClusters() ) {
+        my %queries;
+        my %queriesResponse;
+        my $email = $me->default('notify.email');
+
+        my @indexMgrApps = grep { $_->appName() eq 'IndexMgr' } $arches->appInstancesInCluster($cluster);
+        exit unless (scalar @indexMgrApps > 0);
+
+        foreach my $indexApp (@indexMgrApps) {
+            my $appNameIndex = $indexApp->instanceName();
+            my $responseUrl = $indexApp->searchIndexResponseURL();
+            debug("Checking $responseUrl");
+
+            my ($url,$response);
+            eval {
+                $url = ariba::monitor::Url->new($responseUrl);
+                $response = $url->request();
+            };
+            if($@) {
+                print "Error [ $@ ]  while fetching $responseUrl,skipping ..\n" if($debug);
+            }
+            ## Sample return XML output on Dev100 service
+            ## url: http://hdp147.lab1.ariba.com:20002/Arches/search/searchmetrics
+            ##'<metrics node="C0_IndexMgr4(Dispatcher)">
+            ##    <NormalSearchStatus adapter="ariba.avro">
+            ##        <Count>172</Count>
+            ##        <TotalTimeTakenInMillis>1415.833</TotalTimeTakenInMillis>
+            ##        <AverageTimeTakenInMillis>8.231587209302326</AverageTimeTakenInMillis>
+            ##        <Percentile90InMillis>8.151</Percentile90InMillis>
+            ##        <AverageRequestsPerSecond>9.010686149728836E-4</AverageRequestsPerSecond>
+            ##    </NormalSearchStatus>
+            ##    <TypeAheadStatus adapter="ariba.avro">
+            ##        <Count>165</Count>
+            ##        <TotalTimeTakenInMillis>1683.779</TotalTimeTakenInMillis>
+            ##        <AverageTimeTakenInMillis>10.204721212121212</AverageTimeTakenInMillis>
+            ##        <Percentile90InMillis>12.674600000000002</Percentile90InMillis>
+            ##        <AverageRequestsPerSecond>8.643972174624536E-4</AverageRequestsPerSecond>
+            ##    </TypeAheadStatus>
+            ##    <NormalSearchStatus adapter="ariba.catalog">
+            ##        <Count>278947</Count>
+            ##        <TotalTimeTakenInMillis>4913284.499</TotalTimeTakenInMillis>
+            ##        <AverageTimeTakenInMillis>17.613684674866555</AverageTimeTakenInMillis>
+            ##        <Percentile90InMillis>23.928900000000002</Percentile90InMillis>
+            ##        <AverageRequestsPerSecond>1.4613436571225933</AverageRequestsPerSecond>
+            ##    </NormalSearchStatus>
+            ##    <TypeAheadStatus adapter="ariba.catalog">
+            ##        <Count>182648</Count>
+            ##        <TotalTimeTakenInMillis>2867754.638</TotalTimeTakenInMillis>
+            ##        <AverageTimeTakenInMillis>15.700991185230608</AverageTimeTakenInMillis>
+            ##        <Percentile90InMillis>12.9087</Percentile90InMillis>
+            ##        <AverageRequestsPerSecond>0.9568537878953429</AverageRequestsPerSecond>
+            ##    </TypeAheadStatus>
+            ##</metrics>';
+
+            my $xs  = XML::Simple->new();
+            my $xml = eval { $xs->XMLin( $response, KeyAttr =>  'adapter' , forcearray => ['NormalSearchStatus', 'TypeAheadStatus'], ) };
+
+            ## Expected output of XMLin ($xml)
+            ##$VAR1 = {
+            ##    'NormalSearchStatus' => {
+            ##                                'ariba.avro' => {
+            ##                                                    'AverageTimeTakenInMillis' => '8.231587209302326',
+            ##                                                    'Percentile90InMillis' => '8.151',
+            ##                                                    'Count' => '172',
+            ##                                                    'TotalTimeTakenInMillis' => '1415.833',
+            ##                                                    'AverageRequestsPerSecond' => '9.010686149728836E-4'
+            ##                                },
+            ##                                'ariba.catalog' => {
+            ##                                                    'AverageTimeTakenInMillis' => '17.613684674866555',
+            ##                                                    'Percentile90InMillis' => '23.928900000000002',
+            ##                                                    'Count' => '278947',
+            ##                                                    'TotalTimeTakenInMillis' => '4913284.499',
+            ##                                                    'AverageRequestsPerSecond' => '1.4613436571225933'
+            ##                                }
+            ##    },
+            ##    'TypeAheadStatus' => {
+            ##                                'ariba.avro' => {
+            ##                                                    'AverageTimeTakenInMillis' => '10.204721212121212',
+            ##                                                    'Percentile90InMillis' => '12.674600000000002',
+            ##                                                    'Count' => '165',
+            ##                                                    'TotalTimeTakenInMillis' => '1683.779',
+            ##                                                    'AverageRequestsPerSecond' => '8.643972174624536E-4'
+            ##                                },
+            ##                                'ariba.catalog' => {
+            ##                                                    'AverageTimeTakenInMillis' => '15.700991185230608',
+            ##                                                    'Percentile90InMillis' => '12.9087',
+            ##                                                    'Count' => '182648',
+            ##                                                    'TotalTimeTakenInMillis' => '2867754.638',
+            ##                                                    'AverageRequestsPerSecond' => '0.9568537878953429'
+            ##                        }
+            ##    },
+            ##    'node' => 'C0_IndexMgr4(Dispatcher)'
+            ## };
+
+            while (my ($type, $content) = each %{$xml}){
+                next if $type =~ /node/;
+                while (my($adapter, $values) = each %{$content}){
+
+                    my $count = $values->{'Count'}; 
+                    my $crit;
+                    my $use_crit = 1;
+
+                    if ( $adapter =~ /avro/ ) {
+                        $crit = undef;
+                        $use_crit = 0;
+                    } else {
+                        $crit = "answer > 1000 && ($count > 100)"
+                    }
+
+                    $queriesResponse{"$appNameIndex $type $adapter Average Time (ms)"} = {
+                        recordMaxResults => 36000,
+                        recordDataType  => 'gauge',
+                        format          => "%0.2f\n",
+                        url             => $responseUrl,
+                        warn            => "answer > 150 && ($count > 100)",
+                        crit            => "answer > 1000 && ($count > 100)",
+                        uiHint          => "metrics/$adapter/$type/Average Time",
+                        perl            => sub { return $values->{'AverageTimeTakenInMillis'} || $url->error(); },
+                        description => "$type performance on $appNameIndex",
+                        correctiveActions   => [
+                            Ops => 'Escalate to Engineering',
+                        ],
+                        inf_field       => "avg_time",
+                        inf_default     => 0,
+                        inf_tags        => qq(cluster="$cluster",adapter="$adapter",type="$type",instance_name="$appNameIndex"),
+                        group_by        => qq($cluster,$adapter,$type,$appNameIndex),
+                    };
+                    $queriesResponse{"$appNameIndex $type $adapter count"} = {
+                        perl            => sub { return $count },
+                        inf_field       => "count",
+                        inf_default     => 0,
+                        inf_tags        => qq(cluster="$cluster",adapter="$adapter",type="$type",instance_name="$appNameIndex"),
+                        group_by        => qq($cluster,$adapter,$type,$appNameIndex),
+                    };
+                    $queriesResponse{"$appNameIndex $type $adapter 90 Percentile Time (ms) use crit"} = {
+                        perl            => sub { return $use_crit },
+                        inf_field       => "ninety_percentile_time_use_crit",
+                        inf_default     => 0,
+                        inf_tags        => qq(cluster="$cluster",adapter="$adapter",type="$type",instance_name="$appNameIndex"),
+                        group_by        => qq($cluster,$adapter,$type,$appNameIndex),
+                    };
+                    $queriesResponse{"$appNameIndex $type $adapter 90 Percentile Time (ms)"} = {
+                        recordMaxResults => 36000,
+                        recordDataType  => 'gauge',
+                        format          => "%0.2f\n",
+                        warn            => "answer > 150 && ($count > 100)",
+                        crit            => $crit,
+                        url             => $responseUrl,
+                        uiHint          => "metrics/$adapter/$type/90 Percentile",
+                        perl            => sub { return $values->{'Percentile90InMillis'} || $url->error(); },
+                        description => "$type performance on $appNameIndex",
+                        correctiveActions   => [
+                            Ops => 'Escalate to Engineering',
+                        ],
+                        inf_field       => "ninety_percentile_time",
+                        inf_default     => 0,
+                        inf_tags        => qq(cluster="$cluster",adapter="$adapter",type="$type",instance_name="$appNameIndex"),
+                        group_by        => qq($cluster,$adapter,$type,$appNameIndex),
+                    };
+                }
+            }
+        }
+        $queriesResponse{'influx_details'} = { measurement => 'arches_search_metrics'};
+        my $qmStatus = ariba::monitor::QueryManager->newWithDetails('search', $arches->name(), $arches->service(), undef, $cluster, \%queriesResponse);
+        $qmStatus->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        my @searchApps = grep { $_->appName() eq 'SearchCore' } $arches->appInstancesInCluster($cluster);
+        exit unless (scalar @searchApps > 0);
+
+        foreach my $app (@searchApps) {
+            my $appNameSearch = $app->instanceName();
+
+            $queries{"$appNameSearch Search index status"} = {
+                warn            => 'answer !~ /iamok/',
+                crit            => 'answer !~ /iamok/ && previousAnswer !~ /iamok/',
+                noCritOnError   => 1,
+                uiHint          => 'search-index',
+                perl            => sub { return searchIndexStatus($app); }, 
+                description => 'Checks the search index for issues / possible corruptions. iamok means "I am ok" 
+                    and the search index is working, otherwise it is not. App instance can potentially be in CRIT
+                    status up to 30 minutes before paging',
+                correctiveActions   => [
+                    Ops => 'Check kr log for details of the corruption and escalate to Engineering',
+                    Engr => 'Look at kr logs for details of the corruption.',
+                ],
+                inf_field       => "status",
+                inf_default     => "none",
+                inf_tags        => qq(cluster=$cluster,instance_name="$appNameSearch",type="search_index_status"),
+                group_by        => $appNameSearch . ",$cluster",
+            };
+        }
+        
+        $queries{'influx_details'} = { measurement => 'arches_node_health'};
+        my $qm = ariba::monitor::QueryManager->newWithDetails('node-health', $arches->name(), $arches->service(), undef, $cluster, \%queries);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub searchIndexStatus {
+    my $app = shift; 
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+    my $statusUrl = $app->searchIndexStatusURL();
+    debug("Checking $statusUrl");
+
+    my $url = ariba::monitor::Url->new($statusUrl);
+    my $response = $url->request();
+    debug("Response: $response");
+    debug("Error: " . $url->error()) if ($url->error());
+    
+    $query->setError($url->error()) if ($url->error());
+
+    return $response || $url->error();
+}
+
+
+main(@ARGV);
+__END__

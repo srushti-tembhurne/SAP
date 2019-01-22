@@ -1,0 +1,332 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/sdb/sdb-activity#18 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+my $FOR_LONGER_THAN = 'for longer than';
+my $runningStatus = 'Running';
+
+sub critIfRunningForLongerThanDays {
+	my $days = shift; 
+	my $query = $ariba::monitor::Query::_ourGlobalQuerySelf; 
+
+	my ($status) = $query->results(); 
+	
+	if ($status && $status eq $runningStatus) {
+		$query->setRunningStartTime(time()) unless ($query->runningStartTime()); 
+		my $runningForDays = (time() - $query->runningStartTime()) / 86400;
+		if ($runningForDays > $days) {
+			$status = "$status $FOR_LONGER_THAN $days days";
+		}
+	} else {
+		$query->deleteRunningStartTime();
+	}
+
+	return qq($status);
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my %queries;
+
+	while(my $arg = shift(@ARGV)) {
+		if($arg =~ m/^-d$/o) { $debug = 1; next; }
+		if($arg =~ m/^-e$/o) { $sendEmail = 1; next; }
+		if($arg =~ m/^-p$/o) { $sendPage = 1; next; }
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $cluster = $me->currentCluster();
+	my $service = $me->service();
+
+	my $product = ariba::rc::InstalledProduct->new("sdb", $service);
+
+	my @instances = $product->appInstancesLaunchedByRoleInCluster("sdbtask", $cluster);
+	my $instance = $instances[0];
+
+	my $monitorStats = ariba::monitor::AppInstanceStats->newFromAppInstance($instance);
+	$monitorStats->fetch();
+
+	$queries{"D&B Load Status"} = {
+		'info' => 1,
+		'crit' => "answer eq 'Error' || answer =~ /$FOR_LONGER_THAN/",
+		'perl' => sub { return $monitorStats->dnBLoadStatus(); },
+		'processAnswer' => sub { main::critIfRunningForLongerThanDays(5) },
+        'inf_field'   => "d&b_load_status",
+        'inf_default' => "none",
+	};
+
+	my $loadWarn = 0;
+	my $loadCrit = 0;
+	if ($monitorStats->dnBLoadStatus() && 
+		$monitorStats->dnBLoadStatus() eq $runningStatus) {
+		$loadWarn = 'answer > 3600';
+		$loadCrit = 'answer > 5400';
+	}
+
+	$queries{"D&B Load Time" } = {
+		'perl' => sub { return $monitorStats->dnBLoadTime(); },
+		'info' => 'answer >= -1',
+		'warn' => $loadWarn,
+		'crit' => $loadCrit,
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "d&b_load_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"D&B Load Preperation Status"} = {
+		'info' => 1,
+		'crit' => 'answer eq "Error"',
+		'perl' => sub { return $monitorStats->dnBLoadPreperationStatusMetric(); },
+        'inf_field'   => "d&b_load_prep_status",
+        'inf_default' => "none",
+	};
+
+	my $loadPrepWarn = 0;
+	if ($monitorStats->dnBLoadPreperationStatusMetric() && 
+		$monitorStats->dnBLoadPreperationStatusMetric() eq $runningStatus) {
+		$loadPrepWarn = 'answer >= 2000';
+	}
+
+	$queries{"D&B Load Preperation Time" } = {
+		'perl' => sub { return $monitorStats->dnBLoadPreperationTimeMetric(); },
+		'info' => 'answer >= -1',
+		'warn' => $loadPrepWarn,
+		'ticketOnWarnOpenAfterMinutes' => 1,
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "d&b_load_prep_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"D&B FTP Download Status"} = {
+		'info' => 1,
+		'warn' => 'answer eq "Error"',
+		'ticketOnWarnOpenAfterMinutes' => 1,
+		'perl' => sub { return $monitorStats->dnBFtpDownload(); },
+        'inf_field'   => "d&b_ftp_download_status",
+        'inf_default' => "none",
+	};
+
+	my $downloadWarn = 0;
+	if ($monitorStats->dnBFtpDownload() &&
+		$monitorStats->dnBFtpDownload() eq $runningStatus) {
+		$downloadWarn = 'answer >= 800';
+	}
+
+	$queries{"D&B FTP Download Time" } = {
+		'perl' => sub { return $monitorStats->dnBFtpDownloadTime(); },
+		'info' => 'answer >= -1',
+		'warn' => $downloadWarn,
+		'ticketOnWarnOpenAfterMinutes' => 1,
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "d&b_ftp_download_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"AN Load Status"} = {
+		'info' => 1,
+		'crit' => 'answer eq "Error"',
+		'perl' => sub { return $monitorStats->aNLoadStatus(); },
+        'inf_field'   => "an_load_status",
+        'inf_default' => "none",
+	};
+	
+	$queries{"AN Load Time" } = {
+		'perl' => sub { return $monitorStats->aNLoadTime(); },
+		'info' => 'answer >= -1',
+		'warn' => 'answer > 120',
+		'crit' => 'answer > 200',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "an_load_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"Enrichment Pending Request Count"} = {
+		'perl' => sub { return $monitorStats->enrichmentPendingRequestCount(); },
+		'info' => 'answer >= 0',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "enrichment_pending_count",
+        'inf_default' => "0",
+	};
+
+	$queries{"Enrichment Average Request Time"} = {
+		'perl' => sub { return $monitorStats->enrichmentAvgProcessTime(); },
+		'info' => 'answer >= 0',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "enrichment_avg_request_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"Enrichment Max Request Time"} = {
+		'perl' => sub { return $monitorStats->enrichmentMaxProcessTime(); },
+		'info' => 'answer >= 0',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "enrichment_max_request_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"Loader Step 01 - Copy Supplier Table Time"} = {
+		'perl' => sub { return $monitorStats->copySupplierTableProcessorTime(); },
+		'info' => 'answer >= -1',
+		'warn' => 'answer >= 180',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "step_1_copy_supplier_table_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"Loader Step 02 - Supplier Pre Req Index Time"} = {
+		'perl' => sub { return $monitorStats->supplierPreReqIndexProcessorTime(); },
+		'info' => 'answer >= -1',
+		'warn' => 'answer >= 90',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "step_2_supplier_pre_req_idx_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"Loader Step 03 - Supplier Insert Time"} = {
+		'perl' => sub { return $monitorStats->supplierInsertProcessorTime(); },
+		'info' => 'answer >= -1',
+		'warn' => 'answer >= 300',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "step_3_supplier_insert_time",
+        'inf_default' => "0",
+	};
+	
+	$queries{"Loader Step 04 - Supplier Insert Count"} = {
+		'perl' => sub { return $monitorStats->supplierInsertProcessorCount(); },
+		'info' => 'answer >= 0',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "step_4_supplier_insert_cnt",
+        'inf_default' => "0",
+	};
+
+	$queries{"Loader Step 05 - Supplier Update Time"} = {
+		'perl' => sub { return $monitorStats->supplierUpdateProcessorTime(); },
+		'info' => 'answer >= -1',
+		'warn' => 'answer >= 4320',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "step_5_supplier_upd_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"Loader Step 06 - Supplier Update Count"} = {
+		'perl' => sub { return $monitorStats->supplierUpdateProcessorCount(); },
+		'info' => 'answer >= 0',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "step_6_supplier_upd_cnt",
+        'inf_default' => "0",
+	};
+	
+	$queries{"Loader Step 07 - Engine Index Time"} = {
+		'perl' => sub { return $monitorStats->engineIndexProcessorTime(); },
+		'info' => 'answer >= -1',
+		'warn' => 'answer >= 150',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "step_7_engine_idx_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"Loader Step 08 - Order Engine Index Time"} = {
+		'perl' => sub { return $monitorStats->orderEngineIndexProcessorTime(); },
+		'info' => 'answer >= -1',
+		'warn' => 'answer >= 150',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "step_8_order_engine_idx_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"Loader Step 09 - Post Load Supplier Index Time"} = {
+		'perl' => sub { return $monitorStats->postLoadSupplierIndexProcessorTime(); },
+		'info' => 'answer >= -1',
+		'warn' => 'answer >= 480',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "step_9_order_engine_idx_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"Loader Step 10 - Post Load Vendor Table Index Time"} = {
+		'perl' => sub { return $monitorStats->postLoadVendorTableIndexProcessorTime(); },
+		'info' => 'answer >= -1',
+		'warn' => 'answer >= 150',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "step_10_vendor_tbl_idx_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"Loader Step 11 - GSO Tracked Supplier Merge Time"} = {
+		'perl' => sub { return $monitorStats->gSOTrackedSupplierMergeProcessorTime(); },
+		'info' => 'answer >= -1',
+		'warn' => 'answer >= 150',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "step_11_gso_supplier_merge_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"Loader Step 12 - GSO Supplier Parent Names Sync Up Time"} = {
+		'perl' => sub { return $monitorStats->gSOSupplierParentNamesSyncUpProcessorTime(); },
+		'info' => 'answer >= -1',
+		'warn' => 'answer >= 150',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "step_12_gso_supplier_parent_names_sync_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"Loader Step 13 - Swap Master Table Name Time"} = {
+		'perl' => sub { return $monitorStats->swapMasterTableNameProcessorTime(); },
+		'info' => 'answer >= -1',
+		'warn' => 'answer >= 30',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "step_13_swap_master_tbl_time",
+        'inf_default' => "0",
+	};
+
+	$queries{"Loader Step 14 - Swap Master Table Index Time"} = {
+		'perl' => sub { return $monitorStats->swapMasterTableIndexProcessorTime(); },
+		'info' => 'answer >= -1',
+		'warn' => 'answer >= 30',
+		'recordDataType' => 'gauge',
+		'recordMaxResults' => 60000,
+        'inf_field'   => "step_14_swap_master_tbl_idx_time",
+        'inf_default' => "0",
+	};
+
+	my $email = $me->default('notify.email');
+    $queries{'influx_details'} = { measurement => 'sdb_sdb_activity'};
+	my $q = ariba::monitor::QueryManager->newWithDetails("sdb-activity", $product->name(), $service, $product->customer(), \%queries);
+
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

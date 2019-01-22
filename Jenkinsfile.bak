@@ -1,0 +1,100 @@
+// Jenkinsfile for stratus CI
+
+// bottom line, this shouldn't be triggered by scm
+// because our tests require passwords (boo!). When/if this
+// requirement is lifted, we can continue with scm triggers
+if(isSCMTrigger{}) { return }
+
+isDevelop = false
+nodeLabel = "swarm"
+if (env.BRANCH_NAME) {
+    isDevelop = env.BRANCH_NAME.equalsIgnoreCase('develop')
+}
+
+node('swarm') {
+    // for aws jenkins, no dns resolution to devlab:
+    //   app1315.lab1.ariba.com = 10.163.5.169
+    //   mon118.lab1.ariba.com = 10.163.6.173
+    //   mon12.sc1-lab1.ariba.com = 10.14.200.135
+    def usernames  = new ChoiceParameterDefinition('REMOTE_CI_USER', ['montest', 'monlq25', 'monsctest1'] as String[], 'Username to run tests')
+    def ci_servers = new ChoiceParameterDefinition('REMOTE_CI_SERVER', ['10.163.5.169', '10.163.6.173', '10.14.200.135'] as String[], 'The server to run tests on')
+
+    properties( [
+        disableConcurrentBuilds(),
+        [$class: 'ParametersDefinitionProperty', parameterDefinitions:
+            [
+                ci_servers,
+                usernames,
+                [$class: 'com.michelin.cio.hudson.plugins.passwordparam.PasswordParameterDefinition', defaultValue: '', description: 'User password', name: 'REMOTE_CI_USER_PW'],
+                [$class: 'com.michelin.cio.hudson.plugins.passwordparam.PasswordParameterDefinition', defaultValue: '', description: 'MasterPassword may be needed to start svc', name: 'MASTER_PW'],
+                [$class: 'BooleanParameterDefinition', defaultValue: false, description: 'Select this if you dont want to create a new build, but rather (re)push an existing one', name: 'PUSH_EXISTING'],
+                [$class: 'StringParameterDefinition', defaultValue: '', description: 'If above is checked, enter existing stratus build that you want re-pushed (e.g., Stratus-20)', name: 'STRATUS_BUILD'],
+            ]
+        ]
+    ] )
+
+
+    def offset = 20
+    def buildNumber = (env.BUILD_NUMBER.toInteger() + offset)
+    def repoBuildPath = "bin-dev/ops/stratus/tmp/${buildNumber}/"
+    def repoLatestPath = "bin-dev/ops/stratus/tmp/LATEST/"
+    def repoBuildFile = "stratus.tar.gz"
+
+    def pushExistingOnly = params.PUSH_EXISTING
+
+    withEnv(["OFFSET=${offset}", "BUILD_NO=${buildNumber}"]) {
+        stage("Git Checkout") {
+            checkout scm
+        }
+
+        stage("Stratus RC Job") {
+            if ( pushExistingOnly ) {
+                withProxy {
+                    run = {
+                        sh "./build/make.sh build-deploy push-only"
+                    }
+                }
+            } else {
+                withProxy {
+                    run = {
+                        sh "./build/make.sh build-deploy"
+                    }
+                }
+            }
+        }
+
+        /*
+         * ci.jenkins wont allow ssh to corestack devlab
+         * disable all calls here and simply call the corestack
+         * jenkins job at jenkins.ariba.com
+        stage("Deployment") {
+            withProxy {
+                run = {
+                    sh "sudo apt-get -y install sshpass"
+                    sh "./build/make.sh deploy"
+                }
+            }
+        }
+
+        stage("Test Stratus") {
+            withProxy {
+                run = {
+                    sh "./build/make.sh test"
+                }
+            }
+        }
+        */
+    }
+
+    // only upload build/artifact if it's from develop branch (to be consumed by test server)
+    // the master branch is the stable and that is built using maven from jenkins.ariba.com
+    if (!isDevelop) {
+        println "Skipping upload to artifactory for all non-develop branches"
+    } else {
+        println "Lets not upload anything yet..."
+
+        // comment out for now (so build passes) and test on own repo...
+        // see this gist: https://gist.github.com/Faheetah/e11bd0315c34ed32e681616e41279ef4
+        // sh 'curl -i -X POST -d payload={"username":"stratus jenkins bot", "text": "#### :heavy_check_mark: Jenkins job [Ariba-ops/stratus/develop](https://ariba-ci.mo.sap.corp/job/Ariba-Ops/job/stratus/job/develop/) created a new stratus build"} https://ariba-mattermost.com/hooks/km83519rptnwjnzhm6m4fyszer'
+    }
+}

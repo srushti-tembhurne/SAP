@@ -1,0 +1,50 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/ebs/ebs-database#3 $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+
+my %queries;
+
+sub main {
+	my $debug = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+    my $answer = 0;
+
+	while(my $arg=shift(@ARGV) ){
+		if($arg =~ /^-d/o){ $debug = 1; }
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+	
+	my $me = ariba::rc::InstalledProduct->new();
+	my $ebs = ariba::rc::InstalledProduct->new("ebs", $me->service());
+
+	my $email = $me->default('notify.email');
+
+	my $db = $ebs->default('DBConnections.DRAN.hostname');
+	$answer = 1 if($db =~ m/snv/);
+
+	$queries{"EBS pointing to BOU DB"} =
+	{
+	  info => 1,
+      crit        => 'answer == 1',
+      perl        => "return qq($answer)",
+      inf_field   => "ebs_points_to_bou_db",
+      inf_default => 0,
+    };
+
+    $queries{'influx_details'} = {measurement => 'ebs_database'};
+	my $q = ariba::monitor::QueryManager->newWithDetails("ebs-database", "ebs", $me->service(), $me->customer(), \%queries);
+
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

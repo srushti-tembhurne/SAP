@@ -1,0 +1,199 @@
+#!/usr/local/bin/perl
+################################################################################
+# $Id: //ariba/services/monitor/bin/s4/esignature-status#5 $
+#
+# Copyright (c) 2014 Ariba
+#
+################################################################################
+
+=head1 NAME
+
+esignature-status - Monitor ESignature feature in S4
+
+=head1 SYNOPSIS
+
+esignature-status [options] -product <product>
+
+=head1 OPTIONS
+
+=over
+
+=item B<-help|h>
+
+Print this usage information and exit.
+
+=item B<-debug|-d>
+
+Enable debugging output
+
+=item B<-email|e>
+
+Enable email sending
+
+=item B<-page|p>
+
+Enable paging
+
+=item B<-product>
+
+Product to monitor
+
+=back
+
+=head1 DESCRIPTION
+
+C<esignature-status> - Monitor status of 3rd party ESignature providers via SOAP and REST
+
+=head1 AUTHOR
+
+Nathan Sullivan C<< <nsullivan@ariba.com> >>
+
+=head1 LICENSE
+
+Copyright 2014 Ariba
+
+=cut
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use vars qw($debug $quiet);
+
+use Pod::Usage;
+use Getopt::Long;
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::Ops::ServiceController;
+use JSON;
+
+use Data::Dumper;
+
+sub main
+{
+    my($sendEmail, $sendPage, $productName);
+
+    GetOptions(
+        'help|h' => sub { pod2usage(1); },
+        'debug|d+' => \$debug,
+        'email|e' => \$sendEmail,
+        'page|p' => \$sendPage,
+        'product=s' => \$productName,
+    );
+
+    pod2usage("Product name required") unless $productName;
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $product = ariba::rc::InstalledProduct->new($productName, $mon->service());
+    my $proxyArg = "";
+
+    ## my $certArg = "--capath /usr/local/ariba/lib/certs/";
+    ## Using -cacert args instead of -capath to fix the issue 48902
+    ## I am not sure, exactly why -cacert is woking & -capath stopped working. - Ankit
+    my $certfile = '/usr/local/tools/lib/perl5/site_perl/5.20.1/Mozilla/CA/cacert.pem';
+    if (!-e $certfile) {
+        $certfile = '/usr/local/tools/perl-5.22.1/lib/site_perl/5.22.1/Mozilla/CA/cacert.pem';
+    }
+    my $certArg = "--cacert $certfile";
+    my $path = $ENV{'PATH'};
+    $ENV{'PATH'} = "/usr/local/tools/bin:$path";
+    my $CURL = "curl";
+
+    if(!ariba::Ops::ServiceController::isProductionServices($mon->service())) {
+        $proxyArg = "-x http://proxy01.ariba.com:8080";
+    }
+    my %queries = ();
+
+    my $user = $product->default('Application.ACM.Signature.DocuSign.MonitoringUser') || 'DocuSignAribaMonitoring@yahoo.com';
+    my $password = $product->default('Application.ACM.Signature.DocuSign.MonitoringPassword') || 'DocuSign1';
+    my $key = $product->default('Application.ACM.Signature.DocuSign.IntegratorKey');
+    my $echoSignKey = $product->default('Application.ACM.Signature.EchoSign.MonitoringAPIKey') || 'UEFDR9565X7IX6';
+    my $url = $product->default('Application.ACM.Signature.DocuSign.RESTMonitoringURL') || "https://www.docusign.net/restapi/v2/login_information";
+
+    exit 0 unless defined($key);
+
+    my $signinHeader = "<DocuSignCredentials><Username>$user</Username><Password>$password</Password><IntegratorKey>$key</IntegratorKey></DocuSignCredentials>";
+
+    my $resp = `$CURL $certArg -s $proxyArg -H "Accept: application/json" -H "Content-Type: application/json" -H "X-DocuSign-Authentication: $signinHeader" $url`;
+
+    my ($queryResult, $json);
+
+    eval {
+        $json = JSON::from_json($resp);
+    };
+
+    if(!$@ && $json->{'loginAccounts'}) {
+        $queryResult = qq(OK);
+    } else {
+        $queryResult = qq(Unexpected response -  $resp);
+    }
+
+    $queries{"Docusign Rest Api"} = {
+        crit => 'answer !~ /^"OK"$/',
+        severity => 1,
+        description => '3rd party service is available',
+        correctiveActions => [
+            Ops => 'Notify Support to escalate to provider',
+            Support => 'Escalate to provider for fix',
+        ],
+        perl => sub { return $queryResult; },
+        inf_field => "docusign_rest_api",
+    };
+
+    my $soapBody = '<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><Ping xmlns="http://www.docusign.net/API/3.0" /></soap:Body></soap:Envelope>';
+    my $soapUrl = $product->default('Application.ACM.Signature.DocuSign.SOAPMonitoringURL') || "https://www.docusign.net/api/3.0/DSAPI.asmx";
+    my $soapAction = "http://www.docusign.net/API/3.0/Ping";
+
+    $resp = `$CURL $certArg -s $proxyArg -H "Content-Type: text/xml; charset=utf-8" -H "X-DocuSign-Authentication: $signinHeader" -H "SOAPAction: $soapAction" -d '$soapBody' $soapUrl`;
+
+    my $soapResult;
+    if($resp =~ m|<PingResult>true</PingResult>|i) {
+        $soapResult = qq(OK);
+    } else {
+        $soapResult = qq(Unexpected Response $resp);
+    }
+
+    $queries{"Docusign Soap Api"} = {
+        crit => 'answer !~ /^"OK"$/',
+        severity => 1,
+        description => '3rd party service is available',
+        correctiveActions => [
+            Ops => 'Notify Support to escalate to provider',
+            Support => 'Escalate to provider for fix',
+        ],
+        perl => sub { return $soapResult; },
+        inf_field => "docusign_soap_api",
+    };
+
+    $soapBody = '<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><soap:Body><testPing xmlns="http://api.echosign"><apiKey>' . $echoSignKey . '</apiKey></testPing></soap:Body></soap:Envelope>';
+    $soapUrl = $product->default('Application.ACM.Signature.EchoSign.EndpointURL') || "https://secure.echosign.com/services/EchoSignDocumentService15";
+
+    $resp = `curl --tlsv1.2 -k -s $proxyArg -H "Content-Type: text/xml; charset=utf-8" -H 'SOAPAction: \"\"' -d '$soapBody' $soapUrl`;
+
+    my $echoSoapResult;
+    if($resp =~ m|testPingResponse|i) {
+        $echoSoapResult = qq(OK);
+    } else {
+        $echoSoapResult = qq(Unexpected Response $resp);
+    }
+
+    $queries{"Echosign Soap Api"} = {
+        crit => 'answer !~ /^"OK"$/',
+        severity => 1,
+        description => '3rd party service is available',
+        correctiveActions => [
+            Ops => 'Notify Support to escalate to provider',
+            Support => 'Escalate to provider for fix',
+        ],
+        perl => sub { return $echoSoapResult; },
+        inf_field => "echosign_soap_api",
+    };
+
+    $queries{influx_details} = { measurement => 'esignature_status' };
+
+    my $email = $mon->default('notify.email');
+    my $qm = ariba::monitor::QueryManager->newWithDetails("esignature-status", $product->name(), $product->service(), $product->customer(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

@@ -1,0 +1,120 @@
+TEST CASES FOR PRODUCT API
+$Id: //ariba/services/tools/lib/perl/ariba/rc/ProductAPI-Test-Cases.txt#2 $
+
+
+Note:
+-----
+PAPI has some API call that can have two different behavior depending on the
+context. All of these API calls return a directory with the product. So for
+ex, the API call that gives docRoot can return the path to docroot in one
+of the following format:
+
+1. Path which has buildname in it. This happens if you initialize the
+   product API with buildname of build that is not currently installed.
+2. Path that does not have buildname in it. This happens if you initialize
+   product API build buildname of a build that is currently installed
+   OR
+   if you initialize the product API without any buildname at all.
+This "magic" behavior is key to some of the basic uses of PAPI.
+
+Test cases for InstalledProduct for SharedService product:
+----------------------------------------------------------
+
+1.  outside of product
+ariba::rc::InstalledProduct->new("an", "dev");
+SS worked
+
+2.  inside of installed build
+ariba::rc::InstalledProduct->new() inside of ~andev/Weezer-134 if Weezer-134 is active
+SS worked
+ASP worked
+
+3.  in another build of the same product (MOST IMPORTANT, startup, c-d)
+ariba::rc::InstalledProduct->new() inside of ~andev/Weezer-133 if Weezer-134 is active
+SS worked
+ASP worked
+
+4.  outside of product but within some other product that has a BuildName file
+ariba::rc::InstalledProduct->new("an","dev") from mondev/bin
+SS worked
+
+
+5.  Fully qualified from outside of product
+ariba::rc::InstalledProduct->new("an", "dev", "Weezer-132");
+SS worked
+
+6.  an_3.8-bjegerlehner is installed. cd ~andev/Weezer-134/bin.  run ~andev/Weezer-133/bin/t
+ariba::rc::InstalledProduct->new();
+SS Old code returns an_3.8-beat (is installed)
+SS New code returns Weezer-133 (is RealBin).  See Product.pm debug=1 to see
+
+
+------------------------------------------------------------------------
+
+Test cases for InstalledProduct for ASP product
+
+all of the SSIP cases plus
+
+1mod.  outside of product w/ customer
+ariba::rc::InstalledProduct->new("aes", "dev", undef, "ops");
+worked
+
+4mod.  outside of product but within some other product that has a CustomerName/BuildName file
+ariba::rc::InstalledProduct->new("aes","dev", undef, "sony") from ~aesdev/dan/dan-2/bin
+worked
+
+C.  outside of product w/ out customer w/build
+ariba::rc::InstalledProduct->new("aes", "dev", "ops-14", undef);
+worked
+
+5mod.  Fully qualified from outside of product
+ariba::rc::InstalledProduct->new("aes", "dev", "ops-14", "ops");
+worked
+
+6mod.  dan-3 is installed, cd ~aesdev/dan/dan-4/bin, run ~aesdev/dan/dan-2/bin/t
+ariba::rc::InstalledProduct->new();
+ASP returned dan-2
+run with cwd = ~aesdev/sony/sony-2
+ASP returned dan-2
+
+------------------------------------------------------------------------
+
+Test cases for ArchivedProduct for SharedService product
+
+1.  outside of product with product and service
+ariba::rc::ArchivedProduct->new("an", "dev");
+Works.
+
+2.  Fully qualified from outside of product
+ariba::rc::ArchivedProduct->new("an", "dev", "Weezer-132");
+Works.
+
+Optional:
+
+3.  inside of archived build
+ariba::rc::ArchivedProduct->new() inside of ~rc/a/d/dev//Weezer-134 if Weezer-134 is latest
+new = Works.
+
+4.  in another archived build of the same product
+ariba::rc::ArchivedProduct->new() inside of ~rc/a/d/dev/Weezer-133 if Weezer-134 is latest
+new = Failed.
+old = same as new
+
+------------------------------------------------------------------------
+
+Test cases for ArchivedProduct for ASPService product
+
+1mod. outside of product with product, service, customer, no build
+works
+
+2mod. fully qualified outside of product
+works
+
+Optional:
+
+3mod. inside of archived build
+ariba::rc::ArchivedProduct->new() inside of ~rc/a/d/dev/ops/ops-8 if ops-8 is latest
+
+4.  in another archived build of the same product
+ariba::rc::ArchivedProduct->new() inside of ~rc/a/d/dev/ops/ops-6 if ops-8 is latest
+new=failed (same as SSP)

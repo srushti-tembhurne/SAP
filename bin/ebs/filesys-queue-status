@@ -1,0 +1,112 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/ebs/filesys-queue-status#3 $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+
+my %queries;
+
+sub main{
+	my $debug = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while(my $arg=shift(@ARGV) ){
+		if($arg =~ /^-d/o){ $debug = 1; }
+		if($arg =~ /^-e/o){ $sendEmail = 1; };
+		if($arg =~ /^-p/o){ $sendPage = 1; };
+	}
+	
+	my $me = ariba::rc::InstalledProduct->new();
+	my $ebs = ariba::rc::InstalledProduct->new("ebs", $me->service());
+
+	my $email = $me->default('notify.email');
+	my $hours = 2;
+
+	my $ebsJobDir = $ebs->default('ebs.jobdirectory');
+
+	if (defined($ebsJobDir)) {
+
+		$queries{"Items in EBS Job queue stuck more than $hours hours in queued"} =
+		{
+		  info => "numrows >= 0",
+		  warn => "numrows >= 1",
+		  crit => "numrows >= 3",
+		  timeout => 60,
+		  perl => "main::ebsJobsInStateForHours(\"$ebsJobDir\", \"Queued\", \"$hours\")",
+          inf_field => "queued_stuck",
+		};
+
+		$queries{"Items in EBS Job queue stuck more than $hours hours in processing"} =
+		{
+		  info => "numrows >= 0",
+		  warn => "numrows >= 1",
+		  crit => "numrows >= 3",
+		  timeout => 60,
+		  perl => "main::ebsJobsInStateForHours(\"$ebsJobDir\", \"In Progress\", \"$hours\")",
+          inf_field => "processing_stuck",
+		};
+	}
+
+    $queries{'influx_details'} = {measurement => 'ebs_queue_status'};
+	my $q = ariba::monitor::QueryManager->newWithDetails("queue-status", "ebs", $me->service(), $me->customer(), \%queries);
+
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+sub ebsJobsInStateForHours {
+	my ($dir, $state, $hours) = @_;
+
+	unless (-d $dir) {
+		return undef;
+	}
+
+	opendir(DIR, $dir) || die "Could not open dir $dir, $!\n";
+	my @contents = grep(! /^\./, readdir(DIR));
+	closedir(DIR);
+
+	my @jobs;
+	my $timeStamp = time() - $hours * 60 * 60;
+
+	my $jobProperties = "EBJob.properties";
+
+	for my $jobDir (@contents) {
+
+		my $jobStatusFile = "$dir/$jobDir/$jobProperties";
+	    next unless (-f "$jobStatusFile");
+
+	    my $mtime = (stat(_))[9];
+
+	    if ($mtime < $timeStamp) {
+			open (JOB, "$jobStatusFile") || next;
+
+			my $user;
+			my $template;
+			while(<JOB>) {
+				if (/user\s*=\s*(\w+)/i) {
+					$user = $1;
+				}
+				if (/template\s*=\s*(\w+)/i) {
+					$template = $1;
+				}
+				if (/state\s*=\s*$state/i) {
+					push(@jobs, "$jobDir\t$template\t$user");
+					last;
+				}
+			}
+
+			close(JOB);
+	    }
+	}
+
+	#print "jobs $dir in state $state for more than $hours hours ", join("\n", @jobs), "\n";
+    ( @jobs ) ?  return (join("\n", @jobs)) : qq("0");
+}
+
+main();

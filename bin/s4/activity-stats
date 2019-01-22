@@ -1,0 +1,1744 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/s4/activity-stats#87 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::DateTime;
+use ariba::Ops::OracleClient;
+use List::Util qw(max);
+use Date::Parse;
+use Data::Dumper;
+
+sub getStarSharedSchemaID  {
+    my $product = shift;
+    my $debug = shift;
+    my @schemaIds = ariba::Ops::ProductAPIExtensions::sharedStarSchemaIdsForProduct($product);
+    my ($dbc) = ariba::Ops::DBConnection->connectionsForProductOfDBType($product, ariba::Ops::DBConnection->typeMain());
+    my $dbh = ariba::Ops::OracleClient->newFromDBConnection($dbc);
+
+    if ( !$dbh->connect() ) {
+        print "Could not connect to database: " . $dbh->error() . "\n";
+        exit(1);
+    }
+
+    my $selectStatement = "SELECT DISTINCT a.databaseschema from SchematypeMapTab a, AnalysisDBSchemaTab b "
+                         . "WHERE a.databaseschema LIKE '%Shared%' "
+                         . "AND a.reservedtimestamp IS NULL AND a.reservedreason IS NULL "
+                         . "AND a.databaseschema = b.ads_schemaname AND b.ADS_STATE != 11 "
+                         . "ORDER BY a.databaseschema;" ;
+
+    my @schemaList = $dbh->executeSql($selectStatement);
+    $dbh->disconnect();
+
+    my @schemaID ;
+    foreach my $schema (@schemaList) {
+        chomp($schema);
+
+        $schema =~ m/(\d+)/;
+        push (@schemaID, $1);
+        print "DEBUG $schema ", " ID=>\t", $1, "\n", if $debug;
+    }
+    return @schemaID;
+}
+
+
+sub initSchemaStats {
+    my $schemaStatsRef = shift;
+    my $schemaIdsRef = shift;
+    my $schemaStatFieldsRef = shift;
+
+    for my $field (keys %$schemaStatFieldsRef) {
+        for my $schemaId (@$schemaIdsRef) {
+            $schemaStatsRef->{$schemaId}{$field} = 0;
+        }
+    }
+}
+
+# Sample stat: Star.Shared.Schema1:4;Star.Shared.Schema2:3;Star.Shared.Schema4:1
+sub parseSchemaStatsAndStoreHighestValues {
+    my $stats = shift;
+    my $schemaStatsRef = shift;
+    my $queryName = shift;
+
+    if ($stats) {
+        while ($stats =~ /Schema(\d+):(\d+)/g) {
+            my $schemaId = int($1);
+            my $value = $2;
+            $schemaStatsRef->{$schemaId}{$queryName} = $value if (!defined($schemaStatsRef->{$schemaId}->{$queryName}) || $value > $schemaStatsRef->{$schemaId}->{$queryName});
+        }
+    }
+}
+
+sub parseDedicatedLoadFailureResults{
+    my $loadFailures = shift;
+
+    my $parsedResults;
+    my $totalFailures;
+
+    # the results look like this:
+    # 3:Star.Dedicated.Schema3:6;4:Star.Dedicated.Schema1:7
+    # it's list of schemas that had failures seperated by ;
+    # each schema failure record is realmid:schemaname:failures
+    for my $schemaFailure (split(/;\s*/, $loadFailures)) {
+        my ($realmId, $schemaName, $numFailures) = split(":", $schemaFailure);
+        $totalFailures += $numFailures;
+        $parsedResults .= sprintf("Realm ID: %d; Schema Name: %s; Number of Failures: %d\n", $realmId, $schemaName, $numFailures);
+    }
+
+    return ($totalFailures, $parsedResults);
+}
+
+# Sample stat: S4All(3), S4All-12(7), S4All-14(12)
+sub parseRealmStats {
+    my $stats = shift;
+    my $sumOfNums = 0;
+    my @schemas;
+    my @counts;
+    if ($stats) {
+        while ($stats =~ /(\S+)\((\d+)\)/g) {
+            my $schemaName = $1;
+            my $value = $2;
+            push (@schemas, $schemaName);
+            push (@counts, $value);
+            $sumOfNums += $value;
+        }
+    }
+    return ($sumOfNums, \@schemas, \@counts);
+}
+
+sub getPosInArrayGreaterThan {
+    my $arrOfNumbers = shift;
+    my $compareNum = shift;
+    my $answer = -1;
+    my $numInArray = @$arrOfNumbers;
+    my $index;
+
+    for($index=0;$index<$numInArray;$index++){
+        if (@$arrOfNumbers[$index] > $compareNum) {
+            $answer = $index;
+            $index = $numInArray;
+        }
+    }
+    return $answer;
+}
+
+sub sumUpAllRealmsInArray {
+    my @array = @{$_[0]};
+    my $answer = "";
+
+    my (@allSchemas, @allCounts);
+    my $index;
+    my $curSchema;
+    my $curVal;
+    foreach my $tmpStr ( @array ) {
+        next unless ( defined $tmpStr );
+        if (length($tmpStr) > 0) {
+            my ($sumOfNums, $schemas, $counts) = parseRealmStats($tmpStr);
+            my $numSchemas = @$schemas;
+            my $index;
+            my $curSchema;
+            my $curVal;
+            for ($index=0; $index < $numSchemas; $index++) {
+                $curSchema = @$schemas[$index];
+                $curVal = @$counts[$index];
+                my %position;
+                @position{@allSchemas} = (0..$#allSchemas);
+                my $position = $position{$curSchema};
+                if (length($position) > 0) {
+                    $allCounts[$position] += $curVal;
+                } else {
+                    push (@allSchemas, $curSchema);
+                    push (@allCounts, $curVal);
+                }
+            }
+        }
+    }
+    my $numAllSchemas = @allSchemas;
+    $answer = "";
+    if ($numAllSchemas > 0) {
+        $curSchema = $allSchemas[0];
+        $curVal = $allCounts[0];
+        $answer .= $curSchema;
+        $answer .= "(";
+        $answer .= $curVal;
+        $answer .= ")";
+    }
+    for ($index=1; $index < $numAllSchemas; $index++) {
+        $answer .= ", ";
+        $curSchema = $allSchemas[$index];
+        $curVal = $allCounts[$index];
+        $answer .= $curSchema;
+        $answer .= "(";
+        $answer .= $curVal;
+        $answer .= ")";
+    }
+    return $answer;
+}
+
+sub sumUpStringMetrics {
+    my $str1 = shift;
+    my $str2 = shift;
+
+    my @strArr;
+    push @strArr, $str1;
+    push @strArr, $str2;
+
+    my $sumRealmsStr = sumUpAllRealmsInArray(\@strArr);
+    return $sumRealmsStr;
+}
+
+sub main {
+    my $debug = 0;
+    my $quiet = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $productName;
+    my $path = "http://ops.ariba.com/documentation/prodops/common/investigating-s4-dataloads.txt";
+    my $note = "For initial debugging refer to $path";
+
+    my $severity = 1;           # failed dataloads are S1 during and S0 at the end of the month
+    $severity = 0 if ariba::Ops::DateTime::isLastWeekOfMonth();
+
+    my %schemaStatFields = (
+        analysisSharedSchemaLoadsFailed => {
+            'queryName' => 'S4 star schema failed pulls',
+            'crit' => 'answer >= 3',
+            'warn' => 'answer >= 2',
+            'severity' => "$severity",
+            'createTicket' => 1,
+            'estimateLastSuccessFullRun' => 1,
+            'note' => "$note",
+            'uiHint' => "Data Load",
+        },
+        analysisFailedASMSharedSchemaValidations => {
+            'queryName' => 'S4 star schema failed validations',
+            'warn' => 'answer >= 1',
+            'createTicket' => 1,
+            'setDueDate' => 'today',
+            'estimateLastSuccessFullRun' => 1,
+            'note' => "$note",
+            'uiHint' => "Data Load",
+        },
+        analysisASMSharedSchemaLoadTime => {
+            'queryName' => 'S4 star schema time taken to complete the last load',
+            'note' => "$note",
+            'uiHint' => "Data Load",
+        },
+        analysisMaxTimeSinceLastSharedLoad => {
+            'queryName' => 'S4 star schema time elapsed since the last load completed (in minutes); 0 if current load has started',
+            'warn' => 'answer >= 720',
+            'crit' => 'answer >= 2160',
+            'createTicket' => 1,
+            'uiHint' => "Data Load",
+            'note' => "$note",
+        },
+        analysisASMSharedSchemaCurrentLoadTime => {
+            'queryName' => 'S4 star schema time for which the current load has been running (in minutes); 0 if current load has not started',
+            'warn' => 'answer >= 1080',
+            'crit' => 'answer >= 2160',
+            'createTicket' => 1,
+            'uiHint' => "Data Load",
+            'note' => "$note",
+        },
+    );
+
+    while(my $arg=shift(@ARGV)){
+            print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+            if($arg =~ /^-d/o){ $debug=1; }
+            if($arg =~ /^-e/o){ $sendEmail=1; };
+            if($arg =~ /^-p$/o){ $sendPage=1; };
+            if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+    unless (@products) {
+        exit(0);
+    }
+    for my $product (@products) {
+
+        my $dataLoadBatchSize = $product->default('System.Analysis.DataLoading.BatchSize');
+        my $warnConcurrentLoads = $dataLoadBatchSize * 0.8; #80% of allocated threads
+
+        my $skip = 0;
+        my %queries  = ();
+
+        my ($totalRFQCount, $totalRFQFailed, $totalRFQSendCount, $totalRFQSendFailed, $totalDiscoveryCount, $totalDiscoveryFailed);
+        my $totalBidsProcessed = 0;
+        my $totalActiveRFX = 0;
+        my $totalActiveLargeOrHugeRFX = 0;
+        my $totalDataLoadCount = 0;
+        my $totalABSwitchCount = 0;
+        my $failedSharedSchemaLoads = 0;
+        my $failedS4SchemaLoads = 0;
+        my $failedS4SchemaValidations = 0;
+        my $activePresentationLoads = 0;
+        my $runningDedicatedPresentationLoads = 0;
+        my $runningSharedPresentationLoads = 0;
+        my $activeSVLoads = 0;
+        my %schemaStats = ();
+
+        # ref to hold various metrics to compute the roll-up numbers after going through app instances.
+        # structure is $ref->{ varname }->{ "values" => [ a,b,c ], "calc" => "sum", "uihint" => "foo" }
+        my $s4MetricRollupRef;
+
+        my %community_rollup_for_arches_uiHint;
+        my %community_rollup_for_arches_name;
+        my %community_rollup_for_arches_rollup_name;
+        my %community_rollup_for_arches_value;
+        my %community_rollup_for_arches_id;
+        my %community_rollup_for_arches_critonitem;
+        my %community_rollup_for_arches_critontotal;
+        my %community_rollup_for_arches_warnonitem;
+        my %community_rollup_for_arches_warnontotal;
+        my %community_rollup_for_arches_sumofnumbers;
+        my %community_rollup_for_sumofnumbers_name;
+        my %community_rollup_for_sumofnumbers_name_rollup;
+
+        my @schemaIds = getStarSharedSchemaID($product, $debug);
+        print "SCHEMA ID \n", Dumper(@schemaIds), "\n", if($debug) ;
+        initSchemaStats(\%schemaStats, \@schemaIds, \%schemaStatFields) if (@schemaIds);
+
+        for my $instance ($product->appInstancesInCluster($cluster)) {
+            next unless $instance->isTomcatApp();
+
+            my $instanceName = $instance->instanceName();
+            $instanceName =~ s/,//g;
+
+            my ($uiHint, $inf_tags);
+
+            my $app_name = $instance->appName();
+            $app_name =~ s/,//g;
+
+            if ($product->isASPProduct()) {
+                $uiHint = $app_name;
+            } else {
+                my $community = $instance->community();
+                if ($community) {
+                    $community = "community $community";
+                } else {
+                    $community = "default community";
+                }
+
+                $uiHint = "$community/" . $app_name;
+                $inf_tags = qq|community="$community",app_name=$app_name,instance_name=$instanceName|;
+            }
+
+            my $results;
+
+            my $monitorStats = ariba::monitor::AppInstanceStats->newFromAppInstance($instance);
+            $monitorStats->fetch();
+
+            my $networkRFQCount = $monitorStats->networkRFQRequestCount();
+            if(defined($networkRFQCount)) {
+                my $networkRFQFailed = $monitorStats->networkRFQRequestFailedCount();
+                my $networkRFQSendCount = $monitorStats->networkRFQSendQuoteCount();
+                my $networkRFQSendFailed = $monitorStats->networkRFQSendQuoteFailedCount();
+                my $networkRFQDiscoveryCount = $monitorStats->networkRFQDiscoveryPostingUpdateCount();
+                my $networkRFQDiscoveryFailed = $monitorStats->networkRFQDiscoveryPostingUpdateFailedCount();
+                $totalRFQCount = defined($totalRFQCount) ? $totalRFQCount + $networkRFQCount : $networkRFQCount;
+                $totalRFQFailed = defined($totalRFQFailed) ? $totalRFQFailed + $networkRFQFailed : $networkRFQFailed;
+                $totalRFQSendCount = defined($totalRFQSendCount) ? $totalRFQSendCount + $networkRFQSendCount : $networkRFQSendCount;
+                $totalRFQSendFailed = defined($totalRFQSendFailed) ? $totalRFQSendFailed + $networkRFQSendFailed : $networkRFQSendFailed;
+                $totalDiscoveryCount = defined($totalDiscoveryCount) ? $totalDiscoveryCount + $networkRFQDiscoveryCount : $networkRFQDiscoveryCount;
+                $totalDiscoveryFailed = defined($totalDiscoveryFailed) ? $totalDiscoveryFailed + $networkRFQDiscoveryFailed : $networkRFQDiscoveryFailed;
+
+                $queries{"$instanceName Incoming Request Count"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+                    'format' => "%d\n",
+                    'uiHint' => $uiHint,
+
+                    'perl' => sub { return $networkRFQCount; },
+                    'inf_field' => "value",
+                    'inf_tags' => qq|$inf_tags,description="Incoming Request Count"|,
+                    'group_by' => qq|$inf_tags,description="Incoming Request Count"|,
+                };
+
+                $queries{"$instanceName Incoming Request Failures"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+                    'format' => "%d\n",
+                    'uiHint' => $uiHint,
+
+                    'perl' => sub { return $networkRFQFailed; },
+                    'inf_field' => "value",
+                    'inf_tags' => qq|$inf_tags,description="Incoming Request Failures"|,
+                    'group_by' => qq|$inf_tags,description="Incoming Request Failures"|,
+                };
+
+                $queries{"$instanceName Send Quote Count"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+                    'format' => "%d\n",
+                    'uiHint' => $uiHint,
+
+                    'perl' => sub { return $networkRFQSendCount; },
+                    'inf_field' => "value",
+                    'inf_tags' => qq|$inf_tags,description="Send Quote Count"|,
+                    'group_by' => qq|$inf_tags,description="Send Quote Count"|,
+                };
+
+                $queries{"$instanceName Send Quote Failures"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+                    'format' => "%d\n",
+                    'uiHint' => $uiHint,
+
+                    'perl' => sub { return $networkRFQSendFailed; },
+                    'inf_field' => "value",
+                    'inf_tags' => qq|$inf_tags,description="Send Quote Failures"|,
+                    'group_by' => qq|$inf_tags,description="Send Quote Failures"|,
+                };
+
+                $queries{"$instanceName Posting Update Count"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+                    'format' => "%d\n",
+                    'uiHint' => $uiHint,
+
+                    'perl' => sub { return $networkRFQDiscoveryCount; },
+                    'inf_field' => "value",
+                    'inf_tags' => qq|$inf_tags,description="Posting Update Count"|,
+                    'group_by' => qq|$inf_tags,description="Posting Update Count"|,
+                };
+
+                $queries{"$instanceName Posting Update Failures"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+                    'format' => "%d\n",
+                    'uiHint' => $uiHint,
+
+                    'perl' => sub { return $networkRFQDiscoveryFailed; },
+                    'inf_field' => "value",
+                    'inf_tags' => qq|$inf_tags,description="Posting Update Failures"|,
+                    'group_by' => qq|$inf_tags,description="Posting Update Failures"|,
+                };
+            }
+
+            if ($instance->isUIApp()) {
+                my $activeRFX = $monitorStats->activeRFXCount() || 0;
+                $totalActiveRFX += $activeRFX;
+
+                if ( $productName eq "s4" ) {
+                    my $activeLargeOrHugeRFX = $monitorStats->largeRFXCount() || 0;
+                    $totalActiveLargeOrHugeRFX += $activeLargeOrHugeRFX;
+
+                    $queries{"$instanceName Large/Huge RFX Count"} = {
+                        'recordMaxResults' => 110000,
+                        'recordDataType' => "gauge",
+
+                        'skip' => $skip,
+                        'info' => "!defined(answer) || answer eq '' || answer >= 0",
+                        #'warn' => "defined(answer) && answer >= 30",
+                        #'crit' => "defined(answer) && answer >= 50",
+                        'uiHint' => $uiHint,
+                        'format' => "%d\n",
+
+                        'perl' => sub { return $activeLargeOrHugeRFX; },
+                        'inf_field' => "value",
+                        'inf_tags' => qq|$inf_tags,description="Large/Huge RFX Count"|,
+                        'group_by' => qq|$inf_tags,description="Large/Huge RFX Count"|,
+                    };
+                }
+
+                $queries{"$instanceName Active RFX Count"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+
+                    'skip' => $skip,
+                    'info' => "!defined(answer) || answer eq '' || answer >= 0",
+                    #'warn' => "defined(answer) && answer >= 30",
+                    #'crit' => "defined(answer) && answer >= 50",
+                    'uiHint' => $uiHint,
+                    'format' => "%d\n",
+
+                    'perl' => sub { return $activeRFX; },
+                    'inf_field' => "value",
+                    'inf_tags' => qq|$inf_tags,description="Active RFX Count"|,
+                    'group_by' => qq|$inf_tags,description="Active RFX Count"|,
+                };
+
+                $queries{"$instanceName New RFX Count"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+
+                    'info' => "!defined(answer) || answer eq '' || answer >= 0",
+                    'skip' => $skip,
+                    #'warn' => "defined(answer) && answer >= 30",
+                    #'crit' => "defined(answer) && answer >= 50",
+                    'uiHint' => $uiHint,
+                    'format' => "%d\n",
+
+                    'perl' => sub { return $monitorStats->newRFXCount(); },
+                    'inf_field' => "value",
+                    'inf_tags' => qq|$inf_tags,description="New RFX Count"|,
+                    'group_by' => qq|$inf_tags,description="New RFX Count"|,
+                };
+
+                $queries{"$instanceName Sourcing Work Load"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+
+                    'info' => "!defined(answer) || answer eq '' || answer >= 0",
+                    'skip' => $skip,
+                    'warn' => "defined(answer) && answer >= 0.9",
+                    #'crit' => "defined(answer) && answer >= 1.0",
+                    'uiHint' => $uiHint,
+                    'format' => "%0.2f\n",
+
+                    'perl' => sub { return $monitorStats->sourcingWorkLoad(); },
+                    'inf_field' => "value",
+                    'inf_tags' => qq|$inf_tags,description="Sourcing Work Load"|,
+                    'group_by' => qq|$inf_tags,description="Sourcing Work Load"|,
+                };
+
+                my $bidsProcessed = $monitorStats->bidsProcessed();
+                $totalBidsProcessed += $bidsProcessed;
+
+                $queries{"$instanceName Number of Bids Processed since last sample"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+
+                    'info' => "!defined(answer) || answer eq '' || answer >= 0",
+                    'skip' => $skip,
+                    'warn' => "defined(answer) && answer >= 75",
+                    #'crit' => "defined(answer) && answer >= 100",
+                    'uiHint' => $uiHint,
+                    'format' => "%d\n",
+
+                    'perl' => sub { return $bidsProcessed; },
+                    'inf_field' => "value",
+                    'inf_tags' => qq|$inf_tags,description="Number of Bids Processed since last sample"|,
+                    'group_by' => qq|$inf_tags,description="Number of Bids Processed since last sample"|,
+                };
+            }
+
+            #
+            # Get the current sv activity from global task nodes
+            #
+            #analysisGlobalDataLoads: number of loads currently in progress,
+            #including ASM data pulls on shared and dedicated schemas, SV data loads.
+            #This is a global metric.
+            #
+            #analysisGlobalSchemaSwitches: number of schema switch operations
+            #currently in progress, global metric as well.
+            #
+            #analysisGlobalPresentationLoads: number of ASM pulls currently in
+            #progress on shared or dedicated schemas, global metric too.
+            #
+            #analysisGlobalSVLoads: number of SV loads in
+            #progress on dedicated schemas, global metric too.
+            #
+            #analysisConsecutiveSchemaOpFailures: number of consecutive failures in
+            #any schema operation, including data loads and schema switches, etc.
+            #From the code this looks like a per-node stats, not very useful if you
+            #asked me.
+            #removed the obsolete AnalysisFailedSharedSchemaLoads monitoring category
+            #AnalysisSharedSchemaLoadsFailed - List of shared schema having
+            #   failed loads with number of failures.
+            #   Replaced AnalysisFailedASMSharedSchemaLoads
+            #   Sample value: Star.Shared.Schema1:4;Star.Shared.Schema2:3
+            #AnalysisFailedASMSharedSchemaValidations - number of validation
+            #   failures. Replaced AnalysisSharedSchemaLoadsFailed
+            #AnalysisGlobalDedicatedPresentationLoads - Number of running
+            #   presentation loads on dedicated schemas.
+            #AnalysisGlobalSharedPresentationLoads - Number of running shared
+            #   schema loads.
+            #AnalysisASMSharedSchemaLoadTime - List of shared schema load times.
+            #AnalysisMaxTimeSinceLastSharedLoad - List of times since last
+            #   shared schema load.
+
+            if ( !($instance->community()) &&
+                 ($instance->isDispatcher() || ($instance->serverRoles() && $instance->serverRoles() =~ /AnalysisBgWorkProcessor/))
+            ) {
+
+                $totalDataLoadCount = $monitorStats->analysisGlobalDataLoads();
+                $totalABSwitchCount = $monitorStats->analysisGlobalSchemaSwitches();
+                $activePresentationLoads = $monitorStats->analysisGlobalPresentationLoads();
+                $failedSharedSchemaLoads = $monitorStats->analysisFailedSharedSchemaLoads();
+                my $dedicatedLoad = $monitorStats->analysisGlobalDedicatedPresentationLoads();
+                $runningDedicatedPresentationLoads = $dedicatedLoad if ($dedicatedLoad > $runningDedicatedPresentationLoads);
+                my $sharedLoad = $monitorStats->AnalysisGlobalSharedPresentationLoads();
+                $runningSharedPresentationLoads = $sharedLoad if ($sharedLoad > $runningSharedPresentationLoads);
+
+                for my $statField (keys %schemaStatFields) {
+                    my $stats = $monitorStats->attribute($statField);
+                    parseSchemaStatsAndStoreHighestValues($stats, \%schemaStats, $statField);
+                }
+                $activeSVLoads = $monitorStats->analysisGlobalSVDataLoads();
+
+                my $dataLoadCount = $monitorStats->analysisGlobalDataLoads();
+                my $abSwitchCount = $monitorStats->analysisGlobalSchemaSwitches();
+
+                my $concurrentOperations = $dataLoadCount + $abSwitchCount;
+
+                $queries{"$instanceName Number of SV dataloads in progress"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+                    'uiHint' => $uiHint,
+                    'info' => 1,
+                    'warn' => "$concurrentOperations >= $warnConcurrentLoads",
+                    'perl' => sub { return $dataLoadCount; },
+                    'inf_field' => "value",
+                    'inf_tags' => qq|$inf_tags,description="Number of SV dataloads in progress"|,
+                    'group_by' => qq|$inf_tags,description="Number of SV dataloads in progress"|,
+                };
+
+                $queries{"$instanceName Number of SV A/B switch in progress"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+                    'uiHint' => $uiHint,
+                    'info' => 1,
+                    'warn' => "$concurrentOperations >= $warnConcurrentLoads",
+                    'perl' => sub { return $abSwitchCount; },
+                    'inf_field' => "value",
+                    'inf_tags' => qq|$inf_tags,description="Number of SV A/B switch in progress"|,
+                    'group_by' => qq|$inf_tags,description="Number of SV A/B switch in progress"|,
+                };
+
+                #
+                # This got added only in SP2, handle the case of
+                # pre sp2 software.
+                #
+                my $schemaOpsFailures = $monitorStats->analysisConsecutiveSchemaOpFailures() || 0;
+
+                $queries{"$instanceName Number of Failed Schema Operations"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+                    'uiHint' => $uiHint,
+                    'crit' => "$schemaOpsFailures >= 15",
+                    'warn' => "$schemaOpsFailures >= 4",
+                    'info' => 1,
+                    'ticketOnWarnOpenAfterMinutes' => 1,
+                    'perl' => sub { return $schemaOpsFailures; },
+                    'inf_field' => "value",
+                    'inf_tags' => qq|$inf_tags,description="Number of Failed Schema Operations"|,
+                    'group_by' => qq|$inf_tags,description="Number of Failed Schema Operations"|,
+                };
+
+                if ( $productName eq "s4" ) {
+                    my ($totalFailures, $parsedLoadFailures) = parseDedicatedLoadFailureResults($monitorStats->analysisDedicatedPresentationLoadsFailed());
+                    unless (exists($queries{"Total number of failed dedicated presentation load failures"})) {
+                            $queries{"Total number of failed dedicated presentation load failures"} = {
+                            'recordMaxResults' => 110000,
+                            'recordDataType' => "gauge",
+                            'info' => 1,
+                            'perl' => sub { return $totalFailures ; },
+                            'note' => $parsedLoadFailures,
+                            'inf_field' => 'total_failed_dedicated_presentation_load',
+                            'group_by' => 'general'
+                            };
+                    }
+                }
+
+                if ( $productName eq "s4" ) {
+                    my $preMigrationMetrics = $monitorStats->analysisPreMigrationLoadStatusMetric();
+                    if (length($preMigrationMetrics) > 0) {
+                        my $hasPreMigrationError = 1;
+                        if ( $preMigrationMetrics =~ /Error:0/ ) {
+                            $hasPreMigrationError = 0;
+                        }
+                        if (($hasPreMigrationError == 1) || (not exists($queries{"Pre-Migration Status"}))) {
+                            $queries{hasPreMigrationError} = {
+                                perl => sub {return $hasPreMigrationError},
+                                inf_field => 'hasPreMigrationError',
+                                group_by => 'general',
+                            };
+                            $queries{"Pre-Migration Status"} = {
+                                'recordMaxResults' => 110000,
+                                'recordDataType' => "gauge",
+                                'crit' => "$hasPreMigrationError >= 1",
+                                'warn' => "$hasPreMigrationError < 0",
+                                'info' => 1,
+                                'perl' => sub { return $preMigrationMetrics; },
+                                'inf_field' => 'pre_migration_status',
+                                'group_by' => 'general',
+                            };
+                        }
+                    }
+
+                    my $postMigrationMetrics = $monitorStats->analysisPostMigrationLoadStatusMetric();
+                    if (length($postMigrationMetrics) > 0) {
+                        my $hasPostMigrationError = 1;
+                        if ( $postMigrationMetrics =~ /Error:0/ ) {
+                            $hasPostMigrationError = 0;
+                        }
+                        if (($hasPostMigrationError == 1) || (not exists($queries{"Post-Migration Status"}))) {
+                            $queries{hasPostMigrationError} = {
+                                perl => sub {return $hasPostMigrationError},
+                                inf_field => 'hasPostMigrationError',
+                                group_by => 'general',
+                            };
+                            $queries{"Post-Migration Status"} = {
+                                'recordMaxResults' => 110000,
+                                'recordDataType' => "gauge",
+                                'crit' => "$hasPostMigrationError >= 1",
+                                'warn' => "$hasPostMigrationError < 0",
+                                'info' => 1,
+                                'perl' => sub { return $postMigrationMetrics; },
+                                'inf_field' => "post_migration_status",
+                                'group_by' => 'general',
+                            };
+                        }
+                    }
+
+                    my $preMigrationTakingLongTime = $monitorStats->analysisLongRunningPreMigrationLoadsMetric();
+                    if (length($preMigrationTakingLongTime) > 0) {
+                        if (($preMigrationTakingLongTime > 0) || (not exists($queries{"Long running Pre-Migrations"}))) {
+                            $queries{"Long running Pre-Migrations"} = {
+                                'recordMaxResults' => 110000,
+                                'recordDataType' => "gauge",
+                                'crit' => "$preMigrationTakingLongTime > 0",
+                                'warn' => "$preMigrationTakingLongTime < 0",
+                                'info' => 1,
+                                'perl' => sub { return $preMigrationTakingLongTime; },
+                                'inf_field' => 'long_running_pre_migration',
+                                'group_by' => 'general',
+                            };
+                        }
+                    }
+
+                    my $postMigrationTakingLongTime = $monitorStats->analysisLongRunningPostMigrationLoadsMetric();
+                    if (length($postMigrationTakingLongTime) > 0) {
+                        if (($postMigrationTakingLongTime > 0) || (not exists($queries{"Long running Post-Migrations"}))) {
+                            $queries{"Long running Post-Migrations"} = {
+                                'recordMaxResults' => 110000,
+                                'recordDataType' => "gauge",
+                                'crit' => "$postMigrationTakingLongTime > 0",
+                                'warn' => "$postMigrationTakingLongTime < 0",
+                                'info' => 1,
+                                'perl' => sub { return $postMigrationTakingLongTime; },
+                                'inf_field' => 'long_running_post_migration',
+                                'group_by' => 'general',
+                            };
+                        }
+                    }
+
+                    #will return a string of the form x;y,y,y,y where x is the number and y is a schema name
+                    my $errorsInLastHanaDedicatedLoads = $monitorStats->analysisHanaDedicatedLoadErrorMetric();
+                    if (length($errorsInLastHanaDedicatedLoads) > 0) {
+                        my ($numErrorsInHanaDedicatedLoad, $schemasInErrorStateFromLastHanaDedicatedLoad) = split(";", $errorsInLastHanaDedicatedLoads);
+                        if (($numErrorsInHanaDedicatedLoad > 0) || (not exists($queries{"Hana Dedicated Load Errors"}))) {
+                            $queries{"Hana Dedicated Load Errors"} = {
+                                'recordMaxResults' => 110000,
+                                'recordDataType' => "gauge",
+                                'crit' => "answer > 0",
+                                'warn' => "answer < 0",
+                                'info' => 1,
+                                'perl' => sub { return $numErrorsInHanaDedicatedLoad; },
+                                'note' => "$schemasInErrorStateFromLastHanaDedicatedLoad",
+                                'inf_field' => 'hana_dedicated_load_errors',
+                                'group_by' => 'general',
+                            };
+                        }
+                    }
+
+                    #will return a string of the form x;y,y,y,y where x is the number and y is a schema name
+                    my $longRunningHanaPresentationLoads = $monitorStats->analysisHanaDedicatedPresentationLoadLongRunningMetric();
+                    if (length($longRunningHanaPresentationLoads) > 0) {
+                        my ($numLongRunningHanaPresentationLoads, $schemasInLongRunningStateFromLastHanaPresentationLoad) = split(";", $longRunningHanaPresentationLoads);
+                        if (($numLongRunningHanaPresentationLoads > 0) || (not exists($queries{"Hana Long running presentation loads"}))) {
+                            $queries{"Hana Long running presentation loads"} = {
+                                'recordMaxResults' => 110000,
+                                'recordDataType' => "gauge",
+                                'crit' => "answer > 0",
+                                'warn' => "answer < 0",
+                                'info' => 1,
+                                'perl' => sub { return $numLongRunningHanaPresentationLoads; },
+                                'note' => "$schemasInLongRunningStateFromLastHanaPresentationLoad",
+                                'inf_field' => 'hana_long_running_presentation_load',
+                                'group_by' => 'general',
+                            };
+                        }
+                    }
+
+                    #will return a string of the form x;y,y,y,y where x is the number and y is a schema name
+                    my $longRunningHanaDataLoads = $monitorStats->analysisHanaDedicatedDataLoadLongRunningMetric();
+                    if (length($longRunningHanaDataLoads) > 0) {
+                        my ($numLongRunningHanaDataLoads, $schemasInLongRunningStateFromLastHanaDataLoad) = split(";", $longRunningHanaDataLoads);
+                        if (($numLongRunningHanaDataLoads > 0) || (not exists($queries{"Hana Long running data loads"}))) {
+                            $queries{"Hana Long running data loads"} = {
+                                'recordMaxResults' => 110000,
+                                'recordDataType' => "gauge",
+                                'crit' => "answer > 0",
+                                'warn' => "answer < 0",
+                                'info' => 1,
+                                'perl' => sub { return $numLongRunningHanaDataLoads; },
+                                'note' => "$schemasInLongRunningStateFromLastHanaDataLoad",
+                                'inf_field' => 'hana_long_running_data_loads',
+                                'group_by' => 'general',
+                            };
+                        }
+                    }
+
+                    #will return a string of the form x;y,y,y,y where x is the number of schemas on more than one host
+                    #and y is a schema that is more than one host.
+                    my $schemasOnMoreThanOneHostStr = $monitorStats->analysisSchemasOnMultipleHostsMetric();
+                    if (length($schemasOnMoreThanOneHostStr) > 0) {
+                        my ($numSchemasOnMoreThanOneHost, $schemasOnMoreThanOneHost) = split(";", $schemasOnMoreThanOneHostStr);
+                        if (($numSchemasOnMoreThanOneHost > 0) || (not exists($queries{"Schemas on more than one host"}))) {
+                            $queries{"Schemas on more than one host"} = {
+                                'recordMaxResults' => 110000,
+                                'recordDataType' => "gauge",
+                                'warn' => "$numSchemasOnMoreThanOneHost > 0",
+                                'info' => 1,
+                                'perl' => sub { return $numSchemasOnMoreThanOneHost; },
+                                'note' => "$schemasOnMoreThanOneHost",
+                                'inf_field' => 'schema_on_more_than_one_host',
+                                'group_by' => 'general',
+                            };
+                        }
+                    }
+                }
+            }
+
+            if ( $productName eq "s4" ) {
+                my ($ansSumOfNums, $ansSchemas, $ansCounts);
+
+                ### NOTE: instances (e.g. 'Node3-app385snv') don't satisfy this condition, so it will never be true
+                if ( $instanceName =~ /^(TaskCXML)/ ) {
+                    #Number of Arches publish request count
+                    my $numberOfArchesPublishRequestCountMetric = $monitorStats->numberOfArchesPublishRequestCountMetric();
+                    if (length($numberOfArchesPublishRequestCountMetric) > 0) {
+                        push @{ $s4MetricRollupRef->{ "numberOfArchesPublishRequestCountMetric" }->{ "values" } }, addS4QueriesWithCritAndWarn( \%queries, $numberOfArchesPublishRequestCountMetric, "$instanceName Arches Search - Number of Arches Publish Request Count", "$uiHint/Arches Search", undef, undef );
+                        $s4MetricRollupRef->{ "numberOfArchesPublishRequestCountMetric" }->{ "calc" } = "sum";
+                        $s4MetricRollupRef->{ "numberOfArchesPublishRequestCountMetric" }->{ "description" } = "Arches Search - Number of Arches Publish Request Count";
+                        $s4MetricRollupRef->{ "numberOfArchesPublishRequestCountMetric" }->{ "uiHint" } = "Arches Search";
+                    }
+
+                    #Average Arches publish time
+                    my $averageArchesPublishTimeMetric = $monitorStats->averageArchesPublishTimeMetric();
+                    if (length($averageArchesPublishTimeMetric) > 0) {
+                        push @{ $s4MetricRollupRef->{ "averageArchesPublishTimeMetric" }->{ "values" } }, addS4QueriesWithCritAndWarn( \%queries, $averageArchesPublishTimeMetric, "$instanceName Arches Search - Average Arches publish time in seconds", "$uiHint/Arches Search", undef, undef );
+                        $s4MetricRollupRef->{ "averageArchesPublishTimeMetric" }->{ "calc" } = "avg";
+                        $s4MetricRollupRef->{ "averageArchesPublishTimeMetric" }->{ "description" } = "Arches Search - Average Arches publish time in seconds";
+                        $s4MetricRollupRef->{ "averageArchesPublishTimeMetric" }->{ "uiHint" } = "Arches Search";
+                    }
+
+                    my @archesMonitors =
+                        ( [ "realmsExceedingPublishTimeForNRTPriorityMetric",
+                            "Arches Search - Number of items exceeding the SLA for NRT priority per realm",
+                            "Arches Search - Number of items exceeding the SLA for NRT priority in community",
+                            "Arches Search - Number of items exceeding the SLA for NRT priority in all communites",
+                            "500",
+                            "200",
+                            "100"],
+                          [ "realmsExceedingPublishTimeForTopPriorityMetric",
+                            "Arches Search - Number of items exceeding the SLA for Top priority per realm",
+                            "Arches Search - Number of items exceeding the SLA for Top priority in community",
+                            "Arches Search - Number of items exceeding the SLA for Top priority in all communities",
+                            "1500",
+                            "600",
+                            "300"],
+                          [ "realmsExceedingPublishTimeForFilePriorityMetric",
+                            "Arches Search - Number of items exceeding the SLA for File priority per realm",
+                            "Arches Search - Number of items exceeding the SLA for File priority in community",
+                            "Arches Search - Number of items exceeding the SLA for File priority in all communities",
+                            "3500",
+                            "1400",
+                            "700"],
+                          [ "realmsExceedingPublishTimeForBatchPriorityMetric",
+                            "Arches Search - Number of items exceeding the SLA for Batch priority per realm",
+                            "Arches Search - Number of items exceeding the SLA for Batch priority in community",
+                            "Arches Search - Number of items exceeding the SLA for Batch priority in all communities",
+                            "2500",
+                            "1000",
+                            "500"],
+                          [ "unpublishedWorkItemCountForNRTPriorityMetric",
+                            "Arches Search - Number of unpublished items for NRT priority per realm",
+                            "Arches Search - Number of unpublished items for NRT priority in community",
+                            "Arches Search - Number of unpublished items for NRT priority in all communities",
+                            "",
+                            "",
+                            ""],
+                          [ "unpublishedWorkItemCountForTopPriorityMetric",
+                            "Arches Search - Number of unpublished items for Top priority per realm",
+                            "Arches Search - Number of unpublished items for Top priority in community",
+                            "Arches Search - Number of unpublished items for Top priority in all communities",
+                            "",
+                            "",
+                            ""],
+                          [ "unpublishedWorkItemCountForFilePriorityMetric",
+                            "Arches Search - Number of unpublished items for File priority per realm",
+                            "Arches Search - Number of unpublished items for File priority in community",
+                            "Arches Search - Number of unpublished items for File priority in all communities",
+                            "",
+                            "",
+                            ""],
+                          [ "unpublishedWorkItemCountForBatchPriorityMetric",
+                            "Arches Search - Number of unpublished items for Batch priority per realm",
+                            "Arches Search - Number of unpublished items for Batch priority in community",
+                            "Arches Search - Number of unpublished items for Batch priority in all communities",
+                            "",
+                            "",
+                            ""],
+                          [ "unpublishedWorkItemCountForBatchPriorityMetric",
+                            "Arches Search - Number of unpublished items for Batch priority per reelm",
+                            "Arches Search - Number of unpublished items for Batch priority in community",
+                            "Arches Search - Number of unpublished items for Batch priority in all communities",
+                            "",
+                            "",
+                            ""],
+                          [ "numberOfArchesPublishRequestFailurePerRealmMetric",
+                            "Arches Search - Number of failed publish requests per realm",
+                            "Arches Search - Number of failed publish requests in community",
+                            "Arches Search - Number of failed publish requests in all communities",
+                            "10",
+                            "",
+                            "2"],
+                          [ "numberOfArchesPublishRequestSkippedPerRealmMetric",
+                            "Arches Search - Number of skipped publish requests per realm",
+                            "Arches Search - Number of skipped publish requests in community",
+                            "Arches Search - Number of skipped publish requests in all communities",
+                            "",
+                            "",
+                            ""]
+                    );
+
+                    my $numArchesMonitors = @archesMonitors;
+                    my $archesMonitorIndex = 0;
+                    for ($archesMonitorIndex=0; $archesMonitorIndex < $numArchesMonitors; $archesMonitorIndex++) {
+                        my $curMetric = $archesMonitors[$archesMonitorIndex][0];
+                        my $curMetricDesc = $archesMonitors[$archesMonitorIndex][1];
+                        my $curMetricCommunityDesc = $archesMonitors[$archesMonitorIndex][2];
+                        my $curMetricCommunitiesDesc = $archesMonitors[$archesMonitorIndex][3];
+                        my $curMetricCritOnTotalVal = $archesMonitors[$archesMonitorIndex][4];
+                        my $curMetricWarnOnTotalVal = $archesMonitors[$archesMonitorIndex][5];
+                        my $curMetricWarnOnItemVal = $archesMonitors[$archesMonitorIndex][6];
+
+                        my $curMetricVar = $monitorStats->$curMetric();
+                        my $keyVal = $uiHint . ":::" . $curMetric;
+                        if (exists $community_rollup_for_arches_name{$keyVal}) {
+                            $curMetricVar = sumUpStringMetrics($community_rollup_for_arches_value{$keyVal}, $curMetricVar);
+                            $community_rollup_for_arches_value{$keyVal} = $curMetricVar;
+                        } else {
+                            $community_rollup_for_arches_uiHint{$keyVal} = $uiHint;
+                            $community_rollup_for_arches_name{$keyVal} = "$uiHint - " . $curMetricDesc;
+                            $community_rollup_for_arches_rollup_name{$keyVal} = $curMetricDesc;
+                            $community_rollup_for_arches_value{$keyVal} = $curMetricVar;
+                            $community_rollup_for_arches_id{$keyVal} = $curMetric;
+                            $community_rollup_for_sumofnumbers_name{$keyVal} = "$uiHint - " . $curMetricCommunityDesc;
+                            $community_rollup_for_sumofnumbers_name_rollup{$keyVal} = $curMetricCommunitiesDesc;
+                        }
+                        $community_rollup_for_arches_critonitem{$keyVal} = undef;
+                        $community_rollup_for_arches_critontotal{$keyVal} = undef;
+                        $community_rollup_for_arches_warnonitem{$keyVal} = undef;
+                        $community_rollup_for_arches_warnontotal{$keyVal} = undef;
+                        ($ansSumOfNums, $ansSchemas, $ansCounts) = parseRealmStats($curMetricVar);
+                        $community_rollup_for_arches_sumofnumbers{$keyVal} = $ansSumOfNums;
+                        if (length($curMetricCritOnTotalVal) > 0) {
+                            if ($ansSumOfNums > $curMetricCritOnTotalVal) {
+                                $community_rollup_for_arches_critontotal{$keyVal} = "1";
+                            }
+                        }
+                        if (length($curMetricWarnOnTotalVal)) {
+                            if ($ansSumOfNums > $curMetricWarnOnTotalVal) {
+                                $community_rollup_for_arches_warnontotal{$keyVal} = "1";
+                            }
+                        }
+                        if (length($curMetricWarnOnItemVal)) {
+                            if (getPosInArrayGreaterThan(\@$ansCounts, $curMetricWarnOnItemVal) >= 0) {
+                                $community_rollup_for_arches_warnonitem{$keyVal} = "1";
+                            }
+                        }
+                    }
+                }
+            }
+
+            if ( $productName eq "s4" ) {
+
+                ### NOTE: instances (e.g. 'Node3-app385snv') don't satisfy this condition, so we'll always skip
+                next unless ( $instanceName =~ /^(TaskCXML|AODDatasync)/ );
+
+                ### NOTE: instances (e.g. 'Node3-app385snv') don't satisfy this condition, so it will never be true
+                if ( $instanceName =~ /^TaskCXML/ ) {
+                    # I've created addS4Queries because it was getting silly copying and pasting the query hash 50 times
+                    # TMID: 126623 Request 1
+                    push @{ $s4MetricRollupRef->{ "dataPushTotalCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "dataPushTotalCount", "$instanceName DataPush - Total number of pushes", "$uiHint/DataPush" );
+                    $s4MetricRollupRef->{ "dataPushTotalCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "dataPushTotalCount" }->{ "description" } = "DataPush - Total number of pushes";
+                    $s4MetricRollupRef->{ "dataPushTotalCount" }->{ "uiHint" } = "AOD DataSync/DataPush";
+
+                    push @{ $s4MetricRollupRef->{ "dataPushSuccessCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "dataPushSuccessCount", "$instanceName DataPush - Number of successful pushes", "$uiHint/DataPush" );
+                    $s4MetricRollupRef->{ "dataPushSuccessCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "dataPushSuccessCount" }->{ "description" } = "DataPush - Number of successful pushes";
+                    $s4MetricRollupRef->{ "dataPushSuccessCount" }->{ "uiHint" } = "AOD DataSync/DataPush";
+
+                    push @{ $s4MetricRollupRef->{ "dataPushErrorCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "dataPushErrorCount", "$instanceName DataPush - Number of failed pushes", "$uiHint/DataPush" );
+                    $s4MetricRollupRef->{ "dataPushErrorCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "dataPushErrorCount" }->{ "description" } = "DataPush - Number of failed pushes";
+                    $s4MetricRollupRef->{ "dataPushErrorCount" }->{ "uiHint" } = "AOD DataSync/DataPush";
+
+                    # TMID: 126623 Request 6
+                    push @{ $s4MetricRollupRef->{ "dataUpdaterWorkTotalCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "dataUpdaterWorkTotalCount", "$instanceName DataUpdater - Total number of updater works", "$uiHint/DataUpdater" );
+                    $s4MetricRollupRef->{ "dataUpdaterWorkTotalCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "dataUpdaterWorkTotalCount" }->{ "description" } = "DataUpdater - Total number of updater works";
+                    $s4MetricRollupRef->{ "dataUpdaterWorkTotalCount" }->{ "uiHint" } = "AOD DataSync/DataUpdater";
+
+                    push @{ $s4MetricRollupRef->{ "dataUpdaterWorkSuccessCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "dataUpdaterWorkSuccessCount", "$instanceName DataUpdater - Number of updater works processed successfully", "$uiHint/DataUpdater" );
+                    $s4MetricRollupRef->{ "dataUpdaterWorkSuccessCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "dataUpdaterWorkSuccessCount" }->{ "description" } = "DataUpdater - Number of updater works processed successfully";
+                    $s4MetricRollupRef->{ "dataUpdaterWorkSuccessCount" }->{ "uiHint" } = "AOD DataSync/DataUpdater";
+
+                    push @{ $s4MetricRollupRef->{ "dataUpdaterWorkErrorCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "dataUpdaterWorkErrorCount", "$instanceName DataUpdater - Number of failed updater works", "$uiHint/DataUpdater" );
+                    $s4MetricRollupRef->{ "dataUpdaterWorkErrorCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "dataUpdaterWorkErrorCount" }->{ "description" } = "DataUpdater - Number of failed updater works";
+                    $s4MetricRollupRef->{ "dataUpdaterWorkErrorCount" }->{ "uiHint" } = "AOD DataSync/DataUpdater";
+
+                    push @{ $s4MetricRollupRef->{ "dataUpdaterSuccessCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "dataUpdaterSuccessCount", "$instanceName DataUpdater - Number of updater tasks finished", "$uiHint/DataUpdater" );
+                    $s4MetricRollupRef->{ "dataUpdaterSuccessCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "dataUpdaterSuccessCount" }->{ "description" } = "DataUpdater - Number of updater tasks finished";
+                    $s4MetricRollupRef->{ "dataUpdaterSuccessCount" }->{ "uiHint" } = "AOD DataSync/DataUpdater";
+
+                    push @{ $s4MetricRollupRef->{ "dataUpdaterWorkAverageTime" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "dataUpdaterWorkAverageTime", "$instanceName DataUpdater - Average time to update one object", "$uiHint/DataUpdater" );
+                    $s4MetricRollupRef->{ "dataUpdaterWorkAverageTime" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "dataUpdaterWorkAverageTime" }->{ "description" } = "DataUpdater - Average time to update one object";
+                    $s4MetricRollupRef->{ "dataUpdaterWorkAverageTime" }->{ "uiHint" } = "AOD DataSync/DataUpdater";
+
+                    # TMID: 126623 Request 11
+                    push @{ $s4MetricRollupRef->{ "dataPushThrottlingQueueBlockedCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "dataPushThrottlingQueueBlockedCount", "$instanceName DataPush - Throttling threads blocked count", "$uiHint/DataPush" );
+                    $s4MetricRollupRef->{ "dataPushThrottlingQueueBlockedCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "dataPushThrottlingQueueBlockedCount" }->{ "description" } = "DataPush - Throttling threads blocked count";
+                    $s4MetricRollupRef->{ "dataPushThrottlingQueueBlockedCount" }->{ "uiHint" } = "AOD DataSync/DataPush";
+
+                    # TMID: 126623 Request 16
+                    push @{ $s4MetricRollupRef->{ "dataPushThrottlingQueueBlockedTime" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "dataPushThrottlingQueueBlockedTime", "$instanceName DataPush - Throttling blocked since", "$uiHint/DataPush" );
+                    $s4MetricRollupRef->{ "dataPushThrottlingQueueBlockedTime" }->{ "calc" } = "max";
+                    $s4MetricRollupRef->{ "dataPushThrottlingQueueBlockedTime" }->{ "description" } = "DataPush - Throttling blocked since";
+                    $s4MetricRollupRef->{ "dataPushThrottlingQueueBlockedTime" }->{ "uiHint" } = "AOD DataSync/DataPush";
+
+                    push @{ $s4MetricRollupRef->{ "dataUpdaterTotalCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "dataUpdaterTotalCount", "$instanceName DataUpdater - Number of updater tasks executed", "$uiHint/DataUpdater" );
+                    $s4MetricRollupRef->{ "dataUpdaterTotalCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "dataUpdaterTotalCount" }->{ "description" } = "DataUpdater - Number of updater tasks executed";
+                    $s4MetricRollupRef->{ "dataUpdaterTotalCount" }->{ "uiHint" } = "AOD DataSync/DataUpdater";
+                }
+                elsif ( $instanceName =~ /^AODDatasync/ ) {
+                    # TMID: 126623 Request 2
+                    push @{ $s4MetricRollupRef->{ "changeListSuccessTime" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "changeListSuccessTime", "$instanceName GetChangeList - Time of last successful request", "$uiHint/GetChangeList" );
+                    $s4MetricRollupRef->{ "changeListSuccessTime" }->{ "calc" } = "max";
+                    $s4MetricRollupRef->{ "changeListSuccessTime" }->{ "description" } = "GetChangeList - Time of last successful request";
+                    $s4MetricRollupRef->{ "changeListSuccessTime" }->{ "uiHint" } = "AOD DataSync/GetChangeList";
+
+                    # TMID: 1226623 Request 3
+                    push @{ $s4MetricRollupRef->{ "changeListTotalCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "changeListTotalCount", "$instanceName GetChangeList - Total number of requests", "$uiHint/GetChangeList" );
+                    $s4MetricRollupRef->{ "changeListTotalCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "changeListTotalCount" }->{ "description" } = "GetChangeList - Total number of requests";
+                    $s4MetricRollupRef->{ "changeListTotalCount" }->{ "uiHint" } = "AOD DataSync/GetChangeList";
+
+                    push @{ $s4MetricRollupRef->{ "changeListSuccessCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "changeListSuccessCount", "$instanceName GetChangeList - Number of successful requests", "$uiHint/GetChangeList" );
+                    $s4MetricRollupRef->{ "changeListSuccessCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "changeListSuccessCount" }->{ "description" } = "GetChangeList - Number of successful requests";
+                    $s4MetricRollupRef->{ "changeListSuccessCount" }->{ "uiHint" } = "AOD DataSync/GetChangeList";
+
+                    push @{ $s4MetricRollupRef->{ "changeListErrorCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "changeListErrorCount", "$instanceName GetChangeList - Number of failed requests", "$uiHint/GetChangeList" );
+                    $s4MetricRollupRef->{ "changeListErrorCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "changeListErrorCount" }->{ "description" } = "GetChangeList - Number of failed requests";
+                    $s4MetricRollupRef->{ "changeListErrorCount" }->{ "uiHint" } = "AOD DataSync/GetChangeList";
+
+                    push @{ $s4MetricRollupRef->{ "changeListChangeIdsCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "changeListChangeIdsCount", "$instanceName GetChangeList - Number of Changes", "$uiHint/GetChangeList" );
+                    $s4MetricRollupRef->{ "changeListChangeIdsCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "changeListChangeIdsCount" }->{ "description" } = "GetChangeList - Number of Changes";
+                    $s4MetricRollupRef->{ "changeListChangeIdsCount" }->{ "uiHint" } = "AOD DataSync/GetChangeList";
+
+                    push @{ $s4MetricRollupRef->{ "changeListAverageTime" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "changeListAverageTime", "$instanceName GetChangeList - Average time for a request", "$uiHint/GetChangeList" );
+                    $s4MetricRollupRef->{ "changeListAverageTime" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "changeListAverageTime" }->{ "description" } = "GetChangeList - Average time for a request";
+                    $s4MetricRollupRef->{ "changeListAverageTime" }->{ "uiHint" } = "AOD DataSync/GetChangeList";
+
+                    # TMID: 1226623 Request 4
+                    push @{ $s4MetricRollupRef->{ "getDataSuccessTime" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "getDataSuccessTime", "$instanceName GetData - Time of last successful request", "$uiHint/GetData" );
+                    $s4MetricRollupRef->{ "getDataSuccessTime" }->{ "calc" } = "max";
+                    $s4MetricRollupRef->{ "getDataSuccessTime" }->{ "description" } = "GetData - Time of last successful request";
+                    $s4MetricRollupRef->{ "getDataSuccessTime" }->{ "uiHint" } = "AOD DataSync/GetData";
+
+                    # TMID: 1226623 Request 5
+                    push @{ $s4MetricRollupRef->{ "getDataTotalCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "getDataTotalCount", "$instanceName GetData - Total number requests", "$uiHint/GetData" );
+                    $s4MetricRollupRef->{ "getDataTotalCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "getDataTotalCount" }->{ "description" } = "GetData - Total number request";
+                    $s4MetricRollupRef->{ "getDataTotalCount" }->{ "uiHint" } = "AOD DataSync/GetData";
+
+                    push @{ $s4MetricRollupRef->{ "getDataSuccessCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "getDataSuccessCount", "$instanceName GetData - Number of successful requests", "$uiHint/GetData" );
+                    $s4MetricRollupRef->{ "getDataSuccessCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "getDataSuccessCount" }->{ "description" } = "GetData - Number of successful requests";
+                    $s4MetricRollupRef->{ "getDataSuccessCount" }->{ "uiHint" } = "AOD DataSync/GetData";
+
+                    push @{ $s4MetricRollupRef->{ "getDataErrorCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "getDataErrorCount", "$instanceName GetData - Number of failed requests", "$uiHint/GetData" );
+                    $s4MetricRollupRef->{ "getDataErrorCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "getDataErrorCount" }->{ "description" } = "GetData - Number of failed requests";
+                    $s4MetricRollupRef->{ "getDataErrorCount" }->{ "uiHint" } = "AOD DataSync/GetData";
+
+                    push @{ $s4MetricRollupRef->{ "getDataSyncObjCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "getDataSyncObjCount", "$instanceName GetData - Number of sync objects", "$uiHint/GetData" );
+                    $s4MetricRollupRef->{ "getDataSyncObjCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "getDataSyncObjCount" }->{ "description" } = "GetData - Number of sync objects";
+                    $s4MetricRollupRef->{ "getDataSyncObjCount" }->{ "uiHint" } = "AOD DataSync/GetData";
+
+                    push @{ $s4MetricRollupRef->{ "getDataUpdaterCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "getDataUpdaterCount", "$instanceName GetData - Number of updater tasks scheduled", "$uiHint/GetData" );
+                    $s4MetricRollupRef->{ "getDataUpdaterCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "getDataUpdaterCount" }->{ "description" } = "GetData - Number of updater tasks scheduled";
+                    $s4MetricRollupRef->{ "getDataUpdaterCount" }->{ "uiHint" } = "AOD DataSync/GetData";
+
+                    push @{ $s4MetricRollupRef->{ "getDataAverageTime" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "getDataAverageTime", "$instanceName GetData - Average time to process a request", "$uiHint/GetData" );
+                    $s4MetricRollupRef->{ "getDataAverageTime" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "getDataAverageTime" }->{ "description" } = "GetData - Average time to process a request";
+                    $s4MetricRollupRef->{ "getDataAverageTime" }->{ "uiHint" } = "AOD DataSync/GetData";
+
+                    # TMID: 126623 Request 7
+                    my $getDataRetryCount = $monitorStats->getDataRetryCount();
+                    if ( $getDataRetryCount || !exists($queries{"GetData - Retry count"}) ) {
+                        $queries{"GetData - Retry count"} = {
+                            'recordMaxResults' => 110000,
+                            'recordDataType' => "gauge",
+                            'info' => 1,
+                            'warn' => 'defined(answer) && answer > 100',
+                            'uiHint' => "AOD DataSync/GetData",
+                            'perl' => sub { return $getDataRetryCount; },
+                        };
+                    }
+
+                    my $dataUpdaterRetryCount = $monitorStats->dataUpdaterRetryCount();
+                    if ( $dataUpdaterRetryCount || !exists($queries{"DataUpdater - Retry count for DataUpdater"}) ) {
+                        $queries{"DataUpdater - Retry count for DataUpdater"} = {
+                            'recordMaxResults' => 110000,
+                            'recordDataType' => "gauge",
+                            'info' => 1,
+                            'warn' => 'defined(answer) && answer > 100',
+                            'uiHint' => "AOD DataSync/DataUpdater",
+                            'perl' => sub { return $dataUpdaterRetryCount; },
+                        };
+                    }
+
+                    # TMID: 126623 Request 8
+                    my $getDataQuarantinedCount = $monitorStats->getDataQuarantinedCount();
+                    if ( $getDataQuarantinedCount || !exists($queries{"GetData - Quarantined count"}) ) {
+                        $queries{"GetData - Quarantined count"} = {
+                            'recordMaxResults' => 110000,
+                            'recordDataType' => "gauge",
+                            'info' => 1,
+                            'warn' => 'defined(answer) && answer > 100',
+                            'ticketOnWarnOpenAfterMinutes' => 1,
+                            'uiHint' => "AOD DataSync/GetData",
+                            'perl' => sub { return $getDataQuarantinedCount; },
+                        };
+                    }
+
+                    my $dataUpdaterQuarantinedCount = $monitorStats->dataUpdaterQuarantinedCount();
+                    if ( $dataUpdaterQuarantinedCount || !exists($queries{"DataUpdater - Quarantined count"}) ) {
+                        $queries{"DataUpdater - Quarantined count"} = {
+                            'recordMaxResults' => 110000,
+                            'recordDataType' => "gauge",
+                            'info' => 1,
+                            'warn' => 'defined(answer) && answer > 100',
+                            'ticketOnWarnOpenAfterMinutes' => 1,
+                            'uiHint' => "AOD DataSync/DataUpdater",
+                            'perl' => sub { return $dataUpdaterQuarantinedCount; },
+                        };
+                    }
+
+                    # TMID: 126623 Request 9
+                    push @{ $s4MetricRollupRef->{ "changeListQueueBlockedCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "changeListQueueBlockedCount", "$instanceName GetChangeList - Threads blocked count", "$uiHint/GetChangeList" );
+                    $s4MetricRollupRef->{ "changeListQueueBlockedCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "changeListQueueBlockedCount" }->{ "description" } = "GetChangeList - Threads blocked count";
+                    $s4MetricRollupRef->{ "changeListQueueBlockedCount" }->{ "uiHint" } = "AOD DataSync/GetChangeList";
+
+                    push @{ $s4MetricRollupRef->{ "changeListOODEsCountMetric" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "changeListOODEsCountMetric", "$instanceName GetChangeList - Number of out of date exceptions", "$uiHint/GetChangeList" );
+                    $s4MetricRollupRef->{ "changeListOODEsCountMetric" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "changeListOODEsCountMetric" }->{ "description" } = "GetChangeList - Number of out of date exceptions";
+                    $s4MetricRollupRef->{ "changeListOODEsCountMetric" }->{ "uiHint" } = "AOD DataSync/GetChangeList";
+
+                    # TMID: 126623 Request 10
+                    push @{ $s4MetricRollupRef->{ "getDataQueueBlockedCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "getDataQueueBlockedCount", "$instanceName GetData - Threads blocked count", "$uiHint/GetData" );
+                    $s4MetricRollupRef->{ "getDataQueueBlockedCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "getDataQueueBlockedCount" }->{ "description" } = "GetData - Threads blocked count";
+                    $s4MetricRollupRef->{ "getDataQueueBlockedCount" }->{ "uiHint" } = "AOD DataSync/GetData";
+
+                    push @{ $s4MetricRollupRef->{ "getDataThrottlingQueueBlockedCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "getDataThrottlingQueueBlockedCount", "$instanceName GetData - Throttling threads blocked count", "$uiHint/GetData" );
+                    $s4MetricRollupRef->{ "getDataThrottlingQueueBlockedCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "getDataThrottlingQueueBlockedCount" }->{ "description" } = "GetData - Throttling threads blocked count";
+                    $s4MetricRollupRef->{ "getDataThrottlingQueueBlockedCount" }->{ "uiHint" } = "AOD DataSync/GetData";
+
+                    # TMID: 126623 Request 12
+                    push @{ $s4MetricRollupRef->{ "dataUpdaterReschedulerQueueBlockedCount" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "dataUpdaterReschedulerQueueBlockedCount", "$instanceName DataUpdater - Rescheduler threads blocked count", "$uiHint/DataUpdater" );
+                    $s4MetricRollupRef->{ "dataUpdaterReschedulerQueueBlockedCount" }->{ "calc" } = "sum";
+                    $s4MetricRollupRef->{ "dataUpdaterReschedulerQueueBlockedCount" }->{ "description" } = "DataUpdater - Rescheduler threads blocked count";
+                    $s4MetricRollupRef->{ "dataUpdaterReschedulerQueueBlockedCount" }->{ "uiHint" } = "AOD DataSync/DataUpdater";
+
+                    # TMID: 126623 Request 13
+                    push @{ $s4MetricRollupRef->{ "changeListQueueBlockedTime" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "changeListQueueBlockedTime", "$instanceName GetChangeList - Blocked since", "$uiHint/GetChangeList" );
+                    $s4MetricRollupRef->{ "changeListQueueBlockedTime" }->{ "calc" } = "max";
+                    $s4MetricRollupRef->{ "changeListQueueBlockedTime" }->{ "description" } = "GetChangeList - Blocked since";
+                    $s4MetricRollupRef->{ "changeListQueueBlockedTime" }->{ "uiHint" } = "AOD DataSync/GetChangeList";
+
+                    # TMID: 126623 Request 14
+                    push @{ $s4MetricRollupRef->{ "getDataQueueBlockedTime" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "getDataQueueBlockedTime", "$instanceName GetData - Blocked since", "$uiHint/GetData" );
+                    $s4MetricRollupRef->{ "getDataQueueBlockedTime" }->{ "calc" } = "max";
+                    $s4MetricRollupRef->{ "getDataQueueBlockedTime" }->{ "description" } = "GetData - Blocked since";
+                    $s4MetricRollupRef->{ "getDataQueueBlockedTime" }->{ "uiHint" } = "AOD DataSync/GetData";
+
+                    # TMID: 126623 Request 15
+                    push @{ $s4MetricRollupRef->{ "getDataThrottlingQueueBlockedTime" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "getDataThrottlingQueueBlockedTime", "$instanceName GetData - Throttling blocked since", "$uiHint/GetData" );
+                    $s4MetricRollupRef->{ "getDataThrottlingQueueBlockedTime" }->{ "calc" } = "max";
+                    $s4MetricRollupRef->{ "getDataThrottlingQueueBlockedTime" }->{ "description" } = "GetData - Throttling blocked since";
+                    $s4MetricRollupRef->{ "getDataThrottlingQueueBlockedTime" }->{ "uiHint" } = "AOD DataSync/GetData";
+
+                    # TMID: 126623 Request 17
+                    push @{ $s4MetricRollupRef->{ "dataUpdaterReschedulerQueueBlockedTime" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "dataUpdaterReschedulerQueueBlockedTime", "$instanceName DataUpdater - Rescheduler blocked since", "$uiHint/DataUpdater" );
+                    $s4MetricRollupRef->{ "dataUpdaterReschedulerQueueBlockedTime" }->{ "calc" } = "max";
+                    $s4MetricRollupRef->{ "dataUpdaterReschedulerQueueBlockedTime" }->{ "description" } = "DataUpdater - Rescheduler blocked since";
+                    $s4MetricRollupRef->{ "dataUpdaterReschedulerQueueBlockedTime" }->{ "uiHint" } = "AOD DataSync/DataUpdater";
+
+                    push @{ $s4MetricRollupRef->{ "changeListErrorTime" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "changeListErrorTime", "$instanceName GetChangeList - Time of last failed request", "$uiHint/GetChangeList" );
+                    $s4MetricRollupRef->{ "changeListErrorTime" }->{ "calc" } = "max";
+                    $s4MetricRollupRef->{ "changeListErrorTime" }->{ "description" } = "GetChangeList - Time of last failed request";
+                    $s4MetricRollupRef->{ "changeListErrorTime" }->{ "uiHint" } = "AOD DataSync/GetChangeList";
+
+                    push @{ $s4MetricRollupRef->{ "getDataErrorTime" }->{ "values" } }, addS4Queries( \%queries, $monitorStats, "getDataErrorTime", "$instanceName GetData - Time of last failed request", "$uiHint/GetData" );
+                    $s4MetricRollupRef->{ "getDataErrorTime" }->{ "calc" } = "max";
+                    $s4MetricRollupRef->{ "getDataErrorTime" }->{ "description" } = "GetData - Time of last failed request";
+                    $s4MetricRollupRef->{ "getDataErrorTime" }->{ "uiHint" } = "AOD DataSync/GetData";
+                }
+            }
+        }
+
+        foreach my $archesKey (keys %community_rollup_for_arches_uiHint) {
+            my $valUIHint = $community_rollup_for_arches_uiHint{$archesKey};
+            my $valName = $community_rollup_for_arches_name{$archesKey};
+            my $valRollupName = $community_rollup_for_arches_rollup_name{$archesKey};
+            my $valValue = $community_rollup_for_arches_value{$archesKey};
+            my $valId = $community_rollup_for_arches_id{$archesKey};
+            my $valCritOnItem = $community_rollup_for_arches_critonitem{$archesKey};
+            my $valWarnOnItem = $community_rollup_for_arches_warnonitem{$archesKey};
+            my $valCritOnTotal = $community_rollup_for_arches_critontotal{$archesKey};
+            my $valWarnTotal = $community_rollup_for_arches_warnontotal{$archesKey};
+            my $valSumNumbers = $community_rollup_for_arches_sumofnumbers{$archesKey};
+            my $valSumOfNumbersName = $community_rollup_for_sumofnumbers_name{$archesKey};
+            my $valSumOfNumbersNameRollup = $community_rollup_for_sumofnumbers_name_rollup{$archesKey};
+
+            #calculate individual items and rollup
+            push @{ $s4MetricRollupRef->{ $valId }->{ "values" } },
+                addS4QueriesWithCritAndWarn( \%queries, $valValue, $valName, "$valUIHint/Arches Search",
+                    $valCritOnItem, $valWarnOnItem );
+            $s4MetricRollupRef->{ $valId }->{ "calc" } = "sumstr";
+            $s4MetricRollupRef->{ $valId }->{ "description" } = $valRollupName;
+            $s4MetricRollupRef->{ $valId }->{ "uiHint" } = "Arches Search";
+
+            #calculate total items and rollup
+            push @{ $s4MetricRollupRef->{ $valId . "Totals" }->{ "values" } },
+                addS4QueriesWithCritAndWarn( \%queries, $valSumNumbers, $valSumOfNumbersName, "$valUIHint/Arches Search",
+                    $valCritOnTotal, $valWarnTotal );
+            $s4MetricRollupRef->{ $valId . "Totals" }->{ "calc" } = "sum";
+            $s4MetricRollupRef->{ $valId . "Totals" }->{ "description" } = $valSumOfNumbersNameRollup;
+            $s4MetricRollupRef->{ $valId . "Totals" }->{ "uiHint" } = "Arches Search";
+        }
+
+        foreach my $var ( keys %{ $s4MetricRollupRef } ) {
+            # there are several things going on here.  I have $s4MetricRollupRef that contains values, uihint, calculation of a particular metric.
+            # if a metric is numeric, I need to add them up; if a metric is a timestamp, I need to pick the max (latest) value.
+
+            # also, some metrics require that alert be raised.  For time-based metrics, we need to do this by setting the warn / crit strings because
+            # it's difficult to do a computation on a timestamp.  As well, we need to set the description so that the end user can see the threshold.
+            # Lastly, some requires TOW so need to set the $ticketOnWarnOpenAfterMinutes where appropriate.
+
+            my @array = @{ $s4MetricRollupRef->{ $var }->{ "values" } };
+            my $calc = $s4MetricRollupRef->{ $var }->{ "calc" };
+            my $description = $s4MetricRollupRef->{ $var }->{ "description" };
+            my $uiHint = $s4MetricRollupRef->{ $var }->{ "uiHint" };
+
+            my $answer;
+            my $critString = undef;
+            my $warnString = undef;
+            my $thresholdDescription = undef;
+            my $ticketOnWarnOpenAfterMinutes = undef;
+
+            if ( $calc eq "sum" ) {
+                foreach my $num ( @array ) {
+                    next unless ( defined $num );
+                    $answer += $num;
+                }
+            }
+            elsif ( $calc eq "max" ) {
+                $answer = max( @array );
+            }
+            elsif ( $calc eq "avg" ) {
+                $answer = 0;
+                if (@array > 0) {
+                    foreach my $num ( @array ) {
+                        next unless ( defined $num );
+                        $answer += $num;
+                    }
+                    $answer = $answer / @array;
+                }
+            }
+            elsif ( $calc eq "sumstr" ) {
+                $answer = sumUpAllRealmsInArray(\@array);
+                $ticketOnWarnOpenAfterMinutes = 1;
+            }
+
+            if ( $var eq "changeListSuccessTime" ) {
+                $thresholdDescription = "Crit threshold: > 2 hours";
+
+                if ( $answer && $answer =~ m|^(\d{4}/\d{1,2}/\d{1,2} \d{2}:\d{2}:\d{2})$| ) {
+                    my $threshold = 120; # 2 hours
+                    my $currentTime = time;
+                    my $blockedTime = str2time( $1 );
+
+                    if ( $blockedTime && $currentTime > $blockedTime + ( $threshold * 60 ) ) {
+                        $critString = $answer . " blocked for > $threshold minutes!";
+                    }
+                }
+            }
+
+            if ( $var eq "changeListQueueBlockedTime"           ||
+                 $var eq "getDataQueueBlockedTime"              ||
+                 $var eq "getDataThrottlingQueueBlockedTime"    ||
+                 $var eq "dataPushThrottlingQueueBlockedTime" ) {
+                $thresholdDescription = "Warn threshold: > 15 minutes";
+
+                if ( $answer && $answer =~ m|^(\d{4}/\d{1,2}/\d{1,2} \d{2}:\d{2}:\d{2})$| ) {
+                    my $threshold = 15; # 15 minutes
+                    my $currentTime = time;
+                    my $blockedTime = str2time( $1 );
+
+                    if ( $blockedTime && $currentTime > $blockedTime + ( $threshold * 60 ) ) {
+                        $warnString = $answer . " blocked for > $threshold minutes!";
+                        $ticketOnWarnOpenAfterMinutes = 1;
+                    }
+                }
+            }
+
+            if ( $var eq "changeListOODEsCountMetric" ) {
+                $warnString = 'defined(answer) && answer > 1';
+                $ticketOnWarnOpenAfterMinutes = 1;
+            }
+
+            $queries{ $description } = {
+                'recordMaxResults' => 110000,
+                'recordDataType' => "gauge",
+                'info' => 1,
+                'warn' => $warnString,
+                'crit' => $critString,
+                'uiHint' => $uiHint,
+                'description' => $thresholdDescription,
+                'ticketOnWarnOpenAfterMinutes' => $ticketOnWarnOpenAfterMinutes,
+                'perl' => sub { return $answer; },
+            };
+        }
+
+        #
+        # Rolled up global summary query objects
+        #
+        $queries{"Total number of active RFX"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => "gauge",
+
+            'info' => "!defined(answer) || answer eq '' || answer >= 0",
+            'skip' => $skip,
+            #'warn' => "defined(answer) && answer >= 200",
+            #'crit' => "defined(answer) && answer >= 300",
+            'format' => "%d\n",
+
+            'perl' => sub { return $totalActiveRFX; },
+            'inf_field' => 'total_number_active_RFX',
+            'group_by' => 'general',
+        };
+
+        if ( $productName eq "s4" ) {
+            $queries{"Total number of active large/huge RFX"} = {
+                'recordMaxResults' => 110000,
+                'recordDataType' => "gauge",
+
+                'info' => "!defined(answer) || answer eq '' || answer >= 0",
+                'skip' => $skip,
+                #'warn' => "defined(answer) && answer >= 200",
+                #'crit' => "defined(answer) && answer >= 300",
+                'format' => "%d\n",
+
+                'perl' => sub { return $totalActiveLargeOrHugeRFX; },
+                'inf_field' => 'Total_number_active_large_huge_RFX',
+                'group_by' => 'general',
+            };
+        }
+
+        $queries{"Total number of bids processed"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => "gauge",
+
+            'info' => "!defined(answer) || answer eq '' || answer >= 0",
+            'skip' => $skip,
+            #'warn' => "defined(answer) && answer >= 200",
+            #'crit' => "defined(answer) && answer >= 300",
+            'format' => "%d\n",
+
+            'perl' => sub { return $totalBidsProcessed; },
+            'inf_field' => 'Total_number_bids_processed',
+            'group_by' => 'general',
+        };
+
+        $queries{"Total number of SV dataloads in progress"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => "gauge",
+            'info' => 1,
+            #'warn' => "defined(answer) && answer >= $warnConcurrentLoads",
+            'perl' => "return $totalDataLoadCount",
+            'inf_field' => 'Total_number_SV_dataload_in_progress',
+            'group_by' => 'general',
+        };
+
+        $queries{"Total number of SV A/B switch in progress"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => "gauge",
+            'info' => 1,
+            #'warn' => "defined(answer) && answer >= $warnConcurrentLoads",
+            'perl' => "return $totalABSwitchCount",
+            'inf_field' => 'Total_number_SV_AB_switch_in_progress',
+            'group_by' => 'general',
+        };
+
+        if(defined($totalRFQCount)) {
+
+            $queries{"Incoming Request Total Count"} = {
+                'recordMaxResults' => 110000,
+                'recordDataType' => "gauge",
+                'uiHint' => "Spot Quote",
+                'perl' => "return $totalRFQCount",
+                'inf_field' => 'incoming_request_total',
+                'group_by' => 'Spot Quote',
+            };
+
+            $queries{"Incoming Request Total Failures"} = {
+                'recordMaxResults' => 110000,
+                'recordDataType' => "gauge",
+                'severity' => 2,
+                'warn' => 'answer >= 15',
+                'ticketOnWarnOpenAfterMinutes' => 1,
+                'correctiveActions' => ["Ops" => "Escalate to CSE"],
+                'uiHint' => "Spot Quote",
+                'perl' => "return $totalRFQFailed",
+                'inf_field' => 'incoming_request_failure_total',
+                'group_by' => 'Spot Quote',
+            };
+
+            $queries{"Send Quote Total Count"} = {
+                'recordMaxResults' => 110000,
+                'recordDataType' => "gauge",
+                'uiHint' => "Spot Quote",
+                'perl' => "return $totalRFQSendCount",
+                'inf_field' => 'send_quote_total',
+                'group_by' => 'Spot Quote',
+            };
+
+            $queries{"Send Quote Total Failures"} = {
+                'recordMaxResults' => 110000,
+                'recordDataType' => "gauge",
+                'severity' => 2,
+                'warn' => 'answer >= 15',
+                'ticketOnWarnOpenAfterMinutes' => 1,
+                'correctiveActions' => ["Ops" => "Escalate to CSE"],
+                'uiHint' => "Spot Quote",
+                'perl' => "return $totalRFQSendFailed",
+                'inf_field' => 'send_quote_failure_total',
+                'group_by' => 'Spot Quote',
+            };
+
+            $queries{"Posting Update Total Count"} = {
+                'recordMaxResults' => 110000,
+                'recordDataType' => "gauge",
+                'severity' => 2,
+                'warn' => 'answer >= 15',
+                'ticketOnWarnOpenAfterMinutes' => 1,
+                'correctiveActions' => ["Ops" => "Escalate to CSE"],
+                'uiHint' => "Spot Quote",
+                'perl' => "return $totalDiscoveryCount",
+                'inf_field' => 'posting_update_total',
+                'group_by' => 'Spot Quote',
+            };
+
+            $queries{"Posting Update Total Failures"} = {
+                'recordMaxResults' => 110000,
+                'recordDataType' => "gauge",
+                'uiHint' => "Spot Quote",
+                'perl' => "return $totalDiscoveryFailed",
+                'inf_field' => 'posting_update_failure_total',
+                'group_by' => 'Spot Quote',
+            };
+        }
+
+#   $queries{"Events stuck in time"} = {
+#   'recordMaxResults' => 110000,
+#   'recordDataType' => "gauge",
+#   'recordItem' => 'numrows',
+#   'info' => 1,
+#   'warn' => "numrows > 10";
+#   'skip' => $skip,
+#   'crit' => "numrows > 20",
+#   'sql' => "SELECT RFX1.rootId FROM RFXQueueEntryTab RFX1 WHERE (RFX1.rqe_Status <> 'INACTIVE' AND RFX1.rqe_TargetTime <= CURRENT_TIMESTAMP - INTERVAL '15:00' MINUTE TO SECOND) AND (RFX1.rqe_Active = 1) AND (RFX1.rqe_PurgeState = 0)",
+#   };
+
+        #
+        # See defect 1-4UC95L 1-3V663A and change 936070 for details
+        #
+        if (defined($failedSharedSchemaLoads)) {
+            my $estimatedLastSuccessFullRun = $product->default('System.Analysis.DataLoading.ReloadIntervalInMins') * 60 * ($failedSharedSchemaLoads+1);
+            my $note = "Last successful run was approximately " .  ariba::Ops::DateTime::scaleTime($estimatedLastSuccessFullRun) . " ago.\nFor initial debugging refer to $path ";
+            $queries{"Failed sourcing or buyer shared star schema pulls"} = {
+                'recordMaxResults' => 110000,
+                'recordDataType' => "gauge",
+                'info' => "defined(answer)",
+                'note' => $note,
+                'warn' => "!defined(answer) || answer > 1",
+                'crit' => "defined(answer) && answer >= 3",
+                'perl' => "return $failedSharedSchemaLoads",
+                'inf_field' => 'failed_sourcing_or_buyer_shared_star_schema_pulls',
+                'group_by' => 'general',
+            };
+        } else {
+            $queries{'Running presentation loads on dedicated schema'} = {
+                'recordMaxResults' => 110000,
+                'recordDataType' => "gauge",
+                'info' => "defined(answer)",
+                'perl' => "return $runningDedicatedPresentationLoads",
+                'inf_field' => 'running_presentation_loads_on_dedicated_schema',
+                'group_by' => 'general',
+            };
+            $queries{'Running presentation loads on shared schema'} = {
+                'recordMaxResults' => 110000,
+                'recordDataType' => "gauge",
+                'info' => "defined(answer)",
+                'perl' => "return $runningSharedPresentationLoads",
+                'inf_field' => 'runing_presentation_loads_on_shared_schema',
+                'group_by' => 'general',
+            };
+            for my $schemaId (keys %schemaStats) {
+                my %stats = %{$schemaStats{$schemaId}};
+                for my $field (keys %stats) {
+                    my $value = $stats{$field};
+                    my $queryName = $schemaStatFields{$field}->{'queryName'};
+                    my $warn = $schemaStatFields{$field}->{'warn'};
+                    my $crit = $schemaStatFields{$field}->{'crit'};
+                    my $uiHint = $schemaStatFields{$field}->{'uiHint'} || "Schema Stat";
+                    my $estimate = $schemaStatFields{$field}->{'estimateLastSuccessFullRun'};
+                    my $createTicket = $schemaStatFields{$field}->{'createTicket'};
+                    my $setDueDate = $schemaStatFields{$field}->{'setDueDate'};
+                    my $note = $schemaStatFields{$field}->{'note'};
+                    if ($estimate) {
+                        my $estimatedLastSuccessFullRun = $product->default('System.Analysis.DataLoading.ReloadIntervalInMins') * 60 * ($value+1);
+                        $note = "Last successful run was approximately " .  ariba::Ops::DateTime::scaleTime($estimatedLastSuccessFullRun) . " ago.\nFor initial debugging refer to $path ";
+                    }
+
+                    $queries{"Schema $schemaId - $queryName"} = {
+                        'recordMaxResults' => 110000,
+                        'recordDataType' => "gauge",
+                        'info' => "defined(answer)",
+                        'note' => $note,
+                        'warn' => $warn,
+                        'crit' => $crit,
+                        'uiHint' => "$uiHint/Schema $schemaId",
+                        'perl' => "return $value",
+                        'ticketOnWarnOpenAfterMinutes' => $createTicket,
+                        'ticketDueInDays' => $setDueDate,
+                        'inf_field' => 'value',
+                        'inf_tags' => qq|schemaId=$schemaId,description="$queryName"|,
+                        'group_by' => qq|schemaId=$schemaId,description="$queryName"|,
+                    };
+                }
+            }
+
+        }
+
+
+        $queries{"Active presentation loads"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => "gauge",
+            'info' => 1,
+            #'warn' => "defined(answer) && answer >= $warnConcurrentLoads",
+            'perl' => "return $activePresentationLoads",
+            'inf_field' => 'active_presentation_load',
+            'group_by' => 'general',
+        };
+
+        $queries{"Active SV loads"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => "gauge",
+            'info' => 1,
+            #'warn' => "defined(answer) && answer >= $warnConcurrentLoads",
+            'perl' => "return $activeSVLoads",
+            'inf_field' => 'active_SV_loads',
+            'group_by' => 'general',
+        };
+
+        my %sql_queries;
+
+        $sql_queries{"Realms with delayed loaddb in progress"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => "gauge",
+            'recordItem' => 'numrows',
+            'skip' => $skip,
+            'info' => 1,
+            'sql' => "select name as realm_name from realmtab where state = 'loading'",
+            'inf_tags' => 'state_description="Realms with delayed loaddb in progress",state="loading"',
+        };
+
+        $sql_queries{"Realms in error state"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => "gauge",
+            'recordItem' => 'numrows',
+            'info' => 1,
+            'skip' => $skip,
+            #'warn' => "numrows > 2",
+            #'crit' => "numrows > 3",
+            'sql' => "select name as realm_name, id as id, TimeStateChanged as state_change_time from realmtab where state = 'loadingError'",
+            'inf_tags' => 'state_description="Realms in error state",state="loadingError"',
+        };
+
+        $sql_queries{"Realms in enablement error state"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => "gauge",
+            'recordItem' => 'numrows',
+            'info' => 1,
+            'skip' => $skip,
+            'crit' => "numrows > 0",
+            'sql' => "select name as realm_name,  id as id, TimeStateChanged as state_change_time from realmtab where state = 'enablementError'",
+            'inf_tags' => qq|state_description="Realms in enablement error state",state="enablementError"|,
+        };
+        $sql_queries{"Realms in enablement error state count"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => "gauge",
+            'recordItem' => 'numrows',
+            'info' => 1,
+            'skip' => $skip,
+            'crit' => "numrows > 0",
+            'sql' => "select count(1) as realm_enablementError_count from realmtab where state = 'enablementError'",
+            'inf_tags' => qq|state_description="Realms in enablement error state count",state="enablementError"|,
+        };
+        my $hours = 2;
+        $sql_queries{"Delayed loaddb stuck for more than $hours hrs"} = {
+            'info' => 1,
+            'warn' => "numrows > 0",
+            'crit' => "numrows > 3",
+            'skip' => $skip,
+            'sql' => "SELECT sts_PartitionName as PartitionName FROM ScheduledTaskStatusTab WHERE sts_TaskName = 'LateLoadDBTask'  AND sts_StartTime IS NOT NULL  AND sts_EndTime IS NULL  AND sts_Active = 1 AND sts_PurgeState = 0 AND (sysdate - sts_TimeUpdated)*24 > $hours ORDER BY sts_TimeCreated ASC",
+            'inf_tags' => qq|state_description="Delayed loaddb stuck for more than $hours hrs",state=stuck|,
+        };
+        $sql_queries{"Delayed loaddb stuck for more than $hours hrs count"} = {
+            'info' => 1,
+            'warn' => "numrows > 0",
+            'crit' => "numrows > 3",
+            'skip' => $skip,
+            'sql' => "SELECT count(1) as sts_PartitionName_count FROM ScheduledTaskStatusTab WHERE sts_TaskName = 'LateLoadDBTask'  AND sts_StartTime IS NOT NULL  AND sts_EndTime IS NULL  AND sts_Active = 1 AND sts_PurgeState = 0 AND (sysdate - sts_TimeUpdated)*24 > $hours ORDER BY sts_TimeCreated ASC",
+            'inf_tags' => qq|state_description="Delayed loaddb stuck for more than $hours hrs count",state=stuck|,
+        };
+
+        my (%general_queries,%spot_quote_queries,%data_load_queries);
+        extract_queries(\%queries,\%general_queries,\%spot_quote_queries,\%data_load_queries);
+
+        my $email = $me->default('notify.email');
+
+        $queries{"influx_details"} = {measurement => "s4_current_activity"};
+        my $q = ariba::monitor::QueryManager->newWithDetails(
+                "current-activity", $product->name(), $service, $product->customer(), \%queries
+                );
+
+        $q->setSQLConnectInfo($product->connectInfoForOracleClient());
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        $sql_queries{"influx_details"} = {measurement => "s4_realms_state"};
+        my $sql_q = ariba::monitor::QueryManager->newWithDetails(
+                "current-activity", $product->name(), $service, $product->customer(), \%sql_queries
+                );
+        $sql_q->setSQLConnectInfo($product->connectInfoForOracleClient());
+        $sql_q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        $general_queries{"influx_details"} = {measurement => "s4_general_current_activity"};
+        my $general_q = ariba::monitor::QueryManager->newWithDetails(
+                "current-activity", $product->name(), $service, $product->customer(), \%general_queries
+                );
+        $general_q->setSQLConnectInfo($product->connectInfoForOracleClient());
+        $general_q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        $spot_quote_queries{"influx_details"} = {measurement => "s4_spot_quote_current_activity"};
+        my $sq_q = ariba::monitor::QueryManager->newWithDetails(
+                "current-activity", $product->name(), $service, $product->customer(), \%spot_quote_queries
+                );
+        $sq_q->setSQLConnectInfo($product->connectInfoForOracleClient());
+        $sq_q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        $data_load_queries{"influx_details"} = {measurement => "s4_data_load_current_activity"};
+        my $dl_q = ariba::monitor::QueryManager->newWithDetails(
+                "current-activity", $product->name(), $service, $product->customer(), \%data_load_queries
+                );
+        $dl_q->setSQLConnectInfo($product->connectInfoForOracleClient());
+        $dl_q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+    }
+}
+
+sub extract_queries {
+    my $queries = shift;
+    my $general_queries = shift;
+    my $spot_quote_queries = shift;
+    my $data_load_queries = shift;
+    foreach my $k (keys %$queries){
+        if ($queries->{$k}->{group_by} eq 'general'){
+            $general_queries->{$k} = $queries->{$k};
+            delete $queries->{$k};
+        } elsif ($queries->{$k}->{group_by} eq 'Spot Quote') {
+            $spot_quote_queries->{$k} = $queries->{$k};
+            $spot_quote_queries->{$k}->{inf_default} = 0;
+            delete $queries->{$k};
+        } elsif ($queries->{$k}->{uiHint} =~ /Data Load/){
+            $data_load_queries->{$k} = $queries->{$k};
+            delete $queries->{$k};
+        } else {
+            $queries->{$k}->{inf_default} = 0;
+        }
+    }
+}
+
+sub addS4Queries {
+    my ( $ref, $monitorStats, $metric, $description, $uiHint ) = @_;
+    return unless ( $ref && $monitorStats && $metric && $description && $uiHint );
+    my $var = $monitorStats->$metric();
+
+    $ref->{ $description } = {
+        'recordMaxResults' => 110000,
+        'recordDataType' => "gauge",
+        'info' => 1,
+        'uiHint' => $uiHint,
+        'perl' => sub { return $var; },
+    };
+
+    return $var;
+}
+
+sub addS4QueriesWithCritAndWarn {
+    my ( $ref, $var, $description, $uiHint, $critString, $warnString ) = @_;
+    return unless ( $ref && $description && $uiHint );
+
+    $ref->{ $description } = {
+        'recordMaxResults' => 110000,
+        'recordDataType' => "gauge",
+        'info' => 1,
+        'ticketOnWarnOpenAfterMinutes' => 1,
+        'warn' => $warnString,
+        'crit' => $critString,
+        'uiHint' => $uiHint,
+        'perl' => sub { return $var; },
+    };
+
+    return $var;
+}
+
+
+main();

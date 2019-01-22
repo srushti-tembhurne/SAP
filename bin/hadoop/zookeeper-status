@@ -1,0 +1,129 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/hadoop/zookeeper-status#6 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use Net::Telnet;
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 <product> [-e|-p|-d|-h]
+
+    product   Name of the Hadoop product
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode. 
+    -h        Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub debug {
+    print "(debug) @_\n" if ($debug && @_);
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $product;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg !~ /^-/o)   { $product = $arg; next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    usage('Product is required') unless ($product);
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled($product, $me->service()));
+    my $hadoop = ariba::rc::InstalledProduct->new($product, $me->service());
+
+    foreach my $cluster ( $hadoop->allClusters() ) {
+
+        my %queries;
+
+        my @zooKeeperInstances = grep { $_->appName() eq 'ZooKeeper' } $hadoop->appInstancesInCluster($cluster);
+
+        debug('Found ' . scalar(@zooKeeperInstances) . ' ZooKeeper app instances'); 
+
+        foreach my $instance (@zooKeeperInstances) {
+            $queries{$instance->instanceName() . ' status'} = {
+                warn    => 'answer ne "imok"',
+                crit    => 'previousAnswer ne "imok" && answer ne "imok"',
+                perl    => sub { return checkZooKeeperStatus($instance); },
+                severity    => 1,
+                description => 'Sends a "ruok" (are you ok) message to the zookeeper node. If it is working properly,
+                    it will respond with "imok".', 
+                correctiveActions => [
+                    Ops => 'Check the kr log for details on why the zookeeper node is not ok. In a cluster setup, ' .
+                        'zookeeper must have majority of its nodes up and running to work. Ex. If there are 3 ' . 
+                        'nodes, then at least 2 nodes must be up. If only one node is up, it will not work. ' . 
+                        'Escalate to Tools if needed.', 
+                    Tools => 'Troubleshoot based on kr log', 
+                ],
+                'inf_field' => 'ZooKeeperStatus',
+                'inf_default'=>'none',
+                'inf_tags'=> sprintf("instance_name=\"%s\",cluster=\"%s\"", $instance->instanceName(), $cluster),
+                'group_by' => $instance->instanceName(),
+            };
+        }
+    
+
+
+        my $email = $me->default('notify.email');
+        $queries{"influx_details"} = {
+            'measurement' => "zookeeper",
+        };
+        my $qm = ariba::monitor::QueryManager->newWithDetails('zookeeper', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $cluster, \%queries);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub checkZooKeeperStatus {
+    my $instance = shift; 
+    my $instanceId = $instance->instanceName();
+    my $host = $instance->host(); 
+    my $port = $instance->port();
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+    my $output;
+
+    debug("Sending 'ruok' to $instanceId at $host:$port"); 
+
+    eval {  
+        my $telnet = Net::Telnet->new(Host => $host, Port => $port, Telnetmode => 1);
+        $telnet->print("ruok");
+        $output = $telnet->getline();   
+    }; 
+
+    my $error = $@; 
+    undef($@);
+
+    debug("Received: $output"); 
+    debug("Error: $error") if ($error);
+
+    return $error || $output;
+}
+
+main(@ARGV);
+
+__END__

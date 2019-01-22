@@ -1,0 +1,115 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+
+use FindBin;
+use lib (
+	"$FindBin::Bin/../lib/perl",
+	"$FindBin::Bin/../../lib/perl",
+	"$FindBin::Bin/../lib",
+	"$FindBin::Bin/../../lib",
+	"$FindBin::Bin/../../tools/lib/perl",
+	"$FindBin::Bin/../../../tools/lib/perl",
+	"$FindBin::Bin/../../tools/lib",
+	"$FindBin::Bin/../../../tools/lib",
+);
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::DateTime;
+use ariba::Ops::Constants;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $debug = 0;
+
+	while(my $arg = shift) {
+		if($arg =~ /^-d$/i) { $debug++; }
+		if($arg =~ /^-e$/i)  { $sendEmail=1; }
+		if($arg =~ /^-p$/i)  { $sendPage=1; }
+	}
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $machine = ariba::Ops::Machine->new($hostname);
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $email = $me->default('notify.email');
+
+	unless( grep /^syslog$/, $machine->providesServices() ) {
+		print "This script must run on the loghost server.\n";
+		exit;
+	}
+
+	my $now = time();
+	my $fourHoursAgo = $now - (4*60*60);
+	my %spews;
+	my %details;
+
+	open(LOG, "< /var/log/spew");
+
+	while(my $line = <LOG>) {
+		next unless($line =~ /SPEW/);
+		chomp $line;
+
+		next unless ($line =~ /^(\w+\s+\d+\s+\d+:\d\d:\d\d)/);
+		my $date = $1;
+		$date = ariba::Ops::DateTime::syslogToTimestamp($date);
+
+		next unless( $date > $fourHoursAgo );
+
+		my ($cmd, $user, $host) = split(/\]/, $line);
+		$cmd =~ s/^[^\[]+\[//;
+		$user =~ s/^[^\[]+\[//;
+		$host =~ s/^[^\[]+\[//;
+
+		next unless($cmd && $user && $host);
+
+		# print "$cmd by $user\@$host\n";
+		$spews{$cmd}++;
+		${$details{$cmd}}{"$user\@$host"}++;
+	}
+
+	#
+	# build the details out
+	#
+	my @spewList;
+	foreach my $script (sort { $spews{$b} <=> $spews{$a} } keys %spews) {
+		my $d = sprintf("$script (%d spews):", $spews{$script});
+		my $ct = 0;
+		my @instances = (sort keys %{$details{$script}});
+		while ((my $k = shift(@instances)) && $ct < 2) {
+			my ($user, $host) = split(/\@/, $k);
+			my $port = ariba::Ops::Constants->logViewerPort();
+			my $escapedScript = $script;
+			$escapedScript =~ s|/|_|g;
+			my $logURL = "http://$host:$port/cat/spew-$user-$escapedScript";
+			
+			$d .= " $logURL ";
+			$ct++;
+		}
+		$d = sprintf("%s ... and %d more...", $d, scalar(@instances))
+			if(scalar(@instances));
+		push(@spewList, "<html>$d</html>");
+	}
+
+	my $q;
+        my $spew_id = 0;
+	my $datacenter = $machine->datacenter();
+        foreach my $spew (@spewList)
+        {
+	    $q->{"$spew_id:Scripts spewing in $datacenter in last 4 hours"} = {
+		info => 1,
+		perl => sub { return $spew; },
+                inf_field => "spew_message",
+                inf_tags =>"spew_id=$spew_id,datacenter=$datacenter",
+	    };
+            $spew_id += 1;
+        }
+        $q->{influx_details} = {measurement => "spew_status"};
+	my $qm = ariba::monitor::QueryManager->newWithDetails("spew-status", $me->name(), $me->service(), $me->customer(), $q);
+	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);

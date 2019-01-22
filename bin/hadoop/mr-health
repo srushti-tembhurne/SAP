@@ -1,0 +1,244 @@
+#!/usr/local/bin/perl -w 
+
+use strict;
+use FindBin; 
+use lib "$FindBin::Bin/../../lib";
+
+use Date::Parse;
+use POSIX qw(strftime);
+
+use ariba::rc::Globals;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::DateTime;
+use ariba::Ops::Startup::Hadoop;
+use ariba::Ops::NetworkUtils;
+use ariba::util::Misc;
+use ariba::monitor::QueryManager;
+
+our $quiet = 1; # Suppresses prints in ariba::Ops::Startup::Common.pm
+my $debug = 0;
+my $GB = 1024 * 1024 * 1024;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+Sends map/reduce health information to monitoring
+
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode. 
+    -h        Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled('hadoop', $me->service()));
+    my $hadoop = ariba::rc::InstalledProduct->new('hadoop', $me->service());
+    my $cluster = $hadoop->currentCluster();
+
+    my ($virtualHost) = $hadoop->rolesManager()->virtualHostsForRoleInCluster('hadoop-name', $cluster);
+    if ($virtualHost) {
+        my $activeHost = $hadoop->activeHostForVirtualHostInCluster($virtualHost, $cluster);
+        my $host = ariba::Ops::NetworkUtils::hostname();
+        debug("Current Host: $host / Active Host: $activeHost / Virtual Host: $virtualHost");   
+        if ($host ne $activeHost) {
+            debug("Exiting as current host is not the active host");
+            exit(0);
+        }
+    }
+
+    my %queries;
+    my $stats = mrHealth($hadoop);
+    populateQueriesForStatsWithNamePrefix(\%queries, $stats);
+    
+    $queries{'number of running jobs'} = { 
+        recordMaxResults => 35000, 
+        perl => sub { main::numOfRunningJobs($hadoop); },
+        inf_field => "\"Number of Running Jobs\"",
+        inf_default => "none",
+    };
+
+    my $email = $me->default('notify.email');
+    $queries{influx_details} = {measurement => "mr_health"};
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('MapReduce', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+} 
+
+sub numOfRunningJobs {
+    my $me = shift;
+    ariba::Ops::Startup::Hadoop::setRuntimeEnv($me);
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+    $ENV{'HADOOP_HOME'} = $ENV{'HADOOP_HOME'} . "/share/hadoop/mapreduce1";
+    my $cmd = "$ENV{'HADOOP_HOME'}/bin/hadoop job -list all";
+
+    # Sample command run on LAB service:
+    # /home/svclab/hadoop/HadoopR2-40/hadoop/share/hadoop/mapreduce1/bin/hadoop job -list all
+
+    # Sample output run on TEST service
+    # States are:
+    # Running : 1	Succeded : 2	Failed : 3	Prep : 4
+    # JobId	State	StartTime	UserName	Priority	SchedulingInfo
+    # job_201406010318_0119	2	1402394413363	I835345	NORMAL	0 running map tasks using 0 map slots. 0 additional slots reserved. 0 running reduce tasks using 0 reduce slots. 0 additional slots reserved.
+
+    my @output = `$cmd`;
+
+    if (!@output) {
+        $! = 'No result' unless ($!);
+        $query->setError("Error getting running jobs: $!");
+        return $query->error();
+    }
+
+    my $runningJobs = 0;
+
+    foreach my $line (@output) {
+        if ($line =~ /^job_\d+_\d+\s+(\d+)\s+/) {
+            $runningJobs++ if ($1 == 1);
+        }
+    }
+
+    return $runningJobs;
+}
+
+sub mrHealth {
+    my $me = shift;
+    ariba::Ops::Startup::Hadoop::setRuntimeEnv($me);
+
+    my $stat = {};
+    my $queue;
+    my $info;
+    my @output = `hadoop queue -list`;
+
+    foreach my $line (@output) {
+        my ($name, $value);
+
+        if ($line =~ /Queue Name : (.+)/o) {
+            $queue = $1;
+            $info = 'queue';
+            next;
+        } elsif ($line =~ /^(\w+) (tasks|info)$/o) {
+            $info = lc($1);
+            next;
+        } elsif ($line =~ /^([\w ]+): ([\d \w]+)$/o) {
+            $name = $1;
+            $value = $2;
+            $value =~ s/ slots$//;
+        } elsif ($line =~ /^([\w ]+): ([\d+.]+).*%.*/o) {
+            $name = $1;
+            $value = int($2); 
+            if ($line =~ /([\d.]+)% of Capacity/ && $queue && $info) { 
+                $stat->{$queue}->{$info}->{'usedCapacityPercentage'} = $1; 
+            }
+        } else {
+            print "Ignored when parsing: $line" if ($debug);
+            next;
+        }
+
+        next unless ($queue && $info);
+
+        $name = ariba::util::Misc::xmlNameForText($name);   
+        $stat->{$queue}->{$info}->{$name} = $value; 
+
+        $stat->{'all'}->{'total'}->{$info . ucfirst($name)} += int($value) if ($name =~ /capacity$|usedCapacity|runningTasks/);
+        $stat->{'all'}->{'total'}->{$name} += $value if ($name =~ /^numberOf/);
+
+    }
+
+    my $total = $stat->{'all'} && $stat->{'all'}->{'total'};
+    foreach my $name (keys %$total) {
+        if ($name =~ /^(\w+)Used(Capacity)$/) {
+            my $capacity = $1 . $2; 
+            my $value = $total->{$name};
+            $total->{$name . 'Percentage'} = $value / $total->{$capacity} if ($total->{$capacity});
+        }
+    }
+
+    return $stat;
+}
+
+sub populateQueriesForStatsWithNamePrefix {
+    my $queries = shift;
+    my $stats = shift; 
+
+    return unless ($queries && $stats);
+
+    foreach my $queue (keys %$stats) {
+        my %info = %{ $stats->{$queue} };
+    
+        foreach my $info (keys %info) {
+            my %attribs = %{ $info{$info} };
+
+            foreach my $name (keys %attribs) {
+                my $value = $attribs{$name};
+                my $warn; 
+                my $format;
+                my $recordMaxResults;
+                my $uiHint = ($queue eq 'all') ? "" : "$queue/$info";
+
+                if ($name =~ /Percentage|userLimit/o) {
+                    $format = '%.1f%%';
+                    $recordMaxResults = 35000 if ($name =~ /Percentage/o);
+                } elsif ($name =~ /usedCapacity/io) { 
+                    $recordMaxResults = 35000;
+                    $format = '%d slots';
+                } elsif ($name =~ /runningTasks|numberOf/io) {
+                    $recordMaxResults = 35000;
+                    $warn = 'answer > 10' if ($name eq 'numberOfWaitingJobs');
+                } elsif ($name eq 'queueState') {
+                    $warn = 'answer ne "running"';
+                } elsif ($name =~ /capacity$/i) {
+                    $format = '%d slots';
+                }
+
+                my $queryName = ariba::util::Misc::textForXmlName($name);
+                my $queryNamePrefix = "$queue - ";
+                if ($info =~ /map|reduce/o) { 
+                    $queryNamePrefix = "$queue - $info"; 
+                } elsif ($info eq 'total') { 
+                    $queryNamePrefix = ''; 
+                }
+
+                $queries->{"$queryNamePrefix $queryName"} = {
+                    format  => $format,
+                    uiHint  => $uiHint,
+                    warn    => $warn,
+                    perl    => sub { return $value },
+                    recordMaxResults => $recordMaxResults,
+                    inf_field => qq|"$queryNamePrefix $queryName"|,
+                    inf_default => "none",
+                    group_by => $uiHint,
+                };
+            }
+        }
+    }
+}
+
+sub debug {
+    my $msg = shift; 
+
+    print "(debug) $msg\n" if ($debug);
+}
+
+main(@ARGV);

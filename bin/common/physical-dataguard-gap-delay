@@ -1,0 +1,206 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/common/physical-dataguard-gap-delay#3 $
+#
+# A script to monitor oracle physical dataguard replication gap delay
+#
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::rc::Globals;
+use ariba::rc::CipherStore;
+use ariba::rc::Utils;
+use ariba::monitor::QueryManager;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+
+$main::quiet = 1;
+my $debug               = 0;
+my $dataguardSQLTimeout = 6 * 60;    # in seconds. gap delay SQL takes a long time.
+
+my $me = ariba::rc::InstalledProduct->new();
+
+my $sysUser = "sys";
+my $sysPass = $me->default("dbainfo.$sysUser.password");
+
+sub main
+{
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    my ($array, @productNames);
+
+    while (my $arg = shift (@ARGV))
+    {
+        if ($arg =~ /^-prod/o) {$array     = \@productNames; next;}
+        if ($arg =~ /^-e/o)    {$sendEmail = 1;              next;}
+        if ($arg =~ /^-p/o)    {$sendPage  = 1;              next;}
+        if ($arg =~ /^-d/o)    {$debug++;                    next;}
+        if ($arg !~ /^-/o)     {push (@$array, $arg);        next;}
+    }
+
+    my @products = ();
+
+    if (@productNames)
+    {
+        for my $productName (@productNames)
+        {
+            push (@products, ariba::rc::InstalledProduct->installedProductsList($me->service(), $productName));
+        }
+    }
+
+    exit (0) unless (@products);
+
+    my @dbconnections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+    #
+    # Check to see if this product is physical DR'ed at all
+    #
+    my $isDRed = 0;
+    for my $dbc (@dbconnections)
+    {
+        if ($dbc->isDR() && $dbc->isPhysicalReplication())
+        {
+            $isDRed = 1;
+            last;
+        }
+    }
+
+    exit (0) unless ($isDRed);
+
+    ## Run against the physical DR hosts
+    for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbconnections))
+    {
+        # skip if it's not oracle
+        next unless $dbc->isOracle();
+
+        next unless ($dbc->isDR() && $dbc->isPhysicalReplication());
+
+        my %drQueries;
+        my $virtualHost = $dbc->host();
+        my $instance    = uc ($dbc->sid());
+
+        my $product     = $dbc->product();
+        my $productName = $product->name();
+        my $email       = $me->default('notify.email');
+
+        my $replicationType = "Physical DataGuard";
+
+        my ($peerDbc) = $dbc->peers();
+        if ($peerDbc)
+        {
+            my $error;
+            my $drLowSequenceSQL = 'select low_sequence# from v$archive_gap';
+            my $drLowSequenceNumber;
+            my $gapDelay;
+
+            my @results = ();
+            my $oc = ariba::Ops::OracleClient->new($sysUser, $sysPass, $instance, $virtualHost);
+            if (!connectToOracleAndRunSQL($oc, $drLowSequenceSQL, \@results))
+            {
+                $error ||= $oc->error() || "Error: " . $results[0];
+            }
+            else
+            {
+                $drLowSequenceNumber = $results[0];
+
+                if ($drLowSequenceNumber)
+                {
+                    my $peerLogFileSql = "select name from v\$archived_log where sequence#=$drLowSequenceNumber and dest_id=1";
+                    my $peerLogFileName;
+                    my $peerInstance    = uc ($peerDbc->sid());
+                    my $peerVirtualHost = $peerDbc->host();
+                    my $peerOc          = ariba::Ops::OracleClient->new($sysUser, $sysPass, $peerInstance, $peerVirtualHost);
+                    @results = ();
+                    if (!connectToOracleAndRunSQL($peerOc, $peerLogFileSql, \@results))
+                    {
+                        $error ||= $oc->error() || "Error: " . $results[0];
+                    }
+                    else
+                    {
+                        $peerLogFileName = $results[0];
+
+                        if ($peerLogFileName)
+                        {
+                            my $cipherStore = ariba::rc::CipherStore->new($me->service());
+                            my $monUser     = ariba::rc::Globals::deploymentUser($me->name(), $me->service());
+                            my $monPass     = $cipherStore->valueForName($monUser);
+                            my $ssh         = ariba::rc::Utils::sshCmd();
+                            my $cmd         = "$ssh $monUser\@$peerVirtualHost stat --format '%Y' '$peerLogFileName'";
+
+                            my @output;
+                            if (executeRemoteCommand($cmd, $monPass, 0, undef, undef, \@output))
+                            {
+                                my $output = join ('', @output);
+                                if ($output =~ /^\s*(\d+)\s*$/)
+                                {
+                                    my $logFileTime = $1;
+                                    $gapDelay = time () - $logFileTime;
+                                }
+                                else
+                                {
+                                    $error = "Modified time stat of '$peerLogFileName' on $peerVirtualHost returned non-numeric result: $output";
+                                }
+                            }
+                            else
+                            {
+                                $error = "Failed to stat '$peerLogFileName' on $peerVirtualHost: $!";
+                            }
+                        }
+                        else
+                        {
+                            $error = "Failed to find log file name with sql: $peerLogFileSql";
+                        }
+                    }
+                }
+            }
+
+            $drQueries{"$replicationType gap delay for [$instance] on $virtualHost"} = {
+                info             => 1,
+                warn             => 0,                                                      # displays error as warn
+                error            => $error,
+                format           => 'scaleTime(answer)',
+                recordMaxResults => 20000,
+                recordDataUnits  => "seconds",
+                perl             => sub {return $error || $gapDelay;},
+                inf_field        => "status",
+                inf_tags         => qq(instance="$instance",virtual_host="$virtualHost"),
+                inf_default      => "none",
+                group_by         => qq($instance,$virtualHost),
+           };
+        }
+
+        $drQueries{influx_details} = {measurement => 'physical_dataguard_gap_delay'};
+        my $qm = ariba::monitor::QueryManager->newWithDetails("dataguard-status", $productName, $me->service(), undef, \%drQueries);
+        $qm->setSQLConnectInfo($sysUser, $sysPass, $instance, $virtualHost);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub connectToOracleAndRunSQL
+{
+    my $oc         = shift;
+    my $sql        = shift;
+    my $resultsRef = shift;
+
+    $oc->connect(20, 4);
+    if (   $oc->error()
+        || !$oc->executeSqlWithTimeout($sql, $dataguardSQLTimeout, $resultsRef)
+        || $oc->error())
+    {
+        $$resultsRef[0] ||= "Oracle Error: " . $oc->error();
+        return 0;
+    }
+    $oc->disconnect();    # Need this to close connection ASAP to avoid conflict with bcv backup.
+
+    return 1;
+}
+
+main();
+
+__END__
+
+

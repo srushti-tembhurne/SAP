@@ -1,0 +1,237 @@
+#!/usr/local/bin/perl
+# $Id: //ariba/services/monitor/bin/arches/nrt-metrics-status#2 $
+
+
+## Creating NRT Metrics Moniotring for Arches 
+## HOA-45829
+## Developed By: Ankit Kotak
+
+use strict;
+use FindBin;
+use XML::Simple;
+use Data::Dumper;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Url;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+my %preetyName = (
+    "unconfirmedJobMetric" => "unconfirmed_job_metric", 
+    "requestProcessingMetric" => "request_processing_metric",         
+    "luceneDocCount" => "lucene_doc_count",
+    "percent90Time"  => "90th_percentile_time",
+    "unconfirmedJobCount" => "unconfirmed_job_count",
+    "averageTime" => "average_time",
+    "count" => "count",
+    "failureCount" => "failure_count",
+    "percent90TimeSearchCore" => "percent_90_timesearch_core",
+    "averageTimeSearchCore" => "average_timesearch_core",
+    "longRunningJobsCount" => "longrunning_jobs_count",
+    "longRunningJobsLogMarker" => "longrunning_job_marker",
+    "requestProcessedMetricLastWindow" => "request_processed_metric_last_window",
+    "requestProcessedMetric" => "request_processed_metric",
+);
+
+
+my $message = "Rolled up value of the corresponding metric across the zone.";
+
+my %description =  ("luceneDocCount" => "The number of Lucene Documents currently stored in memory by NRTManager on the corresponding Search Core.", 
+                    "unconfirmedJobCount" => "The number of NRTUpdateJobs currently stored in memory by NRTManager on the corresponding Search Core. One NRTUpdateJob has one or more Lucene Documents.",
+                    "averageTime" => "The average of the time taken by NRTManager to process requests ( parse and commit). Metric valid for requests processed in past 5 mins by NRTManager on the corresponding Search Core.", 
+                    "count" => "The number of requests processed by NRTManager. Metric valid for requests processed in past 5 mins by NRTManager on the corresponding Search Core.",
+                    "percent90Time" => "The 90th percentile of the time taken by NRTManager to process requests (parse and commit). Metric valid for requests processed in past 5 mins by NRTManager on the corresponding Search Core",
+                    "totalCount" => "$message This is the count of requests processed by NRTManagers for the zone in the last 5 mins.", 
+                    "maxofPercent90Time" => "$message There is no good way to roll-up a 90th percentile. Therefore, this rolled-up value simply picks the max 90th percentile from amongst all the NRTManagers across the zone.",
+                    "countTimesAverage" => "$message The average is for all requests processed by NRTManagers for the zone in the last 5 mins.",
+                    "totalunconfirmedJobCount" => "$message The total number of NRTUpdateJobs stored in memory by all NRTManagers across the zone.",
+                    "totalluceneDocCount" => "$message The total number of Lucene Documents stored by all NRTManagers in memory across the zone.",
+);
+
+my %rollUpType = ("totalCount" => 'Request Processing Metric - Count', 
+                  "maxofPercent90Time" => 'Request Processing Metric - Max of Percentile 90th Time', 
+                  "countTimesAverage" => 'Request Processing Metric - Average Time', 
+                  "totalunconfirmedJobCount" => 'Unconfimed Job Metric - Unconfirmed Job Count',
+                  "totalluceneDocCount" => 'Unconfimed Job Metric - Lucene Doc Count');
+
+my %formatItem = ("totalCount" => '', "maxofPercent90Time" => "%d ms", "countTimesAverage" => "%d ms", "totalunconfirmedJobCount" => '', "totalluceneDocCount" => ''); 
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-daily] [-e|-p|-d|-h]
+
+    -daily    Run daily type of queries
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode. 
+    -h        Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub debug {
+    print "(debug) @_\n" if ($debug);
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $runDailyQueries = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-daily$/o) { $runDailyQueries = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled('arches', $me->service()));
+    my $arches = ariba::rc::InstalledProduct->new('arches', $me->service());
+    my $jobsStatusCollected = 0;
+
+    CLUSTER: 
+    foreach my $cluster ( $arches->allClusters() ) {
+
+        my %queries;
+        my $xml;
+        my @indexMgrApps = grep { $_->appName() eq 'IndexMgr' } $arches->appInstancesInCluster($cluster); 
+        exit unless (@indexMgrApps);
+
+        INSTANCE:
+        for my $app (@indexMgrApps) {
+            my $instanceName = $app->instanceName();
+            my $statusUrl = $app->nrtMetricsMonitoringURL();
+            debug("Checking index manager url: $statusUrl");
+        
+            my $url = ariba::monitor::Url->new($statusUrl);
+            my $response = eval{ $url->request(30); }; # This method can die() with empty message.  The implication of this is staggering.
+            my $xs  = XML::Simple->new();
+     
+            $xml = eval { XMLin( $response, KeyAttr => { nrtMetric => 'shard'} ) };
+            
+            my $error = $url->error() || $@;
+            debug("Error: $error") if ($error);
+            
+            next INSTANCE if $error;
+            last; 
+        }
+
+            my $rollUpData = { } ; 
+            while (my ($xml, $zoneSummary) = each %{ $xml } ) {
+                my $cntAvgTime;
+                foreach my $shard ( keys %{$zoneSummary} ) {
+                    my $zone = $zoneSummary->{$shard}->{'zone'}; 
+                    my $shardInfo = $zoneSummary->{$shard};                   
+                    my $count = $zoneSummary->{$shard}->{'requestProcessingMetric'}->{'count'};
+                    $rollUpData->{$zone}->{'totalCount'} += $count ;
+
+                    my $avgTime = $zoneSummary->{$shard}->{'requestProcessingMetric'}->{'averageTime'};
+                    my $cntTimeAvg = $count * $avgTime;
+                    $rollUpData->{$zone}->{'countTimesAverage'} += $cntTimeAvg;
+
+                    my $percent90Time = $zoneSummary->{$shard}->{'requestProcessingMetric'}->{'percent90Time'};
+                    $rollUpData->{$zone}->{'maxofPercent90Time'} = 0 , unless (defined $rollUpData->{$zone}->{'maxofPercent90Time'});
+
+                    if ( $percent90Time > $rollUpData->{$zone}->{'maxofPercent90Time'}){
+                        $rollUpData->{$zone}->{'maxofPercent90Time'} = $percent90Time;
+                    }
+
+                    $rollUpData->{$zone}->{'totalluceneDocCount'} += $zoneSummary->{$shard}->{'unconfirmedJobMetric'}->{'luceneDocCount'};
+                    $rollUpData->{$zone}->{'totalunconfirmedJobCount'} += $zoneSummary->{$shard}->{'unconfirmedJobMetric'}->{'unconfirmedJobCount'};
+                    
+                    foreach my $info ( keys %{$shardInfo} ) {
+                        next if ($info =~ /zone/i);
+                        my $pinfo = $preetyName{$info};
+                        my $value = $shardInfo->{$info};
+                        my $warn = 0;
+                        my $crit = 0;
+
+                        foreach my $in ( keys %{$value} ) {
+                            my $pin = $preetyName{$in};
+                            my $format;
+                            $format = "%d ms\n", if($in =~ /time/i); 
+                            
+                            $queries{"$zone - $shard - $pinfo - $pin"} = {
+                                recordMaxResults => 103680, ## Every 5 min;  for 1 Year = 5 * 12 * 24 * 365
+                                warn           =>  $warn,
+                                crit           =>  $crit,
+                                format         =>  $format,
+                                perl           =>  sub { return $value->{$in} },
+                                description    =>  $description{$in},
+                                uiHint         =>  "$zone",
+                                inf_field      => "$pin",
+                                inf_default    => ( $pin eq "longrunning_job_marker" ) ? "none" : 0,
+                                inf_tags       => qq(zone="$zone",shard="$shard",type="$pinfo"),
+                                group_by       => qq($zone,$shard,$pinfo),
+                            };
+                        }
+                    }
+                }
+                
+            }
+
+            my $processRollUpInfo = processRollUpData($rollUpData, \%queries);
+            print "Finally Processed Data ", Dumper($processRollUpInfo), "\n", if $debug;
+            print "Total Number of Queries for $cluster ", scalar keys %queries, "\n", if $debug; 
+            
+            next CLUSTER unless (scalar keys %queries > 0 ) ;
+            my $email = $me->default('notify.email');
+            $queries{'influx_details'} = { measurement => 'arches_nrt_metrics'};
+            my $qm = ariba::monitor::QueryManager->newWithDetails('NRT-metrics', $arches->name(), $arches->service(), undef, $cluster, \%queries);
+            $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+        }
+}
+
+sub processRollUpData {
+    my $rollUpData = shift;
+    my $queries = shift;
+    my $warn = 0; 
+    my $crit = 0;          
+
+    print "IN ROLLUPDATA ", Dumper($rollUpData), "\n", if $debug;           
+    my $processrRollUpData = {}; 
+    while (my ($zone, $rollUpInfo) = each %{$rollUpData}){
+        foreach my $item (keys %$rollUpInfo) {
+            my $totalcnt = $rollUpInfo->{'totalCount'};
+            my $cntTimesAvg = $rollUpInfo->{$item};
+            my  $zn = uc $zone;
+            $processrRollUpData->{$zone}->{$rollUpType{$item}} = $rollUpInfo->{$item};          
+
+            if ( ($item =~ /countTimesAverage/i)  && ($totalcnt > 0) ) { 
+                my $avgTime = $cntTimesAvg / $totalcnt;        
+                $processrRollUpData->{$zone}->{$rollUpType{$item}} = $avgTime;
+            }
+            print "ITEM $item ", $rollUpInfo->{$item}, "\n", if $debug;
+            $queries->{ "$zn - $rollUpType{$item}" } = {
+                recordMaxResults => 103680, ## Every 5 min;  for 1 Year = 5 * 12 * 24 * 365
+                warn           =>  $warn,
+                crit           =>  $crit,
+                format         =>  $formatItem{$item},
+                perl           =>  sub { return $processrRollUpData->{$zone}->{$rollUpType{$item}} },
+                description    =>  $description{$item},
+                uiHint         =>  $zone,
+            };         
+        }
+    }
+
+      
+    return $processrRollUpData;        
+}
+
+
+main(@ARGV);
+
+__END__

@@ -1,0 +1,190 @@
+#!/usr/local/bin/perl
+#
+
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use lib "$FindBin::Bin/../../bin";
+use JSON;
+use File::Slurp;
+use XML::Simple;
+use Data::Dumper;
+use Getopt::Long qw(:config bundling no_ignore_case_always no_getopt_compat require_order);
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Url;
+use ariba::monitor::QueryManager;
+
+# Initialize first 4 to zero, last is undef.  These are all global and available to any function.
+my ($debug, $sendEmail, $sendPage, $test, $cluster) = (0,0,0,0);
+
+sub main
+{
+    GetOptions  (
+                    'debug|d'      => \$debug,
+                    'sendemail|e'  => \$sendEmail,
+                    'sendpage|p'   => \$sendPage,
+                    'test|t'       => \$test,
+                    'cluster|c'    => \$cluster,
+                );
+
+    my $monProduct = ariba::rc::InstalledProduct->new ();
+    my $etc = $monProduct->installDir () . '/etc';
+    my $product = ariba::rc::InstalledProduct->new ('an', $monProduct->service ());
+    unless ($cluster)
+    {
+        $cluster = $product->currentCluster () || 'primary';
+    }
+
+    my @instances = $product->appInstancesInCluster ($cluster);
+    my $email = $product->default ('notify.email');
+    # Some of these may duplicate information inside the foreach loop, but I'm not inclined to determine which ones yet.
+    my $name = $product->name ();
+    my $service = $product->service ();
+    my $customer = $product->customer () || undef;
+
+    # Read in configuration from JSON format file:
+    my $config_file;
+    my %statusMap = eval {
+         $config_file = $ENV{MOBILE_STATUS_CONFIG_FILE} || "$etc/query/an-mobile-status.conf";
+         my $contents = read_file($config_file) or die "failed to read_file $config_file: $!";
+         my $config = decode_json $contents or die "failed to decode_json the contents of $config_file";
+         return %$config;
+    };
+    # we currently fail silently (not a good idea!), at least print the error in debug/test mode
+    print "$@" if ( $@ and ($debug or $test) );
+
+    my %queries;
+
+    $queries{'influx_details'} = { measurement => 'mobile_api_response' };
+
+    foreach my $inst (@instances)
+    {
+        my $appName = $inst->appName();
+        next unless $appName eq 'ANMobile';
+
+        # instanceName() only returns the Node... part.
+        my $instance = $inst->instance(); # ANmobilev1-234-Node25-app1112lab1
+        my $securePort = $inst->securePort();
+        my $host = $inst->host();
+
+        # URL to call to get data:  http://app1115.lab1.ariba.com:14361/ANmobilev1-234-Node19-app1115lab1/ad/monitorStats
+        my $url = "http://$host:$securePort/$instance/ad/monitorStats/";
+        print "$url\n" if $debug or $test;
+
+        my $xml;
+
+        eval
+        {
+            my $monURL = ariba::monitor::Url->new ($url);
+            my $tmp = $monURL->request ();
+            $xml = XMLin ($tmp);
+        };
+
+        # We only want to see the element with the label 'ResponseCounts', so reasign that to $xml.
+        $xml = $xml->{MonitorStatus}{ResponseCounts}{entry};
+        # $xml is now a ref to a hash keyed with HTTP return codes, each of which is a ref to a hash of 3 elementes, the
+        # crit level, warn level and content (data).  Note that if a system is down or communication failes, there's no
+        # XML, no keys and no update to any query, which should cause stale data for all queries.
+        foreach my $httpCode ( keys %statusMap )
+        {
+            # The config file has a "special" value, which must be skipped in this loop.  It is used only for error conditions
+            # when there is no data string available.
+            next if $httpCode eq 'ERROR';
+
+            my ($crit, $warn, $info, $data);
+            # These are from the configuration file and will always exist.
+            $crit = $statusMap{$httpCode}{crit} // 0;
+            $warn = $statusMap{$httpCode}{warn} // 0;
+
+            # separately save the warn/crit thresholds as they are
+            my ($crit_threshold, $warn_threshold) = ($crit, $warn);
+
+            # The xml string may or may not exist, depending on whether the system can be contacted and is responding.  If not,
+            # set the data string to some sort of error message.
+            $data = int( $xml->{$httpCode}{content} // -1 );
+
+            if ( $crit < 0 ) # -1 usually, but covers other possible negative values.
+            {
+                $info = $crit;
+                undef $crit;
+                undef $warn;
+            }
+
+            printf "Crit:  %-7s Warn:  %-7s Data:  %-7s\n",
+                      $crit ? $crit : "NoCrit",
+                      $warn ? $warn : "NoWarn",
+                      $data
+                if $debug or $test;
+
+            my $qname = "Mobile API Status ($host $httpCode)";
+            $queries{$qname} = {
+                uiHint      => "$instance",
+                perl        => sub { $data },
+                description => "ANMobile API Status for HTTP code $httpCode",
+                inf_tags    => qq(node="$host",uihint="$instance"),
+                inf_field   => $httpCode,
+                inf_default => 0,
+                group_by    => $instance,
+            };
+            $queries{"$qname warn threshold"} = {
+                perl        => sub { $warn_threshold },
+                inf_tags    => qq(node="$host",uihint="$instance"),
+                inf_field   => $httpCode . '_warn_threshold',
+                group_by    => $instance,
+            };
+            $queries{"$qname crit threshold"} = {
+                perl        => sub { $crit_threshold },
+                inf_tags    => qq(node="$host",uihint="$instance"),
+                inf_field   => $httpCode . '_crit_threshold',
+                group_by    => $instance,
+            };
+
+            ### warn/crit logic here:
+            # crit_threshold >= 0
+            #    info: false
+            #    warn: answer > warn_threshold
+            #    crit: answer == -1 || answer > crit_threshold
+            # crit_threshold < 0
+            #    info: answer > crit_threshold
+            #    warn: false
+            #    crit: answer == -1
+
+            ### will  translate into JSON alert configs (for all configs) logic:
+            # info: crit_threshold < 0 AND answer > crit_threshold
+            # warn: crit_threshold >= 0 AND answer > warn_threshold
+            # crit: answer == -1 OR ( crit_threshold >= 0 AND answer > crit_threshold )
+
+            if ( !defined $crit ) {
+                $queries{$qname}{crit} = "answer == -1";
+                $queries{$qname}{info} = "answer > $info";
+            }
+            else # Assumes that crit and warn are not -1, checked above.
+            {
+                $queries{$qname}{crit}        = "answer > $crit || answer == -1";
+                $queries{$qname}{warn}        = "answer > $warn";
+                $queries{$qname}{ticketOwner} = 'unassigned-sre';
+                $queries{$qname}{severity}    = 1;
+                $queries{$qname}{correctiveActions} = [ Ops => 'Open a ticket with the team responsible for the ANMobile API' ];
+            }
+        }
+    }
+
+    print Dumper (\%queries) if $test;
+
+    unless ($test)
+    {
+        my $q;
+        $q = ariba::monitor::QueryManager->newWithDetails (
+                    "mobile-api-response-counts", $name, $service, $customer, $cluster, \%queries);
+
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+main ();
+
+__END__

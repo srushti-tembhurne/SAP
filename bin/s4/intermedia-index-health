@@ -1,0 +1,206 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/s4/intermedia-index-health#12 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+use ariba::Ops::OracleClient;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use Data::Dumper;
+
+sub main {
+	my $debug = 0;
+	my $quiet = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $productName;
+	my $path = "//ariba/services/operations/documentation/prodops/common/intermedia-index-health.txt";
+
+	while(my $arg=shift(@ARGV)){
+			print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+			if($arg =~ /^-d/o){ $debug=1; }
+			if($arg =~ /^-e/o){ $sendEmail=1; };
+			if($arg =~ /^-p$/o){ $sendPage=1; };
+			if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $cluster = $me->currentCluster();
+	my $service = $me->service();
+
+	my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+	unless (@products) {
+		exit(0);
+	}
+
+	for my $product (@products) {
+
+		my %queries  = ();
+
+		my @instances = $product->appInstancesInCluster($cluster);
+		last unless (@instances);
+
+		my $instance = $instances[0];
+
+		my $url = $instance->freeTextSearchIndexHealthURL();
+
+		print "url = $url\n" if ($debug);
+
+		my $freeTextSearchHealth = ariba::monitor::Url->new($url);
+		my @results = $freeTextSearchHealth->request(180);
+
+		# 
+		# <XML>
+		# <FreeTextSearchOpsMonitoring>
+		# <DatabaseSchemas>
+		# <DatabaseSchema name="Transaction.Schema05">
+		# <ErrorMessage></ErrorMessage>
+		# <FreeTextIndexes>
+		# <FreeTextIndex name="ATTRSBLOBTAB_IDX">
+		# <MinutesOutOfDate>0</MinutesOutOfDate>
+		# <PendingCount>0</PendingCount>
+		# </FreeTextIndex>
+		# <FreeTextIndex name="FILEBLOBTAB_IDX">
+		# <MinutesOutOfDate>0</MinutesOutOfDate>
+		# <PendingCount>0</PendingCount>
+		# </FreeTextIndex>
+		# </FreeTextIndexes>
+		# </DatabaseSchema>
+		# <DatabaseSchema name="Transaction.Schema02">
+		# <ErrorMessage></ErrorMessage>
+		# <FreeTextIndexes>
+		# <FreeTextIndex name="ATTRSBLOBTAB_IDX">
+		# <MinutesOutOfDate>0</MinutesOutOfDate>
+		# <PendingCount>0</PendingCount>
+		# </FreeTextIndex>
+		# <FreeTextIndex name="FILEBLOBTAB_IDX">
+		# <MinutesOutOfDate>0</MinutesOutOfDate>
+		# <PendingCount>0</PendingCount>
+		# </FreeTextIndex>
+		# </FreeTextIndexes>
+		# </DatabaseSchema>
+		# <DatabaseSchema name="Transaction.Schema04">
+		# <ErrorMessage></ErrorMessage>
+		# <FreeTextIndexes>
+		# <FreeTextIndex name="ATTRSBLOBTAB_IDX">
+		# <MinutesOutOfDate>0</MinutesOutOfDate>
+		# <PendingCount>0</PendingCount>
+		# </FreeTextIndex>
+		# <FreeTextIndex name="FILEBLOBTAB_IDX">
+		# <MinutesOutOfDate>0</MinutesOutOfDate>
+		# <PendingCount>0</PendingCount>
+		# </FreeTextIndex>
+		# </FreeTextIndexes>
+		# </DatabaseSchema>
+		# <DatabaseSchema name="Transaction.Schema06">
+		# <ErrorMessage></ErrorMessage>
+		# <FreeTextIndexes>
+		# <FreeTextIndex name="ATTRSBLOBTAB_IDX">
+		# <MinutesOutOfDate>0</MinutesOutOfDate>
+		# <PendingCount>0</PendingCount>
+		# </FreeTextIndex>
+		# <FreeTextIndex name="FILEBLOBTAB_IDX">
+		# <MinutesOutOfDate>0</MinutesOutOfDate>
+		# <PendingCount>0</PendingCount>
+		# </FreeTextIndex>
+		# </FreeTextIndexes>
+		# </DatabaseSchema>
+		# <DatabaseSchema name="Transaction.Schema03">
+		# <ErrorMessage></ErrorMessage>
+		# <FreeTextIndexes>
+		# <FreeTextIndex name="ATTRSBLOBTAB_IDX">
+		# <MinutesOutOfDate>0</MinutesOutOfDate>
+		# <PendingCount>0</PendingCount>
+		# </FreeTextIndex>
+		# <FreeTextIndex name="FILEBLOBTAB_IDX">
+		# <MinutesOutOfDate>0</MinutesOutOfDate>
+		# <PendingCount>0</PendingCount>
+		# </FreeTextIndex>
+		# </FreeTextIndexes>
+		# </DatabaseSchema>
+		# </DatabaseSchemas>
+		# <Timestamp>2007-05-24T17:44:06Z</Timestamp>
+		# </FreeTextSearchOpsMonitoring>
+		# </XML>
+		my $schemaName;
+		my $indexName;
+		my $outOfDate;
+		my $pendingCount;
+		for my $line (@results) {
+			if ($line =~ /<DatabaseSchema\s*name\s*="([^"]*)">/i) {
+				$schemaName = $1;
+			next;
+		} elsif ($line =~ /<FreeTextIndex\s*name\s*="([^"]*)">/i) {
+		$indexName = $1;
+		next;
+		} elsif ($line =~ m|<MinutesOutOfDate>(.*)</MinutesOutOfDate>|i) {
+			$outOfDate = $1;
+			next;
+		} elsif ($line =~ m|<PendingCount>(.*)</PendingCount>|i) {
+			$pendingCount = $1;
+			next;
+		} elsif ($line =~ m|</FreeTextIndex>|) {
+			# Queries are updated to only crit on two results over the threshold.  
+			# We will set this back to normal when defect 1-AFGI39 is resolved
+			# See TMID:60684
+			$queries{"Free Text Index $indexName on $schemaName out of date in mins"} = {
+				recordMaxResults => 30000,
+				recordDataType => "gauge",
+				info => "!answer || answer < 360",
+				warn => "answer && answer >= 360",
+				crit => "answer && (answer >= 720 && previousAnswer >= 720)",
+				perl => "$outOfDate",
+				note => "For initial debugging refer to $path",
+				uiHint => "Primary",
+                inf_field   => "out_of_date",
+                inf_tags    => "index_name=\"$indexName\", schema_name=\"$schemaName\"",
+                inf_default => 0,
+                group_by    => $indexName,
+			};
+			$queries{"Free Text Index $indexName on $schemaName pending items"} = {
+				recordMaxResults => 30000,
+				recordDataType => "gauge",
+				info => "!answer || answer < 1000",
+				warn => "answer && answer >= 1000",
+				ticketOnWarnOpenAfterMinutes => 10, 
+				perl => "$pendingCount",
+				uiHint => "Primary",
+                inf_field   => "pending_items",
+                inf_tags    => "index_name=\"$indexName\", schema_name=\"$schemaName\"",
+                inf_default => 0,
+                group_by    => $indexName,
+			};
+
+			print "$indexName, $schemaName, $outOfDate, $pendingCount\n" if ($debug);
+			$indexName = undef;
+			$outOfDate = undef;
+			$pendingCount = undef;
+			next;
+		} elsif ($line =~ m|</DatabaseSchema>|) {
+			$schemaName = undef;
+			next;
+		}
+		}
+
+		next unless (keys(%queries));
+
+		my $email = $me->default('notify.email');
+        	$queries{influx_details} = { measurement => 'intermedia_index_health' };
+
+
+		my $q = ariba::monitor::QueryManager->newWithDetails(
+				"intermedia-index-health", $product->name(), $service, $product->customer(), \%queries
+				);
+
+		$q->setSQLConnectInfo($product->connectInfoForOracleClient());
+		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+main();

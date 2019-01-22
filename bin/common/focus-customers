@@ -1,0 +1,297 @@
+#!/usr/local/bin/perl
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::OracleClient;
+use ariba::Ops::DBConnection;
+
+use Data::Dumper;
+
+# List of customer realms that we want to monitor
+# tmid 202435, 206025,HOA-32592 focus customers: SAP, 
+my @focusCustomers = (
+	'SAPAG',
+);
+
+# List of queries that we care about. Handling of these 
+# needs to be defined in processQuery() sub below.
+my @focusQueries = (
+	'BPM',
+	'Realms Awaiting Publish',
+	'Repeated Search Failures',
+	'High VM heap usage',
+	'Repeated Node Deaths',
+	'Persisted Mail Queue',
+	'Delayed Indexing for Contract Searches',
+	'Data Loads',
+	'High CPU',
+);
+
+# We only care about S4 and Buyer
+my @products = qw'buyer s4';
+
+my $debug = 0;
+
+sub usage {
+	my $error = shift;
+	
+	print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+	-e    Enables sending of email for monitor query.
+	-p    Enables sending of pages for monitor query.
+	-d    Turns on debug mode.
+	-h    Shows this help.
+
+USAGE
+
+	print "(error) $error\n" if ($error);
+	exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while (my $arg = shift) {
+		if ($arg =~ /^-h$/o) { usage();         next; }
+		if ($arg =~ /^-d$/o) { $debug++;        next; }
+		if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+		if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+		usage("Invalid argument: $arg");
+	}
+    
+	my $mon = ariba::rc::InstalledProduct->new();
+	my %queries;
+
+	my $focusCustomersHashRef = populateCustomersHash(@focusCustomers);
+
+	foreach my $focusQuery (@focusQueries) {
+		$queries{"$focusQuery"} = {
+			info => "numrows > -1",
+			crit => "numrows >= 1",
+			description => "Monitoring for realms (@focusCustomers)",
+			perl   => sub { main::processQuery($focusQuery, $focusCustomersHashRef) },
+			inf_field => "query_result",
+                        inf_tags => "query_name=\"$focusQuery\"",
+		};
+	}
+
+    my $email = $mon->default('notify.email');
+
+    $queries{influx_details} = {measurement => "focus_customers"};
+    my $qm = ariba::monitor::QueryManager->newWithDetails('Focus Customers', $mon->name(), $mon->service(), undef, \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+# Dispatcher function. Defines handling of each focus query
+sub processQuery {
+	my $focusQuery = shift;
+	my $focusCustomersHashRef = shift;
+	my $result;
+
+	my $pathToQueries = '/var/mon/query-storage';
+
+	if ($focusQuery eq 'BPM') {
+		my @queryResults;
+		
+		foreach my $focusCustomer (@focusCustomers) {
+			my @searchResults = `cd $pathToQueries; grep -il '$focusCustomer' bpm/*`;
+			@searchResults = map { chomp $_; $_ .= " : $focusCustomer" } @searchResults;
+			push @queryResults, @searchResults;
+		}
+	
+		$result = makePretty(@queryResults);
+	}
+
+	if ($focusQuery eq 'Realms Awaiting Publish') {
+		my @queryResults;
+		
+		foreach my $focusCustomer (@focusCustomers) {
+			my @searchResults = `cd $pathToQueries; grep -il '\b$focusCustomer\b' buyer/*Realms_Awaiting_Publish.query`;
+			@searchResults = map { chomp $_; $_ .= " : $focusCustomer" } @searchResults;
+			push @queryResults, @searchResults;
+		}
+	
+		$result = makePretty(@queryResults);
+	}
+
+	if ($focusQuery eq 'Repeated Search Failures') {
+		my @queryResults;
+		
+		foreach my $focusCustomer (@focusCustomers) {
+			my $customerCommunity = $focusCustomersHashRef->{$focusCustomer}{'buyer'}[0];
+			my @searchResults = `cd $pathToQueries; grep -l 'status: crit' buyer/*community_${customerCommunity}__Search_Client_Failed_Queries.query`;
+			@searchResults = map { chomp $_; $_ .= " : $focusCustomer" } @searchResults;
+			push @queryResults, @searchResults;
+		}
+	
+		$result = makePretty(@queryResults);
+	}
+
+	if ($focusQuery eq 'High VM heap usage') {
+		my @queryResults;
+		
+		foreach my $focusCustomer (@focusCustomers) {
+			foreach my $product (@products) {
+				my $customerCommunity = $focusCustomersHashRef->{$focusCustomer}{$product}[0];
+				my @searchResults = `cd $pathToQueries; grep -l 'status: warn' ${product}/*_vm_heap_usage_in_KBytes.query | xargs grep -l 'uiHint: community ${customerCommunity}/'`;
+				next if scalar @searchResults < 2;		# We want to notify only if 2 or more nodes are affected
+				@searchResults = map { chomp $_; $_ .= " Community $customerCommunity : $focusCustomer" } @searchResults;
+				push @queryResults, @searchResults;
+			}
+		}
+
+		$result = makePretty(@queryResults);
+	}
+
+	if ($focusQuery eq 'Repeated Node Deaths') {
+		my @queryResults;
+
+		foreach my $focusCustomer (@focusCustomers) {
+			foreach my $product (@products) {
+				my $customerCommunity = $focusCustomersHashRef->{$focusCustomer}{$product}[0];
+				my @searchResults = `cd $pathToQueries; grep -il "Community $customerCommunity " ${product}/${product}_instances_in_snv_restarted_in_last_hour.query | xargs grep -l 'status: crit'`;
+				@searchResults = map { chomp $_; $_ .= " : $focusCustomer" } @searchResults;
+				push @queryResults, @searchResults;
+			}
+		}
+
+		$result = makePretty(@queryResults);
+	}
+
+	if ($focusQuery eq 'Persisted Mail Queue') {
+		my @queryResults;
+
+		foreach my $focusCustomer (@focusCustomers) {
+			my $customerSchema = $focusCustomersHashRef->{$focusCustomer}{'buyer'}[5];
+			$customerSchema =~ s/\D*//;
+			my @searchResults = `cd $pathToQueries; grep -l 'status: crit' buyer/${customerSchema}/Persisted_mail_queue_length_for_schema_${customerSchema}.query`;
+			@searchResults = map { chomp $_; $_ .= " : $focusCustomer" } @searchResults;
+			push @queryResults, @searchResults;
+		}
+
+		$result = makePretty(@queryResults);
+	}
+
+	if ($focusQuery eq 'Delayed Indexing for Contract Searches') {
+		my @queryResults;
+
+		foreach my $focusCustomer (@focusCustomers) {
+			my $customerTransactionSchema = $focusCustomersHashRef->{$focusCustomer}{'s4'}[7];
+			my @searchResults = `cd $pathToQueries; grep -l 'status: crit' s4/Free_Text_Index_*_on_${customerTransactionSchema}_out_of_date_in_mins.query`;
+			@searchResults = map { chomp $_; $_ .= " : $focusCustomer" } @searchResults;
+			push @queryResults, @searchResults;
+		}
+
+		$result = makePretty(@queryResults);
+	}
+
+	if ($focusQuery eq 'Data Loads') {
+		my @queryResults;
+
+		foreach my $focusCustomer (@focusCustomers) {
+			my $customerStarSchema = $focusCustomersHashRef->{$focusCustomer}{'s4'}[5];
+			$customerStarSchema =~ s/Star\.Shared\.//;	# Transform Star.Schema.X
+			$customerStarSchema =~ s/(\D)0?(\d)/$1_$2/;	# to Schema_X
+			my @searchResults = `cd $pathToQueries; grep -l 'status: crit' s4/${customerStarSchema}_-_S4_star_schema_*`;
+			@searchResults = map { chomp $_; $_ .= " : $focusCustomer" } @searchResults;
+			push @queryResults, @searchResults;
+		}
+
+		$result = makePretty(@queryResults);
+	}
+
+	if ($focusQuery eq 'High CPU') {
+		my @queryResults;
+
+		foreach my $focusCustomer (@focusCustomers) {
+			foreach my $product (@products) {
+				my $customerCommunity = $focusCustomersHashRef->{$focusCustomer}{$product}[0];
+				my @searchResults = `cd $pathToQueries; grep -l 'status: crit' ${product}/*_percent_CPU_usage.query | xargs grep -l 'uiHint: community ${customerCommunity}/'`;
+				next if scalar @searchResults < 2;      # We want to notify only if 2 or more nodes are affected
+				@searchResults = map { chomp $_; $_ .= " Community $customerCommunity : $focusCustomer" } @searchResults;
+				push @queryResults, @searchResults;
+			}
+		}
+
+		$result = makePretty(@queryResults);
+	}
+
+	return $result;
+}
+
+sub makePretty {
+	my @queryResults = @_;
+
+	foreach my $queryResult (@queryResults) {
+	    $queryResult =~ s/_/ /g;
+		$queryResult =~ s/\.query//;
+	}
+
+	return join("\n", @queryResults);
+}
+
+sub populateCustomersHash {
+	my @focusCustomers = @_;
+	my $focusCustomersHash = {};
+
+
+	for my $customer (@focusCustomers) {
+		for my $productName (@products) {
+			# print "$customer: $productName => 1\n";
+			# $focusCustomersHash->{$customer}{$product}[0] = 1;
+			push @{ $focusCustomersHash->{$customer}{$productName} }, getCustomerInfo($customer, $productName);
+		}
+	}
+
+	print Dumper($focusCustomersHash) if $debug;
+
+	return $focusCustomersHash;
+}
+
+sub getCustomerInfo {
+	my ($customer, $productName) = @_;
+	my @result;
+
+	# Parse the Realm Community mapping
+	# Community ID, Realm ID, Name, Label, State
+	my $realmQueryName = "$productName/Realm_community_mapping__Community_ID__Realm_ID__Name__Label__State_";
+	my $realmQuery = ariba::monitor::Query->new($realmQueryName);
+	my @realmResults = $realmQuery->results();
+
+	for my $realmResult (@realmResults) {
+		if ($realmResult =~ /\s$customer\s/) {
+			print "$realmResult\n" if $debug;
+			@result = split /\t/, $realmResult;
+		}
+	}
+
+	# Parse the Realm Schema mapping
+	# Realm ID, Name, Schema, SID
+	my $schemaQueryName = "$productName/Realm_to_schema_to_SID_mapping__ID__Name__Schema__SID_";
+	my $schemaQuery = ariba::monitor::Query->new($schemaQueryName);
+	my @schemaResults = $schemaQuery->results();
+
+	for my $schemaResult (@schemaResults) {
+		if ($schemaResult =~ /\s$customer\s/) {
+			print "$schemaResult\n" if $debug;
+			my @schemaInfo = split /\t/, $schemaResult;
+			push @result, splice @schemaInfo, 2, 2;
+		}
+	}
+
+	return @result;
+}
+
+main(@ARGV);
+
+__END__

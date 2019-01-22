@@ -1,0 +1,123 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/everywhere/monitor-safeguard#5 $
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Constants;
+use ariba::Ops::CFEngine::MonitoringGlueUtils;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Utils;
+use dmail::LockLib;
+
+use File::Tail;
+use POSIX qw(setsid);
+
+my $safeguardLogFile = '/var/log/secure';
+my $runLockFile = '/tmp/run-lock-monitor-safeguard';
+my $lastUpdatedTime = (stat($0))[9];
+my $debug = 0;
+
+$SIG{ALRM} = sub { reloadIfUpdated(1); };
+
+sub reloadIfUpdated {
+	my $force = shift;
+
+	if ($force || !(-e $0) || $lastUpdatedTime != (stat($0))[9]) {
+		dmail::LockLib::releaselock($runLockFile);
+		exec($0 . ($debug ? ' -d' : ''));
+		exit(); # Exit if failed to execute.
+	}
+}
+
+sub main {
+	my $sendEmail = 1;
+	my $sendPage = 1;
+	
+	while (my $arg = shift) {
+		if ($arg =~ /^-d/) { $debug++; next; }
+	}
+
+	# Run on safeguard machines only
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $machine  = ariba::Ops::Machine->new($hostname);
+	my $datacenter = $machine->monitoringDatacenter() || $machine->datacenter();
+	exit() unless ($machine->provides('safeguard') && $machine->status() eq 'inservice');
+
+	my $monServer   = ariba::Ops::CFEngine::MonitoringGlueUtils::monitorServer($hostname);
+	exit() unless defined $monServer;
+
+	# Become a daemon
+	my $pid;
+	exit() if ($pid = fork()); # Parent
+	unless (defined($pid)) {
+		print "Failed to fork: $!\n" if ($debug); 
+		exit();
+	}
+	unless ($debug) {
+		close(STDOUT);
+		close(STDERR);
+	}
+
+	# Ensure only one instance is running
+	dmail::LockLib::forceQuiet() unless ($debug);
+	exit() unless (dmail::LockLib::requestlock($runLockFile, 1));
+
+
+	setsid();
+	alarm(86400);
+
+	my $product = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+	my $service = $machine->service();
+	my $customer = undef;
+	my $email = ariba::Ops::Constants->operationsEmailNotificationAddress();
+
+	if (my $tail = File::Tail->new($safeguardLogFile)) {
+		print "Tailing $safeguardLogFile\n" if ($debug);
+		while (defined(my $line = $tail->read())) {
+			next unless ($line =~ /Activation Time: username=(\w+) masterAccount=([\w\-]+) totalTime=(\d+)/o);
+			my $username = $1;
+			my $masterAccount = $2;
+			my $totalTime = $3; 
+
+			my %queries  = ();
+			$queries{"$masterAccount activation time"} = {
+				info	=> 1,
+				warn	=> 'answer > 30',
+				ticketOnWarnOpenAfterMinutes	=> 60,
+				format	=> 'scaleTime(answer)',
+				perl	=> sub { return $totalTime },
+				uiHint	=> 'Activation Time',
+				recordMaxResults	=> 110000,
+				recordDataType		=> 'gauge',
+				recordDataUnits		=> 'sec',
+				hasErraticSchedule	=> 1,
+                inf_field => "activationTime",
+                inf_tags => qq|datacenter="$datacenter",masterAccount="$masterAccount"|,
+                inf_default => 0,
+                group_by => "$datacenter,$masterAccount",
+			};
+	
+            $queries{influx_details} = {measurement => "Safeguard"};
+			my $qm = ariba::monitor::QueryManager->newWithDetails(
+				'Safeguard', $product, $service, $customer, \%queries
+			);
+
+			$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+			reloadIfUpdated();
+		}
+	} elsif ($debug) {
+		print "Failed to tail $safeguardLogFile: $!\n";
+	}
+
+	dmail::LockLib::releaselock($runLockFile);
+}
+
+main(@ARGV);
+
+__END__

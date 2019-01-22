@@ -1,0 +1,73 @@
+#!/usr/local/bin/perl -w
+
+#Jira-Id: https://product-jira.ariba.com/browse/HOA-11828
+# $Id: //ariba/services/monitor/etc/monitor-query-template#6 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $me = ariba::rc::InstalledProduct->new('community', $mon->service());
+    my %queries;
+
+    $queries{'AUC Siebel Routing'} = {
+        sql   => "SELECT count(*) as count FROM queue WHERE created < ((SYSDATE - TO_DATE('01-JAN-1970','DD-MON-YYYY')) * (86400)) - (30*60) and name = 'ariba_question_sr_queue'",
+        warn    => "answer >= 1",
+	    severity => 2,
+        info    => "answer == 0",
+        description => 'AUC Siebel Routing',
+        correctiveActions => [
+            Ops => 'Please notify the auc team',
+        ],
+    };
+
+
+    my $email = $me->default('notify.email');
+    $queries{'influx_details'} = { measurement => 'community_siebel_routing'};
+    my $qm = ariba::monitor::QueryManager->newWithDetails('auc-siebel-routing', $me->name(), $me->service(), $me->customer(), \%queries);
+    $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($me));
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);
+
+__END__

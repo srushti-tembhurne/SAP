@@ -1,0 +1,122 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/cert-bundle-expire#13 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Constants;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use ariba::Crypto::Certificate;
+
+use Crypt::OpenSSL::X509 qw(FORMAT_PEM FORMAT_ASN1);
+use Symbol;
+
+sub main {
+
+    my $debug     = 0;
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while (my $arg = shift(@ARGV)) {
+        if( $arg =~ /^-e/o ){ $sendEmail = 1; };
+        if( $arg =~ /^-p/o ){ $sendPage = 1; };
+        if( $arg =~ /^-d/o ){ $debug = 1; };
+    }
+
+    my $cert      = ariba::Crypto::Certificate->new();
+
+    my $me        = ariba::rc::InstalledProduct->new();
+    my $email         = $me->default('notify.email');
+
+    my $hostname      = ariba::Ops::NetworkUtils::hostname();
+    my $machine   = ariba::Ops::Machine->new($hostname);
+    my $datacenter    = $machine->datacenter();
+    my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+    my $certDir       = ariba::Ops::Constants->caCertDir();
+
+    my %queries       = ();
+
+    # recurse through directories.
+    processCertDir($cert, $certDir, \%queries, $datacenter);
+    #adding an cert dir,if there are more cert dir need to be parsed,then we can iterate it
+    my $service = $me->service();
+    my $anCertDir       = "/home/an$service/lib/certs";
+    if ( -e $anCertDir ) {
+        print "Parsing AN certs $anCertDir \n" if($debug);
+        processCertDir($cert, $anCertDir, \%queries, $datacenter);
+    }
+    else {
+        print "No AN certs present in $anCertDir for this $service service \n" if($debug);
+    }
+
+    $queries{influx_details} = {measurement => "certificate_time_until_expire"};
+    my $q  = ariba::monitor::QueryManager->newWithDetails(
+        "cert-bundle-expire", $pn, $me->service(), $me->customer(), \%queries
+    );
+
+    $q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+sub processCertDir {
+    my $cert    = shift;
+    my $dir     = shift;
+    my $queries = shift;
+    my $datacenter = shift;
+    my $uiHint  = shift;
+
+    my $certDir = Symbol::gensym();
+
+    my $path = "//ariba/services/operations/documentation/prodops/common/certificate_management.shtml";
+
+    opendir($certDir, $dir) or do {
+        warn "Can't open directory: [$dir] - $!";
+        return;
+    };
+
+    while(my $file = readdir($certDir)) {
+
+        next if $file =~ /^\.\.?/;
+
+        # recurse
+        if (-d "$dir/$file") {
+            processCertDir($cert, "$dir/$file", $queries, $file);
+        }
+
+        next unless $file =~ /\.pem$/;
+
+        my $displayName = $file;
+
+        my $days = $cert->daysToCertExpireTimeForX509("$dir/$file");
+
+        $queries->{"Days to Expire for CA $displayName"} = {
+            noRowCount => 1,
+            format => "%d days\n",
+            info => "answer >= 20",
+            warn => "answer < 90",
+            # tmid:188326
+#            crit => "answer < 60",
+            perl => "return $days",
+            uiHint => $uiHint,
+            ticketOnWarnOpenAfterMinutes => 30,
+            description => "For initial debugging refer to $path",
+            inf_field => "certDaysToExpiration",
+            inf_tags => "CADisplayName=\"$displayName\"",
+            group_by => "$datacenter,$displayName",
+            inf_default => 0,
+        };
+    }
+
+    close($certDir);
+}
+
+main();
+
+__END__

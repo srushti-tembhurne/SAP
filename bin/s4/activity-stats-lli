@@ -1,0 +1,259 @@
+#!/usr/local/bin/perl
+# $Id:
+
+use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::AppInstanceStats;
+use ariba::monitor::QueryManager;
+use Data::Dumper;
+use JSON;
+use Getopt::Long;
+use Pod::Usage;
+
+my $debug = 0;
+my $sendEmail = 0;
+my $sendPage = 0;
+my $help = 0;
+my $productName = "s4";
+my $cfgfile;
+
+#-----------------------------------------------------------------
+#process the command line options
+GetOptions (
+    "debug"   =>  \$debug,
+    "eMail"   =>  \$sendEmail,
+    "page"    =>  \$sendPage,
+    "cfg:s"    =>  \$cfgfile,
+    "prod=s"  =>  \$productName,
+    "help|?"    =>  \$help,
+) or pod2usage(2);
+
+pod2usage(1) if $help;
+#pod2usage("Product name has to be specified") if not defined($productName);
+die "This script is for s4 only" if ( "$productName" ne "s4" );
+
+#-----------------------------------------------------------------
+my $me = ariba::rc::InstalledProduct->new();
+die "No installed product" unless $me;
+
+my $installdir = $me->installDir();
+my $email = $me->default('notify.email');
+my $service = $me->service();
+my $cluster = $me->currentCluster();
+my $product = ariba::rc::InstalledProduct->new($productName, $service);
+die "No product $productName in service" unless defined($product);
+
+#-----------------------------------------------------------------
+#get the configuration for the lli metrics
+$cfgfile = "$installdir/etc/activity-stats-lli.json" unless $cfgfile;
+
+my $fh;
+open ($fh, "<", $cfgfile) or die "Can't open configuration file $cfgfile: $!\n";
+my @lines = <$fh>;
+my $jsonStr = join('', @lines);
+my $cfg = JSON::decode_json($jsonStr);
+close($fh);
+
+#-----------------------------------------------------------------
+#retrieve stat data
+my $statsdata = {};
+my $qspec = $cfg->{queryspec};
+my @appinstances = $product->appInstancesInCluster($cluster) ;
+
+retrieveStatsData (\@appinstances, $qspec, $statsdata ); 
+print Dumper($statsdata) if $debug;
+
+#-----------------------------------------------------------------
+#construct query hash
+my $queries = {};
+buildQueries($statsdata, $qspec, $queries);
+print Dumper($queries) if $debug;
+
+#-----------------------------------------------------------------
+#create QueryManager object and process queries
+$queries->{influx_details} = { measurement => 's4_current_activity_lli' };
+my $qmName = "Current-Activity-LLI";
+my $qm = ariba::monitor::QueryManager->newWithDetails (
+        $qmName, $productName, $service, undef, $queries
+);
+
+$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+exit 0;
+#-----------------------------------------------------------------
+#-----------------------------------------------------------------
+sub retrieveStatsData {
+    my ($instances, $qcfg, $data) = @_;
+
+    my @qnlist = keys %$qcfg;
+    for my $instance ( @$instances ) {
+        next unless $instance->isTomcatApp();
+        
+        #app instance information
+        my $instancename = $instance->instanceName();
+        my $appname = $instance->appName();
+        my $community = $instance->community() || 0; #use 0 for non community
+
+        #app instance stats
+        my $monitorStats = 
+            ariba::monitor::AppInstanceStats->newFromAppInstance($instance);
+        my $host = $monitorStats->host();
+        $monitorStats->fetch();
+
+        #now we have the data. put them in the right bucket.
+        for my $qn ( @qnlist ) {
+            my $val = $monitorStats->$qn ();
+            if ( defined($val) ) {
+                $data->{$qn}{instance}{$instancename}{value} = $val;
+                $data->{$qn}{instance}{$instancename}{community} = $community;
+                $data->{$qn}{instance}{$instancename}{appname} = $appname;
+
+                $data->{$qn}{host}{$host}{count}++;
+                $data->{$qn}{host}{$host}{value} += $val;
+
+                $data->{$qn}{total}{count}++;
+                $data->{$qn}{total}{value} += $val;
+            }
+        }
+    } #for each app instance
+}
+
+sub buildQueries {
+    my ($data, $qcfg, $qs) = @_;
+
+    my %influx_db_col = ( 'LLI Exception Count For Submit Excel Bid' => 'submit_excel_bid_cnt',
+                          'LLI Exception Count For Delete All Content' => 'delete_all_content_cnt',
+                          'LLI RFX Count' => 'rfx_cnt',
+                          'LLI Exception Count For Optimize' => 'optimize_cnt',
+                          'LLI Time For All Buyer Reports' => 'buyer_reports_time',
+                          'LLI Exception Count For Publish' => 'publish_cnt',
+                          'LLI Time For Optimize' => 'optimize_time',
+                          'LLI Exception Count For Award' => 'award_cnt',
+                          'LLI Exception Count' => 'exp_cnt',
+                          'LLI Time For Submit Excel Bid' => 'submit_excel_bid_time',
+                          'LLI Time For Delete All Content' => 'delete_all_content_time',
+                          'LLI Exception Count For Generate Excel Bid File' => 'excel_bid_file_cnt',
+                          'Contract Request Count' => 'contract_req_cnt',
+                          'Contract Request Failed Count' => 'contract_req_failed_cnt' );
+
+    for my $qn ( keys %$data ) { #the first key of data is the query name
+        #spec for the given query
+        my $qspec = $qcfg->{$qn};
+        my $qdisplayname = $qspec->{"display-name"};
+        my $inf_field    = $influx_db_col{$qdisplayname};
+        my $description = $qspec->{"description"};
+        my $showinstance = $qspec->{"appinstance"};
+        my $severity = $qspec->{"severity"};
+        my $ticket = $qspec->{"ticket"};
+
+#        my $warnvalue = $qspec->{"warn"};
+#        my $critvalue = $qspec->{"crit"};
+
+        my $aggrtype = $qspec->{"aggr-type"};
+        my $aggrnode = $qspec->{"aggr-node"};
+        my $aggrall = $qspec->{"aggr-all"};
+        
+        if ( $showinstance ) {
+            for my $instancename ( keys %{$data->{$qn}{instance}} ) {
+                my $queryname = "$instancename $qdisplayname";
+                my $community = "Community " . 
+                    $data->{$qn}{instance}{$instancename}{community};
+                $community = "Default Community" 
+                    if not $data->{$qn}{instance}{$instancename}{community};
+                my $appname = $data->{$qn}{instance}{$instancename}{appname};
+                my $uiHint = "$community/$appname";
+                my $val = $data->{$qn}{instance}{$instancename}{value};
+
+                my $q = {};
+                $q->{description} = $description;
+                $q->{uiHint} = $uiHint;
+                $q->{perl} = "return $val;"; 
+                $q->{warn} = "answer > " . $qspec->{"warn"};
+                $q->{crit} = "answer > " . $qspec->{"crit"};
+        
+                $q->{inf_field} = $inf_field;
+                $q->{inf_default} = 0;
+                $q->{inf_tags} = qq(community="$community",instance_type="$appname",instance_name="$instancename");
+                $q->{group_by} = qq($community,$appname,$instancename);
+                $qs->{$queryname} = $q; # a query prepared for QueryManager
+            }    
+        }
+
+        if ( $aggrnode ) {
+            for my $h ( keys %{$data->{$qn}{host}} ) {
+                my $inf_field = $influx_db_col{$qdisplayname};
+                my $queryname = "$h $qdisplayname";
+                my $val = $data->{$qn}{host}{$h}{value};
+                my $cnt = $data->{$qn}{host}{$h}{count};
+                $val = $val / $cnt if ( "$aggrtype" eq "average" && $cnt );
+                
+                my $q = {};
+                $q->{description} = $description;
+                $q->{perl} = "return $val";
+                $q->{warn} = "answer > " . $qspec->{"aggr-node-warn"};
+                $q->{crit} = "answer > " . $qspec->{"aggr-node-crit"};
+
+                $q->{inf_field} = $inf_field;           
+                $q->{inf_default} = 0;
+                $q->{inf_tags} = qq(instance_name="$h");
+                $q->{group_by} = qq($h);
+
+                $qs->{$queryname} = $q; # a node level query for QueryManager
+            }
+        }
+        
+        if ( $aggrall ) {
+            my $queryname = "Summary: $qdisplayname";
+            my $inf_field    = $influx_db_col{$qdisplayname};
+            my $val = $data->{$qn}{total}{value};
+            my $cnt = $data->{$qn}{total}{count};
+            $val = $val / $cnt if ( "$aggrtype" eq "average" && $cnt );
+
+            my $q = {};
+            $q->{description} = $description;
+            $q->{perl} = "return $val";
+            $q->{warn} = "answer > " . $qspec->{"aggr-all-warn"};
+            $q->{crit} = "answer > " . $qspec->{"aggr-all-crit"};
+
+            $q->{inf_field} = $inf_field;
+            $q->{inf_default} = 0;
+            $q->{inf_tags} = qq(instance_type="summary");
+            $q->{group_by} = qq(summary);
+            $qs->{$queryname} = $q; # a summary query for QueryManager;
+        }
+    }
+
+    return;
+}
+
+
+=pod
+
+=head1 NAME
+
+activity-stats-lli
+
+=head1 SYNOPSIS
+
+activity-stats-lli [-d] [-e] [-page] [-cfg <cfgfile>] -prod <prodname>
+
+    -d: debug
+    -e: send email for alerts
+    -page: send page for alerts
+    -cfg: alternative json configuration file
+    -prod <prodname>: provide product name (required)
+
+=head1 DESCRIPTION
+
+This script will query each node in the cluser of the given service enviornment
+to retrieve the status data for product S4 and use that 
+along with the json configuration file to construct query configurations. 
+It sends that to QueryManager to create Query objects for display on the 
+monitoring pages and alerts
+
+=cut

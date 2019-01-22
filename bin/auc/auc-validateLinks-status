@@ -1,0 +1,144 @@
+#!/usr/local/bin/perl
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+require "geturl";
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use JSON;
+use Pod::Usage;
+use Getopt::Long;
+
+
+my $debug = 0;
+
+my($mon,$me,$siteurl,$url,@results,$decoded_json);
+ 
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    
+    GetOptions(
+        "help|h" => sub { pod2usage(1); },
+        "debug|d+" => \$debug,
+        "e" => \$sendEmail,
+        "p" => \$sendPage,
+    );
+
+    $mon = ariba::rc::InstalledProduct->new('mon');
+    $me = ariba::rc::InstalledProduct->new('community', $mon->service());
+    $siteurl = $me->default('SiteURLSecure');
+    chomp($siteurl);
+    my $start_time = `date +%s` - (12*60*60);
+    my $interval = 12*60*60;
+    $url = "$siteurl/internal/link_validation_monitoring.php?start_ts=\'$start_time\'&duration_sec=\'$interval\'";
+    eval { geturl("-e","-q","-timeout", '60', "-results",\@results,$url) };
+    if ($@) {
+	    @results = ("URL error");
+    } else {
+        my $json = join('',@results);
+        eval { $decoded_json = JSON::decode_json($json); };
+        if ($@) {
+		    @results=("Invalid JSON");
+        }
+    }
+    my %queries;
+    $queries{'Timed-out calls'} = {
+                                    crit => "answer > 0 or answer =~ /(invalid|error)/i",
+                                    severity => 1,
+                                    description => 'Timed out validate link run',
+                                    note => 'Link validation runs that started during the monitoring period and have not finished, and whose expected finished time has passed',
+                                    correctiveActions => [
+                                          Ops => '1) Send email to AUC Community alias DL ARB AUC_Eng (External) <DL_5419DA6CFD84A00838000005@exchange.sap.corp>'
+                                    ],
+                                    recordMaxResults => 8640,
+				                    perl => sub {  return scan_status('timeout_calls'); }, 
+                                    inf_field   => "timed_out_calls",
+                                    inf_default => 0,
+                                  };
+
+     $queries{'Link validation failed'} = {
+                                         warn => "answer >= 1",
+                                         crit => "answer >= 2 or answer =~ /(invalid|error)/i",
+                                         severity => 1,
+                                         description => 'Link validation failed',
+                                         note => 'Run of Link validations failed unexpectedly',
+                                         correctiveActions => [
+                                              Ops => '1)Send email to AUC Community alias DL ARB AUC_Eng (External) <DL_5419DA6CFD84A00838000005@exchange.sap.corp>'
+                                          ],
+                                          recordMaxResults => 8640,
+                                          perl =>  sub { return scan_status('failed_calls'); },
+                                          inf_field   => "link_validation_failed",
+                                          inf_default => 0,
+                                         };
+      $queries{'Succeeded'} =  {
+                                   warn => "answer =~ /(invalid|error)/i",
+                                   description => 'Links validation succeeded',
+                                   note => 'These runs of link validations succeeded',
+                                   info => 1,
+                                   recordMaxResults => 8640,
+                                   perl =>  sub { return scan_status('succeeded_calls'); },
+                                   inf_field   => "succeeded",
+                                   inf_default => 0,
+                                 };
+
+      $queries{'Found bad links'} = {
+                                         warn => "answer >= 10",
+                                         crit => "answer >= 30 or answer =~ /(invalid|error)/i",
+                                         description => 'Found Bad links',
+                                         note => 'The run detected bad links in community',
+                                         correctiveActions => [
+                                               Ops => 'Send email to AUC Community alias DL ARB AUC_Eng (External) <DL_5419DA6CFD84A00838000005@exchange.sap.corp>'
+                                         ],
+                                         recordMaxResults => 8640,
+                                         perl =>  sub { return scan_status('bad_links_found_calls'); },
+                                         inf_field   => "found_bad_links",
+                                         inf_default => 0,
+                                         };
+
+      $queries{'Total Link Validation Runs'} = {
+                                                 warn => "answer =~ /(invalid|error)/i",
+                                                 description => 'Total link validation runs',
+                                                 note => 'The total number of link validation runs',
+                                                 info => 1,
+                                                 recordMaxResults => 8640,
+                                                 perl => sub { return scan_status('total'); },
+                                                 inf_field   => "total_link_validation_runs",
+                                                 inf_default => 0,
+       };
+
+      my $email = $me->default('notify.email');
+      $queries{'influx_details'} = { measurement => 'community_links_validation'};
+      my $qm = ariba::monitor::QueryManager->newWithDetails('Links Validation', $me->name(), $me->service(), $me->customer(), \%queries);
+      $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+                                    
+}
+
+ sub scan_status {
+     my $results = join('',@results);
+     if ($results =~ m/URL error/) {
+        return "Error in fetching $url";
+     } elsif ($results =~ m/Invalid JSON/) {
+        return "Invalid JSON returned from $url";
+     } else {
+        my $p = shift;
+        if ($p eq 'timeout_calls') {
+            return $decoded_json->{'timed_out'};
+        } elsif ($p eq 'failed_calls') {
+            return $decoded_json->{'failed'};
+        } elsif ($p eq 'succeeded_calls') {
+            return $decoded_json->{'succeeded'};
+        } elsif ($p eq 'bad_links_found_calls') {
+            return $decoded_json->{'found_bad_links'};
+        } elsif ($p eq 'total'){
+            return $decoded_json->{'total'};
+        }
+    }
+ }
+
+main(@ARGV);
+
+__END__

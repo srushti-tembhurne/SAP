@@ -1,0 +1,281 @@
+#!/usr/local/bin/perl -w 
+
+use strict;
+use FindBin; 
+use lib "$FindBin::Bin/../../lib";
+
+use Date::Parse;
+use File::Copy;
+use POSIX qw(strftime);
+
+use ariba::rc::Globals;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::DateTime;
+use ariba::Ops::Startup::Hadoop;
+use ariba::Ops::HadoopConfig;
+use ariba::util::Misc;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Query;
+
+our $quiet = 1; # Suppresses prints in ariba::Ops::Startup::Common.pm
+my $debug = 0;
+
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+Checks and sends checkpoint health information to monitoring
+
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode. 
+    -h        Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub debug {
+    my $msg = shift; 
+
+    print "(debug) $msg\n" if ($debug);
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled('hadoop', $me->service()));
+    my $hadoop = ariba::rc::InstalledProduct->new('hadoop', $me->service());
+
+    my @nameHosts = $hadoop->hostsForRoleInCluster('hadoop-name', $me->currentCluster());
+    my $host = ariba::Ops::NetworkUtils::hostname();
+    my ($checkpointInterval, $error) = checkpointIntervalForProduct($hadoop);
+    my $nnFlag = 0;
+
+    my %queries;
+
+    if (scalar @nameHosts > 0) {
+        if (grep ($_ eq $host, @nameHosts)) {
+            $nnFlag = 1;
+        }
+    }
+
+    if ($nnFlag) {
+        debug("fsimage checkpoint interval - config: $checkpointInterval secs " . 
+            "/ crit: $checkpointInterval secs");
+        debug("                     error: $error") if ($error);
+
+        $queries{"checkpoint fsimage on $host - last modified"} = {
+            format              => 'scaleTime(answer) ago',
+            crit                => 'answer > ' . $checkpointInterval,
+            error               => $error,
+            noCritOnError       => 1,
+            recordMaxResults    => 32000,
+            perl                => sub { return checkpointImageLastModifiedAgeForProduct($hadoop); },
+            description         => qq`The HDFS fsimage and edit logs are consolidated by 
+                the Secondary Name node every $checkpointInterval seconds. If the fsimage on the
+                Secondary Name node is not updated, then it may indicate the Secondary Name is not working.`,
+            correctiveActions   => [
+                Ops => 'Make sure there is a Secondary Name node configured for the ' . 
+                    'the product and it is up. Check the Secondary Name node\'s kr log' . 
+                    'to see what happened. Escalate to Tools if needed.', 
+                Tools => 'Debug based on the Secondary Name node\'s kr log',
+            ],
+            inf_field => "checkpoint_fsimage_last_mod",
+            inf_default => "none",
+            inf_tags => "host=\"$host\"",
+        };
+    }
+
+    $queries{"checkpoint fsimage on $host - last modified crit threshold"} = {
+        perl      => sub { $checkpointInterval },
+        inf_field => "cflm_crit_threshold",
+        inf_tags  => "host=\"$host\"",
+    };
+
+    $queries{'checkpoint fsimage - validation'} = {
+        warn                => 'answer ne "OK"',
+        crit                => 'answer ne "OK" && previousAnswer ne "OK"',
+        timeout             => 840,
+        perl                => sub { return validateCheckpointImage($hadoop); },
+        description         => qq`The HDFS fsimage and edit logs are consolidated by 
+            the Secondary Name node every $checkpointInterval seconds. This monitoring
+            runs the 'hdfs oiv' (Offline Image Viewer) tool to verify the consolidated
+            fsimage to make sure it is ok.`,
+        correctiveActions   => [
+            Ops => 'Make sure there is a Secondary Name node configured for the ' . 
+                'the product and it is up if the checkpoint fsimage is missing. ' . 
+                'If it is running, yet the image is missing, check the Secondary Name ' . 
+                'node\'s kr log to see what happened. If the oiv tool failed, ' . 
+                'correct based on what the error. Otherwise, Escalate to Tools if needed.', 
+            Tools => 'Debug based on the error',
+        ],
+        inf_field => "checkpoint_fsimage_validation",
+        inf_default => "none",
+        inf_tags => "host=\"$host\"",
+    };
+
+    my $email = $me->default('notify.email');
+
+    $queries{"influx_details"} = {measurement => "hadoop_checkpoint"};
+    my $qm = ariba::monitor::QueryManager->newWithDetails('checkpoint', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+} 
+
+sub checkpointImageLastModifiedAgeForProduct {
+    my $hadoop = shift; 
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+    my ($fsImageFile, $lastModifiedAge, $latestTime);
+
+    my $confFile = $hadoop->installDir() . '/hadoop/conf/hdfs-site.xml'; 
+    debug("Getting name dir from $confFile");
+    
+    my $conf = ariba::Ops::HadoopConfig->new($confFile); 
+    if ($conf->error()) { 
+        $query->setError("$confFile: " . $conf->error());
+    } else { 
+        my $dir = $conf->fsCheckpointDir($hadoop); 
+
+        my $checkDir = (split(",", $dir))[0];
+        $fsImageFile = latestFsImageFile($checkDir);
+
+        debug("Checkpoint dir: $dir");
+        debug("fsimage file: $fsImageFile");
+
+        if (my $lastModifiedTime = (stat($fsImageFile))[9]) {
+            $lastModifiedAge = time() - $lastModifiedTime;
+            debug("fsimage last modified: " . localtime($lastModifiedTime));
+            debug("fsimage last modified age: $lastModifiedAge");
+        } else {
+            $query->setError("Failed to stat / get last modified of $fsImageFile: $!");
+        }
+    } 
+
+    return $query->error() || $lastModifiedAge;
+}
+
+#
+# Get fsimage_* filenames (not .md5) with the latest timestamp
+#
+sub latestFsImageFile {
+    my $dir = shift;
+    my ($fsImageFile, $latestTime);
+
+    my @files = glob "$dir/current/fsimage_*";
+
+    foreach my $file (grep {/fsimage\_\d+$/} @files) {
+        my $time = (stat($file))[9];
+
+        if (!defined($fsImageFile) || $time > $latestTime) {
+            $fsImageFile = $file;
+            $latestTime = $time;
+        }
+    }
+    return $fsImageFile;
+}
+
+sub validateCheckpointImage {
+    my $hadoop = shift; 
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+    my $minModifiedAge = 5 * 60;
+
+
+    debug("Checking checkpoint image's last modified age to be at least $minModifiedAge sec(s)");
+    while (my $lastModifiedAge = checkpointImageLastModifiedAgeForProduct($hadoop)) {
+        return $query->error() if ($query->error());
+        last if ($lastModifiedAge > $minModifiedAge);   
+
+        debug('Sleeping for 60 sec(s)');    
+        sleep(60);
+    }
+
+    ariba::Ops::Startup::Hadoop::setRuntimeEnv($hadoop);
+
+    my $confFile = $hadoop->installDir() . '/hadoop/conf/hdfs-site.xml'; 
+    debug("Getting name dir from $confFile");
+    
+    my $conf = ariba::Ops::HadoopConfig->new($confFile); 
+    if ($conf->error()) { 
+        $query->setError("$confFile: " . $conf->error());
+    } else { 
+        my $dir = $conf->fsCheckpointDir($hadoop); 
+
+        my $checkDir = (split(",", $dir))[0];
+        my $fsImageFile = latestFsImageFile($checkDir);
+        debug("Checkpoint dir: $dir");
+        debug("fsimage file: $fsImageFile");
+
+        if (-e $fsImageFile) {
+            my $tmpImageFile = "/tmp/checkpoint-fsimage";
+            my $outputFile = "/tmp/checkpoint-output";
+            eval { 
+                # Do pre-clean up
+                !(-e $tmpImageFile) || unlink($tmpImageFile)    or die "(Pre) Failed to delete $tmpImageFile: $!"; 
+                !(-e $outputFile) || unlink($outputFile)        or die "(Pre) Failed to delete $outputFile: $!";
+
+                # Copy the fs image file as it may take a while to run the oiv tool
+                copy($fsImageFile, $tmpImageFile)               or die "(Pre) Failed to copy from $fsImageFile to $tmpImageFile: $!"; 
+        
+                # Run the oiv tool
+                my $cmd = $hadoop->installDir() . "/hadoop/bin/hdfs oiv -i $tmpImageFile -o $outputFile -p Ls";
+                debug("Running '$cmd'");
+                my $output = `$cmd 2>&1`;
+                die "Running of '$cmd' failed with error: $output" if ($output);
+
+                # Check size
+                my $outputSize = -s $outputFile;
+                debug("Size of $outputFile: " . (defined $outputSize ? $outputSize : 'undef'));
+                die "Size of $outputFile from 'hadoop oiv' is zero" unless ($outputSize); 
+
+                # If it failed above, leave the files for investigation.
+                # Cleaup the files
+                !(-e $tmpImageFile) || unlink($tmpImageFile)    or die "(Post) Failed to delete $tmpImageFile: $!"; 
+                !(-e $outputFile) || unlink($outputFile)        or die "(Post) Failed to delete $outputFile: $!";
+            }; 
+
+            $query->setError($@);
+            undef $@;   # Query.pm checks this variable and will re-throw the error, which causes it to die.
+        } else {
+            $query->setError("$fsImageFile does not exist");
+        }
+    } 
+
+    return $query->error() || 'OK';
+}
+
+sub checkpointIntervalForProduct { 
+    my $product = shift; 
+
+    my $confFile = $product->installDir() . '/hadoop/conf/hdfs-site.xml';
+    debug("Getting checkpoint interval from $confFile");
+    my $conf = ariba::Ops::HadoopConfig->new($confFile); 
+
+    my $interval = $conf->valueForName('fs.checkpoint.period');
+    
+    unless ($interval) { 
+        my $defaultCheckpointInterval = 3900;
+        debug("Defaulting checkpoint interval to $defaultCheckpointInterval");
+        $interval = $defaultCheckpointInterval;
+    }
+
+    return $interval, $conf->error();
+}
+
+main(@ARGV);

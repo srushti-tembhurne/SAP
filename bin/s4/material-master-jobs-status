@@ -1,0 +1,387 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/s4/material-master-jobs-status#none $
+
+# General comments regarding this script template:
+#   1.  The first monitoring script using this is/was for AUC Learning Center, which has some specific processing
+#       rules that I wasn't able to figure out a way to make them configuration items.  The main example of this
+#       is the time setup.  The DA URL needs to have a start time set one hour before the script runs, with a
+#       duration of one hour.  This requires code and logic to get the current time, calculate the start time,
+#       and build the URL to request data from the DA host.
+#
+#       This could be isolated in a module (perhaps the right way to go), but if it is only used once, it might
+#       as well stay here.  But that does mean this template would need more modification to use it for another
+#       monitoring request, rather than less.
+#
+#   2.  Given the above, and that there may be many of these sorts of things, I've marked the ones present in
+#       this template with the word NOTE, hoping it will stand out (it does in vim, because vim also highlights
+#       this all caps string whan found in a comment).
+
+use warnings;
+use strict;
+
+use Data::Dumper;
+use File::Basename;
+use Getopt::Long qw(:config no_ignore_case_always no_getopt_compat require_order no_bundling);
+use LWP;
+use IO::Socket::SSL qw();
+use JSON;
+use XML::Simple;
+use File::Slurp;
+use FindBin;
+# This INC dir works for release and testing, to find the released lib in the user's home.
+use lib "$FindBin::Bin/../../lib";
+# While this one will find the test lib hierarchy, only useful when run from the <.user/bin> directory.
+use lib "$FindBin::Bin/../lib";
+
+# Used within the context of the Influx string, to ascribe meaning to the numbers.  GOOD is set to zero because
+# the returned XML for ErrorItems has multiple possible Status values >= 0.  Based on the response for the mach
+# service, it looks like the ErrorItems response will always be >= 0, while InProgressItems is always 0.
+use constant {GOOD => 0, FAILED => 1};
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::ServiceController;
+use ariba::Ops::Utils;
+use ariba::monitor::Utils;
+
+# Debug can have incrementing values, such that '-d -d' sets it to '2'.  For development work, a value of
+# '2' implies not wanting to actually run the queries, but just to dump the query hash and exit.  This
+# can of course be changed as needed.
+my $debug = 0;
+
+# NOTE:  This will be different for each version of the script, and should be defined in the config file.
+#        However, this would mean no possible message until after the config is read and converted, so
+#        no usage for everything that comes before that.  The simple solution is to create a very generic
+#        usage message here.  This will be *replaced* by the values read in from the config, if any.
+my $program = basename $0; # remove leading path elements, provided by some host systems.
+my $usage = "usage:  $program [-t] [-d] [-e] [-p] [-h] -product|-prod product-name\n\n" .
+            "Option names may also be spelled out:\n" .
+            "\t-d or -debug\n\t-e or -sendemail (note spelling!)\n\t-p or -sendpage\n\t-h or -help\n\t" .
+            "-t or -test\n\t" .
+            "-product or -prod product-name (required)\n\n" .
+            "If the 'help' option is present, all other options are ignored.";
+
+# This will 'die' if any of the needed pieces are not found, with the basic message:
+my $message = "ERROR:  Failed to obtain information required to process: ";
+my $count = 0;
+sub main
+{
+    # handle command line args.  NOTE:  these are the basics, more may be needed to meet functional
+    # and design requirements.
+    my ($sendEmail, $sendPage, $productName, $test, $xml, $help); # Debug is defined as a file global, above.
+    GetOptions (
+                   'debug|d+'       => \$debug,      # allow multiple debug options to increase debug level.
+                   'sendemail|e'    => \$sendEmail,
+                   'test|t'         => \$test,
+                   'sendpage|p'     => \$sendPage,
+                   'product|prod=s' => \$productName,
+                   'help|h'         => \$help,
+               );
+
+    if ($test)
+    {
+        $xml = '<xml><INFO message="No results found"/></xml>';
+    }
+
+    # Check for help option, print usage and exit:
+    if ($help)
+    {
+        print "$usage\n";
+        exit 0;
+    }
+
+    # The only required option, for a minimal setup, is the product name.
+    die "$message missing required product name.\n\n$usage\n" unless $productName;
+
+    # For testing in devlab, service 'mach', stratus is not installed, and the conf file is in .rmcgown/etc/query
+    # And, we want to set this up whether or not the script is run in debug mode, so check the FindBin for .rmcgowan
+    my ($prod, $installDir);
+    if ($FindBin::Bin =~ /\.rmcgowan/)
+    {
+        $prod = ariba::rc::InstalledProduct->new ('mon');
+        die "$message cannot create a 'mon' product object.\n" unless $prod;
+        $installDir = $prod->installDir () . '/../.rmcgowan';
+    }
+    else
+    {
+        $prod = ariba::rc::InstalledProduct->new ('stratus');
+        die "$message cannot create a 'stratus' product object.\n" unless $prod;
+        $installDir = $prod->installDir ();
+    }
+
+    die "$message cannot retrieve install directory from monitor product object.\n" unless $installDir;
+
+    # Determine the datacenter this is running in.  Assumes index 0 is always primary, which is what we want.
+    my $dc = (ariba::Ops::ProductAPIExtensions::datacentersForProducts ($prod))[0];
+
+    # Prepend the 'home' directory, aka the install directory.  NOTE:  the config file names will be different.  Edit this.
+    my $confFile = "$installDir/etc/query/material-master-jobs.conf";
+    # Read the conf file and convert the JSON to Perl data structures.
+    chomp (my $configString = read_file ($confFile));
+    print "DEBUG:  $configString\n" if $debug > 1 and $debug < 4;
+    die "$message cannot read configuration file '$confFile'.\n" unless $configString;
+    my $config = eval {decode_json ($configString)}; # trap any JSON error messages.
+    # If the decode failed, $config should be undef or empty, and fail the test below.
+    die "$message cannot decode JSON string:\n\n'$configString'.\n\n$@\n" unless $config;
+
+    # The config structure has one key named 'globals', for all config information not specific to a
+    # particular monitored item.  This needs to be removed from the config and saved separately.
+    my $configGlobals = delete $config->{globals};
+    # There may be "comment" keys present to explain usage/purpose of the 'globals' key content, useful only in
+    # the JSON source file, so remove those keys here.  NOTE:  there is no limit on the number of comment keys, so long as
+    # they begin with the string 'comment' followed by zero or more additional characters.  The method used here changes
+    # the referenced hash in place, there is no return value.
+    ariba::monitor::Utils::removeCommentKeys ($configGlobals);
+    # And finally, there is a 'usage' key, which may or may not have content.  If the generic usage above is sufficient, this
+    # could be empty, otherwise it should be an array of strings.
+    my $newUsage = join '', @{delete $config->{'usage'}};
+    $usage = $newUsage if $newUsage;  # Preserves the original unless we have a new one.
+
+    my $service = $prod->service ();
+    # NOTE:  this section is very product dependent and should be replaced for new monitoring.
+    # ======================
+    # Check that the product named from the command line exists in this service.
+    die "$message product '$productName' is not installed for service '$service'.\n"
+        unless ariba::rc::InstalledProduct->isInstalled ($productName, $service);
+    # Retrieve the site URL and append our option path and arguments.
+    my $product = ariba::rc::InstalledProduct->new ($productName, $service);
+    die "$message cannot create a 'product' object for '$productName'.\n" unless $product;
+    chomp (my $siteURL = $product->default ($configGlobals->{'url_path_default'}));
+    die "$message could not retrieve site URL.\n" unless $siteURL;
+    print "DEBUG:  site url:  $siteURL\n" if $debug > 1 and $debug < 4;
+    # ======================
+
+    my ($inProgressOpts, $errorOpts);
+    $inProgressOpts = $configGlobals->{'in_progress_opts'};
+    $errorOpts = $configGlobals->{'error_opts'};
+
+    # Now, get the data from the remote host.  Because we are using self-signed certificates, and have no local set to verify
+    # against, the request needs to ignore verification:
+    my $userAgent = LWP::UserAgent->new (ssl_opts => {SSL_verify_mode => 0,
+                                                      verify_hostname => 0,});
+
+    # For Material Master Jobs, there are two distinct GETs to run.  This will do one, process the result, then do the second.
+    for my $queryName (keys %$config)
+    {
+        my $fullURL;
+        # note:  the below quoted elements are *string concatenations*, don't remove the double quotes!
+        if ($queryName eq 'InProgressItems')
+        {
+            $fullURL = "$siteURL$inProgressOpts";
+        }
+        elsif ($queryName eq 'ErrorItems')
+        {
+            $fullURL = "$siteURL$errorOpts";
+        }
+        else
+        {
+            die "ERROR:  Invalid query name '$queryName'!\n";
+        }
+
+        my $request = HTTP::Request->new (GET => $fullURL);
+        my $response = $userAgent->request ($request);
+        $response->is_success or die "ERROR:  Request failed for '$fullURL':  ", $response->message (), "\n";
+
+        # To be absolutely sure we don't pick up some other error, zero the $@ variable:
+        $@ = undef;
+
+        # The response will be XML from the remote host, which needs to be converted...  The ForceArray is REQUIRED, so all entities
+        # are consistent, even when there is only one element.  Normally, a single element is handled differently than multiple.  The
+        # NormaliseSpace value of 2 causes all text (keys or values) to have leading/trailing whitespace removed, and any 2+ series
+        # of spaces collapsed to a sinlge space.
+        $xml = $response->content () unless $xml;
+        my $responseHashRef = eval {XMLin ($xml, ForceArray => 1, NormaliseSpace => 2)};
+
+        # And again, if this is undef/empty, we've failed for some reason and an error exit seems best for now.
+        die "$message invalid or missing response from remote '$fullURL'\nor malfromed XML:  $@\n" unless $responseHashRef and ! $@;
+
+        # For comparison, dump both the XML and the converted data, for each HTTP request.  Set this up to happen only when debug
+        # is 4.
+        if ($debug == 4)
+        {
+            print "The returned XML:\n\n", $response->content (), "\n\n", '='x80, "\n\n", Dumper ($responseHashRef), "\n", '#'x80, "\n";
+        }
+        print Dumper ($responseHashRef), "\n" if $debug and $debug < 4;
+        # The response can be a simple XML "INFO" data, or a more complex, nested XML data set with various parts.  Each must be handled
+        # separately and differently, but the resulting output must be consistent and identifiable by Influx db, so use generateInfluxLine,
+        # which requires the following hash structure:
+        # my %influx_data = (
+        #                    'measurement' => 'lineprotocol_wrapper_errors',
+        #                    'data'        => {
+        #                               'cmd'         => $ran,
+        #                               'error_descr' => "$error_descr",
+        #                              },
+        #                    'tags' => {error_code => $error_code, 'product' => "stratus", 'service' => $service},
+        #                   );
+        my $influxData;
+        if (exists $responseHashRef->{INFO}->[0]->{message} && $responseHashRef->{INFO}->[0]->{message} eq 'No results found')
+        {
+            # Using the generateInfluxLine from the Stratus version of ariba::Ops::Utils.
+            # GOOD is a constant, defined in this script.
+            $influxData = {
+                            measurement => 'material_master_jobs_status',
+                            data        => {
+                                                status  => GOOD,
+                                           },
+                            tags        => {
+                                                cmd     => $program,
+                                                dc      => $dc,
+                                                service => $service,
+                                                product => $productName,
+                                                query   => $queryName,
+                                           },
+                          };
+            # Here we call the method to generate an Influx string, using the hash ref for data:
+            print ariba::Ops::Utils::generateInfluxLine ($influxData), "\n";
+        }
+        else # Anything else is error conditions.
+        {
+            # For this, there are additional tags to use, for Realm, BusinessSystem, WorkItem, RunningFor and Id.  The XML also
+            # supplies ArchesJobID and Status, which have been requested by engineering.  These will be data, as they change often.
+            my ($tags, $fields);
+            if ($queryName eq 'InProgressItems')
+            {
+                # Iterate over the set of values, building the string for Influx, and print after each WorkItem is done.
+                for my $realm (keys %{$responseHashRef->{Realm}})
+                {
+                    for my $businessSystem (keys %{$responseHashRef->{Realm}->{$realm}->{BusinessSystem}})
+                    {
+                        # At the WorkItem level, the reference is to an ARRAY of hash refs.  We need to process the hash refs.  Note
+                        # that for a BusinessSystem, there is only one WorkItem hash element and one array of work items.
+                        for my $workItem (@{$responseHashRef->{Realm}->{$realm}->{BusinessSystem}->{$businessSystem}->{WorkItem}})
+                        {
+                            # Each hash in the array has four keys but only 3 are useful for in progress (marked by *):
+                            # ArchesJobId * sometimes refers to an empty anonymous hash, sometimes to a string.
+                            # RunningFor * a number
+                            # Id * an ugly hex(?) number with dashes and more numbers.
+                            # Status is always 0
+                            my $id = $workItem->{Id}->[0];
+                            my $archesJobId = $workItem->{ArchesJobId}->[0];
+                            ref ($archesJobId) eq 'HASH' and $archesJobId = 'N/A';
+                            $influxData = {
+                                            measurement => 'material_master_jobs_status',
+                                            data        => {
+                                                                status          => FAILED,
+                                                                id              => qq($id),
+                                                                running_for     => $workItem->{RunningFor}->[0],
+                                                                arches_job_id   => qq($archesJobId),
+                                                           },
+                                            tags        => {
+                                                                cmd             => $program,
+                                                                dc              => $dc,
+                                                                service         => $service,
+                                                                product         => $productName,
+                                                                query           => $queryName,
+                                                                realm           => $realm,
+                                                                business_system => $businessSystem,
+                                                           },
+                                          };
+                            # Here we call the method to generate an Influx string, using the hash ref for data:
+                            print ariba::Ops::Utils::generateInfluxLine ($influxData), "\n";
+                        }
+                    }
+                }
+            }
+            elsif ($queryName eq 'ErrorItems')
+            {
+                # Iterate over the set of values, building the string for Influx, and print after each WorkItem is done.
+                for my $realm (keys %{$responseHashRef->{Realm}})
+                {
+                    for my $businessSystem (keys %{$responseHashRef->{Realm}->{$realm}->{BusinessSystem}})
+                    {
+                        # At the WorkItem level, the reference is to an ARRAY of hash refs.  We need to process the hash refs.  Note
+                        # that for a BusinessSystem, there is only one WorkItem hash element and one array of work items.
+                        for my $workItem (@{$responseHashRef->{Realm}->{$realm}->{BusinessSystem}->{$businessSystem}->{WorkItem}})
+                        {
+                            # Each hash in the array has four keys but only 3 are useful for in progress (marked by *):
+                            #   ArchesJobId * refers to an empty anonymous hash, or a string (formatted as for Id).
+                            #   Message is mentioned in the Doc as having data, but verbal communication with the team indicates it is no
+                            #     longer needed/desired.
+                            #   Id * an ugly hex(?) number with dashes and more numbers, treated as a string.
+                            #   Status * a number >= 0
+                            my $id = $workItem->{Id}->[0];
+                            my $archesJobId = $workItem->{ArchesJobId}->[0];
+                            ref ($archesJobId) eq 'HASH' and $archesJobId = 'N/A';
+                            $influxData = {
+                                            measurement => 'material_master_jobs_status',
+                                            data        => {
+                                                                status          => $workItem->{Status}->[0],
+                                                                id              => $id,
+                                                                arches_job_id   => $archesJobId,
+                                                           },
+                                            tags        => {
+                                                                cmd             => $program,
+                                                                dc              => $dc,
+                                                                service         => $service,
+                                                                product         => $productName,
+                                                                query           => $queryName,
+                                                                realm           => $realm,
+                                                                business_system => $businessSystem,
+                                                           },
+                                          };
+                            # Here we call the method to generate an Influx string, using the hash ref for data:
+                            print ariba::Ops::Utils::generateInfluxLine ($influxData), "\n";
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+main (@ARGV);
+
+__END__
+
+Example XML for failed states:
+
+<xml>
+        <Realm name='s4SVAll'>
+                <BusinessSystem name='TestSendMsg'>
+                        <WorkItem>
+                                <Id> 0b21bc02a8ac295c185339af20457a55-3-30 </Id>
+                                <Status> 0 </Status>
+                                <RunningFor> 361709 </RunningFor>
+                                <ArchesJobId>  </ArchesJobId>
+                        </WorkItem>
+                        <WorkItem>
+                                <Id> 0b21bc02a8ac295c185339af20457a55-3-31 </Id>
+                                <Status> 0 </Status>
+                                <RunningFor> 361709 </RunningFor>
+                                <ArchesJobId>  </ArchesJobId>
+                        </WorkItem>
+.
+.
+.
+</xml>
+
+And:
+
+<xml>
+        <Realm name='s4SVAll'>
+                <BusinessSystem name='TestValidateCache745'>
+                        <WorkItem>
+                                <Id> e092c0b58ce2bdd1de1e96b18f62bd95-3 </Id>
+                                <Status> 12 </Status>
+                                <Message>  </Message>
+                                <ArchesJobId>  </ArchesJobId>
+                        </WorkItem>
+                        <WorkItem>
+                                <Id> e092c0b58ce2bdd1de1e96b18f62bd95-3-1 </Id>
+                                <Status> 9 </Status>
+                                <Message>  </Message>
+                                <ArchesJobId> e092c0b58ce2bdd1de1e96b18f62bd95-3-1.9385.414638223214 </ArchesJobId>
+                        </WorkItem>
+                </BusinessSystem>
+        </Realm>
+.
+.
+.
+</xml>
+
+Request to show:  Job ID and Arches Job ID
+
+    But, ArchesJobId may be emtpy, in which case the 'value' is an empty hash, otherwise it is a string.

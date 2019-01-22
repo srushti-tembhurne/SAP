@@ -1,0 +1,144 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use lib qw(/usr/local/ariba/lib);
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::PageUtils;
+use ariba::Ops::Machine;
+use ariba::Ops::CFEngine::MonitoringGlueUtils;
+
+my $debug = 0;
+
+
+sub usage {
+    my $error = shift;
+    print "Error: $error\n" if $error;
+    print "Usage: $0\n";
+    print "       [-d] Debug\n";
+    print "       [-e] Send email\n";
+    print "       [-p] Send page\n";
+
+    exit(1);
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my(@stats, %queries);
+    while(my $arg = shift @ARGV) {
+        if($arg eq "-d") { $debug++; next; }
+        if($arg eq "-e") { $sendEmail = 1; next; }
+        if($arg eq "-p") { $sendPage = 1; next; }
+        usage("Unknown arg: $arg");
+    }
+
+    my $machine = ariba::Ops::Machine->new();
+    my $hostname = $machine->hostname();
+    my $datacenter = $machine->datacenter();
+    my @products = ariba::rc::InstalledProduct->installedProductsList($machine->service());
+    my $uiHint;
+    my $timeout = 250;
+    my $hostType;
+
+    if($machine->provides("db")) {
+        $uiHint = "Database/$hostname";
+        $hostType = "Database";
+    } else {
+        $uiHint = "Other/$hostname";
+        $hostType = "Other";
+    }
+    my $me = $products[0];
+    exit(0) unless $me;
+    exit(0) unless $machine->os() eq "redhat";
+    my $monserver = ariba::Ops::CFEngine::MonitoringGlueUtils::monitorServer();
+    
+    my $email = $me->default('ops.notify.email') || $me->default('notify');
+    my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+    open(STAT, "/proc/stat") or die "Could not open /proc/stat\n";
+
+    while(my $line = <STAT>) {
+        next if $line !~ m/^cpu(\d+)/;
+        my $cpuid = $1;
+        my($dummy, $user, $nice, $system, $idle, $iowait, $irq, $softirq) = split(/\s+/, $line);
+        my $total = $user + $nice + $system + $idle + $iowait + $irq + $softirq; #with idle
+        my $usage = $user + $nice + $system + $iowait + $irq + $softirq; #without idle
+        push(@stats, [$cpuid, $total, $user, $nice, $system, $idle, $iowait, $irq, $softirq, $usage]);
+    }
+
+    foreach my $cpu (@stats) {
+        my $cpuid = $cpu->[0];
+        $queries{"$hostname CPU $cpuid Total Counter"} = {
+            'info' => 1,
+            'uiHint' => "ignore",
+            'perl' => "return $cpu->[1]",
+            inf_field => "totalCounter",
+            inf_tags => qq|datacenter="$datacenter",hostType="ignore",hostname="$hostname",cpuid=$cpuid|,
+            inf_default => 0,
+            group_by => "$datacenter,$hostname,$cpuid,ignore",
+        };
+
+        $queries{"$hostname CPU $cpuid Usage Counter"} = {
+            'info' => 1,
+            'uiHint' => "ignore",
+            'perl' => "return $cpu->[9]",
+            inf_field => "usageCounter",
+            inf_tags => qq|datacenter="$datacenter",hostType="ignore",hostname="$hostname",cpuid=$cpuid|,
+            inf_default => 0,
+            group_by => "$datacenter,$hostname,$cpuid,ignore",
+        };
+    }
+
+    $queries{influx_details} = {measurement => "per-cpu"};
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails("per-cpu", $tab, $machine->service(), undef, \%queries);
+    $qm->processQueries();
+
+    %queries = ();
+
+    foreach my $cpu (@stats) {
+        my $cpuid = $cpu->[0];
+        my $qname = "$hostname CPU $cpuid Total Counter";
+        my $instance = ariba::monitor::Query->generateInstanceName($qname, $tab);
+        my $query = ariba::monitor::Query->new($instance);
+        next unless defined($query->previousResults());
+        my $total = $query->results() - $query->previousResults();
+        my $usage;
+
+        $qname = "$hostname CPU $cpuid Usage Counter";
+        $instance = ariba::monitor::Query->generateInstanceName($qname, $tab);
+        $query = ariba::monitor::Query->new($instance);
+        $usage = $query->results() - $query->previousResults();
+         
+        $queries{"$hostname CPU $cpuid Usage"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => 'gauge',
+            'format' => '%.2f%%',
+            'info' => 1,
+            'uiHint' => "$uiHint",
+            'perl' => "return ($usage / $total * 100)",
+            inf_field => "cpuUsage",
+            inf_tags => qq|datacenter="$datacenter",hostname="$hostname",cpuid=$cpuid,hostType="$hostType"|,
+            inf_default => 0,
+            group_by => "$datacenter,$hostname,$cpuid,$hostType",
+        };
+    }
+
+
+    $queries{influx_details} = {measurement => "per-cpu"};
+    $qm = ariba::monitor::QueryManager->newWithDetails("per-cpu", $tab, $machine->service(), undef, \%queries);
+    eval { $qm->processQueries($debug, $email, $sendEmail, $sendPage); };
+    if ( $@ ) {
+        print $@;
+        # do something else as needed
+    }
+}
+
+main();

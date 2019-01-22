@@ -1,0 +1,105 @@
+#!/usr/local/bin/perl 
+
+use strict;
+use warnings;
+
+use Getopt::Long qw(:config no_bundling no_ignore_case_always no_getopt_compat require_order pass_through);
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+use constant {TRUE => 1, FALSE => 0};
+
+# This is an initial stab, of an emergency nature, which means it is bare bones and probably will have a lot of hard coded cruft
+# that should be obtained otherwise.
+#
+# But because this is a stop gap process, to guard against CIRS level problems, and is needed on short notice (ie same day) :(
+# that's the way it's gonna be.
+
+# This is the hard coded cruft.  We are assuming the authorization strings are constant.
+my %curlCmd = (
+                prod   => q(curl -s -k -X POST -H "Authorization: Basic Z29tZXotY2xpZW50OmZiMWM5MmZlMzMyMjdkYTc4Y2JlOWZlYjMyY2MwOWQx" -H "Content-Type: application/x-www-form-urlencoded" -d 'scope=healthcheck&grant_type=openapi_2lo'  https://api.ariba.com/private/v2/system/healthcheck),
+                prodeu => q(curl -s -k -X POST -H "Authorization: Basic Z29tZXotY2xpZW50OmZiMWM5MmZlMzMyMjdkYTc4Y2JlOWZlYjMyY2MwOWQx" -H "Content-Type: application/x-www-form-urlencoded" -d 'scope=healthcheck&grant_type=openapi_2lo' https://api-eu.ariba.com/private/v2/system/healthcheck),
+                prodru => q(curl -s -k -X POST -H "Authorization: Basic Z29tZXotY2xpZW50OmZiMWM5MmZlMzMyMjdkYTc4Y2JlOWZlYjMyY2MwOWQx" -H "Content-Type: application/x-www-form-urlencoded" -d 'scope=healthcheck&grant_type=openapi_2lo' https://api-ru.ariba.com/private/v2/system/healthcheck),
+                # Commented out as it is currently not responding correctly.  The result is 503, service unavailable.
+              # prodcn => curl -s -k -X POST -H "Authorization: Basic Z29tZXotY2xpZW50OmZiMWM5MmZlMzMyMjdkYTc4Y2JlOWZlYjMyY2MwOWQx" -H "Content-Type: application/x-www-form-urlencoded" -d 'scope=healthcheck&grant_type=openapi_2lo' https:// https://api.sapariba.cn/private/v2/system/healthcheck
+                # This one if for devlab, QA service.  Commented out since the actual devlab service name may vary.
+              # qa     => $curlCmd = q(curl -s -k -X POST -H "Authorization: Basic Z29tZXotY2xpZW50OmZiMWM5MmZlMzMyMjdkYTc4Y2JlOWZlYjMyY2MwOWQx" -H "Content-Type: application/x-www-form-urlencoded" -d 'scope=healthcheck&grant_type=openapi_2lo' http://app1289.lab1.ariba.com:13130/private/v2/system/healthcheck),
+              );
+
+sub main
+{
+    # Create a product so we can get the email for QueryManager.
+    my $me = ariba::rc::InstalledProduct->new ();
+    my $product = ariba::rc::InstalledProduct->new ('mobile', $me->service ());
+    my $serviceName = $product->service ();
+    # For this particular case, this should only ever run in US production.
+    die "ERROR:  must be run for US production only (SNV), exiting...\n"
+        unless $serviceName =~ /^prod($|eu$|ru$)/;
+    my $clusterName = $product->currentCluster () || 'primary';
+    my $productName = $product->name () ;
+    my $customer    = $product->customer () || undef;
+
+    my ($debug, $email, $sendEmail, $sendPage);
+    $debug     = 0;
+    $email     = $product->default ('notify.email');
+    $sendEmail = 1;
+    $sendPage  = 1;
+    my $results;
+
+    open my $CURLCMD, '-|', $curlCmd{$serviceName} or die "ERROR:  failed to execute curl command!  $!\n";
+    {
+        # Read in ALL the output:
+        local $/;
+        $results = <$CURLCMD>;
+        chomp $results;
+    }
+
+    my $status;
+    if ($results =~ /^OK$/)
+    {
+        $status = TRUE;
+    }
+    else
+    {
+        $status = FALSE;
+    }
+
+    # There is a single query here, so no looping in this script!
+    my %query;
+    $query{'MobileMaster OAuth Check'} = {
+                                            info   => "answer == OK",
+                                            crit   => "answer == FAILED",
+                                            perl   => sub {return $status ? qq(OK) : qq(FAILED);},
+                                            inf_field => "oauth_check",
+                                         };
+
+    $query{'influx_details'} = { measurement => 'mobile_oauth_status' };
+    my $queryManager = ariba::monitor::QueryManager->newWithDetails ('OAuth Status', $productName, $serviceName, $clusterName, \%query);
+    $queryManager->processQueries ($debug, $email, $sendEmail, $sendPage);
+}
+
+main ();
+
+__END__
+
+Return from curl command when REST API is not present or if any path element of REST URL is bad (except the last):
+
+<html>
+<head><title>404 Not Found</title></head>
+<body bgcolor="white">
+<center><h1>404 Not Found</h1></center>
+<hr><center>nginx</center>
+</body>
+</html>
+
+Response for good case:
+  OK
+
+Response for bad case (ie URL is "found" but auth fails):
+  {"error":"unauthorized_client","description":"The client is not authorized to access this resource."}
+
+Response for bad case (URL method is bad but REST API is otherwise good):
+  {"timestamp":1491598514988,"status":405,"error":"Method Not Allowed","exception":"org.springframework.web.HttpRequestMethodNotSupportedException","message":"Request method 'POST' not supported","path":"/private/v2/system/ealthcheck"}

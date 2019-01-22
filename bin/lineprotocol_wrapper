@@ -1,0 +1,162 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use warnings;
+
+use lib qq(/usr/local/ariba/lib);
+use Data::Dumper;
+use IPC::Open3;
+use IO::Select;
+use ariba::Ops::Utils;
+use Log::Log4perl qw(:easy);
+
+### 200 is not used, because conventionally its successful
+my %error = (
+             CMD_NOT_FOUND                   => 101,
+             CMD_NOT_EXECUTABLE              => 102,
+             MEASUREMENT_NOT_FOUND           => 301,
+             CMD_ERROR                       => 302,
+             CMD_SPEWED_ERRORS               => 303,
+             CMD_SPEWED_INVALID_INFLUX_LINES => 304,
+             CMD_SPEWED_NO_INFLUX_LINES      => 305,
+            );
+
+sub main
+{
+    my $cmd = shift (@ARGV);
+
+    Log::Log4perl->easy_init({level => $DEBUG, file => ">>/tmp/lineprotocol_wrapper.log"});
+    DEBUG("Running : $cmd");
+
+    log_lineprotocol_error($cmd, $error{CMD_NOT_FOUND})      unless (-e $cmd);
+    log_lineprotocol_error($cmd, $error{CMD_NOT_EXECUTABLE}) unless (-x $cmd);
+
+    ### Execute the cmd and gather output & stderr spews
+    my ($child_pid, $cmd_in, $cmd_out_fh, $cmd_err_fh);
+    eval {
+        $child_pid = open3($cmd_in, $cmd_out_fh, $cmd_err_fh, $cmd, @ARGV);
+    };
+    log_lineprotocol_error($cmd, $error{CMD_ERROR}) if ($@);
+
+    my (@cmd_out, @cmd_err);
+
+    # added due to https://go.sap.corp/t8u to handle reading from output FHs
+    my $select = new IO::Select;
+    $select->add($cmd_out_fh,$cmd_err_fh);
+    while( my @ready_fhs = $select->can_read ) {
+        foreach my $fh ( @ready_fhs ) {
+            while ( my $line = <$fh> ) {
+                if( $fh == $cmd_out_fh ) {
+                    push (@cmd_out, $line);
+                } else {
+                    push (@cmd_err, $line);
+                }
+            }
+            $select->remove($fh);        
+        }
+    }
+    
+    waitpid ($child_pid, 0);
+
+    log_lineprotocol_error($cmd, $error{CMD_SPEWED_NO_INFLUX_LINES}) if (!(@cmd_out)) && !((@cmd_err));
+
+    ### Filter the output and print only the good influx lines
+    my ($valid_influx, $invalid_influx) = filter_influx_lines(\@cmd_out);
+    print_influxlines($valid_influx) if (@{$valid_influx});
+
+    ### Log the error on bad influx lines - 128 max chars
+    if (@{$invalid_influx})
+    {
+        my $error_desc = join (";", @{$invalid_influx});
+        my $short_desc = substr ($error_desc, 0, 128);
+        log_lineprotocol_error($cmd, $error{CMD_SPEWED_INVALID_INFLUX_LINES}, $short_desc);
+    }
+
+    if (scalar @cmd_err)
+    {
+        ### Send only 128 max chars
+        my $error_desc = join (";", @cmd_err);
+        my $short_desc = substr ($error_desc, 0, 128);
+        log_lineprotocol_error($cmd, $error{CMD_SPEWED_ERRORS}, $short_desc);
+    }
+
+    exit ();
+}
+
+sub get_measurement_names
+{
+    my $file = shift;
+
+    open (my $fh, "<", $file) || die "unable to open $file";
+    my @data = <$fh>;
+    close ($fh);
+    my @measurement_names;
+
+    foreach my $line (@data)
+    {
+        chomp ($line);
+        if ($line =~ /measurement/)
+        {
+            $line =~ /=>\s*("|')(.*)\s*("|')/;
+            push (@measurement_names, $2) if ($2);
+        }
+    }
+
+    return (@measurement_names);
+}
+
+sub log_lineprotocol_error
+{
+    my ($ran, $error_code, $error_descr) = @_;
+    chomp($ran);
+    my $exit_value = $? >> 8;
+    $ran =~ /\/mon(.*?)\//;
+    my $service = $1;
+
+    ### Remove newline characters and quote
+    $error_descr =~ s/(\"|\n)//g if ( $error_descr );
+    $error_descr = ( $error_descr ) ? $error_descr : qq(none);
+
+    my %influx_data = (
+                       'measurement' => 'lineprotocol_wrapper_errors',
+                       'data'        => {
+                                  'cmd'         => $ran,
+                                  'error_descr' => "$error_descr",
+                                 },
+                       'tags' => {error_code => $error_code, 'product' => "stratus", 'service' => $service},
+                      );
+
+    print ariba::Ops::Utils::generateInfluxLine(\%influx_data);
+    exit ($exit_value);
+}
+
+sub print_influxlines
+{
+    my $influx_lines = shift;
+
+    foreach my $row (@{$influx_lines})
+    {
+        print "$row";
+    }
+}
+
+sub filter_influx_lines
+{
+    my ($influx_lines) = @_;
+
+    my (@valid_influx_lines, @invalid_influx_lines);
+
+    ### Check if the line is valid
+    foreach my $line (@{$influx_lines})
+    {
+        if ( $line =~ /^[a-zA-Z0-9_-]+,[a-zA-Z0-9_-]+?=(.+).*\ [a-zA-Z0-9_-]+=.+$/ ) {
+            push (@valid_influx_lines, $line);
+        } else {
+            push (@invalid_influx_lines, $line);
+	}
+    }
+    return (\@valid_influx_lines, \@invalid_influx_lines);
+}
+
+main();
+

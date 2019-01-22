@@ -1,0 +1,786 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/common/node-status#49 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::Url;
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Globals;
+use ariba::Ops::Utils;
+use ariba::Ops::OracleClient;
+use ariba::Ops::ProductAPIExtensions;
+use dmail::LockLib;
+use Data::Dumper;
+
+my $log        = 1;
+my $maxResults = 17520;    # one year at twice an hour
+
+sub main
+{
+    my $debug     = 0;
+    my $quiet     = 0;
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $productName;
+
+    while (my $arg = shift (@ARGV))
+    {
+        print STDERR "parsing arg $arg\n" if $debug > 1 and !$quiet;
+        if ($arg =~ /^-d/o)    {$debug++;}
+        if ($arg =~ /^-e/o)    {$sendEmail = 1;}
+        if ($arg =~ /^-p$/o)   {$sendPage = 1;}
+        if ($arg =~ /^-prod/o) {$productName = shift (@ARGV);}
+    }
+
+    my $me      = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+    my $email   = $me->default('notify.email');
+
+    unless ($productName)
+    {
+        print "Must specify a product.\n" if (-t STDOUT);
+        exit (0);
+    }
+
+    unless (grep {$_ eq $productName} (ariba::rc::Globals::sharedServicePlatformProducts(), "an"))
+    {
+        print "node-status only works for AN and platform shared service products.\n" if (-t STDOUT);
+        exit (0);
+    }
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+    unless (@products)
+    {
+        exit (0);
+    }
+
+    for my $product (@products)
+    {
+        my $productIdentifier = $product->name();
+        $productIdentifier .= $product->customer() if $product->customer();
+
+        my $lockFile = "/tmp/stratus-$productIdentifier-node-status";
+        if (!dmail::LockLib::requestlock($lockFile, 5))
+        {
+            die "node-status: Can't grab lock";
+        }
+
+        my $tmpFile = "/var/tmp/$productIdentifier-internodeResponse.log";
+        my $time    = localtime (time ());
+
+        if ($log)
+        {
+            open (LOG, ">> $tmpFile") || die "ERROR: unable to open $tmpFile, $!\n";
+
+            print LOG '-' x 72, "\n";
+            print LOG "Time = $time\n";
+            print LOG '-' x 72, "\n";
+        }
+
+        my $skip = 0;
+
+        my %queries = ();
+        my %realmsServed;
+        my %nodeServesRealms;
+        my %nodeCount;
+        my $nodesUsingBuildRef;
+        my %realmBelongsToCommunity;
+
+        my @instances;
+        if ($productName eq 'an')
+        {
+            @instances = grep {$_->isTomcatApp() or $_->isWOFApp() or $_->isSpringbootApp()} $product->appInstancesInCluster($cluster);
+        }
+        else
+        {
+            @instances = grep {$_->isTomcatApp() or $_->isWOFApp()} $product->appInstancesInCluster($cluster);
+        }
+
+        my $numInstances  = scalar (@instances);
+        my $downInstances = 0;
+        my %internodeCommunications;
+        my %communityInternodeCommunications;
+        my %communitySSOClientState;
+        my %shutdownTimePerCommunity;
+        my %communityToNodesHash;
+        my %communities;
+        my @comhash;
+        my @bhash;
+
+        for my $instance (@instances)
+        {
+
+            my $instanceName = $instance->workerName();
+            $nodeCount{'Total'}++;
+            my $type = $instance->appName();
+            $nodeCount{"$type"}++;
+            my $community = $instance->community() || "Default";
+            push @comhash, {'community' => $community, 'node' => $instance->workerName()};
+            push (@{$communityToNodesHash{$community}}, "<html><a href=\"" . $instance->logURL() . "\">" . $instance->workerName() . "</a></html>");
+
+            my $monitorStats = ariba::monitor::AppInstanceStats->newFromAppInstance($instance);
+            $monitorStats->fetch();
+
+            #
+            # ignore, if the node is down or cannot respond right now
+            #
+            if ($monitorStats->error())
+            {
+                print "**** $instanceName error: ", $monitorStats->error(), "\n" if ($debug > 1);
+                $downInstances++;
+                next;
+            }
+
+            $communities{$community} = 1;
+
+            # The way to tell if an instance is a task node or a UI node is by checking if this instance needs to be nightly recycled.
+            # A task node doesn't need to be nighly recycled
+            $shutdownTimePerCommunity{$community}{$instance->instanceName()} = $monitorStats->shutdownTime() unless ($instance->needsNightlyRecycle());
+
+            realmsServedByNode($monitorStats, $instanceName, $type, \%realmsServed, \%nodeServesRealms, \%realmBelongsToCommunity,);
+            my $buildName = $monitorStats->applicationBuildName();
+            my $expectedBuildName = ($product->isASPProduct() ? $product->baseBuildName() : $product->buildName());
+            push (@bhash, {'buildname' => $buildName, 'node' => $instanceName, 'community' => $community}) if ($buildName);
+        }
+        my %squeries;
+        foreach my $k (keys %nodeCount)
+        {
+            $squeries{"Total number of nodes $k"} = {
+                                                     info             => 1,
+                                                     perl             => sub {return $nodeCount{$k};},
+                                                     recordMaxResults => $maxResults,
+                                                     recordDataType   => 'gauge',
+                                                     recordItem       => 'answer',
+                                                     'inf_field'      => "node_count",
+                                                     'inf_default'    => 0,
+                                                     'inf_tags'       => "node_type=\"$k\"",
+                                                     'group_by'       => $k
+                                                    };
+        }
+
+        $squeries{"influx_details"} = {'measurement' => "node_status_summary"};
+        my $q = ariba::monitor::QueryManager->newWithDetails("node-status", $product->name(), $service, $product->customer(), \%squeries);
+
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        unless ($productName =~ /^(an|arches)$/)
+        {
+            $queries{"Realm serving errors"} = {
+                                                'rowCountLimit' => 4000,
+                                                'noRowCount'    => 1,
+                                                'format'        => "%5s: %15s: %15s: %15s",
+                                                'info'          => "numrows > -1",
+                                                'skip'          => $skip,
+                                                'crit'          => "answer =~ /^Error/ && previousAnswer =~ /^Error/",
+                                                'warn'          => "answer =~ /^Warn/",
+                                                'severity'      => 0,
+                                                'perl'          => sub {main::realmServedStatus($product, \%realmsServed, \%nodeServesRealms, \%realmBelongsToCommunity);},
+                                               };
+        }
+
+        $queries{"Communities to nodes"} = {
+            'noRowCount' => 1,
+            'format'     => "<html><td>%s</td><td>%s</td></html>",
+            'info'       => 1,
+            'multiRow'   => 1,
+            'perl'       => sub {
+                join (
+                      "\n", map {"$_:" . "\t" . join (", ", @{$communityToNodesHash{$_}})}
+                        sort (keys %communityToNodesHash)
+                     );
+            },
+        };
+
+        my %bqueries;
+        my $expectedBuildName = ($product->isASPProduct() ? $product->baseBuildName() : $product->buildName());
+
+        foreach my $arr (@bhash)
+        {
+            $bqueries{"Build being used by nodes" . $arr->{buildname} . $arr->{node} . $arr->{community}} = {
+                                                                                                             'noRowCount' => 1,
+                                                                                                             'info'       => "numrows > -1",
+                                                                                                             'skip'       => $skip,
+                                                                                                             'crit'       => "numrows > 1 || answer !~ /$expectedBuildName/",
+                                                                                                             'perl'       => sub {return $arr->{buildname}},
+                                                                                                             inf_field    => 'build_name',
+                                                                                                             inf_tags     => qq(node=$arr->{node},community=$arr->{community}),
+                                                                                                             group_by     => qq($arr->{buildname},$arr->{node},$arr->{community}),
+                                                                                                            };
+        }
+        $bqueries{"influx_details"} = {'measurement' => "node_status_build"};
+        my $q = ariba::monitor::QueryManager->newWithDetails("node-status", $product->name(), $service, $product->customer(), \%bqueries);
+
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        unless ($productName eq 'an')
+        {
+            #
+            # shuffle array elements, and pick the first one for monitoring
+            # split cluster health
+            #
+            ariba::Ops::Utils::fisherYatesShuffle(\@instances);
+            my $checkedInternodeResponseTime = 0;
+            my %checkedCommunityInternodeResponseTime;
+
+            for my $instance (@instances)
+            {
+
+                my $instanceName = $instance->workerName();
+
+                # check atleast three nodes for global communication health
+                if ($checkedInternodeResponseTime < 3)
+                {
+                    my $responseTimeUrl = $instance->internodesResponseTimeMonitorURL();
+                    my $responseTimes   = ariba::monitor::Url->new($responseTimeUrl);
+
+                    print "$instanceName responseTimeUrl = $responseTimeUrl\n" if ($debug > 1);
+
+                    $responseTimes->setTimeout(180);
+                    my @responseTimeStats = $responseTimes->request();
+                    my $nodeResponses = nodeResponseTimes(\@responseTimeStats, $instanceName);
+
+                    if ($log)
+                    {
+                        print LOG "$instanceName responseTimeUrl = $responseTimeUrl\n";
+                        print LOG "  ", join ("  ", @responseTimeStats), "\n";
+                    }
+
+                    $internodeCommunications{$instanceName} = $nodeResponses;
+                    $checkedInternodeResponseTime++;
+                }
+
+                next unless ($product->numCommunities());
+
+                my $community = $instance->community() || 0;
+
+                next unless ($community);
+
+                # check at least two nodes for community level internode
+                # communication
+                next if ($checkedCommunityInternodeResponseTime{$community} >= 2);
+                unless (defined ($checkedCommunityInternodeResponseTime{$community}))
+                {
+                    $checkedCommunityInternodeResponseTime{$community} = 0;
+                }
+                $checkedCommunityInternodeResponseTime{$community}++;
+
+                my $communityResponseTimeUrl = $instance->internodesResponseTimeMonitorURL(1);
+                my $communityResponseTimes   = ariba::monitor::Url->new($communityResponseTimeUrl);
+                print "$instanceName community ($community) responseTimeUrl = $communityResponseTimeUrl\n" if ($debug > 1);
+
+                $communityResponseTimes->setTimeout(60);
+                my @communityResponseTimeStats = $communityResponseTimes->request();
+                my $communityNodeResponses = nodeResponseTimes(\@communityResponseTimeStats, $instanceName);
+
+                if ($log)
+                {
+                    print LOG "$instanceName community ($community) responseTimeUrl = $communityResponseTimeUrl\n";
+                    print LOG "  ", join ("  ", @communityResponseTimeStats), "\n";
+                }
+
+                $communityInternodeCommunications{$community}->{$instanceName} = $communityNodeResponses;
+            }
+
+            if ($log)
+            {
+                print LOG '=' x 72, "\n";
+                close (LOG);
+            }
+
+            my $expectedResponses = $numInstances - $downInstances;
+            $queries{"Internode communication health"} = {
+                                                          'noRowCount'                   => 1,
+                                                          'skip'                         => $skip,
+                                                          'crit'                         => "answer !~ /^Info:/ && answer =~ /split cluster/ && previousAnswer !~ /^Info:/ && previousAnswer =~ /split cluster/",
+                                                          'info'                         => 1,
+                                                          'warn'                         => "answer =~ /^Warn/ || answer =~ /^Error/",
+                                                          'ticketOnWarnOpenAfterMinutes' => 180,
+                                                          'perl'                         => sub {main::consolidatedNodeResponseHealth(\%internodeCommunications, $expectedResponses);},
+                                                         };
+
+            for my $community (keys (%communityInternodeCommunications))
+            {
+
+                my $thisCommunityInternodeCommunication = $communityInternodeCommunications{$community};
+                my $thisCommunitySSOClientState         = $communitySSOClientState{$community};
+
+                my $numInstancesInCommunity = scalar (keys (%$thisCommunityInternodeCommunication));
+                if ($community)
+                {
+                    $community = "community $community";
+                }
+                else
+                {
+                    $community = "default community";
+                }
+
+                my $uiHint = "$community";
+
+                $queries{"Internode communication health for $community"} = {
+                                                                             'noRowCount'                   => 1,
+                                                                             'skip'                         => $skip,
+                                                                             'info'                         => 1,
+                                                                             'uiHint'                       => $uiHint,
+                                                                             'warn'                         => "answer =~ /^Warn/ || answer =~ /^Error/",
+                                                                             'ticketOnWarnOpenAfterMinutes' => 180,
+                                                                             'perl'                         => sub {main::consolidatedNodeResponseHealth($thisCommunityInternodeCommunication, $numInstancesInCommunity);},
+                                                                            };
+
+                if (defined ($thisCommunitySSOClientState))
+                {
+                    for my $instanceName (keys %$thisCommunitySSOClientState)
+                    {
+                        $queries{"$instanceName SSO status"} = {
+                                                                'skip'   => $skip,
+                                                                'uiHint' => $uiHint,
+                                                                'crit'   => "!defined(answer) || answer =~ /^Server has LogoutProblem/i",
+                                                                'info'   => 1,
+                                                                'perl'   => sub {return $thisCommunitySSOClientState->{$instanceName};},
+                                                               };
+                    }
+                }
+            }
+        }
+
+        for my $community (keys (%communities))
+        {
+
+            if ($shutdownTimePerCommunity{$community})
+            {
+
+                my $uiHint = "community $community";
+
+                unless ($productName eq 'an')
+                {
+                    my %shutdownTime = %{$shutdownTimePerCommunity{$community}};
+                    foreach my $instanceName (keys (%shutdownTime))
+                    {
+
+                        $queries{"$instanceName, $uiHint, has been in a shutdown state"} = {
+                            'recordMaxResults' => 60000,
+                            'recordDataType'   => "counter",
+
+                            'info' => "!defined(answer) || answer eq '' || answer >= 0",
+
+                            # XXX CR 1-AHI1QJ, tmid: 60469 Making this ticketOnWarn until devs find a solution.  old values: warn=4*60, crit=6*60
+                            'warn'                         => "defined(answer) && answer >= 6*60",
+                            'crit'                         => "defined(answer) && answer >= 13*60",
+                            'ticketOnWarnOpenAfterMinutes' => 1,
+                            'uiHint'                       => $uiHint,
+                            'format'                       => "%d min\n",
+
+                            'perl' => sub {return $shutdownTime{$instanceName}},
+                                                                                           };
+                    }
+                }
+
+            }
+        }
+
+        my $q = ariba::monitor::QueryManager->newWithDetails("node-status", $product->name(), $service, $product->customer(), \%queries);
+
+        ### Prints html output and hence not calling it
+        ###$q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        dmail::LockLib::releaselock($lockFile);
+    }
+}
+
+#
+# <?xml version="1.0"?>
+# <xml>
+# <monitorStatus>
+# <applicationName>ACM</applicationName>
+# <applicationVersion>3.0</applicationVersion>
+# <applicationBuildNumber>Ariba Spend Management 7.0 (build 4247, 09/13/2005)</applicationBuildNumber>
+# <isDBConnectionOn>true</isDBConnectionOn>
+# <AverageIdleSince>0</AverageIdleSince>
+# <AverageSessionCacheSize>356</AverageSessionCacheSize>
+# <AverageSessionLength>0</AverageSessionLength>
+# <BackgroundQueue>0</BackgroundQueue>
+# <Community>2</Community>
+# <ConcurrentUserSessions>2</ConcurrentUserSessions>
+# <ForegroundQueue>0</ForegroundQueue>
+# <FreeMemory>858009</FreeMemory>
+# <Hostname>robin.ariba.com</Hostname>
+# <InMemoryMailQueueSize>11</InMemoryMailQueueSize>
+# <LocalRealms>site1 (14 - assigned); realm_aqs_1 (5 - enabled); realm_pd_1 (11 - enabled); realm_gpd_fr (10 - enabled); realm_platform_2 (8 - enabled); realm_pd_2 (12 - enabled); realm_aqs_2 (6 - enabled); realm_aqs_4 (2 - enabled)</LocalRealms>
+# <MaximumSessionCacheSize>1040</MaximumSessionCacheSize>
+# <NodeManagerThreadPoolQueueSize>0</NodeManagerThreadPoolQueueSize>
+# <NumAssignedRealms>13</NumAssignedRealms>
+# <NumAuthenticationsPerPeriod>0</NumAuthenticationsPerPeriod>
+# <NumDelegationsPerPeriod>0</NumDelegationsPerPeriod>
+# <NumTotalRealms>25</NumTotalRealms>
+# <NumUserConnectionsPerPeriod>0</NumUserConnectionsPerPeriod>
+# <PersistedMailQueueSize>0</PersistedMailQueueSize>
+# <ServerCacheSize>3273</ServerCacheSize>
+# <ServerRoles>AribaUI</ServerRoles>
+# <ThreadCount>135</ThreadCount>
+# <TotalMemory>1179648</TotalMemory>
+# <TotalUserConnections>0</TotalUserConnections>
+# <UpTime>915</UpTime>
+# <WorkflowQueue>0</WorkflowQueue>
+# <sessions>-4</sessions>
+# <state>running</state>
+# </monitorStatus>
+# </xml>
+#
+
+sub realmsServedByNode
+{
+    my $monitorStats                   = shift;
+    my $instanceName                   = shift;
+    my $appName                        = shift;
+    my $realmsServedHashRef            = shift;
+    my $nodeServesRealmsHashRef        = shift;
+    my $realmBelongsToCommunityHashRef = shift;
+
+    my $realmsOnNode = $monitorStats->localRealms();
+    my $community = $monitorStats->community() || 0;
+
+    #
+    # Go over list of realms assigned to this node and save the
+    # results in a global list
+    #
+    #site1 (14 - assigned); realm_aqs_1 (5 - enabled); realm_pd_1 (11 - enabled); realm_gpd_fr (10 - enabled); realm_platform_2 (8 - enabled); realm_pd_2 (12 - enabled); realm_aqs_2 (6 - enabled); realm_aqs_4 (2 - enabled)
+
+    for my $realmDetail (split (/;/, $realmsOnNode))
+    {
+        #site1 (14 - assigned)
+        if ($realmDetail =~ m|\s*(\w+)\s*\((\d+).*(\w+)\)|)
+        {
+            my $realmName   = $1;
+            my $realmId     = $2;
+            my $realmStatus = $3;
+
+            #
+            # add this node to the list of nodes serving this realm
+            #
+            push (@{$realmsServedHashRef->{$realmId}}, [$instanceName, $appName]);
+            push (@{$nodeServesRealmsHashRef->{$community}->{$instanceName}}, $realmId);
+            $realmBelongsToCommunityHashRef->{$realmId}->{$community} = 1;
+        }
+    }
+}
+
+sub realmServedStatus
+{
+    my $product                        = shift;
+    my $realmsServedHashRef            = shift;
+    my $nodeServesRealmsHashRef        = shift;
+    my $realmBelongsToCommunityHashRef = shift;
+    my ($realmIdsRef, $ocError) = realmIdsForProduct($product);
+
+    my %results;
+
+    my @errors;
+    my @warns;
+    my $sep = "\t";
+
+    return "Error $sep oracle $sep $ocError" if ($ocError);
+
+    for my $id (sort {$a <=> $b} keys (%$realmIdsRef))
+    {
+        my $nodesArrayRef = $realmsServedHashRef->{$id};
+        my @nodeList      = map {$_->[0]} @$nodesArrayRef;
+        my @appTypeList   = map {$_->[1]} @$nodesArrayRef;
+        my $realmId       = $id;
+        my $realmState    = $realmIdsRef->{$id};
+        #
+        # count how many communities this realm belongs to
+        #
+        my @communities = keys (%{$realmBelongsToCommunityHashRef->{$realmId}});
+        if (@communities > 1)
+        {
+            my $communitiesString = join (", ", @communities);
+            push (@errors, "Error $sep realm $realmId $sep belongs to multiple communities $communitiesString");
+        }
+        #
+        # A realm in hardPurgeComplete state is not supposed
+        # to have any nodes serving it, so skip the next two tests
+        #
+        next if ($realmState eq "hardPurgeComplete");
+        #
+        # If there is no task node serving a realm,
+        # its in warn state
+        #
+        if (!grep /TaskCXML/, @appTypeList)
+        {
+            push (@warns, "Warn $sep realm $realmId $sep state $realmState $sep No Task node");
+        }
+        #
+        # If there is no UI node serving a realm,
+        # its in crit state
+        #
+        if (!grep /UI/, @appTypeList)
+        {
+            push (@errors, "Error $sep realm $realmId $sep state $realmState $sep No UI node");
+        }
+
+    }
+
+    my @communities = keys (%$nodeServesRealmsHashRef);
+    for my $community (@communities)
+    {
+        my @instances      = keys (%{$nodeServesRealmsHashRef->{$community}});
+        my $realmsArrayRef = undef;
+        for my $instanceName (@instances)
+        {
+            my $thisNodesRealmsArrayRef = $nodeServesRealmsHashRef->{$community}->{$instanceName};
+            unless ($realmsArrayRef)
+            {
+                $realmsArrayRef = $nodeServesRealmsHashRef->{$community}->{$instanceName};
+            }
+
+            # see if the contents of two arrays match
+            my $diffsRef = ariba::Ops::Utils::computeDifference($thisNodesRealmsArrayRef, $realmsArrayRef);
+            if (@$diffsRef > 0)
+            {
+                my $errorString = "$instanceName: " . join (", ", @$diffsRef);
+                push (@errors, "Error $sep community $community $sep Not all nodes in community $community serve same set of realms [$errorString]");
+            }
+        }
+    }
+
+    return (join ("\n", @errors, @warns));
+}
+
+#
+# <ResponseTimes>
+# <Node name="UI2036131" time="2"/>
+# <Node name="SVUI2056134" time="20"/>
+# <Node name="Local" time="0"/>
+# <Node name="Admin2056136" time="0"/>
+# <Node name="GlobalTask516143" time="10"/>
+# <Node name="Task2036138" time="2"/>
+# <Node name="Task516140" time="0"/>
+# <Node name="SVUI516135" time="10"/>
+# <Node name="UI2056130" time="0"/>
+# <Node name="GlobalTask2036142" time="2"/>
+# <Node name="UI2056132" time="20"/>
+# <Node name="UI516133" time="0"/>
+# <Node name="Admin2036137" time="2"/>
+# <Node name="Task516141" time="0"/>
+# <Node name="Task2036139" time="2"/>
+# </ResponseTimes>
+#
+sub nodeResponseTimes
+{
+    my $results      = shift;
+    my $instanceName = shift;
+
+    my %nodeResponses;
+
+    for my $line (@$results)
+    {
+        if ($line =~ m|<Node name="([^"]*)" time="([^"]*)"/>|)
+        {
+            my $nodeName = $1;
+            my $time     = $2;
+
+            if ($nodeName eq "Local")
+            {
+                $nodeName = $instanceName;
+                next;
+            }
+
+            $nodeResponses{$nodeName} = $time;
+        }
+    }
+
+    return \%nodeResponses;
+}
+
+sub consolidatedNodeResponseHealth
+{
+    my $globalNodeResponseHashRef = shift;
+    my $totalNumNodes             = shift;
+    my $timeout                   = shift;
+
+    my @errors = ();
+    my @warns  = ();
+    my @infos  = ();
+
+    # Build list of common timed out nodes
+    my %commonTimedoutNodes;
+    my $numNodes = scalar (keys (%$globalNodeResponseHashRef));
+    for my $instanceName (keys (%$globalNodeResponseHashRef))
+    {
+        my $nodeResponseRef = $globalNodeResponseHashRef->{$instanceName};
+        foreach my $nodeName (keys (%$nodeResponseRef))
+        {
+            my $responseTime = $nodeResponseRef->{$nodeName};
+            if ($responseTime == -1 || defined ($timeout) && $responseTime > $timeout)
+            {
+                $commonTimedoutNodes{$nodeName}++;
+            }
+        }
+    }
+    foreach my $nodeName (keys (%commonTimedoutNodes))
+    {
+        my $numTimedoutNodes = $commonTimedoutNodes{$nodeName};
+        delete ($commonTimedoutNodes{$nodeName}) unless ($numTimedoutNodes == $numNodes);
+    }
+
+    for my $instanceName (sort (keys (%$globalNodeResponseHashRef)))
+    {
+        my ($errorArrayRef, $warnArrayRef, $infoArrayRef) = checkNodeResponseTimes($globalNodeResponseHashRef->{$instanceName}, $totalNumNodes, $timeout, \%commonTimedoutNodes);
+        if (scalar (@$errorArrayRef))
+        {
+            my $resultString = "Error: Ping request from $instanceName " . join (", ", @$errorArrayRef, @$warnArrayRef, @$infoArrayRef);
+            push (@errors, $resultString);
+            next;
+        }
+        if (scalar (@$warnArrayRef))
+        {
+            my $resultString = "Warn: Ping request from $instanceName " . join (", ", @$warnArrayRef, @$infoArrayRef);
+            push (@warns, $resultString);
+            next;
+        }
+        if (scalar (@$infoArrayRef))
+        {
+            my $resultString = "Info: Ping request from $instanceName " . join (", ", @$infoArrayRef);
+            push (@infos, $resultString);
+            next;
+        }
+    }
+
+    return (join ("\n", @errors, @warns, @infos));
+}
+
+sub checkNodeResponseTimes
+{
+    my $nodeResponseTimeHashRef = shift;
+    my $totalNumNodes           = shift;
+    my $timeout                 = shift;
+    my $commonTimedoutNodesRef  = shift;
+
+    my @results;
+
+    my @keys         = sort (keys (%$nodeResponseTimeHashRef));
+    my $numResponses = scalar (@keys);
+
+    my @errors = ();
+    my @warns  = ();
+    my @infos  = ();
+
+    my $warn = 5;
+    my $crit = 10;
+
+    my $differenceInExpectedResponses = $totalNumNodes - $numResponses;
+
+    #
+    # in case one of the nodes is going down, some nodes get more
+    # responses than we expect
+    #
+    if ($differenceInExpectedResponses < 0)
+    {
+        $differenceInExpectedResponses = 0;
+    }
+
+    my $message;
+
+    $message = "missing $differenceInExpectedResponses responses (split cluster?)";
+    if ($differenceInExpectedResponses > $crit)
+    {
+        push (@errors, $message);
+    }
+    elsif ($differenceInExpectedResponses > $warn)
+    {
+        push (@warns, $message);
+    }
+    elsif ($differenceInExpectedResponses && $differenceInExpectedResponses <= $warn)
+    {
+        push (@infos, $message);
+    }
+
+    my @timeOuts;
+    my $treatTimeoutAsCrit = 0;
+    for my $instanceName (@keys)
+    {
+        my $responseTime = $nodeResponseTimeHashRef->{$instanceName};
+        if (exists $commonTimedoutNodesRef->{$instanceName})
+        {
+            $treatTimeoutAsCrit = 1;
+            $instanceName       = "*$instanceName";
+        }
+        if (defined ($timeout) && $responseTime > $timeout)
+        {
+            push (@timeOuts, "$instanceName $responseTime");
+        }
+        if ($responseTime == -1)
+        {
+            push (@timeOuts, "$instanceName");
+        }
+    }
+
+    my $numTimeOuts = scalar (@timeOuts);
+    my $timedOutNodes = join (", ", @timeOuts);
+    $message = "timedout for: $timedOutNodes";
+    if ($treatTimeoutAsCrit && $numTimeOuts > $crit)
+    {
+        push (@errors, $message);
+    }
+    elsif ($numTimeOuts > $warn)
+    {
+        push (@warns, $message);
+    }
+    elsif ($numTimeOuts && $numTimeOuts <= $warn)
+    {
+        push (@infos, $message);
+    }
+    my $allResponses = join (", ", @keys);
+
+    if ($differenceInExpectedResponses)
+    {
+        push (@infos, "responses from: $allResponses");
+    }
+    else
+    {
+        push (@infos, "responses from: all nodes");
+    }
+
+    if (!$numTimeOuts && !$differenceInExpectedResponses)
+    {
+        #push(@infos, "is healthy");
+    }
+
+    my @empty = ();
+
+    #return(\@errors, \@warns, \@empty);
+    return (\@errors, \@warns, \@infos);
+}
+
+sub realmIdsForProduct
+{
+    my $product = shift;
+    my %realmStatus;
+
+    my $oc = ariba::Ops::OracleClient->new($product->connectInfoForOracleClient());
+    if ($oc->connect())
+    {
+        my @results;
+        $oc->executeSqlWithTimeout("select id, state from realmtab", 30, \@results);
+        unless ($oc->error())
+        {
+            my $colsep = ariba::Ops::OracleClient->colsep();
+            foreach my $result (@results)
+            {
+                my ($id, $status) = split (/$colsep/, $result);
+                $realmStatus{$id} = $status;
+            }
+        }
+    }
+
+    return (\%realmStatus, $oc->error());
+}
+
+main();

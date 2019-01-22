@@ -1,0 +1,28 @@
+<html>
+	<b>ASN Uptime</b>
+
+	<OWParallelRepetition
+	list0=*ariba::monitor::CircularDB->new("uptime/sla")->readRecords()*
+	list1=*ariba::monitor::CircularDB->new("uptime/all")->readRecords()*
+	list2=*ariba::monitor::CircularDB->new("uptime/unplanned")->readRecords()*>
+
+		time=*scalar(localtime($$currentItem0[0]))*
+		sla=*$$currentItem0[1]*
+		all=*$$currentItem1[1]*
+		unplanned=*$$currentItem2[1]*
+
+	</OWParallelRepetition>
+
+
+
+	<OWVar id=count
+	   value=*scalar(ariba::monitor::CircularDB->new("uptime/sla")->readRecords())*
+	   nodisplay=1 />
+
+	Try1: There are *ariba::Ops::OW::Var->new("count")->value()* records in the cdb.
+
+	Try 2: There are 
+	<OWVar value=*scalar(ariba::monitor::CircularDB->new("uptime/sla")->readRecords())* />
+	records in the cdb:
+
+</html>

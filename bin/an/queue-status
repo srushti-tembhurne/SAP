@@ -1,0 +1,1192 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/an/queue-status#124 $
+
+use strict;
+use warnings;
+
+use Time::Local;
+use Date::Parse;
+use Data::Dumper;
+
+use FindBin;
+use lib "$FindBin::Bin/../../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::OracleClient;
+use ariba::Ops::NotificationRequest;
+use ariba::monitor::OutageSchedule;
+use dmail::LockLib;
+
+my $LOCKFILE = '/tmp/an-queue-status';
+
+my $debug = 0;
+my $me = ariba::rc::InstalledProduct->new();
+my $email = $me->default('notify.email');
+my $an = ariba::rc::InstalledProduct->new("an", $me->service());
+my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+my $communitiesList = join(", ", @communityIds);
+
+my $outage = ariba::monitor::OutageSchedule->new('sat 19:00-23:00');
+my %maxDelayTimes; # For Sodexo
+my @stuckResults;
+my %queries = ();
+my $sendEmail = 0;
+my $sendPage = 0;
+
+# default query settings
+my %defaults = (
+    index      => '',
+    type       => 'normal',
+    hours      => 2,
+    warn       => 30,
+    crit       => 100,
+    warnRows   => 0,
+    critRows   => 500,
+    openTicket => 0,
+    note       => '',
+    hysteresis => '',
+    skipNotifications => 0,
+);
+
+# queue-specific settings (override defaults)
+# key is table name
+# all of these are also rate queues
+my %queues = (
+    bulk_reg_processor_queue => {
+        index => 'IND_BE4F5EE2_20EB57A7',
+        type  => 'normal',
+    },
+    commit_task_queue => {
+        index => 'commit_task_queue (status)',
+        type => 'task',
+    },
+    doc_mover_dispatcher_queue => {
+        index => 'doc_mover_dispatcher_queue (status)',
+        type => 'normal',
+    },
+    forecast_task_queue => {
+        index => 'forecast_task_queue (status)',
+        type => 'task',
+    },
+    invoice_archive_queue => {
+        index => 'invoice_archive_queue (status)',
+        type => 'normal',
+    },
+    po_doc_edi_queue => {
+        index => 'po_doc_edi_queue (status)',
+        type => 'normal',
+    },
+    soap_dispatcher_queue => {
+        index => 'soap_dispatcher_queue (status)',
+        type => 'normal',
+    },
+    admail_disp_queue => {
+        index => 'admail_disp_queue (status)',
+        type => 'docRegulated',
+    },
+    charge_disp_queue => {
+        index => 'charge_disp_queue (status)',
+        type => 'docRegulated',
+    },
+    st_disp_queue => {
+        index => 'st_disp_queue (status)',
+        type => 'docRegulated',
+    },
+    flow_ext_in_q => {
+        index => 'flow_ext_in_q (status)',
+        type => 'docRegulated',
+    },
+    flow_ext_ob_q => {
+        index => 'flow_ext_ob_q (status)',
+        type => 'docRegulated',
+    },
+    doc_disp_queue => {
+        index      => 'IND_FFE3E16D_CD3323B5',
+        type       => 'docRegulated',
+        warn       => 4000,
+        crit       => 8000,
+        critRows   => 7000,
+        hysteresis => 'and previousAnswer > 8000', # previousAnswer > crit
+    },
+    doc2_disp_queue => {
+        index      => 'IND_AB7492BF_CD3323B5',
+        type       => 'docRegulated',
+        warn       => 4000,
+        crit       => 8000,
+        critRows   => 7000,
+        hysteresis => 'and previousAnswer > 8000', # previousAnswer > crit
+    },
+    error_queue => { # this is allowed to spike
+        index => 'IND_5D0A03A6_20EB57A7',
+        type  => 'normal',
+
+        # per TMID 39144
+        warn       => 2500,
+        crit       => undef,
+        warnRows   => 100,
+        openTicket => 1,
+        note       => "Open an S2 CR.  Include a graph of when the queue was high.  Close this CR when the queue has cleared.",
+    },
+    excel_cif_dispatcher_queue => {
+        index => 'IND_4DB2E8A4_20EB57A7',
+        type  => 'normal',
+    },
+    fax_disp_queue => {
+        index => 'IND_EB5286A_CD3323B5',
+        type  => 'docRegulated',
+        warn  => 800,
+        crit  => 1500,
+    },
+    mail_disp_queue => {
+        index      => 'IND_B0C5B8E2_CD3323B5',
+        type       => 'docRegulated',
+        warn       => 30000,
+        crit       => 50000,
+
+        # $critRows .= " and previousAnswer > $critRows"
+        critRows   => $defaults{'critRows'} . ' and previousAnswer > ' . $defaults{'critRows'},
+        hysteresis => 'and previousAnswer > 50000', # previousAnswer > crit
+        skipNotifications => 1,
+    },
+    notification_queue => {
+        index      => 'IND_7405B619_20EB57A7',
+        type       => 'normal',
+        warn       => 300,
+        crit       => 1500,
+        hysteresis => 'and previousAnswer > 1500', # previousAnswer > crit
+    },
+    org_data_dispatcher_queue => {
+        index => 'IND_85580267_20EB57A7',
+        type  => 'normal',
+    },
+    pay_disp_queue => {
+        index => 'IND_7E2331B9_CD3323B5',
+        type  => 'docRegulated',
+
+        # From Michael Chu:
+        # "The threshhold for failure is 1"
+        # For payment dispatcher queue, since we batch process these payments once per day, its okay to have more than 1
+        crit     => 1000,
+        critRows => 0,
+    },
+    po_doc_disp_queue => {
+        index => 'IND_19916353_1727CE62',
+        type  => 'docRegulated',
+        warn  => 1500,
+        crit  => 3000,
+    },
+    po2_doc_disp_q => {
+        index => 'IND_F28F3B1_1727CE62',
+        type  => 'docRegulated',
+        warn  => 1500,
+        crit  => 3000,
+    },
+    validator_queue => {
+        index => 'IND_55425706_20EB57A7',
+        type  => 'normal',
+    },
+);
+
+# special queues
+my %propQueues = (
+    prop_disp_queue => {
+        index => 'IND_BF954B3C_B1A4A7A0',
+    },
+    prop2_disp_queue => {
+        index => 'IND_EFF1D75D_B1A4A7A0',
+    },
+);
+
+my @ediPOQueues = ('po_doc_disp_queue', 'po2_doc_disp_q');
+
+sub get_queue_settings {
+    my $table = shift;
+
+    my %h;
+
+    # 1st load the defaults...
+    for my $setting (keys %defaults) {
+        $h{$setting} = $defaults{$setting};
+    }
+
+    # ...then overlay the specifics.
+    for my $setting (keys %{$queues{$table}}) {
+        $h{$setting} = $queues{$table}->{$setting};
+    }
+    return \%h;
+}
+
+sub appendRetryForNumberOfRecords {
+    my $recordLimit = shift;
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+    my @results = $query->results(); 
+    my $colsep = ariba::Ops::OracleClient::colsep(); 
+
+    my $oldResults = join("\n", @results);
+    return $oldResults if $query->error();
+    
+    # Append the 'with xx retries' to the results if possible
+    if (my $numResults = scalar(@results)) {
+        
+        # Only process the first $recordLimit records - for performance reason
+        my @unprocessedResults;
+        if ($numResults > $recordLimit) {
+            my $splitIndex = $recordLimit - 1;
+            @unprocessedResults = @results[$recordLimit..$#results];
+            @results = @results[0..$splitIndex];
+        } 
+
+        # Build cxml ids
+        my @cxmlIds;
+        foreach my $result (@results) {
+            my @cols = split($colsep, $result, 2);
+            push(@cxmlIds, $cols[0]) if (@cols);
+        }
+        return $oldResults unless @cxmlIds;
+        
+        print "cxmlIds: @cxmlIds\n" if ($debug);
+
+        # Get payload ids using cxmlIds
+        my $cxmlIdsList = join(', ', @cxmlIds);
+        my @payloadResults = $query->_runSql("SELECT id, payload_id, TO_CHAR(created, 'yyyy-mm-dd hh24:mi:ss') FROM cxml_document WHERE id IN ($cxmlIdsList)");
+        return $oldResults if ($query->error() || !@payloadResults);
+
+        my %payloadToCxmlIdMap;
+        my %cxmlCreatedMap;
+        foreach my $result (@payloadResults) {
+            my @cols = split($colsep, $result);
+            if (scalar(@cols) == 3) {
+                $payloadToCxmlIdMap{$cols[1]} = $cols[0];
+                $cxmlCreatedMap{$cols[0]} = $cols[2];
+            }
+        }
+
+        my @payloadIds = keys(%payloadToCxmlIdMap); 
+        print "payloadIds: @payloadIds\n" if ($debug);
+
+        my $ediDbc = ariba::Ops::DBConnection->connectionsForProductOfDBType($an, ariba::Ops::DBConnection::typeMainEdi());
+        return $oldResults unless ($ediDbc);
+
+        my $oc = ariba::Ops::OracleClient->newFromDBConnection($ediDbc);
+        my $payloadIdsList = "'" . join("', '", @payloadIds) . "'";
+        my $sql = "Select /*+ INDEX(c IND_UN_BCF57836_3B40FC81) USE_NL(c r e f q) */ c.payload_id, q.RETRY_COUNT, q.status, TO_CHAR(q.status_changed, 'yyyy-mm-dd hh24:mi:ss') FROM edi_cxml_document c, edi_document_relation r, edi_edi_document e, edi_functional_group f, edi_out_queue q WHERE c.payload_id IN ($payloadIdsList) AND c.BASEDOCUMENT = r.sourcedocument AND r.TARGETDOCUMENT = e.BASEDOCUMENT AND e.FUNCTIONALGROUP = f.id AND f.INTERCHANGEDOCUMENT = q.item AND c.buyer = 'AN01001506640'";
+        my @retryResults;
+
+        unless ($oc->connect() && 
+                $oc->executeSqlWithTimeout($sql, undef, \@retryResults) && 
+                @retryResults) {
+            $query->setError($oc->error());
+            return $oldResults;
+        }
+
+        my %retryForCxmlIdMap; 
+        my %newStuckTimeForCxmlIdMap;
+        foreach my $result (@retryResults) {
+            my @cols = split($colsep, $result); 
+            next unless (scalar(@cols) == 4);
+
+            my $payloadId = $cols[0];
+            my $retryCount = $cols[1];
+            my $status = $cols[2]; 
+            my $statusChanged = $cols[3];
+
+            my $cxmlId = $payloadToCxmlIdMap{$payloadId};
+            $retryForCxmlIdMap{$cxmlId} = $retryCount; 
+
+            if ($status && $statusChanged && $cxmlCreatedMap{$cxmlId} && $status eq 'Processed') {
+                my $newStuckTime = int((str2time($statusChanged) - str2time($cxmlCreatedMap{$cxmlId})) / 60); 
+                $newStuckTimeForCxmlIdMap{$cxmlId} = $newStuckTime;
+            }
+        }
+
+        my @newResults;
+        my $adjustedTimesOverLimit = 0;
+        foreach my $result (@results) {
+            my @cols = split($colsep, $result);
+            next unless (scalar(@cols) == 5);
+        
+            my ($cxmlId, $buyerId, $communityId, $status, $mins) = @cols;
+            if (defined($newStuckTimeForCxmlIdMap{$cxmlId})) {
+                $mins = $newStuckTimeForCxmlIdMap{$cxmlId};
+                $status = 'Sent';
+            }
+            my $retry = $retryForCxmlIdMap{$cxmlId} || 0; 
+            my $realMins = int($mins - $retry * 30);
+            my $retriesWord = $retry <= 1 ? 'retry' : 'retries';
+
+            my $adjustedTime = ''; 
+            $realMins = 0 if ($realMins < 0);
+            $adjustedTime = " (adj. $realMins mins) " if ($realMins != $mins);
+            if (($realMins > 35) && ($status ne 'Sent')) {
+                $adjustedTimesOverLimit++;
+                push(@stuckResults, join($colsep, $cxmlId, $buyerId, $communityId, $status, $mins) . 
+                    $colsep . "with $retry $retriesWord $adjustedTime");
+            }
+
+            if (!$maxDelayTimes{$query->communityId()}{'maxDelayTime'} || 
+                $realMins > $maxDelayTimes{$query->communityId()}{'maxDelayTime'}) {
+                $maxDelayTimes{$query->communityId()}{'maxDelayTime'} = $realMins;
+                $maxDelayTimes{$query->communityId()}{'cxmlId'} = $cxmlId;
+            }
+
+            push(@newResults, join($colsep, $cxmlId, $buyerId, $communityId, $status, $mins) . 
+                $colsep . "with $retry $retriesWord $adjustedTime");
+        }
+
+        push(@newResults, @unprocessedResults);
+
+        return join("\n", @newResults);
+    }
+
+    return $oldResults;
+}
+
+sub main {
+    while(my $arg=shift(@ARGV)){
+        if($arg =~ /^-d/o){ $debug = 1; }
+        if($arg =~ /^-e/o){ $sendEmail = 1; };
+        if($arg =~ /^-p/o){ $sendPage = 1; };
+    }
+
+    for my $queue (sort keys %queues) {
+        my $h          = get_queue_settings($queue);
+
+        my $index      = $h->{'index'};
+        my $type       = $h->{'type'};
+        my $hours      = $h->{'hours'};
+        my $warn       = $h->{'warn'};
+        my $crit       = $h->{'crit'};
+        my $warnRows   = $h->{'warnRows'};
+        my $critRows   = $h->{'critRows'};
+        my $openTicket = $h->{'openTicket'};
+        my $note       = $h->{'note'};
+        my $hysteresis = $h->{'hysteresis'};
+        my $skipNotifications = $h->{'skipNotifications'};
+
+        printf STDERR ("%-34s %-29s %-19s %-7s %-10s %-11s %-12s %-15s %-12s %-12s %-30s %s\n",
+            "queue='$queue'", "index='$index'", "type='$type'", "hours=$hours", "warn=$warn",
+            "crit=" . (defined $crit ? $crit : "(null)"), "warnRows=$warnRows", "critRows='$critRows'",
+            "openTicket=$openTicket", "skipNotify=$skipNotifications",
+            "hysteresis='$hysteresis'", "note='$note'") if $debug;
+		
+        if ($type eq 'docRegulated') {
+            my $time = time();
+            #
+            # For ingress/egress:
+            #
+            # Look only at the last week -- this means we'll have a pass at
+            # midnight daily that doesn't get ingress/egress, but that's pretty
+            # acceptable, and limiting the result set makes the query run MUCH
+            # faster.
+            #
+            my ($month, $year, $day) = (localtime($time - 604800))[4,5,3];
+            my $cut = timelocal( 0,0,0,$day,$month,$year );
+            #
+            # status_changed is in thousands of a second.
+            #
+            $cut .= "000";
+
+            $queries{"$queue: items stuck more than $hours hrs"} = {
+                recordMaxResults => 20000,
+                recordDataType=> "gauge",
+                recordItem => "numrows",
+                runForCommunities => $communitiesList,
+                aggregationMethod => "rows",
+                info => "numrows > -1",
+                warn => "numrows > 0",
+                crit => "numrows > $critRows",
+                format => "$queue.id %s $queue.item %s community %s %s %s hours\n",
+                note => $note,
+
+                sql => "SELECT /*+ INDEX($queue $index) */ 
+                    id, item, schema_community(),
+                    DECODE(status, 1, 'Queued', 2, 'Processing', 'Unknown' || status),
+                    ROUND(($time - (status_changed/1000))/3600) stuck_time FROM $queue
+                    WHERE status IN (1, 2) AND $time - (status_changed/1000) > $hours * 3600",
+            };
+
+            $queries{"$queue: queue length (Queued, Processing)"} = {
+                recordMaxResults => 20000,
+                recordDataType=> "gauge",
+                runForCommunities => $communitiesList,
+                aggregationMethod => "counts",
+                info => "answer > -1",
+                warn => "answer > $warn",
+                crit => "answer > $crit $hysteresis",
+                skipNotifications => $skipNotifications,
+                sql  => "SELECT /*+ INDEX($queue $index) */ COUNT(id) FROM $queue WHERE status IN (1,2)",
+
+                details => {
+                    "$queue status summary" => {
+                        noRowCount => 1,
+                        format     => "%s -> %s  %s  num: %s  avg retry: %s\n",
+                        sql => "SELECT /*+ INDEX(pdq $index) USE_NL(pdq p so bo) */
+                            NVL(bo.name, 'Name unavailable'),
+                            NVL(so.name, 'Name unavailable'),
+                            DECODE(pdq.status, 1, 'Queued', 2, 'Processing', 'Unknown'||pdq.status),
+                            COUNT(p.id),
+                            ROUND(avg(pdq.retry_count))
+                                FROM org_join bo,
+                                  org_join so,
+                                  cxml_document p,
+                                  $queue pdq
+                                WHERE pdq.status IN (1, 2)
+                                  AND pdq.item = p.id
+                                  AND p.from_org = bo.id(+)
+                                  AND p.to_org = so.id(+)
+                                GROUP BY bo.id,
+                                  so.id,
+                                  bo.name,
+                                  so.name,
+                                  pdq.status
+                                ORDER BY COUNT(p.id) desc
+                        ",
+                    },
+
+                    "$queue item summary" => {
+                        noRowCount => 1,
+                        format     => "%s transactions in %s FROM %s -> %s\n",
+                        sql => "SELECT /*+ INDEX(pdq $index) USE_NL(pdq p sorg borg) */
+                              COUNT(pdq.item),
+                              DECODE(pdq.status, 1, 'Queued', 2, 'Processing', 'Unknown'||pdq.status),
+                              NVL(borg.deployment, 'Not available'),
+                              NVL(sorg.deployment, 'Not available')
+                            FROM
+                              org_join borg,
+                              org_join sorg,
+                              cxml_document p,
+                              $queue pdq
+                            WHERE pdq.status IN (1,2)
+                              AND p.id = pdq.item
+                              AND p.from_org = borg.id(+)
+                              AND p.to_org = sorg.id(+)
+                            GROUP BY pdq.status,
+                              borg.deployment,
+                              sorg.deployment
+                        ",
+                    },
+                }
+            };
+
+            $queries{"$queue: completed length"} = {
+                info => 1,
+                recordMaxResults => 20000,
+                recordDataType=> "gauge",
+                runForCommunities => $communitiesList,
+                aggregationMethod => "counts",
+                uiHint => "ignore",
+                sql  => "SELECT COUNT(id) FROM $queue WHERE (status_changed) > $cut AND status NOT IN (1,2)",
+            };
+
+            $queries{"$queue: total length"} = {
+                info => 1,
+                recordMaxResults => 20000,
+                recordDataType=> "gauge",
+                runForCommunities => $communitiesList,
+                aggregationMethod => "counts",
+                uiHint => "ignore",
+                sql  => "SELECT COUNT(id) FROM $queue WHERE (status_changed) > $cut",
+            };
+
+        }
+        else {
+            # these are the column identifiers for a 'normal' queue:
+            my $item_col = '';
+            my $date_col = 'status_changed';
+
+            if($type eq 'task') {
+                # a 'task' queue is similar to a 'normal' queue, except for these two column identifiers:
+                $item_col = 'cxml_document_id';
+                $date_col = 'last_updated';
+            }
+	
+            if ($queue ne "error_queue") {
+                $queries{"$queue: items stuck more than $hours hrs"} = {
+                    recordMaxResults => 20000,
+                    recordDataType=> "gauge",
+                    recordItem => "numrows",
+                    runForCommunities => $communitiesList,
+                    aggregationMethod => "rows",
+                    info => "numrows > -1",
+                    warn => "numrows > $warnRows",
+                    crit => "numrows > $critRows",
+                    format => "$queue.id %s $queue.item %s community %s %s %d hours\n",
+                    note => $note,
+                    sql => "SELECT /*+ INDEX($queue $index) */ 
+                    id,$item_col item,schema_community(),status,(SYSDATE-$date_col)*24 stuck_time 
+                    FROM $queue WHERE 
+                    status IN ('Queued','Processing') AND 
+                    (SYSDATE-$date_col)*24 > $hours",
+                };
+            }
+
+            my $critString = $crit ? "answer > $crit $hysteresis" : '';
+
+            $queries{"$queue: queue length (Queued, Processing)"} = {
+                recordMaxResults => 20000,
+                recordDataType=> "gauge",
+                runForCommunities => $communitiesList,
+                aggregationMethod => "counts",
+                info => "answer > -1",
+                warn => "answer > $warn",
+                crit => "$critString",
+                skipNotifications => $skipNotifications,
+                ticketOnWarnOpenAfterMinutes => $openTicket,
+                note => $note,
+
+                sql => "SELECT /*+ INDEX($queue $index) */ 
+                    COUNT(id) FROM $queue WHERE status IN ('Queued','Processing')",
+            };
+
+            #
+            # Again for ingress/egress, we'll only look at the last week.
+            #
+            # same pro/con as above.
+            #
+            my ($month, $year, $day);
+            if($queue eq 'error_queue') {
+                #
+                # error queue is too big, look at a smaller window.
+                #
+                ($month, $year, $day) = (localtime(time() - 259200))[4,5,3];
+            } else {
+                ($month, $year, $day) = (localtime(time() - 604800))[4,5,3];
+            }
+            $month++;
+            $year+=1900;
+            my $cut = sprintf("%4d-%02d-%02d", $year, $month, $day);
+
+            $queries{"$queue: completed length"} = {
+                info => 1,
+                recordMaxResults => 20000,
+                recordDataType=> "gauge",
+                runForCommunities => $communitiesList,
+                aggregationMethod => "counts",
+                uiHint => "ignore",
+
+                sql => "SELECT COUNT(id) FROM $queue WHERE $date_col > TO_DATE('$cut', 'YYYY-MM-DD') AND status IN ('Processed','Failed')",
+
+            };
+
+            $queries{"$queue: total length"} = {
+                info => 1,
+                recordMaxResults => 20000,
+                recordDataType=> "gauge",
+                runForCommunities => $communitiesList,
+                aggregationMethod => "counts",
+                uiHint => "ignore",
+
+                sql => "SELECT COUNT(id) FROM $queue WHERE $date_col > TO_DATE('$cut', 'YYYY-MM-DD')",
+            };
+        }
+    }
+
+    # special queries
+    define_po_queue_edi_queries();
+    define_prop_queue_queries();
+    define_eintro_backlog_query();
+    define_remit_disp_queue_queries();
+
+    add_app_url(); # stuff each query that has a format with the AdminAppURL result.
+
+    # we're ready to start processing queries, so acquire lock
+    die "can't grab lock\n" unless dmail::LockLib::requestlock($LOCKFILE,5);
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails( "queue-status", "an", $me->service, $me->customer(), \%queries);
+
+    # We want mail_disp_queue monitoring to be smarter and only page if the queues are growing. TMID: 168936
+    add_smart_rate_queries('mail_disp_queue', $qm);
+
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+#print STDERR Dumper $qm;
+
+    postprocess_edi_po_queue_queries();
+    process_rp_queue_queries();
+    process_rate_queries();
+
+    dmail::LockLib::releaselock($LOCKFILE);
+}
+
+sub add_app_url {
+    while (my ($key, $query) = each %queries) {
+
+        next unless $queries{$key}->{'format'};
+        next if (exists $queries{$key}->{'processAnswer'});
+
+        $queries{$key}->{'processAnswer'} = sub {
+            ariba::monitor::StatusPage::addAdminAppLinksToQueueResults($an->default('acadminurlprefix'));
+        }
+    }
+}
+
+sub addNoteToRatingProfile {
+    my $self = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+    if($self->results()) {
+        $self->setNote("When this is yellow, you should open a CR (P2) and notify the AN Discovery team");
+    } else {
+        $self->setNote(undef);
+    }
+
+    my $ret = join("\n",( $self->results() ) );
+    return($ret);
+}
+
+sub define_eintro_backlog_query {
+    $queries{"EIntro backlog"} = {
+        recordMaxResults => 20000,
+        recordDataType=> "gauge",
+        recordItem => "numrows",
+        aggregationMethod => "rows",
+        info => "numrows < 480",
+        warn => "numrows >= 480",
+        crit => "numrows > 880",
+        sql => "SELECT COUNT(*) FROM rfx_event 
+            WHERE event_state = '1005' AND created < SYSDATE -1 AND 
+            TO_CHAR(SYSDATE,'HH24') >= 8 AND TO_CHAR(SYSDATE,'HH24') <= 18",
+    };
+}
+
+sub define_remit_disp_queue_queries {
+    my $hoursAgo = 2;
+    my $statusChangeTime = (time() - ($hoursAgo * 60 * 60)) * 1000; # q.status_changed is in msecs
+
+    $queries{"remit_disp_queue: payment failed to process in last $hoursAgo hrs"} = {
+        recordMaxResults => 20000,
+        recordDataType=> "gauge",
+        recordItem => "numrows",
+        runForCommunities => $communitiesList,
+        aggregationMethod => "rows",
+        format => "remit_disp_queue.id %s remit_disp_queue.item %s\n",
+        info => "numrows < 1",
+        warn => "numrows >= 1",
+        crit => "numrows > 10",
+        ticketOnWarnOpenAfterMinutes => 60,
+        sql => "SELECT /*+ INDEX(q IND_EA887AD7_B1A4A7A0)  */ distinct q.id, q.item
+            FROM remit_disp_queue q
+            WHERE q.status_changed > $statusChangeTime AND q.status = 4
+            ORDER BY q.id desc",
+    };
+
+    $queries{"remit_disp_queue: payment stuck for more than $hoursAgo hours"} = {
+        recordMaxResults => 20000,
+        recordDataType=> "gauge",
+        recordItem => "numrows",
+        runForCommunities => $communitiesList,
+        aggregationMethod => "rows",
+        format => "remit_disp_queue.id %s remit_disp_queue.item %s\n",
+        info => "numrows < 1",
+        warn => "numrows >= 1",
+        crit => "numrows > 10",
+        ticketOnWarnOpenAfterMinutes => 60,
+        sql => "SELECT /*+ INDEX(q IND_EA887AD7_8FFB4247)  */ distinct q.id, q.item
+            FROM remit_disp_queue q
+            WHERE q.status IN (1, 2) AND q.schedule_time < (SYSDATE - $hoursAgo/24)
+            ORDER BY q.id desc",
+    };
+}
+
+sub add_smart_rate_queries {
+    my ($queue, $qm) = @_;
+    my @queries = $qm->queries();
+    for my $q ( @queries ) {
+        next unless $q->queryName() =~ /$queue: items stuck more than 2 hrs for community (\d+)/ and my $community = $1;
+
+        my $qname = "$queue in community $community size change rate (items per hour)";
+        my $instance = ariba::monitor::Query->generateInstanceName(
+            $qname, "an", $me->customer(), $me->currentCluster(), undef
+        );
+        my $rateQuery = ariba::monitor::Query->new($instance);
+        my $result = $rateQuery->results();
+
+        my $qcrit = $q->crit();
+        $qcrit .= " and $result > 0";
+
+        $q->setCrit($qcrit);
+    }
+}
+
+# Rating Profile Queue items for AD7... this needs its own QM for different SQL connection setup (uggg!).
+sub process_rp_queue_queries {
+    my $anReleaseName = $an->releaseName();
+    if($anReleaseName &&
+        (
+          ($anReleaseName =~ /^AD(\d+)/ && $1 >= 7)
+          ||
+          ($anReleaseName =~ /^(\d+)s(\d+)/ && $1 >= 11)
+          ||
+          # AN.2016.05.Rel is the new format.
+          ($anReleaseName =~ /^AN\.(\d+)\.\d+\.Rel$/ && $1 >= 2016)
+        )
+      ) {
+        my %rpQ;
+
+        $rpQ{"Rating Profile Queue items retried more than 5 times"} = {
+            sql => "SELECT id,retrieval_count FROM rating_profile_queue WHERE retrieval_count > 5",
+            format => "id=%s retried %s times.",
+            info => 1, 
+            warn => "numrows > 0",
+            ticketOnWarnOpenAfterMinutes => 15,
+            processAnswer => sub { addNoteToRatingProfile() },
+        };
+
+        $rpQ{"Rating Profile Queue items older than 24 hours"} = {
+            sql => "SELECT id, TO_CHAR(retrieval_request_date,'YYYY-MM-DD HH24:MI') AS datestamp
+                    FROM rating_profile_queue WHERE retrieval_request_date < SYSDATE-1",
+            format => "id=%s queued at %s.",
+            info => 1, 
+            warn => "numrows > 0",
+            ticketOnWarnOpenAfterMinutes => 15,
+            processAnswer => sub { addNoteToRatingProfile() },
+        };
+
+        $rpQ{"Size of Rating Profile Queue"} = {
+            sql => "SELECT COUNT(*) FROM rating_profile_queue",
+            info => 1, 
+            recordMaxResults => 20000,
+            recordDataType=> "gauge",
+            recordItem => "answer",
+        };
+
+        my $rpQM = ariba::monitor::QueryManager->newWithDetails( "queue-status", "an", $me->service, $me->customer(), \%rpQ);
+        $rpQM->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+        $rpQM->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub define_po_queue_edi_queries {
+    for my $queue (@ediPOQueues) {
+        my $index = $queues{$queue}->{'index'};
+        define_po_queue_edi_query($queue, $index);
+    }
+}
+
+sub define_po_queue_edi_query {
+    my ($poQueue, $poIndex) = @_;
+
+    #
+    # for po_doc_disp_queue, explicitly monitor for edi items
+    # destined for internal processing stuck over 30 minutes
+    #
+    my $serviceHost = $an->default('ServiceHost');
+    my $time = time();
+    my $minutesAgo = 35;
+
+    ## Since this is being specified as '11S4SP1', we'll just look for that test string instead:
+    ## Once this is more widely available we'll have to either adjust or remove this conditional.
+    ## TMID: 131764
+    if ( $an->releaseName() =~ m/11s4sp1/i ){
+        ## For this next query (MasterCard VCA PO failures) we need the even numbered communities:
+        my $communitiesListPO = join(", ", ( grep { ( $_ % 2 ) == 0 } @communityIds ) );
+
+        my $sql = q{  
+            SELECT /*+ leading( q ) */ distinct m.cxml_document cxmldoc_id
+            FROM pay_disp_queue q, pay_document d, vcapayment_msg m, 
+            (SELECT EXTRACT(day FROM (SYSTIMESTAMP - timestamp '1970-01-01 00:00:00')) * 86400
+                 + EXTRACT(hour FROM (SYSTIMESTAMP - timestamp '1970-01-01 00:00:00')) * 3600
+                 + EXTRACT(minute FROM (SYSTIMESTAMP - timestamp '1970-01-01 00:00:00')) * 60
+                 + EXTRACT(second FROM (SYSTIMESTAMP - timestamp '1970-01-01 00:00:00')) value
+            FROM dual) time_in_secs 
+            WHERE q.status = 4
+            AND time_in_secs.value - (q.status_changed/1000) < 1 * 3600
+            AND q.item = d.id
+            AND d.cxml_document = m.cxml_document
+            AND (m.error_code IS NOT NULL OR (m.return_code IS NOT NULL AND m.return_code != 'A')) 
+        };
+
+        $queries{'MasterCard VCA PO failures in the past 1 hr'} = { 
+            warn    => 'numrows > 5',
+            crit    => 'numrows > 10',
+            sql     => $sql,
+            runForCommunities => $communitiesListPO,
+            format  => "DocID: %s\n",
+            recordMaxResults => 36000,
+            recordDataType=> "gauge",
+            recordItem => "numrows",
+            ticketOnWarnOpenAfterMinutes    => 30, 
+            ticketDueInDays => 1,
+            ticketOwner => 'unassigned-prodops',
+            severity    => 2,
+            description => 'This metric shows the number of Purchase Orders that failed because of response from MasterCard in the past 1 hr.', 
+            correctiveActions => [
+                Ops  => 'File ticket with Engineering.', 
+                Engr => 'Check the history of the orders that failed. If it is because of similar failure then ask GSO to inform buyer that there is some issue with the orders sent and they should consult MasterCard to fix the issue before sending any more orders.', 
+            ],
+        };
+    }
+
+    $queries{"$poQueue: edi PO items updated more than $minutesAgo mins ago"} = {
+        recordMaxResults => 20000,
+        recordDataType=> "gauge",
+        recordItem => "numrows",
+        runForCommunities => $communitiesList,
+        aggregationMethod => "rows",
+        info => "numrows < 1",
+        warn => "numrows > 0",
+        crit => "numrows > 4",
+        format => "$poQueue.id %s $poQueue.item %s community %s %s %d mins\n",
+        sql => "SELECT /*+ INDEX(pdq $poIndex) USE_NL(pdq p) */ pdq.id, pdq.item,
+        schema_community(),
+        DECODE(pdq.status, 1, 'Queued', 2, 'Processing', 'Unknown'||pdq.status),
+        ((SYSDATE-p.status_changed)*24*60) stuck_time 
+        FROM $poQueue pdq, cxml_document p 
+        WHERE pdq.status IN (1, 2) 
+            AND pdq.item = p.id
+            AND pdq.DESTINATION0 = '$serviceHost' 
+            AND pdq.DESTINATION1 = 'Ariba.EDIGateway'
+            AND (SYSDATE-p.status_changed)* 24 * 60 > $minutesAgo",
+    };
+
+    # AN01001506640 is Sodexo
+    my $critRows = 1000;
+    $queries{"$poQueue: Sodexo edi PO items stuck more than $minutesAgo mins ago"} = {
+        recordMaxResults => 20000,
+        recordDataType=> "gauge",
+        recordItem => "numrows",
+        runForCommunities => $communitiesList,
+        aggregationMethod => "rows",
+        info => 1,
+        warn => 0,
+        crit => "numrows > $critRows",
+        note => '',
+        # outageSchedule attribute does not work when using processQueriesUsingServer
+        # Temp fix by using skipNotifications for now. Should make outageSchedule work.
+        skipNotifications => $outage->isInScheduledOutage(),
+        format => "$poQueue.item %s buyer %s community %s %s %d mins %s\n",
+        noFormat => 0, # Undo this from previous processAnswer (for AdminLink)
+        sql => "SELECT * FROM (
+            SELECT /*+ INDEX(pdq $poIndex) USE_NL(pdq p o) */ 
+            pdq.item item, o.anid buyer, schema_community() community, 
+            DECODE(pdq.status, 1, 'Queued', 2, 'Processing', 'Others') status, 
+            ((SYSDATE-p.created)*24*60) stuck_time 
+            FROM $poQueue pdq, cxml_document p, org_join o 
+            WHERE pdq.status IN (1, 2) AND pdq.DESTINATION0 = '$serviceHost' 
+            AND pdq.DESTINATION1 = 'Ariba.EDIGateway' AND pdq.item = p.id 
+            AND (SYSDATE-p.created)* 24 * 60 > $minutesAgo AND p.from_org = o.id 
+            UNION ALL SELECT /*+ INDEX(cti IND_CDEB7B6D_7DECA1ED) USE_NL(cti p) */ 
+            cti.document item, o.anid buyer, schema_community() community, 
+            (CASE WHEN cti.SENT_TIME < TO_DATE('1970-01-02', 'yyyy-mm-dd') 
+            AND cti.ACKNOWLEDGED_TIME < TO_DATE('1970-01-02', 'yyyy-mm-dd') 
+            THEN 'Forwarding' ELSE 'Sent' END) status, 
+            (((CASE WHEN cti.SENT_TIME < TO_DATE('1970-01-02', 'yyyy-mm-dd') 
+            THEN (CASE WHEN cti.ACKNOWLEDGED_TIME < TO_DATE('1970-01-02', 'yyyy-mm-dd') 
+            THEN SYSDATE ELSE cti.ACKNOWLEDGED_TIME END) 
+            ELSE cti.sent_time END) - p.created)*24*60) stuck_time 
+            FROM CXML_TRANSACTION_INFO cti, cxml_document p, org_join o 
+            WHERE cti.RECEIVER = 80 AND cti.IN_PROGRESS_TIME > SYSDATE - 1 
+            AND ((CASE WHEN cti.SENT_TIME < TO_DATE('1970-01-02', 'yyyy-mm-dd') 
+            THEN (CASE WHEN cti.ACKNOWLEDGED_TIME < TO_DATE('1970-01-02', 'yyyy-mm-dd') 
+            THEN SYSDATE ELSE cti.ACKNOWLEDGED_TIME END) 
+            ELSE cti.sent_time END)-p.created)* 24 * 60 > $minutesAgo
+            AND cti.document = p.id AND p.from_org = o.id)
+            WHERE buyer = 'AN01001506640'",
+        processAnswer => sub { main::appendRetryForNumberOfRecords($critRows) },
+    };
+
+    $queries{"$poQueue: edi PO items stuck more than $minutesAgo mins ago"} = {
+        recordMaxResults => 20000,
+        recordDataType=> "gauge",
+        recordItem => "numrows",
+        runForCommunities => $communitiesList,
+        aggregationMethod => "rows",
+        info => 1,
+        format => "$poQueue.item %s buyer %s community %s %s %d mins\n",
+        sql => "SELECT /*+ INDEX(pdq $poIndex) USE_NL(pdq p o) */ 
+            pdq.item item, o.anid buyer, schema_community() community, 
+            DECODE(pdq.status, 1, 'Queued', 2, 'Processing', 'Others') status, 
+            ((SYSDATE-p.created)*24*60) stuck_time 
+            FROM $poQueue pdq, cxml_document p, org_join o 
+            WHERE pdq.status IN (1, 2) AND pdq.DESTINATION0 = '$serviceHost' 
+            AND pdq.DESTINATION1 = 'Ariba.EDIGateway' AND pdq.item = p.id 
+            AND (SYSDATE-p.created)* 24 * 60 > $minutesAgo AND p.from_org = o.id 
+            UNION ALL SELECT /*+ INDEX(cti IND_CDEB7B6D_7DECA1ED) USE_NL(cti p) */ 
+            cti.document item, o.anid buyer, schema_community() community, 
+            (CASE WHEN cti.SENT_TIME < TO_DATE('1970-01-02', 'yyyy-mm-dd') 
+            AND cti.ACKNOWLEDGED_TIME < TO_DATE('1970-01-02', 'yyyy-mm-dd') 
+            THEN 'Forwarding' ELSE 'Sent' END) status, 
+            (((CASE WHEN cti.SENT_TIME < TO_DATE('1970-01-02', 'yyyy-mm-dd') 
+            THEN (CASE WHEN cti.ACKNOWLEDGED_TIME < TO_DATE('1970-01-02', 'yyyy-mm-dd') 
+            THEN SYSDATE ELSE cti.ACKNOWLEDGED_TIME END) 
+            ELSE cti.sent_time END) - p.created)*24*60) stuck_time 
+            FROM CXML_TRANSACTION_INFO cti, cxml_document p, org_join o 
+            WHERE cti.RECEIVER = 80 AND cti.IN_PROGRESS_TIME > SYSDATE - 1 
+            AND ((CASE WHEN cti.SENT_TIME < TO_DATE('1970-01-02', 'yyyy-mm-dd') 
+            THEN (CASE WHEN cti.ACKNOWLEDGED_TIME < TO_DATE('1970-01-02', 'yyyy-mm-dd') 
+            THEN SYSDATE ELSE cti.ACKNOWLEDGED_TIME END) 
+            ELSE cti.sent_time END)-p.created)* 24 * 60 > $minutesAgo
+            AND cti.document = p.id AND p.from_org = o.id", };
+}
+
+sub postprocess_edi_po_queue_queries {
+    my %queriesForSodexo;
+    for my $queue (@ediPOQueues) {
+        $queriesForSodexo{"$queue: Sodexo edi PO items longest stuck time"} = {
+            recordMaxResults    => 20000,
+            runForCommunities => $communitiesList,
+            info => 1,
+            format => "%d mins\n",
+            perl => sub { 
+                my $query = $ariba::monitor::Query::_ourGlobalQuerySelf; 
+                my $cxmlId = $maxDelayTimes{$query->communityId()}{'cxmlId'};
+                $query->setFormat("%d mins for cxmlId $cxmlId\n") if ($cxmlId);
+                return $maxDelayTimes{$query->communityId()}{'maxDelayTime'};
+            }
+        };
+
+        #
+        #  The following query depends on a @stuckResults, a global variable that containts
+        #  the results that have been stuck for 35 minutes or longer and have *NOT* been 
+        #  marked as 'Sent') to run.
+        #
+        $queriesForSodexo{"$queue: Sodexo edi PO items stuck more than 35 mins ago that have not been marked as 'Sent'"} = {
+            info => 1,
+            warn => "numrows > 0",
+            crit => "numrows > 5",
+            # outageSchedule attribute does not work when using processQueriesUsingServer
+            # Temp fix by using skipNotifications for now. Should make outageSchedule work.
+            skipNotifications => $outage->isInScheduledOutage(),
+            format => "$queue.item %s buyer %s community %s %s %d mins %s\n",
+            perl => sub { return join("\n", @stuckResults); },
+        };
+    }
+
+    my $qmForSodexo = ariba::monitor::QueryManager->newWithDetails(
+        "queue-status", "an", $me->service, $me->customer(), \%queriesForSodexo
+    );
+    $qmForSodexo->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+sub define_prop_queue_queries {
+    for my $queue (sort keys %propQueues) {
+        my $index = $propQueues{$queue}->{'index'};
+        define_prop_queue_query($queue, $index);
+    }
+}
+
+sub define_prop_queue_query {
+    my $propQueue = shift;
+    my $propQueueIndex = shift;
+
+    my $minutesAgo = 15; 
+    my $daysAgo = $minutesAgo / 60 / 24;
+    my $time = time();
+
+    $queries{"$propQueue: documents should be propagated in last $minutesAgo mins"} = {
+        recordMaxResults => 20000,
+        recordDataType=> "gauge",
+        recordItem => "numrows",
+        runForCommunities => $communitiesList,
+        aggregationMethod => "rows",
+        format => "cxml_document.created %s cxml_document.item %s cxml_document.document_type %s\n",
+        info => "numrows < 1",
+        warn => "numrows > 0",
+        bindVariables => sub {
+            my $self = $ariba::monitor::Query::_ourGlobalQuerySelf; 
+            return $self->communityId(); 
+        },
+        sql => "SELECT /*+ INDEX(c IND_B398011A_2B45162B) */ c.created, c.id, c.document_type, o1.community 
+            from_community, o2.community to_community 
+            FROM cxml_document c, org_join o1, org_join o2, org_type_join t1, org_type_join t2 
+            WHERE c.created > SYSDATE-$daysAgo 
+                AND NOT EXISTS (SELECT item FROM $propQueue q WHERE q.item=c.id)
+                AND c.document_type NOT IN ('PaymentRemittanceRequestToEdi', 'ProviderSetupRequest', 'ChargeFileRequest') 
+                AND c.from_org = o1.id AND o1.community = ? AND c.to_org = o2.id 
+                AND (c.is_copy IS NULL OR c.is_copy =0) AND o2.type = t2.id 
+                AND t2.IS_SERVICE_PROVIDER = 0 AND o1.community != o2.community 
+                AND (c.document_type != 'StatusUpdateRequest' OR NOT EXISTS (SELECT rel.id
+            FROM cxml_doc_relation rel, cxml_document cc 
+            WHERE rel.derived_document = c.id AND rel.SOURCE_DOCUMENT = cc.id 
+                AND cc.document_type = 'OpenNetworkDocument')) ORDER BY c.created desc;",
+    };
+
+    my @time = ("10", "30");    
+    for my $minutes (@time) {
+        my $warn;
+        my $crit;
+        my $note;
+        my $tow;
+        my $severity;
+        my $secondsAgo = $minutes * 60;
+        my $secondsLowerLimit = (30*24*60*60); #30 day limit as per HOA-77193
+
+        if ($minutes == "10") {
+            $warn = "numrows > 0";
+        } else {
+            $crit = "numrows > 0";
+            $severity = 1;
+            $note = "If this crits it means the propagation queue " . $propQueue . " has stopped working or is processing very slowly.  Check the PropagationDispatcher nodes under an > http urls status > Community Supplier > PropagationDispatcher.  Escalate if monitoring is reporting the nodes are up.  Development needs to investigate immediately to determine if this is an S0.";
+        }
+
+        $queries{"$propQueue: documents stuck in propagation queue for more than $minutes mins"} = {
+            recordMaxResults => 20000,
+            recordDataType=> "gauge",
+            recordItem => "numrows",
+            runForCommunities => $communitiesList,
+            aggregationMethod => "rows",
+            format => "$propQueue.id %s $propQueue.item %s community %s %s %s mins\n",
+            info => "numrows < 1",
+            warn => $warn,
+            crit => $crit,
+            severity => $severity,
+            note => $note,
+            ticketOnWarnOpenAfterMinutes => $tow,
+            sql => "SELECT /*+ INDEX($propQueue IND $propQueueIndex) */ id, item, schema_community(), DECODE(status, 1, 'Queued', 2, 'Processing', 'Unknown' || status), ROUND(($time - (status_changed/1000))/60) stuck_time FROM $propQueue WHERE status IN (1, 2) AND retry_count = 0 AND status_changed < ($time -$secondsAgo)*1000 AND status_changed > ($time - $secondsLowerLimit)",
+        };
+
+        if ($propQueue eq 'prop_disp_queue') {
+           $queries{"$propQueue: documents stuck in propagation queue for more than $minutes mins"}->{'timeout'} = 1800;
+        }
+    }
+
+    my $hoursAgo = 2; 
+    my $statusChangeTime = (time() - ($hoursAgo * 60 * 60)) * 1000; # q.status_changed is in milliseconds
+    $queries{"$propQueue: documents failed to propagate in last $hoursAgo hrs"} = {
+        recordMaxResults => 20000,
+        recordDataType=> "gauge",
+        recordItem => "numrows",
+        runForCommunities => $communitiesList,
+        aggregationMethod => "rows",
+        format => "$propQueue.id %s $propQueue.item %s\n",
+        info => "numrows < 1",
+        warn => "numrows > 0",
+        crit => "numrows > 300",
+        ticketOnWarnOpenAfterMinutes => 1,
+        sql => "SELECT /*+ INDEX(q $propQueueIndex)  */ distinct q.id, q.item 
+            FROM $propQueue q 
+            WHERE q.status_changed > $statusChangeTime AND q.status = 4 AND q.reason = 0
+            AND retry_count = 0
+            ORDER BY q.id desc",
+    };
+
+    $queries{"$propQueue: documents failed to propagate due to race condition in last $hoursAgo hrs"} = {
+        recordMaxResults => 20000,
+        recordDataType=> "gauge",
+        recordItem => "numrows",
+        runForCommunities => $communitiesList,
+        aggregationMethod => "rows",
+        format => "$propQueue.id %s $propQueue.item %s\n",
+        info => "numrows < 20",
+        warn => "numrows >= 20",
+        crit => "numrows > 300",
+        ticketOnWarnOpenAfterMinutes => 1,
+        sql => "SELECT /*+ INDEX(q $propQueueIndex)  */ distinct q.id, q.item 
+            FROM $propQueue q 
+            WHERE q.status_changed > $statusChangeTime AND q.status = 4 AND q.reason = 1
+            ORDER BY q.id desc",
+    };
+
+    $hoursAgo = 1;
+    $statusChangeTime = (time() - ($hoursAgo * 60 * 60)) * 1000; # q.status_changed is in milliseconds
+
+    $queries{"$propQueue: ICS invoices that fail to make to buyer communities in $hoursAgo hours"} = {
+        recordMaxResults => 20000,
+        recordDataType=> "gauge",
+        recordItem => "numrows",
+        runForCommunities => $communitiesList,
+        aggregationMethod => "rows",
+        format => "$propQueue.id %s $propQueue.item %s buyer %s provider %s\n",
+        info => "numrows < 1",
+        warn => "numrows >= 1",
+        crit => "numrows > 100",
+        ticketOnWarnOpenAfterMinutes => 60,
+        sql => "SELECT /*+ INDEX(q $propQueueIndex)  */ distinct q.id, q.item, bo.name, o.name
+            FROM $propQueue q, cxml_document d, provider_doc pdoc, org_join o, org_join bo
+            WHERE q.status IN (4) AND q.status_changed > $statusChangeTime AND q.item = d.id AND
+            d.document_type='InvoiceDetailRequest' AND d.id = pdoc.document AND pdoc.provider = o.id
+            AND bo.id = d.to_org
+            ORDER BY q.id desc",
+    };
+}
+
+sub process_rate_queries {
+    my %qq;
+    foreach my $queue (sort keys %queues) {
+        foreach my $subdir ( "", @communityIds ) {
+            my $qname = "$queue: total length";
+            $qname .= " for community $subdir" if($subdir);
+            my $instance = ariba::monitor::Query->generateInstanceName(
+                $qname, "an", $me->customer(), $me->currentCluster(), $subdir
+            );
+            my $totalQuery = ariba::monitor::Query->new($instance);
+
+            $qname = "$queue: completed length";
+            $qname .= " for community $subdir" if($subdir);
+            $instance = ariba::monitor::Query->generateInstanceName(
+                $qname, "an", $me->customer(), $me->currentCluster(), $subdir
+            );
+            my $completedQuery = ariba::monitor::Query->new($instance);
+
+            my ($egress, $ingress, $delta) = (undef, undef, undef);
+
+            #
+            # at midnight, when seven days ago changes, our result counters
+            # will shrink.  We'll just skip this pass.
+            #
+            if( $totalQuery->hasAttribute('previousResults') &&
+                $totalQuery->results() >= $totalQuery->previousResults()
+            ) {
+                my $interval = $totalQuery->checkTime() - $totalQuery->previousCheckTime();
+                $interval /= 3600;
+
+                $egress = ($completedQuery->results() - $completedQuery->previousResults()) / $interval;
+                $egress = (int($egress*100))/100;
+                $ingress = ($totalQuery->results() - $totalQuery->previousResults()) / $interval;
+                $ingress = (int($ingress*100))/100;
+
+                $delta = $ingress - $egress;
+                $delta = (int($delta*100))/100;
+            }
+
+            my $uiHint = "Aggregated";
+            $uiHint = "community $subdir" if($subdir);
+
+            $qname = $queue;
+            $qname .= " in community $subdir" if($subdir);
+
+            $qq{"$qname egress rate (items per hour)"} = {
+                info => 1,
+                perl => $egress,
+                uiHint => $uiHint,
+                recordMaxResults => 20000,
+                recordDataType => "gauge",
+                recordDataUnits => "items/hour",
+                recordItem => "answer",
+            };
+
+            $qq{"$qname ingress rate (items per hour)"} = {
+                info => 1,
+                perl => $ingress,
+                uiHint => $uiHint,
+                recordMaxResults => 20000,
+                recordDataType => "gauge",
+                recordDataUnits => "items/hour",
+                recordItem => "answer",
+            };
+
+            $qq{"$qname size change rate (items per hour)"} = {
+                info => 1,
+                perl => $delta,
+                uiHint => $uiHint,
+                recordMaxResults => 20000,
+                recordDataType => "gauge",
+                recordDataUnits => "items/hour",
+                recordItem => "answer",
+            };
+        }
+    }
+
+    my $qqm = ariba::monitor::QueryManager->newWithDetails(
+        "queue-egress-and-ingress", "an", $me->service, $me->customer(), \%qq
+    );
+    $qqm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

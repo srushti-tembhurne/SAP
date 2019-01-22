@@ -1,0 +1,187 @@
+#!/usr/local/bin/perl -w
+
+###############################################################################
+# $Id: //ariba/services/monitor/bin/an/aribapay-status#7 $
+# $HeadURL:$
+#
+# Copyright (c) 2013 Ariba
+#
+# aribapay-status - Monitor AribaPay
+#
+###############################################################################
+
+=head1 NAME
+
+aribapay-status - Monitor AribaPay
+
+=head1 SYNOPSIS
+
+aribapay-status [options]
+
+=head1 OPTIONS
+
+=over
+
+=item B<-help|-h>
+
+Print this usage information and exit.
+
+=item B<-debug|-d>
+
+Enable debugging output / dryrun
+
+=item B<-e>
+
+Enable sending of emails
+
+=item B<-p>
+
+Enable sending of pages
+
+=back
+
+=head1 DESCRIPTION
+
+C<aribapay-status> - Monitor the status of AribaPay
+
+=cut
+
+=author
+
+Nathan Sullivan C<< <nsullivan@ariba.com> >>
+
+=head1 LICENSE
+
+Copyright 2013 Ariba
+
+=cut
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use Pod::Usage;
+use Getopt::Long;
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use Data::Dumper;
+
+my $debug = 0;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    GetOptions(
+        "help|h" => sub { pod2usage(1); },
+        "debug|d+" => \$debug,
+        "e" => \$sendEmail,
+        "p" => \$sendPage,
+    );
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $an = ariba::rc::InstalledProduct->new("an", $mon->service());
+    my $cluster = $mon->currentCluster();
+    my $email = $mon->default('notify.email');
+    my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+    my $communitiesList = join(", ", ( grep { ( $_ % 2 ) == 0 } @communityIds ) );
+    my $monserver = ariba::Ops::PageUtils::monitorServer(); 
+
+    my %squeries = ();
+    $squeries{influx_details} = { measurement => 'an_aribapay_status'};
+
+    my $pingUrl = $an->default("WOCGIAdaptorURLSecure");
+    $pingUrl .= "/ANAS2Gateway.aw/ad/pingDiscover";
+    my $monUrl = ariba::monitor::Url->new($pingUrl);
+    $monUrl->setTimeout(30);
+    my @results = $monUrl->request();
+    my $result = $monUrl->error() || join(' ', @results);
+
+    $squeries{"AribaPay Discover Status"} = {
+        crit => "answer !~ /OK/",
+        description => "Result of a test transaction with provider",
+        severity => 1,
+        perl => "return '$result';",
+        inf_field => qq(discover_status),
+        inf_default => qq(none),
+    };
+
+    my $pingFirstDataUrl = $an->default("WOCGIAdaptorURLSecure")."/ANAS2Gateway.aw/ad/pingFirstData";
+    my $monUrl2 = ariba::monitor::Url->new($pingFirstDataUrl);
+    $monUrl2->setTimeout(30);
+    my @result2s = $monUrl2->request();
+    my $result2 = $monUrl2->error() || join(' ', @result2s);
+
+    $squeries{"AribaPay FirstData Status"} = {
+        crit => "answer !~ /OK/",
+        description => "Result of a aribapay first data status",
+        severity => 1,
+        perl => "return '$result2';",
+        inf_field => qq(firstdata_status),
+        inf_default => "none",
+    };
+
+    $squeries{"Payment Batch in Failed Status"} = {
+        warn    => "numrows > 0",
+        sql => q`select count(*) as pb_failed_status_cnt
+                 from payment_batch pb
+                 inner join org oj on oj.id = pb.org
+                 inner join payment_method pm on pm.id = pb.payment_method
+                 where pb.status='error' and pm.name='aribapay'`,
+    };
+
+    $squeries{"Payment Batch without Status Update"} = {
+        warn    => "numrows > 0",
+        sql => q`select count(*) as pb_wo_status_upd_cnt
+                 from payment_batch p
+                 inner join org oj on oj.id = p.org
+                 inner join payment_method pm on pm.id = p.payment_method
+                 where p.status='sent' and pm.name='aribapay' and p.created < (sysdate - 1/24)`,
+    };
+
+    $squeries{"Remittances with No Status Updates"} = {
+        warn    => "numrows > 0",
+        runForCommunities => $communitiesList,
+        sql => q `select count(*) as remit_w_no_status_upd_cnt
+                 from cxml_document cd, org_join oj1, org_join oj2, payment_remittance p
+                 inner join payment_method_join pm on pm.id=p.payment_method
+                 where cd.id=p.GENERIC_DOCUMENT and cd.document_status not in ('Failed', 'Paid')
+                 and pm.name='aribapay' and oj1.id=cd.from_org and oj2.id=cd.to_org and
+                 cd.document_type='PaymentRemittanceRequest' and sysdate > cd.document_date`,
+    };
+
+    $squeries{"Remittances in Temporary Error State"} = {
+        warn    => "numrows > 0",
+        runForCommunities => $communitiesList,
+        sql => q`select count(*) as remit_temp_err_state
+                 from cxml_document cd, org_join oj1, org_join oj2, payment_remittance p
+                 inner join payment_method_join pm on pm.id=p.payment_method
+                 where cd.id=p.GENERIC_DOCUMENT and cd.document_status='Failed'
+                 and p.detail_status_code like '4%'
+                 and pm.name='aribapay' and oj1.id=cd.from_org and oj2.id=cd.to_org and
+                 cd.document_type='PaymentRemittanceRequest'`,
+    };
+
+    $squeries{"Missing PRSUR 2001"} = {
+      warn    => "numrows > 0",
+      runForCommunities => $communitiesList,
+      sql => q`select count(*) as missing_prsur_2001
+               from cxml_document cd, org_join oj1, org_join oj2, payment_remittance p inner join
+               payment_method_join pm on pm.id=p.payment_method where cd.id=p.GENERIC_DOCUMENT and 
+               cd.document_status = 'Sent' and p.detail_status_code is NULL and pm.name='aribapay' and oj1.id=cd.from_org and oj2.id=cd.to_org and cd.document_type='PaymentRemittanceRequest' and sysdate > (cd.created + 2/24)`,
+     };
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('aribapay', $an->name(), $mon->service(), undef, \%squeries);
+    $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+}
+
+main(@ARGV);
+
+__END__

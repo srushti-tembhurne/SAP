@@ -1,0 +1,400 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/dms/dms-metrices#1 $
+#
+#
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../lib/perl";
+use lib "$FindBin::Bin";
+
+use JSON;
+use ariba::monitor::Url;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use Data::Dumper;
+require "geturl";
+my $debug = 0;
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -r        To get the realm level metric data.
+    -n        To get the node level metric data.
+    -ds       To get the dataSource specific metric data.
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode.
+    -h        Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+my %lookup = (
+    'scheduledJobs'         => [ 'success', 'failure', 'created', 'processing' ],
+    'inBoundMessageQueue'   => [ 'success', 'failure', 'created', 'processing' ],
+    'outBoundMessageQueue'  => [ 'success', 'failure', 'created', 'processing' ],
+    'fileImport'            => [ 'cancelled' ],
+);
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $dsParam = 0;
+    my $realmParam = 0;
+    my $nodeParam = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail++;    next; }
+        if ($arg =~ /^-p$/o) { $sendPage++;     next; }
+        if ($arg =~ /^-n$/o)  { $nodeParam++;   next; } # Node level queries will be executed.
+        if ($arg =~ /^-ds$/o) { $dsParam++;     next; } # DataSource queries will be executed.
+        if ($arg =~ /^-r$/o)  { $realmParam++;  next; } # Realm level queries will be executed.
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled('dms', $me->service()));
+    my $dms = ariba::rc::InstalledProduct->new('dms', $me->service());
+    my $cluster = $dms->currentCluster();
+    my %queries;
+
+    if ( $realmParam ) {
+        #Realm specific metrics
+        #Gather data from front-door URL
+
+        my $url = $dms->default("VendedUrls.FrontDoor");
+        $url .= '/monitor/metrices';
+        my $data =  gatherData( $url );
+
+        if ( $data ){
+            my $realms = $data->{realms};
+
+            foreach my $realm ( @$realms ) {
+                my $realmData = $realm->{realm};
+                my $realmid = $realmData->{realm_id};
+        
+                foreach my $field (keys %lookup) {
+                    my $fieldData = $realmData->{$field};
+                    my $result = ( defined $fieldData ) ? 1 : 0; # 1 = "Yes", 0 = "No"
+                    $queries{"Data fetched for $field in realm $realmid"} = {
+                            'uiHint'             => "Realms / Realm $realmid / $field",
+                            'info'               => "answer eq 'Yes'",
+                            'warn'               => "answer eq 'No'",
+                            'severity'           => 1,
+                            'perl'               => sub { return $result},
+                            'inf_field'          => "data_fetched",
+                            'inf_default'        => 0,
+                            'inf_tags'           => qq(field="$field",realmid="$realmid"),
+                            'group_by'           => qq($realmid,$field),
+                        };
+                        
+                    if ( defined $fieldData ) {
+                        # parameter to look for this particular field
+                        # e.g. ScheduleJobs:'success/failure/created/processing', FileImport:'cancelled'
+                        my $parameters = $lookup{$field};
+                        # There can be multiple types of same field
+                        # e.g. Types of ScheduleJobs can be BOMUploadPostProcess, ITEM_MASTER_PULL, S4_UOM_PULL , etc.
+                        foreach my $type (@$fieldData) {
+
+                            foreach my $param (@$parameters) {          
+                                my $info = 1 ;
+                                my $warn = 0;
+
+                                if ( $param =~ /failure|cancelled/ ){
+                                    #As per the requirement: if param is other than failure/cancelled NO threshold/action needed.
+                                    $info = "answer > -1" ;
+                                    $warn = "answer > 5";
+                                }
+                                $queries{"$param $field of type $type->{type} in realm $realmid"} = {
+                                        'recordMaxResults'  => 180,
+                                        'recordDataType'    => 'gauge',
+                                        'recordOnError'     => 1,
+                                        'uiHint'            => "Realms / Realm $realmid / $field",
+                                        'severity'          => 1,
+                                        'perl'              => sub { return $type->{$param} },
+                                        'inf_field'         => "cnt",
+                                        'inf_default'       => 0,
+                                        'inf_tags'          => qq(action="$param",field="$field",type="$type->{type}",realmid="$realmid"),
+                                        'group_by'          => qq($realmid,$param,$field,$type->{type}),
+                                        'info'              => $info,
+                                        'warn'              => $warn,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+    for my $instance ( $dms->appInstances() ) {
+       
+        if ( $instance->isSpringbootApp ) {
+
+            if ($nodeParam){
+                #Node specific metrics
+                #Gather data from nodes
+                my $nodeUrl = $instance->dmsNodeLevelMetricsURL();
+                my $data =  gatherData( $nodeUrl );
+
+                if ($data) {
+                    my $nodeData = $data->{node};
+                    my $nodeName = $nodeData->{nodeName};
+                    # As per requirement, inBoundMessageQueue & outBoundMessageQueue not needed for node level metrics
+                    delete $lookup{inBoundMessageQueue};
+                    delete $lookup{outBoundMessageQueue};
+
+                    foreach my $field (keys %lookup) {
+                        my $fieldData = $nodeData->{$field};
+                        my $result = ( defined $fieldData ) ? 1 : 0; # 1 = "Yes" 0 = "No"
+                        $queries{"Data fetched for $field for node $nodeName"} = {
+                                'uiHint'             => "Nodes / Node $nodeName / $field",
+                                'info'               => "answer eq 'Yes'",
+                                'warn'               => "answer eq 'No'",
+                                'severity'           => 1,
+                                'perl'               => sub { return $result},
+                                'inf_field'          => 'data_fetched',
+								'inf_default'        => 0,
+                                'inf_tags'           => qq(field="$field",node="$nodeName"),
+                                'group_by'           => qq($nodeName,$field),
+                                    };
+
+                        if ( defined $fieldData ) {
+                            # parameter to look for this particular field
+                            # e.g. ScheduleJobs:'success/failure/created/processing', FileImport:'cancelled'
+                            my $parameters = $lookup{$field};
+                            # There can be multiple types of same field
+                            # e.g. Types of ScheduleJobs can be BOMUploadPostProcess, ITEM_MASTER_PULL, S4_UOM_PULL , etc.
+
+                            foreach my $type (@$fieldData) {
+
+                                foreach my $param (@$parameters) {
+                                    my $info = 1;
+                                    my $warn = 0;
+
+                                    if ( $param =~ /failure|cancelled/ ){
+                                        #As per the requirement: if param is other than failure/cancelled NO threshold/action needed.
+                                        $info = "answer > -1" ;
+                                        $warn = "answer > 5";
+                                    }
+                                    $queries{"$param $field of type $type->{type} in node $nodeName"} = {
+                                            'recordMaxResults'  => 4500,
+                                            'recordDataType'    => 'gauge',
+                                            'recordOnError'     => 1,
+                                            'uiHint'            => "Nodes / Node $nodeName / $field",
+                                            'severity'          => 1,
+                                            'perl'              => sub { return $type->{$param} },
+                                            'inf_field'         => "cnt",
+                                            'inf_default'       => 0,
+                                            'inf_tags'          => qq(action="$param",field="$field",type="$type->{type}",node="$nodeName"),
+                                            'group_by'          => qq($nodeName,$param,$field,$type->{type}),
+                                            'info'              => $info,
+                                            'warn'              => $warn,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if ($dsParam){
+                #Datasource specific metrics
+                my $dataSourceUrl = $instance->dmsDatasourceMetricsURL();
+                my $datasourceData =  gatherData( $dataSourceUrl );
+
+                if ($datasourceData){
+                    my @params = ("activeConnections", "idleConnections", "maxConnections", "effectiveUsage" );
+                    my $dataSources = $datasourceData->{dataSources};
+
+                    foreach my $source ( @$dataSources ) {
+                        my $name = $source->{dataSourceName};
+                        my $nodeName = $datasourceData->{nodeName};
+
+                        foreach my $param (@params) {
+                            my $info = 1;
+                            my $warn = 0;
+
+                            if ( $param =~ /activeConnections/ ){
+                                #As per the requirement: if param is other than activeConnections NO threshold/action needed.
+                                $info = "answer > -1" ;
+                                $warn = "answer > 30";
+                            }
+                            $queries{"$param of dataSourceName $name in node $nodeName"} = {
+                                    'recordMaxResults'  => 4500,
+                                    'recordDataType'    => 'gauge',
+                                    'recordOnError'     => 1,
+                                    'uiHint'            => "Nodes / Node $nodeName / Database Connection Monitoring /dataSourceName $name/ $param",
+                                    'severity'          => 1,
+                                    'perl'              => sub { return $source->{$param} },
+                                    'inf_field'         => "cnt",
+                                    'inf_default'       => 0,
+                                    'inf_tags'          => qq(action="$param",datasource="$name",node="$nodeName"),
+                                    'group_by'          => qq($nodeName,$param,$name),
+                                    'info'              => $info,
+                                    'warn'              => $warn,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (%queries) {
+        #my $email = $me->default('notify.email');
+        my $email = $me->default('DL_5A20FDE65F99B71551000010@exchange.sap.corp');
+        $queries{'influx_details'} = {measurement => 'dms_metrics'};
+        my $qm = ariba::monitor::QueryManager->newWithDetails('dms-metrices', $dms->name(), $dms->service(), undef, $cluster, \%queries);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+
+}
+
+
+sub gatherData {
+
+    ## build URL, scrape, return response
+    my $url = shift;
+
+    print "Scraping DMS Metrics from '$url'\n" if $debug;
+
+    my $timeout = 300;
+    my @output;
+    my @errors;
+    my @geturlArgs = ("-e","-q","-timeout",$timeout,"-results",\@output, "-errors", \@errors);
+
+        eval 'main::geturl(@geturlArgs, $url);';
+
+        if ($@) {
+                print " Connection to DA failed: $@\n";
+                if (scalar(@errors)) {
+                    print "Connection to DA returned the following: ", join("\n", @errors), "\n";
+                }
+                return;
+        }
+         else {
+
+            my $json = JSON->new->ascii->allow_nonref;
+            my $result ;
+            my $response = join "", @output;
+
+            #Avoiding surprises
+            eval {
+                 $result = $json->decode( $response );
+            };
+            if($@) {
+                print "Error in decoding url [$url] response: [$@]\n";
+                return;
+            }
+          return $result;
+    }
+}
+
+
+#
+# sample output DEV8 service
+# http://svcdev8ss.ariba.com/dms/monitor/metrices
+=head
+
+{  
+   "status":"OK",
+   "statusCode":200,
+   "fetchSize":0,
+   "pageNumber":0,
+   "totalRecords":0,
+   "totalPages":0,
+   "errorMessages":[  
+
+   ],
+   "debugInfo":{  
+      "requestProcessingTime":null,
+      "storeProcessingTime":null
+   },
+   "realms":[  
+      {  
+         "realm":{  
+            "realm_id":"s4All-21",
+            "scheduledJobs":[  
+               {  
+                  "type":"AML_PULL",
+                  "lastSuccessfulRunTime":1481029200597,
+                  "sourceId":"DMSE2E",
+                  "success":3831,
+                  "failure":38990,
+                  "created":11,
+                  "processing":0
+               },
+            ],
+            "inBoundMessageQueue":[  
+               {  
+                  "type":"ITEM_PRICE",
+                  "success":3,
+                  "failure":0,
+                  "created":0,
+                  "processing":0
+               }
+            ],
+            "outBoundMessageQueue":[  
+               {  
+                  "type":"PIR",
+                  "success":0,
+                  "failure":0,
+                  "created":2,
+                  "processing":0
+               }
+            ],
+            "fileImport":null
+         }
+      },
+      {  
+         "realm":{  
+            "realm_id":"s4All-7",
+            "scheduledJobs":[  
+               {  
+                  "type":"BOMUploadPostProcess",
+                  "lastSuccessfulRunTime":1480412584699,
+                  "sourceId":"s4All-7",
+                  "success":2134,
+                  "failure":43828,
+                  "created":0,
+                  "processing":0
+               },
+            ],
+            "inBoundMessageQueue":null,
+            "outBoundMessageQueue":null,
+            "fileImport":[  
+               {  
+                  "type":"DataMigration",
+                  "inProgress":0,
+                  "completed":39,
+                  "cancelled":0
+               }
+            ]
+         }
+      }
+   ]
+}
+
+=cut
+
+main(@ARGV);
+
+__END__

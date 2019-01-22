@@ -1,0 +1,179 @@
+#!/usr/local/bin/perl
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::rc::RolesManager;
+use Data::Dumper;
+use LWP::Simple;
+use YAML;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my %queries;
+    my $mon = ariba::rc::InstalledProduct->new(); # for emailing
+    my @wsProds = qw{ ssws mws };
+
+    foreach my $wsProd ( @wsProds ){
+        my $ws = ariba::rc::InstalledProduct->new( $wsProd );
+        exit unless ( $ws );
+
+        $queries{'modjk worker status'} = {
+            warn                            => 'numrows > 0 and answer =~ /Warn/',
+            crit                            => 'numrows > 0 and answer =~ /Crit/',
+            ticketOnWarnOpenAfterMinutes    => 1,
+            perl                            => sub { return runQuery( $ws ); },
+            correctiveActions => [
+                Ops                         => 'Please look into the node on the webserver.',
+            ],
+            description                     => "modjk worker status for given webserver, app, tasknode",
+	        timeout                         => 600,
+            inf_field                       => "status",
+            inf_default                     => "none",
+        };
+ 
+        $queries{'influx_details'} = { measurement => 'ssws_modjk_worker_status' };
+        my $email = $mon->default('notify.email');
+        my $qm = ariba::monitor::QueryManager->newWithDetails('modjk-worker-status', $ws->name(), $ws->service(), $ws->customer(), \%queries);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub runQuery {
+    my $ws = shift;
+    my $wsName = shift || 'ssws';
+    my $dataRef = {}; # holds data of nodes returing non-OK status
+    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+    
+    # the purpose of this tmpFile is to store the result from last run
+    # if node status is bad for 2 consecutive tries then we'll raise a crit.
+    my $tmpFile = "/tmp/modjk-worker-status.tmp";
+    if ( -f $tmpFile ) {
+        $dataRef = eval{ YAML::LoadFile( $tmpFile ); };
+        $dataRef = {} unless ( $dataRef ); # if loading should fail, we can't leave $ref being undef
+    }
+
+    my $rolesMgr = ariba::rc::RolesManager->new( $ws->configDir(), $wsName, $ws->service(),  $ws->buildName() );
+    my $role = ( $wsName eq 'ssws' ) ? 'ss-webserver' : 'mwswebserver';
+    my @webservers = $rolesMgr->hostsForRoleInCluster( $role, "primary" );
+    my $port = $ws->default( "WebServerHTTPPort" );
+    my @answers;
+
+    for my $webserver ( @webservers ) {
+        my $url = "http://$webserver:$port/jkstatus";
+        $query->setUrl( $url );
+        my $content = LWP::Simple::get( $url );
+        unless ( $content ) {
+            #push @answers, "Could not fetch jkstatus from $webserver: Warn";
+            next;
+        }
+        push @answers, parseAndUpdate( $dataRef, $content, $webserver );
+    }
+
+    YAML::DumpFile( $tmpFile, $dataRef );
+    return join( "\n", sort @answers );
+}
+
+# This sub will parse HTML, update the reference, then populates warn / crit conditions into an array and return it.
+sub parseAndUpdate {
+    my ( $ref, $content, $webserver ) = @_;
+    my @lines = split( /\n/, $content );
+    
+#<hr/>
+#<h3>Worker Status for <a href="/jkstatus?cmd=show&w=buyerTaskCXML_C6">buyerTaskCXML_C6</a></h3>
+#<table><tr><th>Type</th><th>Sticky session</th><th>Force Sticky session</th><th>Retries</th><th>Method</th><th>Lock</th></tr>
+#<tr><td>lb</td><td>True</td><td>False</td><td>3</td><td>Request</td><td>Optimistic</td></tr>
+#
+#</table>
+#<br/>
+#<table><tr><th>Name</th><th>Type</th><th>Host</th><th>Addr</th><th>Stat</th><th>F</th><th>V</th><th>Acc</th><th>Err</th><th>Wr</th><th>Rd</th><th>Busy</th><th>Max</th><th>RR</th><th>Cd</th></tr>
+#
+#<tr>
+#<td><a href="/jkstatus?cmd=show&w=TaskCXML18820029">TaskCXML18820029</a></td><td>ajp13</td><td>app355.ariba.com:20029</td><td>10.10.14.188:20029</td><td>Error</td><td>1</td><td>0</td><td>1</td><td>1</td><td>  0 </td><td>  0 </td><td>0</td><td>1</td><td>&nbsp;</td><td>
+#
+#&nbsp;</td>
+#</tr>
+#<tr>
+#<td><a href="/jkstatus?cmd=show&w=TaskCXML18720028">TaskCXML18720028</a></td><td>ajp13</td><td>app354.ariba.com:20028</td><td>10.10.14.187:20028</td><td>Error</td><td>1</td><td>2</td><td>1</td><td>1</td><td>  0 </td><td>  0 </td><td>0</td><td>1</td><td>&nbsp;</td><td>
+#
+#&nbsp;</td>
+#</tr>
+#</table><br/>
+#<hr/>
+
+    my $app;
+    my @answers;
+
+    for my $line ( @lines ) {
+        if ( $line =~ m|<h3>Worker Status for <[^>]+>(.*)</a></h3>| ) {
+            $app = $1;
+        }
+        elsif ( $line =~ m|<td><[^>]+>(.*)</a></td>(?:<td>.*?</td>){3}<td>(.*?)</td>| ) {
+            my ( $taskNode, $status ) = ( $1, $2 );
+
+            # Bogus workers added to workaround a bug in modjk.
+            # They are supposed to be down (because they don't exist), ignore them
+            next if ($taskNode eq "XX" || $taskNode eq "XX*XX");
+
+            if ( my $prevStatus = $ref->{ $webserver }->{ $app }->{ $taskNode }->{ status } ) {
+                unless ( $prevStatus eq "OK" || $prevStatus eq "Recovering" ) { # precautious check on inadvertent autovivification
+                    unless ( $status eq "OK" || $status eq "Recovering" ) {
+                        push @answers, "Crit: $webserver $app $taskNode: $status";              # status wasn't OK / Recovering for two consecutive times
+                        $ref->{ $webserver }->{ $app }->{ $taskNode } = { status => $status };  # just in case the status may have changed from error1 to error2
+                        next;
+                    }
+                    else {
+                        delete $ref->{ $webserver }->{ $app }->{ $taskNode };
+                        next;
+                    }
+                }
+            }
+            else {
+                unless ( $status eq "OK" || $status eq "Recovering" ) {
+                    #push @answers, "Warn: $webserver $app $taskNode: $status"; # status didn't exist and not OK or Recovering
+                    $ref->{ $webserver }->{ $app }->{ $taskNode } = { status => $status };
+                }
+            }
+        }
+    }
+    
+    return @answers;
+}
+
+main(@ARGV);
+
+__END__

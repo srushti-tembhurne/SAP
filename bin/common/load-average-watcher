@@ -1,0 +1,103 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/load-average-watcher#9 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::CircularDB;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::monitor::OutageSchedule;
+
+# this script does the following:
+# 1. runs on mon nodes, generates a list of hosts providing DB service
+# 2. for each machine, finds the # of cores from machineDB; sets crit to 8x cores and open ToW ticket
+# 3. extracts 30-min moving average of 5-min load average from CDB, raises a query if it is above the threshold
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $debug     = 0;
+
+    # tmid:161074
+    my $machineStatsDoc = "https://wiki.ariba.com:8443/display/ENGDPTS/Machinestats";
+    my $note = "\n<html>For load average issues, see <a href=\"$machineStatsDoc\">$machineStatsDoc</a></html>";
+
+    while ( my $arg = shift ( @ARGV ) ) {
+        if ( $arg =~ /^-d/o ) { $debug     = 1; }
+        if ( $arg =~ /^-e/o ) { $sendEmail = 1; }
+        if ( $arg =~ /^-p/o ) { $sendPage  = 1; }
+    }
+
+    my $me          = ariba::rc::InstalledProduct->new();
+    my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts( $me );
+
+    for my $datacenter ( @dataCenters ) {
+        my %matchDatacenter = (
+            status               => 'inservice',
+            datacenter           => $datacenter,
+            monitoringDatacenter => '',
+            providesServices => 'db, hana, hadoop', 
+        );
+
+        my %matchMonitoringDatacenter = (
+            status               => 'inservice',
+            monitoringDatacenter => $datacenter,
+            providesServices => 'db, hana, hadoop', 
+        );
+
+        my @machines = ariba::Ops::Machine->machinesWithProperties( %matchDatacenter );
+        push ( @machines, ariba::Ops::Machine->machinesWithProperties( %matchMonitoringDatacenter ) );
+
+        my %queries = ();
+
+        for my $machine ( @machines ) {
+            my $hostname = $machine->hostname();
+            my $cpuCores = $machine->cpuCount();
+            my $crit = $cpuCores * 8; # crit threshold = # of cores * 8
+            
+            print "hostname: $hostname cpucores: $cpuCores crit: $crit \n" if $debug;
+
+            # average over 6 samples by default (30 minutes)
+            my $samples = 6;
+            my $cdbName = "average(snmp/$hostname/Load_Average__5_min_, $samples)";
+
+            $queries{ qq!$hostname load average! } = {
+                format          => "%.1f\n",
+                info            => "answer eq '' or answer > -1",
+                crit            => "answer eq '' or answer > $crit or answer > 250",
+                note            => $note,
+                extractRecorded => $cdbName,
+                description     => "Load average is the # of processes in CPU runqueue.  Generally speaking, processes are queuing up if load average goes above the number of CPU cores on the machine.",
+                correctiveActions => [
+                    Ops => 'Please run top or ps and investigate where the load is coming from, then work with DBA to investigate further.',
+                ],
+                inf_tags => qq|datacenter=$datacenter,hostname=$hostname,listener_host=$hostname|,
+                inf_field => "loadavg",
+                inf_default => 0,
+                group_by => "$datacenter,$hostname"
+            };
+            $queries{ qq!$hostname load average crit threshold! } = {
+                perl      => sub { $crit },
+                inf_field => "loadavg_crit_threshold",
+                inf_tags  => qq|datacenter=$datacenter,hostname=$hostname,listener_host=$hostname|,
+                group_by  => "$datacenter,$hostname"
+            };
+        }
+
+	$queries{influx_details} = {measurement => "load_average_watcher"};
+        my $email = $me->default( 'notify.email' );
+        my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter( $datacenter );
+        my $q = ariba::monitor::QueryManager->newWithDetails( "load-average", $pn, $me->service(), $me->customer(), \%queries );
+        $q->processQueries( $debug, $email, $sendEmail, $sendPage );
+    }
+}
+
+main();
+
+__END__

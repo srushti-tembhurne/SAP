@@ -1,0 +1,61 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/an/misc-status-account-deprecated#0 $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+
+sub main
+{
+    my $debug     = 0;
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while (my $arg = shift (@ARGV))
+    {
+        if ($arg =~ /^-d/o) {$debug     = 1;}
+        if ($arg =~ /^-e/o) {$sendEmail = 1;}
+        if ($arg =~ /^-p/o) {$sendPage  = 1;}
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $an = ariba::rc::InstalledProduct->new("an", $me->service());
+
+    my $queries = {};
+
+    $queries->{"Orgs in deprecating status for more than 3 hours"} = {
+        format                       => "org ANID %s since %s\n",
+        recordMaxResults             => 200,
+        recordItem                   => "numrows",
+        info                         => "1",
+        severity                     => "2",
+        note                         => "On warn open an S2 CR, downgrade this query for a week, and close this ticket.",
+        warn                         => "numrows > 0",
+        ticketOnWarnOpenAfterMinutes => "1",
+        sql                          => qq`
+                SELECT o.ANID as an_id, o.dbupdated as db_updated
+                FROM   org o
+                WHERE   o.status='Deprecating' AND
+                        o.dbupdated < sysdate - 3/24
+            `
+                                                                     };
+
+    my $email = $me->default('notify.email');
+    $queries->{influx_details} = {measurement => 'an_misc_status_account_deprecated'};
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails("misc-status", "an", $me->service, $me->customer(), $queries);
+
+    $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
+
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+}
+
+main();

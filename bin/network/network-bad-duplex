@@ -1,0 +1,136 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/network/network-bad-duplex#8 $
+ 
+use strict;
+use File::Basename;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::NetworkDeviceManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::rc::CipherStore;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use dmail::LockLib;
+
+my $debug = 0;
+my $lockFile = "/tmp/Stratus_" . basename($0);
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage  = 1; };
+		if ($arg =~ /^-d/o) { $debug     = 1; };
+	}
+
+	die "can't grab lock\n" unless dmail::LockLib::requestlock($lockFile, 5);
+
+	my $me    = ariba::rc::InstalledProduct->new();
+	my $email = $me->default('notify.email');
+
+	my $cipherStore    = ariba::rc::CipherStore->new($me->service());
+	my $accessPassword = $cipherStore->valueForName('networkAccess');
+	my $enablePassword = $cipherStore->valueForName('networkEnable');
+
+	my %queries  = ();
+
+	for my $datacenter ( ariba::Ops::ProductAPIExtensions::datacentersForProducts($me) ) {
+
+		for my $deviceType ('switch', 'router', 'loadbalancer', 'firewall') {
+
+			my %matchDatacenter = (
+				status     => 'inservice',
+				datacenter => $datacenter,
+				monitoringDatacenter => '',
+				providesServices => $deviceType,
+			);
+
+			my %matchMonitoringDatacenter = (
+				status     => 'inservice',
+				monitoringDatacenter => $datacenter,
+				providesServices => $deviceType,
+			);
+
+			my @machines = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+			@machines = (@machines , ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+
+			for my $machine (@machines) {
+
+				my $hostname = $machine->hostname();
+
+				my $networkDevice = ariba::Ops::NetworkDeviceManager->newFromMachine($machine);
+				unless($networkDevice) {
+					print "[DEBUG] driver init failed for $hostname: '$@', skipping...\n" if $debug;
+					$@ = undef; # clear the error
+					next;
+				}
+				$networkDevice->snmp()->setTimeout(30);
+
+				my $duplexErrors;
+
+				if ($deviceType eq 'switch' || $deviceType eq 'router') { 
+					print "working on $deviceType [$hostname] in $datacenter\n" if ($debug);
+
+					#Get duplex errors for switches and routers
+					$duplexErrors  = $networkDevice->combinedDuplexStatus();
+
+				}
+				elsif ($deviceType eq 'loadbalancer' || $deviceType eq 'firewall') {
+					print "working on $deviceType [$hostname] in $datacenter\n" if ($debug);
+
+					# Set passwords
+					if ($deviceType eq 'loadbalancer'){
+						$networkDevice->setAccessPassword($enablePassword);
+					} else {
+						$networkDevice->setAccessPassword($accessPassword);
+					}
+					$networkDevice->setEnablePassword($enablePassword);
+					$networkDevice->setDebug($debug) if $debug > 1;
+					
+					#Connect to the network device
+					$networkDevice->connect() || do {
+						print "Failed to log in to host $hostname, check password\n" if ($debug);
+						next;
+					};
+
+					#Get duplex errors for loadbalancers and firewalls
+					$duplexErrors  = $networkDevice->getDuplexState();
+				}
+
+				$queries{"$hostname duplex problems"} = {
+					uiHint => $deviceType,
+					noRowCount => 1,
+					info => "numrows > -1",
+					warn => "numrows > 0", 
+					crit => "answer =~ /half/i", 
+					perl => "return '$duplexErrors'",
+					inf_field => "duplex_error",
+					inf_default => "none",
+					inf_tags => "datacenter=$datacenter,host=$hostname,device_type=$deviceType",
+					group_by => "$datacenter,$deviceType,$hostname"
+				};
+			}
+		}
+
+		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+                $queries{influx_details} = {measurement => "network_bad_duplex"};
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			'network-bad-duplex', $pn, $me->service(), $me->customer(), \%queries
+		);
+
+		$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+		# After each datacenter reinit queries hash.
+		%queries  = ();
+	}
+	dmail::LockLib::releaselock($lockFile);
+}
+
+main();

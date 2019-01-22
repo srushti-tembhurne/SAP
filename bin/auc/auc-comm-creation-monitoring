@@ -1,0 +1,155 @@
+#!/usr/local/bin/perl
+
+#Jira-Id: https://product-jira.ariba.com/browse/HOA-105179
+# $Id: //ariba/services/monitor/bin/auc/auc-comm-creation-monitoring#1 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use JSON;
+use ariba::monitor::Url;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $me = ariba::rc::InstalledProduct->new('community', $mon->service()); 
+    
+    # Fetch data from URL
+    my $url = $me->default("SiteURLSecure");
+    $url .= '/internal/community_creation_monitoring.php?';
+    
+    my $timeCmd = 'date +%s -d "4 hour ago"';
+    
+    my $start_ts = `$timeCmd`;
+    chomp($start_ts);
+    my $duration_sec = 14400;
+    
+    $url .= 'start_ts='.$start_ts.'&duration_sec='.$duration_sec;
+ 
+    print "Scraping community creation metrics from '$url'\n" if $debug;
+    my $monUrl = ariba::monitor::Url->new( $url );
+    my $timeout = 30;
+    my $response = $monUrl->request($timeout);
+    my $json = JSON->new->ascii->allow_nonref;
+    my $result;
+    
+    #Avoiding surprises
+    eval {
+         $result = $json->decode( $response );
+    };
+    if($@) {
+        print "Error in decoding url [$url] response [$@] \n Exiting! \n";
+        exit();
+    }
+    
+    my %queries;
+
+     $queries{"Timed out community creation runs"} = {
+                    description        => 'Timed out community creation runs',
+                    note               => 'Community creation calls that started during the monitoring period and have not finished, and whose expected finished time has passed',
+                    recordMaxResults   => 180,
+                    recordDataType     => 'gauge',
+                    recordOnError      => 1,
+                    uiHint             => "Timed-out calls",
+                    crit               => "answer >= 1",
+                    info               => "answer == 0",
+                    severity           => 1,
+                    perl               => sub { return $result->{timed_out}},
+                    ticketOnWarnOpenAfterMinutes    => 1,
+                    ticketOwner                     => 'unassigned-prodops',
+                    ticketDueInDays                 => 'today',
+                    inf_field           => "timed_out",
+                    inf_default         => 0,
+                        };
+                        
+    $queries{"Community creations failed"} = {
+                    description        => 'Community creations failed',
+                    note               => 'Community creations failed unexpectedly',
+                    recordMaxResults   => 180,
+                    recordDataType     => 'gauge',
+                    recordOnError      => 1,
+                    uiHint             => "Creations failed",
+                    crit               => "answer >= 1",
+                    info               => "answer == 0",
+                    severity           => 1,
+                    perl               => sub { return $result->{failed}},
+                    inf_field           => "failed",
+                    inf_default         => 0,
+                        };
+
+        $queries{"Community creations succeeded"} = {
+                    description        => 'Community creations succeeded',
+                    note               => 'These runs of Community creations succeeded',
+                    recordMaxResults   => 180,
+                    recordDataType     => 'gauge',
+                    recordOnError      => 1,
+                    uiHint             => "Succeeded",
+                    info               => "answer >= 0",
+                    severity           => 1,
+                    perl               => sub { return $result->{succeeded}},
+                    inf_field           => "succeeded",
+                    inf_default         => 0,
+                                    };
+
+        $queries{"Total Community creations"} = {
+                    description        => 'Total Community creations',
+                    note               => 'The total number of community creation calls',
+                    recordMaxResults   => 180,
+                    recordDataType     => 'gauge',
+                    recordOnError      => 1,
+                    uiHint             => "Total community creation calls",
+                    info               => "answer >= 0",
+                    severity           => 1,
+                    perl               => sub { return $result->{total}},
+                    inf_field           => "total",
+                    inf_default         => 0,
+                                    };
+
+
+    my $email = $me->default('notify.email');
+    $email .= ',DL_5419DA6CFD84A00838000005@exchange.sap.corp';
+    $queries{'influx_details'} = { measurement => 'community_creation'};
+    my $qm = ariba::monitor::QueryManager->newWithDetails('Community Creation', $me->name(), $me->service(), $me->customer(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);
+
+__END__
+

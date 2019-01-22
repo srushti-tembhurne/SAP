@@ -1,0 +1,217 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/auc/current-memcached-connections#6 $
+
+###############################################################################
+# $Id: //ariba/services/monitor/bin/auc/current-memcached-connections#6 $
+# $HeadURL:$
+#
+# Copyright (c) 2014 Ariba
+#
+# current-memcached-connections - Monitor Current Memcached status
+#
+###############################################################################
+
+=head1 NAME
+
+current-memcached-connections - Monitor Current Memcached status
+
+=head1 SYNOPSIS
+
+current-memcached-connections [Options]
+
+=head1 OPTIONS
+
+=over
+
+=item B<-help|-h>
+
+Print this usage information and exit.
+
+=item B<-debug|-d>
+
+Enable debugging output / dryrun
+
+=item B<-e>
+
+Enable sending of emails
+
+=item B<-p>
+
+Enable sending of pages
+
+=item B<-product>
+
+Supply product name as the argument
+
+=back
+
+=head1 DESCRIPTION
+
+<current-memcached-connections> - Monitor Current Memcached status
+
+=cut
+
+=author
+
+Saran thiyagarajan<< <saran.thyagrajan@sap.com> >>
+
+=head1 LICENSE
+
+Copyright 2015 Ariba
+
+=cut
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use IO::Socket;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Url;
+use Data::Dumper;
+
+my $debug = 0;
+
+sub usage {
+	my $error = shift; 
+
+	print <<USAGE;
+Usage: $0 [-e|-p|-d|-h] -product  <<product name>>
+
+	-e    Enables sending of email for monitor query.
+	-p    Enables sending of pages for monitor query.
+	-d    Turns on debug mode. 
+	-h    Shows this help.
+	-product <<product name>>
+
+USAGE
+
+	print "(error) $error\n" if ($error);
+
+	exit();
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $productName;
+	my $isRunningCCM = "";
+
+	while (my $arg = shift) {
+		if ($arg =~ m/^-h$/o) { usage();		next; }
+		if ($arg =~ m/^-d$/o) { $debug++; 		next; }
+		if ($arg =~ m/^-e$/o) { $sendEmail = 1;	next; }
+		if ($arg =~ m/^-p$/o) { $sendPage = 1; 	next; }
+		if ($arg =~ m/^-product$/o) { $productName = shift; next; }
+
+		usage("Invalid argument: $arg");
+	}
+	
+	unless ( defined($productName) ) {
+		usage("Product name required");
+	}
+
+	my $mon = ariba::rc::InstalledProduct->new();
+	exit(0) unless ariba::rc::InstalledProduct->isInstalled($productName, $mon->service());
+
+	my $me = ariba::rc::InstalledProduct->new($productName, $mon->service());
+
+    my $memCachedExe = $me->default('AUC.Memcached.Exe') || $me->default('Memcached.Exe');
+    my $memCachedPort = $me->default('AUC.Memcached.Port') || $me->default('Memcached.Port') || 11211;
+
+	# Exit cleanly if Community is not configured for memcached
+	exit(0) unless $memCachedExe;
+
+	my %queries = ();
+
+    my @hosts;
+    my $emailId;
+    if ( $productName eq 'community' ) {
+        @hosts = $me->hostsForRoleInCluster("communityapp");
+        $emailId = 'DL_5419DA6CFD84A00838000005';
+    } else {
+        @hosts = $me->hostsForRoleInCluster("memcached");
+        $emailId = 'DL_53595553FD84A07365000008';
+    }
+    my $opsMsg = "On Critical escalate to $productName.  On warning file a ticket with $productName.  Email alias: $emailId";
+
+	for my $memCacheHost (@hosts) {
+		my $stats = ();
+
+		my $remote = IO::Socket::INET->new("$memCacheHost:$memCachedPort");
+		#$remote->timeout(15);
+
+
+		my $memCachedDown;
+		unless ( defined($remote) ) {
+			$memCachedDown = 1;
+			$queries{"$memCacheHost memcached isup"} = {
+				uiHint => "$memCacheHost",
+				crit => 1,
+				perl => sub { return "down" },
+                inf_field   => "is_up",
+                inf_default => "none",
+                inf_tags    => "mem_cache_host=\"$memCacheHost\"",
+                group_by    => $memCacheHost,
+			};
+		} else {
+			$remote->autoflush(1);
+			print $remote "stats\n";
+
+			while ( defined ( my $line = <$remote> ) ) {
+				last if ( $line =~ /END/ );
+				chomp $line;
+				my ($key, $value) = $line =~ /STAT (\S+)\s+(\S+)/;
+				$stats->{$key} = $value;
+			}
+		}
+
+		print "stats Dumper".Dumper($stats) if($debug);
+
+		$queries{"$memCacheHost current number of open connections"} = {
+				noRowCount => 1,
+				uiHint => "$memCacheHost",
+				recordMaxResults => 110000,
+				recordDataType => "gauge",
+				warn => "answer > 2000",
+				ticketOnWarnOpenAfterMinutes  => 1,
+				crit => "answer>4750 or  answer!~/[0-9]+/s",
+				perl => sub { return $stats->{'curr_connections'} },
+				correctiveActions => [
+                 	Ops => "$opsMsg", 
+        		],
+                inf_field   => "num_of_open_connection",
+                inf_default => 0,
+                inf_tags    => "mem_cache_host=\"$memCacheHost\"",
+                group_by    => $memCacheHost,
+		};
+		
+		$queries{"$memCacheHost accepting connections"} = {
+				noRowCount => 1,
+				uiHint => "$memCacheHost",
+				recordMaxResults => 110000,
+				recordDataType => "gauge",
+				crit => "answer == 0",
+				perl => sub { return $stats->{'accepting_conns'} },
+				correctiveActions => [
+                 	Ops => "$opsMsg",
+        		],
+                inf_field   => "accepting_connections",
+                inf_default => 0,
+                inf_tags    => "mem_cache_host=\"$memCacheHost\"",
+                group_by    => $memCacheHost,
+		};
+
+	}
+
+    $queries{'influx_details'} = { measurement => 'memcached_current_connections'};
+	my $q = ariba::monitor::QueryManager->newWithDetails( "Memcached Current Connections", $me->name(), $me->service(), $me->customer(), \%queries);
+
+	my $ret = $q->processQueries($debug, $me->default('notify.email'), $sendEmail, $sendPage);
+
+}
+
+main(@ARGV);
+
+__END__

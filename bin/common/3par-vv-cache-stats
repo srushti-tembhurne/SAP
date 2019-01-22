@@ -1,0 +1,186 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/common/3par-vv-cache-stats#13 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::NetworkDeviceManager;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::Startup::Common;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::FileSystemUtilsRPC;
+use ariba::Ops::DatacenterController;
+
+# keep about a year's worth of results, at 1 sample every 5 minutes
+my $MAX_RESULTS = 105120;
+
+sub main {
+
+	my $debug=0;
+	my $sendEmail=0;
+	my $sendPage=0;
+
+	while(my $arg=shift(@ARGV)){
+		if($arg =~ /^-d/o){ $debug++; }
+		if($arg =~ /^-e/o){ $sendEmail=1; };
+		if($arg =~ /^-p/o){ $sendPage=1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+
+	# set this so that inserv logs to the right place
+	$ENV{'LOGSDIR'} = ariba::Ops::Startup::Common::logsDirForProduct($me);
+	$main::quiet = 1 unless $debug >= 1;
+
+	my $cipherStore = ariba::rc::CipherStore->new( $me->service() );
+	my $username = "svc" . $me->service();
+	my $password = $cipherStore->valueForName($username);
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $machine = ariba::Ops::Machine->new($hostname);
+	my $datacenter = $machine->datacenter();
+
+	my @inservDevices = ariba::Ops::NetworkDeviceManager->newFromDatacenter($datacenter, 'inserv');
+
+	unless (scalar(@inservDevices)) {
+		print "no 3par units found in $datacenter" if $debug;
+		exit 1;
+	}
+
+	for my $nm (@inservDevices) {
+		$nm->setDebug($debug -1 ) if $debug >= 2;
+		$nm->setLogResponses(0);
+	}
+
+	$| = 1;
+
+	my @machines;
+
+	#
+	# in load (devlab), we only want to grab db servers used by mig, mig2, and
+	# load service... while in prod/lab we grab everything in datacenter.
+	#
+	if(ariba::Ops::DatacenterController::isDevlabDatacenters($datacenter)) {
+		my @products;
+		foreach my $service ('load', 'mig', 'mig2') {
+			push(@products, ariba::rc::InstalledProduct->new('an',$service));
+			push(@products, ariba::rc::InstalledProduct->new('s4',$service));
+			push(@products, ariba::rc::InstalledProduct->new('buyer',$service));
+		}
+		my %seenHosts;
+		foreach my $p (@products) {
+			my @hosts;
+			my @roles = grep { $_ =~ /^(?:dr-)?database/ } $p->allRolesInCluster('primary');
+			foreach my $r (@roles) {
+				push(@hosts, $p->hostsForRoleInCluster($r, 'primary'));
+			}
+
+			foreach my $dbHostname (@hosts) {
+				next if($seenHosts{$dbHostname});
+				my $m = ariba::Ops::Machine->new($dbHostname);
+				push(@machines, $m);
+				$seenHosts{$dbHostname} = 1;
+			}
+		}
+	} else {
+		my %match = (
+			'datacenter'       => $datacenter,
+			'providesServices' => 'storage',
+			'status'           => 'inservice',
+		);
+
+		@machines = ariba::Ops::Machine->machinesWithProperties(%match);
+	}
+
+	my %queries;
+
+	for my $storageMachine (@machines) {
+
+		# We can't log into bastion hosts to get the filesystem details
+		next if grep /^bastion$/, $storageMachine->providesServices();
+
+		my @fsList;
+		eval {
+			@fsList = ariba::Ops::FileSystemUtilsRPC::vvsForMountPoints(undef, $storageMachine->hostname(), $me->service())
+		};
+
+		## We should do something with this error.
+		next if $@;
+		for my $fsDetails (@fsList) {
+			my ($fs, $vvlist) = split(/:/, $fsDetails);
+			my ($fsTotalReadHits, $fsTotalReadAccesses);
+			my ($fsTotalWriteHits, $fsTotalWriteAccesses);
+			for my $vvInfo (split(/ /, $vvlist)) {
+				my ($vv, $WWn, $inservHostname) = split(/,/, $vvInfo);
+
+				next unless ($inservHostname);
+
+				my $nm = ariba::Ops::NetworkDeviceManager->newFromMachine(ariba::Ops::Machine->new($inservHostname));
+
+				die  "Can't build NetworkManager object for '$inservHostname'" unless $nm;
+
+				# The PO cache requires instance names to be distinct and we cannot guarantee that there will
+				# be no duplicat vv names between multiple inservs
+				$vv = $nm->hostname() . "-" . $vv;
+
+				if ($nm->vvCacheStats->{$vv}) {
+					$fsTotalReadHits += $nm->vvCacheStats->{$vv}->readHits()
+						if $nm->vvCacheStats->{$vv}->readHits();
+					$fsTotalReadAccesses += $nm->vvCacheStats->{$vv}->readAccesses()
+						if  $nm->vvCacheStats->{$vv}->readAccesses();
+
+					$fsTotalWriteHits += $nm->vvCacheStats->{$vv}->writeHits()
+						if $nm->vvCacheStats->{$vv}->writeHits();
+					$fsTotalWriteAccesses += $nm->vvCacheStats->{$vv}->writeAccesses()
+						if $nm->vvCacheStats->{$vv}->writeAccesses();
+				}
+			}
+
+			my $warning = 0;
+			$warning = $1 if ($fsDetails =~ /Warning: (.*)$/i);
+
+			my $fsTotalReadHitRatio = -1;  # we need to record 'none' (-1) to influx if no data
+			$fsTotalReadHitRatio = sprintf "%2.2f", $fsTotalReadHits / $fsTotalReadAccesses * 100
+				if $fsTotalReadAccesses;
+			$queries{"$fs Average Read Cache Hit Ratio"} = {
+				uiHint => "Cache/VV",
+				recordMaxResults => $MAX_RESULTS,
+				info => 1,
+				warn => "answer && answer =~ /Can't/",
+				crit => 0,
+				perl => sub { return $warning || $fsTotalReadHitRatio; },
+				inf_field => "read_cache_hit_ratio",
+				inf_tags  => "datacenter=\"$datacenter\",uiHint=\"VV\",fs=\"$fs\"",
+				inf_default => ""
+			};
+
+			my $fsTotalWriteHitRatio = -1;  # we need to record 'none' (-1) to influx if no data
+			$fsTotalWriteHitRatio = sprintf "%2.2f", $fsTotalWriteHits / $fsTotalWriteAccesses * 100
+				if $fsTotalWriteAccesses;
+			$queries{"$fs Average Write Cache Hit Ratio"} = {
+				uiHint => "Cache/VV",
+				recordMaxResults => $MAX_RESULTS,
+				info => 1,
+				warn => "answer && answer =~ /Can't/",
+				crit => 0,
+				perl => sub { return $warning || $fsTotalWriteHitRatio; },
+				inf_field => "write_cache_hit_ratio",
+				inf_tags  => "datacenter=\"$datacenter\",uiHint=\"VV\",fs=\"$fs\"",
+				inf_default => ""
+			};
+		}
+	}
+
+	my $email = $me->default('notify.email');
+	my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+	$queries{"influx_details"} = { 'measurement' => "3par_vv_cache_status"};
+	my $q = ariba::monitor::QueryManager->newWithDetails("3par-performance-stats", $tab, $me->service(), undef, \%queries);
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

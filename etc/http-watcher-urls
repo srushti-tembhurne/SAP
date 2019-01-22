@@ -1,0 +1,96 @@
+
+########################
+# urls from our products
+########################
+include ariba::HTTPWatcherPlugin::WOFAppInstance an
+include ariba::HTTPWatcherPlugin::DeploymentDefaultsUrls an
+include ariba::HTTPWatcherPlugin::ANServiceProviders an
+include ariba::HTTPWatcherPlugin::DBConnectivity an
+
+include ariba::HTTPWatcherPlugin::WOFAppInstance aod
+include ariba::HTTPWatcherPlugin::DeploymentDefaultsUrls aod
+
+include ariba::HTTPWatcherPlugin::WOFAppInstance estore
+include ariba::HTTPWatcherPlugin::DeploymentDefaultsUrls estore
+
+include ariba::HTTPWatcherPlugin::DeploymentDefaultsUrls ws
+
+include ariba::HTTPWatcherPlugin::DeploymentDefaultsUrls aesws
+
+include ariba::HTTPWatcherPlugin::DeploymentDefaultsUrls ssws
+
+include ariba::HTTPWatcherPlugin::DeploymentDefaultsUrls ows
+
+include ariba::HTTPWatcherPlugin::DeploymentDefaultsUrls mws
+
+include ariba::HTTPWatcherPlugin::DeploymentDefaultsUrls cws
+
+include ariba::HTTPWatcherPlugin::DeploymentDefaultsUrls cxml
+
+include ariba::HTTPWatcherPlugin::WOFAppInstance perf
+include ariba::HTTPWatcherPlugin::DeploymentDefaultsUrls perf
+
+include ariba::HTTPWatcherPlugin::WOFAppInstance ebs
+include ariba::HTTPWatcherPlugin::DeploymentDefaultsUrls ebs
+
+include ariba::HTTPWatcherPlugin::WOFAppInstance esig
+include ariba::HTTPWatcherPlugin::DeploymentDefaultsUrls esig
+
+include ariba::HTTPWatcherPlugin::AES aes
+
+include ariba::HTTPWatcherPlugin::TomcatAppInstance s4
+include ariba::HTTPWatcherPlugin::SSRealms s4 standalone
+include ariba::HTTPWatcherPlugin::SSRealms s4 integrated
+include ariba::HTTPWatcherPlugin::DBConnectivity s4
+
+include ariba::HTTPWatcherPlugin::TomcatAppInstance sdb
+include ariba::HTTPWatcherPlugin::DBConnectivity sdb
+
+include ariba::HTTPWatcherPlugin::TomcatAppInstance s4pm
+include ariba::HTTPWatcherPlugin::SSRealms s4pm
+include ariba::HTTPWatcherPlugin::DBConnectivity s4pm
+
+include ariba::HTTPWatcherPlugin::TomcatAppInstance anl
+include ariba::HTTPWatcherPlugin::DBConnectivity anl
+include ariba::HTTPWatcherPlugin::TomcatAppInstance acm
+include ariba::HTTPWatcherPlugin::DBConnectivity acm
+include ariba::HTTPWatcherPlugin::TomcatAppInstance s2
+include ariba::HTTPWatcherPlugin::DBConnectivity s2
+include ariba::HTTPWatcherPlugin::TomcatAppInstance cdbuyer
+include ariba::HTTPWatcherPlugin::DBConnectivity cdbuyer
+
+include ariba::HTTPWatcherPlugin::TomcatAppInstance buyer
+include ariba::HTTPWatcherPlugin::SSRealms buyer standalone
+include ariba::HTTPWatcherPlugin::SSRealms buyer integrated
+include ariba::HTTPWatcherPlugin::DBConnectivity buyer
+
+include ariba::HTTPWatcherPlugin::TomcatAppInstance buyerpm
+include ariba::HTTPWatcherPlugin::SSRealms buyerpm
+include ariba::HTTPWatcherPlugin::DBConnectivity buyerpm
+
+include ariba::HTTPWatcherPlugin::Doc doc
+
+include ariba::HTTPWatcherPlugin::TomcatAppInstance help
+include ariba::HTTPWatcherPlugin::DeploymentDefaultsUrls help
+
+include ariba::HTTPWatcherPlugin::Piwik piwik
+
+include ariba::HTTPWatcherPlugin::Community community
+
+include ariba::HTTPWatcherPlugin::LogiAppInstance logi
+
+include ariba::HTTPWatcherPlugin::TomcatAppInstance arches
+include ariba::HTTPWatcherPlugin::TomcatAppInstance arecibo
+
+include ariba::HTTPWatcherPlugin::HadoopAppInstance hadoop
+include ariba::HTTPWatcherPlugin::HadoopAppInstance arches
+
+include ariba::HTTPWatcherPlugin::TomcatAppInstance spotbuy
+include ariba::HTTPWatcherPlugin::WOFAppInstance hanasim
+include ariba::HTTPWatcherPlugin::WOFAppInstance mobile
+
+include ariba::HTTPWatcherPlugin::TomcatAppInstance sellerdirect
+include ariba::HTTPWatcherPlugin::TomcatAppInstance suppliermanagement
+include ariba::HTTPWatcherPlugin::TomcatAppInstance supplierrisk
+include ariba::HTTPWatcherPlugin::TomcatAppInstance gb
+include ariba::HTTPWatcherPlugin::TomcatAppInstance dms

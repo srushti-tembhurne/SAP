@@ -1,0 +1,211 @@
+#!/usr/local/bin/perl -w 
+
+use strict;
+use FindBin; 
+use lib "$FindBin::Bin/../../lib";
+
+use Date::Parse;
+use POSIX qw(strftime);
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::Ops::Startup::Hadoop;
+use ariba::Ops::HadoopConfig;
+use ariba::Ops::HadoopProperties;
+use ariba::Ops::NetworkUtils;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Product;
+
+our $quiet = 1; # Suppresses prints in ariba::Ops::Startup::Common.pm
+my $debug = 0;
+my $ACTIVE = "active";
+my $STANDBY = "standby";
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+Sends hbase health information to monitoring
+
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode. 
+    -h        Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub debug {
+    my $msg = shift; 
+
+    print "(debug) $msg\n" if ($debug);
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $runHbck;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();             next; }
+        if ($arg =~ /^-d$/o) { $debug++;            next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;      next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;       next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled('hadoop', $me->service()));
+    my $hadoop = ariba::rc::InstalledProduct->new('hadoop', $me->service());
+    my $cluster = $hadoop->currentCluster();
+    my ($nnFlag, $jtFlag, $masterFlag) = 0;
+    my $host = ariba::Ops::NetworkUtils::hostname();
+    my $warn = "answer =~ /standby/i && previousAnswer =~ /active/i || (answer =~ /active/ && previousAnswer =~ /standby/i)";
+    my %queries;
+
+    ariba::Ops::Startup::Hadoop::setRuntimeEnv($hadoop);
+
+    #
+    # Hbase Master
+    #
+    my @hostsForRoleMaster = $hadoop->rolesManager()->hostsForRoleInCluster('hbase-master', $cluster);
+    if (scalar @hostsForRoleMaster > 0) {
+        if (grep ($_ eq $host, @hostsForRoleMaster)) {
+            $masterFlag = 1;
+        }
+
+        if ($masterFlag) {
+            my $status;
+
+            foreach my $hostm (@hostsForRoleMaster) {
+                my $activeHost = $hadoop->activeHostForVirtualHostInCluster($hostm, $cluster);
+                if ($host eq $activeHost) {
+                    $status = $ACTIVE;
+                } else {
+                    $status = $STANDBY;
+                }
+
+                $queries{"$host status"} = {
+                    warn        => $warn,
+                    crit        => "!defined(answer)",
+                    perl        => sub { return $status },
+                    uiHint      => "hbase-master",
+                    description => qq`status of which host is the 'active' or 'standby' host. WARN status if
+                        service state changes between standby to active, or active to standby`,
+                    inf_field => "hbase_master_status_hash",
+                    inf_default => "none",
+                    inf_tags => qq|host="$host"|,
+                    group_by => $host,
+                }
+            }
+        }
+    }
+
+    #
+    # hadoop-namenode
+    #
+    my @hostsForRoleName = $hadoop->rolesManager()->hostsForRoleInCluster('hadoop-name', $cluster);
+    if (scalar @hostsForRoleName > 0) {
+        if (grep ($_ eq $host, @hostsForRoleName)) {
+            $nnFlag = 1;
+        }
+    }
+
+    if ($nnFlag) {
+        # get namenodes from hdfs-site.xml dfs.ha.namenodes.<nameservices>
+        my @namenodes = split(",", ariba::Ops::HadoopProperties::getNamenode($ENV{'HBASE_HOME'}));
+
+        foreach my $nn (@namenodes) {
+            my $nnHost = ariba::Ops::HadoopProperties::getNamenodehost($ENV{'HADOOP_HOME'}, $nn);
+            my $cmd = "hdfs haadmin -getServiceState $nn";
+            my $status = runCmd($cmd);
+
+            $queries{"$nnHost $nn status"} = {
+                warn        => $warn,
+                crit        => "!defined(answer)",
+                perl        => sub { return $status },
+                uiHint      => "namenode",
+                description => qq`Runs 'hdfs haadmin -getServiceState <namenode>' on a hadoop-name host
+                    to get the namenode's service state. Results are either 'Active', 'standby' and undef.
+                    if undef, contact DBAs to investigate. WARN status if service state changes between
+                    standby to active, or active to standby`,
+                inf_field => "hadoop_namenode_status_hash",
+                inf_default => "none",
+                inf_tags => qq|host="$nnHost",namenode="$nn"|,
+                group_by => "$nnHost-$nn",
+            }
+        }
+    }
+
+    #
+    # HA jobtracker
+    #
+    my @hostsForRoleJT = $hadoop->rolesManager()->hostsForRoleInCluster('ha-jobtracker', $cluster);
+    if (scalar @hostsForRoleJT > 0) {
+        if (grep ($_ eq $host, @hostsForRoleJT)) {
+            $jtFlag = 1;
+        }
+    }
+
+    if ($jtFlag) {
+        # get jobtracker nodes from mapred-site.xml mapred.jobtrackers.hajobtracker
+        my @jtnodes = split(",", ariba::Ops::HadoopProperties::getJobtrackernode($ENV{'HADOOP_HOME'}));
+
+        foreach my $jt (@jtnodes) {
+            ariba::Ops::Startup::Hadoop::setRuntimeEnv($hadoop);
+            my $jtHost = ariba::Ops::HadoopProperties::getJobtrackerhost($ENV{'HADOOP_HOME'}, $jt);
+            $ENV{'HADOOP_HOME'} = $ENV{'HADOOP_HOME'} . "/share/hadoop/mapreduce1";
+            my $cmd = $ENV{'HADOOP_HOME'} . "/bin/hadoop mrhaadmin -getServiceState $jt";
+
+            my @output = runCmd($cmd);
+            my $status;
+
+            if (grep ($_ =~ /$ACTIVE/, @output)) {
+                $status = $ACTIVE;
+            } elsif (grep ($_ =~ /$STANDBY/, @output)) {
+                $status = $STANDBY;
+            }
+
+            $queries{"$jtHost $jt status"} = {
+                warn        => $warn,
+                crit        => "!defined(answer)",
+                perl        => sub { return $status },
+                uiHint      => "jobtracker",
+                description => qq`Runs 'mapred mrhaadmin -getServiceState <hajobtracker>' on a jobtracker host
+                    to get the jobtracker's service state. Results are either 'Active', 'standby' and undef.
+                    if undef, contact DBAs to investigate. WARN status if service state changes between standby
+                    to active, or active to standby`,
+                inf_field => "hadoop_namenode_status_hash",
+                inf_default => "none",
+                inf_tags => qq|host="$jtHost",namenode="$jt"|,
+                group_by => "$jtHost-$jt",
+            }
+        }
+    }
+
+    my $email = $me->default('notify.email');
+
+    $queries{"infux_details"} = {measurement => "hadoop_node_health"};
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('node-health', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+} 
+
+sub runCmd {
+    my $cmd = shift;
+
+    my $output = `$cmd 2>&1`;
+    if ($?) {
+        return undef;
+    } else {
+        return $output;
+    }
+}
+
+main(@ARGV);

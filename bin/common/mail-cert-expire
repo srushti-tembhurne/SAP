@@ -1,0 +1,94 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/mail-cert-expire#5 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Constants;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Crypto::Certificate;
+
+my $debug = 0;
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while (my $arg = shift) {
+		if( $arg =~ /^-e/o ){ $sendEmail = 1; 	next; };
+		if( $arg =~ /^-p/o ){ $sendPage = 1; 	next; };
+		if( $arg =~ /^-d/o ){ $debug = 1; 		next; };
+	}
+
+	my $cert = ariba::Crypto::Certificate->new();
+	my $me = ariba::rc::InstalledProduct->new();
+	my $email = $me->default('notify.email');
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $machine = ariba::Ops::Machine->new($hostname);
+	my $datacenter = $machine->datacenter();
+
+	my $certDir       = ariba::Ops::Constants->mailCertDir();
+
+	my %queries       = ();
+
+	processCertDir($cert, $certDir, \%queries, $hostname, $datacenter) if ($certDir);
+
+	if (%queries) {
+		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+        $queries{influx_details} = {measurement => "mail-cert-expire"};
+        my $q  = ariba::monitor::QueryManager->newWithDetails(
+			"mail-cert-expire", $pn, $me->service(), $me->customer(), \%queries
+		);
+
+		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+sub processCertDir {
+	my $cert    = shift;
+	my $dir     = shift;
+	my $queries = shift;
+	my $hostname = shift;
+    my $datacenter = shift;
+
+	my $path = "//ariba/services/operations/documentation/prodops/common/certificate_management.shtml";
+
+	if (opendir(my $dh, $dir)) {
+		while(my $file = readdir($dh)) {
+			next if $file =~ /^\./;
+			next unless $file =~ /\.cert$/;
+
+			my $certPath = "$dir/$file";
+			next unless (-r $certPath); 
+
+			my $days = $cert->daysToCertExpireTimeForX509($certPath);
+			$queries->{"$hostname Days to Expire for Cert $file"} = {
+				noRowCount => 1,
+				format => "%d days\n",
+				info => "answer >= 20",
+				warn => "answer < 20",
+				crit => "answer < 10 ",
+				perl => "return $days",
+                inf_field => "dayToExpire",
+                inf_tags => qq|datacenter="$datacenter",hostname="$hostname",cert="$file"|,
+                inf_default => 0,
+				ticketOnWarnOpenAfterMinutes => 30,
+				openTicketInServices => "prod, sales",	
+				description => "For initial debugging refer to $path",
+			};
+		}
+
+		close($dh);
+	}
+}
+
+main(@ARGV);
+
+__END__

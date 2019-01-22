@@ -1,0 +1,142 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/common/persisted-mail-queue#1 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::monitor::OutageSchedule;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use dmail::LockLib;
+
+sub main {
+    my $debug = 0;
+    my $quiet = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $productName;
+
+    while(my $arg=shift(@ARGV)){
+            print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+            if($arg =~ /^-d/o){ $debug=1; }
+            if($arg =~ /^-e/o){ $sendEmail=1; };
+            if($arg =~ /^-p$/o){ $sendPage=1; };
+            if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+    my $email = $me->default('notify.email');
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+
+    unless (@products) {
+        exit(0);
+    }
+
+    for my $product (@products) {
+
+        my $lockfile = "/tmp/stratus-persisted-mail-queue";
+        $lockfile .= "-" . $product->name();
+        $lockfile .= "-" . $product->customer() if($product->customer());
+        if (!dmail::LockLib::requestlock($lockfile,5)) {
+            print STDERR "can't grab lock $lockfile\n";
+            next;
+        }
+
+        my $skip = 0;
+
+        my %queries  = ();
+
+        my $outage;
+
+        # remove this outage once 10s2 is released
+        # See TMID 86123
+        # $outage = ariba::monitor::OutageSchedule->new('daily 00:00-02:00');
+
+        my $mailQueueWarn = 5000;
+        my $mailQueueCrit = 10000;
+
+        # Different thresholds for Buyer, tmid: 181715
+        if ($productName eq 'buyer') {
+            $mailQueueWarn = 30000;
+            $mailQueueCrit = 50000;
+        }
+#
+#SQL:
+#SELECT COUNT(Dur1.rootId) FROM DurableEmailTab Dur1
+#WHERE (Dur1.dem_RetryCount < 30) AND (Dur1.dem_Active = 1) AND
+#(Dur1.dem_PurgeState = 0)
+#AND (Dur1.dem_PartitionNumber IN
+#(0,10,20,30,40,50,60,70,80,90,100,110,120,130,140,150,160,170,180,190,20
+#0,210,220,230,240,250))
+#
+#The last where condition for PartitionNumber is not needed if you want
+#results for all realms.  If you want specific realms, you need to add
+#appropriate partition number.
+#
+
+        my $persistedMailQueueSql = "SELECT COUNT(Dur1.rootId) as count FROM DurableEmailTab Dur1 WHERE (Dur1.dem_Active = 1) AND (Dur1.dem_PurgeState = 0)";
+        #FIXME
+        # remove this after everyone is on 10s1 or greater
+        my $releaseName = $product->isASPProduct() ? $product->baseReleaseName() : $product->releaseName();
+        unless ($releaseName =~ /^9/) {
+            $persistedMailQueueSql .= " AND (Dur1.dem_SentStatus = 0)";
+        }
+
+        if (grep /^$productName$/, (ariba::rc::Globals::sharedServiceSourcingProducts(), ariba::rc::Globals::sharedServiceBuyerProducts())) {
+            $persistedMailQueueSql .= " AND (Dur1.dem_RetryCount < 96)";
+        }
+        my @schemaIds = ariba::Ops::ProductAPIExtensions::transactionSchemaIdsForProduct($product);
+        my $aggregationMethod = (scalar(@schemaIds) > 1 ? "counts" : undef);
+
+        # tmid: 156019
+        # We want to display only number for emails that are to be sent and not composing emails.
+        $persistedMailQueueSql .= " AND (DEM_ProcessingNode IS NULL OR DEM_ProcessingNode not like 'Composing%')";
+
+            $queries{"Persisted mail queue length"} = {
+                'recordMaxResults' => 110000,
+                'recordDataType' => "gauge",
+                'aggregationMethod' => $aggregationMethod,
+                'outageSchedule' => $outage,
+                'info' => "!defined(answer) || answer >= 0",
+                'warn' => "defined(answer) && answer >= $mailQueueWarn",
+                'crit' => "defined(answer) && answer >= $mailQueueCrit && previousAnswer >= $mailQueueCrit",
+                'timeout' => 10 * 60,
+                'sql'  => $persistedMailQueueSql,
+                'runForSchemaIds' => join(", ", @schemaIds),
+            };
+
+        $queries{influx_details } = { measurement => 'persisted_mail_queue' };
+        my $q = ariba::monitor::QueryManager->newWithDetails(
+                "persisted-mail-queue", $product->name(), $service, $product->customer(), \%queries
+        );
+
+        #
+        # set a sane default -- if we don't have sub schemas, this needs to
+        # get set to something because...
+        #
+        my $defaultDbc=ariba::Ops::DBConnection->connectionsForProductOfDBType(
+                        $product, ariba::Ops::DBConnection::typeMain()
+        );
+        $q->setSQLConnectInfoFromDBConnection( $defaultDbc );
+
+        #
+        # this call only sets overrides for individual schemas, and misses a
+        # default that is not numbered
+        #
+        ariba::Ops::ProductAPIExtensions::setTransactionSchemaSQLConnectInfoOnQueryManager($product, $q);
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        dmail::LockLib::releaselock($lockfile);
+    }
+}
+
+main();

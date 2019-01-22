@@ -1,0 +1,131 @@
+#!/usr/local/tools/perl-5.22.1/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/common/client-cert-expire#33 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Crypto::Certificate;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::monitor::QueryManager;
+
+my $debug = 0;
+
+sub main {
+
+	my $sendEmail = 0;
+        my $sendPage  = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if( $arg =~ /^-e/o ){ $sendEmail = 1; };
+		if( $arg =~ /^-p/o ){ $sendPage = 1; };
+		if( $arg =~ /^-d/o ){ $debug = 1; };
+	}
+
+	my $cert	  = ariba::Crypto::Certificate->new();
+
+	my $me		  = ariba::rc::InstalledProduct->new();
+	my @products	  = ariba::rc::InstalledProduct->installedProductsList( $me->service() );
+	my $cluster	  = $me->currentCluster();
+	my $email     = $me->default('notify.email');
+
+	my $hostname	  = ariba::Ops::NetworkUtils::hostname();
+	my $shortHostname = ariba::Ops::NetworkUtils::fqdnToShortHostname( $hostname );
+
+	my $path = "//ariba/services/operations/documentation/prodops/common/certificate_management.shtml";
+
+	# Find out what we run
+	for my $product (@products) {
+
+		my $name     = $product->name();
+		my $service  = $product->service();
+		my $customer = $product->customer();
+		my $install  = $product->installDir();
+		my %queries  = ();
+
+		#
+		# products can have 0, 1, or 2 identity certs
+		# 
+
+		for my $keyPathFile ( 
+			'outboundhttps.identitykeystore.file',	#AN uses a different path than the rest of the products.
+			'outboundhttps.ediidentitykeystore.file',	#EDI in AN
+			'cert.clientcert.path',	# the standard location
+			'edi.communication.cert.path', #EDI also has this
+			'esigclient.identitykeystore.file',
+			'System.Authentication.Keystores.AribaPrivateKeystore.File',
+			'System.Authentication.Keystores.AppleProductionKeystore.File',
+		) {
+
+			my $password = '';
+			my $pkcs12   = '';
+
+                        #Do not need to monitor Apple certificate for s4 product per Shawn Ma.
+                        next if ($name =~ /s4/ && $keyPathFile =~ /AppleProductionKeystore/);
+
+			if ($product->default($keyPathFile)) {
+				print "Processing client certs $keyPathFile for ", $product->name(), "\n" if $debug;
+
+				my $keyPathPassword = $keyPathFile;
+				$keyPathPassword =~ s/\.[^.]+$//;
+
+				if ($keyPathFile =~ /System.Authentication.Keystores/ ) {
+					$keyPathPassword .= '.StorePassword';
+				} else {
+					$keyPathPassword .= '.password';
+				}
+
+				$password = $product->default($keyPathPassword);
+
+				my @pathToClientCert = ($install);
+				push (@pathToClientCert, 'base') if $product->customer();
+				push (@pathToClientCert, $product->default($keyPathFile));
+				$pkcs12 = join('/', @pathToClientCert);
+
+			} else {
+				next;
+			}
+
+			next unless -f $pkcs12;
+ 			unless ($password) {
+ 				print "SKIPPING $pkcs12, no password\n";
+ 				next;
+ 			}
+
+			my $displayName = $pkcs12;
+			   $displayName =~ s/$install\///;
+
+			my $days = $cert->daysToCertExpireTimeForPKCS12($pkcs12, $password);
+
+			$queries{"Days to Expire for pkcs12 $displayName"} = {
+				noRowCount => 1,
+				format => "%d days\n",
+				info => "answer >= 20",
+				warn => "answer < 90",
+				crit => "answer < 60",
+				perl => "return $days",
+				ticketOnWarnOpenAfterMinutes => 30,
+				openTicketInServices => "prod,sales",
+				description   => "For initial debugging refer to $path",
+                'inf_field'   => "days_to_expire",
+                'inf_tags'    =>  "cert=\"$displayName\"",
+                'inf_default' => 0,
+                'group_by'    => $displayName
+			};
+
+		}
+
+		# skip, if there are not client certs for this product.
+		next unless(scalar(keys(%queries)));
+
+        $queries{"influx_details"} = { 'measurement' => "client_cert_expire" };
+		my $q = ariba::monitor::QueryManager->newWithDetails("client-cert-expire", $name, $service, $customer, \%queries);
+		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+main();
+
+__END__

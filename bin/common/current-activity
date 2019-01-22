@@ -1,0 +1,555 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/common/current-activity#73 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::monitor::OutageSchedule;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use dmail::LockLib;
+
+sub main {
+    my $debug = 0;
+    my $quiet = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $productName;
+
+    while(my $arg=shift(@ARGV)){
+            print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+            if($arg =~ /^-d/o){ $debug=1; }
+            if($arg =~ /^-e/o){ $sendEmail=1; };
+            if($arg =~ /^-p$/o){ $sendPage=1; };
+            if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+    my $email = $me->default('notify.email');
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+
+    unless (@products) {
+        exit(0);
+    }
+
+    for my $product (@products) {
+
+        my $lockfile = "/tmp/stratus-current-activity";
+        $lockfile .= "-" . $product->name();
+        $lockfile .= "-" . $product->customer() if($product->customer());
+        if (!dmail::LockLib::requestlock($lockfile,5)) {
+            print STDERR "can't grab lock $lockfile\n";
+            next;
+        }
+
+        my $skip = 0;
+
+
+        # warn/crit levels per  Gopal Sundaram 7/31/2006
+        # lowering the warn level to 100, tmid: 144114
+        my $warnSessionsPerNode = 100;
+        my $critSessionsPerNode = 200;
+
+        my %queries  = ();
+        my %totqueries  = ();
+        my %sessionsPerRealmQueries = ();
+        my %sessionsPerRealm = ();
+        my %sessionsPerCommunity = ();
+        my %sessionsPerCommunityQueries = ();
+        my %uiNodesPerCommunity = ();
+
+        my $totalActiveSessions = 0;
+        my $totalProdRealmsWithActiveSessions = 0;
+        my $totalTestRealmsWithActiveSessions = 0;
+        my $totalEmailCount = 0;
+        my $totalEmailSize = 0;
+        my $uiNodeCount = 0;
+
+        for my $instance ($product->appInstancesInCluster($cluster)) {
+
+            next unless $instance->isTomcatApp();
+
+            my $instanceName = $instance->instanceName();
+            my $appName = $instance->appName();
+            my $threadsQueryName = "$instanceName number of threads";
+            my $community = $instance->community();
+	    $community = ( $community ) ? "community $community" : "default community";
+
+            my $uiHint;
+
+            my $maxHeapSize = $product->default("Ops.JVM.$appName.MaxHeapSize") || 
+                $product->default('Ops.JVM.MaxHeapSize') || 
+                $product->default('System.Base.ToolsDefault.JavaMemoryMax');
+
+            #
+            # Convert MB/GB to KB
+            #
+            $maxHeapSize =~ s|M\s*$||;
+            $maxHeapSize *= 1024 if ($maxHeapSize=~ s/G$//i);
+            $maxHeapSize *= 1024;
+
+            #
+            # warn on 75% heap used
+            # crit at 90%
+            #
+            my $warnHeap = $maxHeapSize * 0.85;
+            my $critHeap = $maxHeapSize * 0.93;
+
+            # 
+            # single-tenant products won't have communities
+            #
+            if ($product->isASPProduct()) {
+                $uiHint = $instance->appName();
+            } else {
+                my $community = $instance->community();
+                if ($community) {
+                    $community = "community $community";
+                } else {
+                    $community = "default community";
+                }
+
+                $uiHint = $instance->appName();
+                $threadsQueryName = "$instanceName, $community, number of threads";
+            } 
+        
+            my $heapCrit = "defined(answer) && answer >= $critHeap";
+            
+            # Disabling paging for high vm heap usage for S2
+            # tmid: 142336
+            if ($product->name() eq 's2') {
+                $heapCrit = undef;
+                $critHeap = 0;
+            }
+
+            my $results;
+
+            my $monitorStats = ariba::monitor::AppInstanceStats->newFromAppInstance($instance);
+            $monitorStats->fetch();
+
+            $queries{"$instanceName vm heap usage in KBytes"} = {
+                'recordMaxResults' => 110000,
+                'recordDataType' => "gauge",
+                'info' => "answer",
+                'uiHint' => $uiHint,
+                'format' => "%d\n",
+
+                'perl' => sub { main::vmMemUsage($monitorStats) },
+                inf_field => "vm_heap_usage",
+                inf_default => 0,
+                inf_tags  => qq(node="$instanceName",app_name="$uiHint"),
+                group_by  => qq($instanceName,$uiHint)
+            };
+            $queries{"$instanceName vm heap usage in KBytes warn threshold"} = {
+                perl      => sub { $warnHeap },
+                inf_field => "vhu_warn_threshold",
+                inf_tags  => qq(node="$instanceName",app_name="$uiHint"),
+                group_by  => qq($instanceName,$uiHint)
+            };
+            $queries{"$instanceName vm heap usage in KBytes crit threshold"} = {
+                perl      => sub { $critHeap },
+                inf_field => "vhu_crit_threshold",
+                inf_tags  => qq(node="$instanceName",app_name="$uiHint"),
+                group_by  => qq($instanceName,$uiHint)
+            };
+
+            my $commQueueSizeWarn = 50;
+            my $commQueueSizeCrit = 100;
+            my $queueSize = $monitorStats->nodeManagerThreadPoolQueueSize();
+
+            # backwards-compatible for 9r1/10s1) 
+            if ($product->releaseName() =~ /^10s1/ || $product->releaseName() =~ /^9r1/) {
+                $queries{"$instanceName internode communication queue size"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+
+                    'skip' => $skip,
+                    'info' => "!defined(answer) || answer eq '' || answer >= 0",
+                    'warn' => "defined(answer) && answer >= $commQueueSizeWarn && previousAnswer >= $commQueueSizeWarn",
+                    'crit' => "defined(answer) && answer >= $commQueueSizeCrit && previousAnswer >= $commQueueSizeCrit",
+                    'uiHint' => $uiHint,
+                    'format' => "%d\n",
+
+                    'perl'        => sub { $queueSize },
+                    'inf_field'   => "internode_communication_size_queue",
+                    'inf_default' => 0,
+                    'inf_tags'    => "community=\"$community\",node=\"$instanceName\",app_name=\"$uiHint\"",
+                    'group_by'    => "$community,$instanceName,$uiHint"
+                };
+            } else {
+                my $sizeMetric = $monitorStats->nodeManagerThreadPoolSizeMetric();
+
+                $queries{"$instanceName internode communication size metric"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+
+                    'skip' => $skip,
+                    'info' => "answer eq '' || answer >= 0",
+                    'warn' => "answer >= $commQueueSizeWarn",
+                    # tmid 190386
+#                   'crit' => "(answer == $queueSize) && answer >= $commQueueSizeCrit",
+                    'uiHint' => $uiHint,
+                    'format' => "%d\n",
+
+                    'perl' => sub { return $sizeMetric },
+                    'inf_field' => "internode_communication_size_metric",
+                    'inf_default' => 0,
+                    'inf_tags' =>  "community=\"$community\",node=\"$instanceName\",app_name=\"$uiHint\"",
+                    'group_by' =>  "$community,$instanceName,$uiHint"
+                },
+                $queries{"$instanceName internode communication queue size"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+
+                    'skip' => $skip,
+                    'info' => "answer eq '' || answer >= 0",
+                    'warn' => "answer >= $commQueueSizeWarn",
+                    'uiHint' => $uiHint,
+                    'format' => "%d\n",
+
+                    'perl' => sub { return $queueSize },
+                    'inf_field' => "internode_communication_size_queue",
+                    'inf_default' => 0,
+                    'inf_tags' =>  "community=\"$community\",node=\"$instanceName\",app_name=\"$uiHint\"",
+                    'group_by' =>  "$community,$instanceName,$uiHint"
+                }
+            }
+
+            if(defined($monitorStats->emailToWorkspaceMessageCount())) {
+                $totalEmailCount += $monitorStats->emailToWorkspaceMessageCount();
+                $totalEmailSize += $monitorStats->emailToWorkspaceMessageSize();
+            }
+
+            my $threadWarn = 600;
+            my $threadCrit = 700;
+            my $openTicket;
+            if ($product->name() eq 's4' && $instance->appName() =~ /^UI/) { 
+                $threadWarn = 550;
+                $threadCrit = 1000;
+                $openTicket = 12;
+            }
+            # HOA-31557
+            if ($product->name() eq 'buyer') { 
+                $threadWarn = 1000;
+                $threadCrit = 1400;
+            }
+            $queries{$threadsQueryName} = {
+                'recordMaxResults' => 110000,
+                'recordDataType' => "gauge",
+
+                'skip' => $skip,
+                'info' => "!defined(answer) || answer eq '' || answer >= 0",
+                'warn' => "defined(answer) && answer >= $threadWarn",
+                'ticketOnWarnOpenAfterMinutes' => $openTicket,
+                'crit' => "defined(answer) && answer >= $threadCrit && previousAnswer >= $threadCrit",
+                'uiHint' => $uiHint,
+                'format' => "%d\n",
+
+                'perl' => sub { return $monitorStats->threadCount()},
+                'inf_field' => "number_of_threads",
+                'inf_default' => 0,
+                'inf_tags' =>  "community=\"$community\",node=\"$instanceName\",app_name=\"$uiHint\"",
+                'group_by' =>  "$community,$instanceName,$uiHint"
+            };
+            $queries{"$threadsQueryName warn threshold"} = {
+                'perl'      => sub { $threadWarn },
+                'inf_field' => "not_warn_threshold",
+                'inf_tags'  => "community=\"$community\",node=\"$instanceName\",app_name=\"$uiHint\"",
+                'group_by'  => "$community,$instanceName,$uiHint"
+            };
+            $queries{"$threadsQueryName crit threshold"} = {
+                'perl'      => sub { $threadCrit },
+                'inf_field' => "not_crit_threshold",
+                'inf_tags'  => "community=\"$community\",node=\"$instanceName\",app_name=\"$uiHint\"",
+                'group_by'  => "$community,$instanceName,$uiHint"
+            };
+
+            # Get the current active session count only for instances
+            # that users can log into.
+            #
+            if ($instance->isUIApp()) {
+                my $activeSessions = $monitorStats->concurrentUserSessions() || 0;
+                $totalActiveSessions += $activeSessions;
+                $uiNodeCount++;
+
+                my $thisCommunity = $instance->community();
+
+                if (defined($thisCommunity)) {
+                    $thisCommunity = "Community $thisCommunity"; 
+                } else {
+                    $thisCommunity = "Default Community";
+                }
+
+                unless(defined($sessionsPerCommunity{$thisCommunity})) {
+                    $sessionsPerCommunity{$thisCommunity} = 0;
+                }
+
+                $sessionsPerCommunity{$thisCommunity} += $activeSessions;
+
+                if ($instance->alias() eq 'UI') {
+                    $uiNodesPerCommunity{$thisCommunity}++;
+                }
+
+                $queries{"$instanceName $thisCommunity number of active sessions"} = {
+                    'recordMaxResults' => 110000,
+                    'recordDataType' => "gauge",
+
+                    'skip' => $skip,
+                    'info' => "!defined(answer) || answer eq '' || answer >= 0",
+                    'warn' => "defined(answer) && answer >= $warnSessionsPerNode",
+                    'crit' => "defined(answer) && answer >= $critSessionsPerNode",
+                    'uiHint' => $uiHint,
+                    'format' => "%d\n",
+
+                    'perl' => sub { return $activeSessions; },
+                    'inf_field' => "number_of_active_sessions",
+                    'inf_default' => 0,
+                    'inf_tags' =>  "community=\"$thisCommunity\",node=\"$instanceName\",app_name=\"$uiHint\"",
+                    'group_by' =>  "$thisCommunity,$instanceName,$uiHint"
+                };
+
+                
+                for my $realmDetail (split(/;/, $monitorStats->localRealms())) {
+                    #site1 (14 - assigned)
+                    if ($realmDetail =~ m|\s*([\w\-]+)\s*\((\d+).*(\w+)\)|) {
+                        my $realmName = $1;
+                        my $realmId = $2;
+
+                        # sessionsForBucketNNN may return  undef,
+                        # force these to be 0 in that case
+                        if ( !exists $sessionsPerRealm{"$realmName (id $realmId)"} ) {
+                            $sessionsPerRealm{"$realmName (id $realmId)"} = 0;
+                        }
+
+                        $sessionsPerRealm{"$realmName (id $realmId)"} += $monitorStats->attribute("sessionsForBucket$realmId");
+                    }
+                }
+            }
+        }
+
+        for my $realm (keys %sessionsPerRealm) {
+            ### AribaNow2-T (id 190) number of active sessions: 0  -- Use regex to parse this type of data
+            $realm =~ m/^(.*?)\s+\(id\s+(.*?)\)/;
+            my $rname = $1;
+            my $id = $2; 
+            $sessionsPerRealmQueries{"$realm number of active sessions"} = {
+                'recordMaxResults' => 110000,
+                'recordDataType'   => "gauge",
+
+                'info'   => 1,
+                'perl'   => sub { $sessionsPerRealm{$realm} },
+                'inf_field' => "number_of_active_sessions",
+                'inf_default' => 0,
+                'inf_tags' =>  qq(realm="$rname",id=$id),
+                'group_by' =>  "$rname,$id"
+            };
+
+            if ($sessionsPerRealm{$realm}) {
+                if ($realm =~ /-T(?:EST)? \(id \d+\)$/i) {
+                    $totalTestRealmsWithActiveSessions++;
+                } else {
+                    $totalProdRealmsWithActiveSessions++
+                }
+            }
+        }
+
+        #
+        # Rolled up global summary query objects
+        #
+
+        my $tas_warn_threshold = $warnSessionsPerNode * $uiNodeCount;
+        my $tas_crit_threshold = $critSessionsPerNode * $uiNodeCount;
+
+        $totqueries{"Total number of active sessions"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => "gauge",
+
+            'info' => "!defined(answer) || answer eq '' || answer >= 0",
+            'skip' => $skip,
+            'warn' => "defined(answer) && answer >= $tas_warn_threshold",
+            'crit' => "defined(answer) && answer >= $tas_crit_threshold",
+            'format' => "%d\n",
+
+            'perl' => sub { return $totalActiveSessions; },
+            'inf_field' => "total_active_sessions",
+            'inf_default' => 0,
+        };
+        $totqueries{"Total number of active sessions warn threshold"} = {
+            'perl' => sub { $tas_warn_threshold },
+            'inf_field' => "tas_warn_threshold",
+        };
+        $totqueries{"Total number of active sessions crit threshold"} = {
+            'perl' => sub { $tas_crit_threshold },
+            'inf_field' => "tas_crit_threshold",
+        };
+
+        $totqueries{"Total number of realms (prod) with active sessions"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => "gauge",
+
+            'info' => 1,
+            'skip' => $skip,
+
+            'perl' => sub { return $totalProdRealmsWithActiveSessions; },
+            'inf_field' => "prod_realms_with_active_sessions",
+            'inf_default' => 0,
+        };
+
+        $totqueries{"Total number of realms (test) with active sessions"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => "gauge",
+
+            'info' => 1,
+            'skip' => $skip,
+
+            'perl' => sub { return $totalTestRealmsWithActiveSessions; },
+            'inf_field' => "test_realms_with_active_sessions",
+            'inf_default' => 0,
+
+        };
+
+        $totqueries{"Total workspace email count"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => "gauge",
+
+            'info' => 1,
+            'skip' => $skip,
+
+            'perl' => sub { return $totalEmailCount; },
+	    'inf_field' => "total_workspace_email_count",
+	    'inf_default' => 0,
+        };
+
+        $totqueries{"Total workspace email size"} = {
+            'recordMaxResults' => 110000,
+            'recordDataType' => "gauge",
+            'format' => "%d bytes\n",
+
+            'info' => 1,
+            'skip' => $skip,
+
+            'perl' => sub { return $totalEmailSize; },
+            'inf_field' => "total_workspace_email_size",
+            'inf_default' => 0,
+        };
+
+        foreach my $key (sort keys %sessionsPerCommunity) {
+            # only set warn for communitites with UI nodes
+            my $warnSessionsPerCommunity;
+            my $spc_warn_threshold = 0;
+
+            if ($uiNodesPerCommunity{$key} > 0) {
+                $spc_warn_threshold = $warnSessionsPerNode * $uiNodesPerCommunity{$key};
+                $warnSessionsPerCommunity = "defined(answer) && answer >= $spc_warn_threshold";
+            }
+            $sessionsPerCommunityQueries{"Total number of active sessions in $key"} = {
+                'recordMaxResults' => 11000,
+                'recordDataType' => "gauge",
+                'info' => 1,
+                'warn' => $warnSessionsPerCommunity,
+                'ticketOnWarnOpenAfterMinutes' => 1,
+                'skip' => $skip,
+                'perl' => sub { return $sessionsPerCommunity{$key}; },
+                'inf_field' => "active_sessions",
+                'inf_default' => 0,
+                'inf_tags' =>  "community=\"$key\"",
+                'group_by' =>  "$key"
+            };
+            $sessionsPerCommunityQueries{"Total number of active sessions in $key warn threshold"} = {
+                'perl'      => sub { $spc_warn_threshold },
+                'inf_field' => "spc_warn_threshold",
+                'inf_tags'  => "community=\"$key\"",
+                'group_by'  => "$key"
+            }
+        }
+
+       $queries{"influx_details"} = { 'measurement' => "current_activity"};
+
+        my $q = ariba::monitor::QueryManager->newWithDetails(
+                "current-activity", $product->name(), $service, $product->customer(), \%queries
+                );
+
+       $q->processQueries($debug, $email, $sendEmail, $sendPage);
+       $totqueries{"influx_details"} = { 'measurement' => "current_activity_total" };
+
+       my $totq = ariba::monitor::QueryManager->newWithDetails(
+                "current-activity", $product->name(), $service, $product->customer(), \%totqueries
+                );
+       $totq->processQueries($debug, $email, $sendEmail, $sendPage);
+
+       $sessionsPerCommunityQueries{"influx_details"} = { 'measurement' => "session_per_community" };
+        my $scq = ariba::monitor::QueryManager->newWithDetails(
+                "current-activity", $product->name(), $service, $product->customer(), \%sessionsPerCommunityQueries
+                );
+        $scq->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        #
+        # Check for high thread counts and go take thread dumps
+        #
+
+        foreach my $query ($q->queries()) {
+            # Only get thread count queries that just turned crit on this run
+            next unless ($query->queryName() =~ m/number of threads/ and $query->status() eq "crit" and $query->previousStatus() ne "crit");
+            my $productName = $product->name();
+            my $name = $query->queryName();
+            $name =~ s/ number of threads$//;
+            $name =~ m/\@(.*)$/;
+            my $hostname = $1;
+            my $user = $product->deploymentUser();
+            my $cipher = ariba::rc::CipherStore->new($service);
+            my $password = $cipher->valueForName($user);
+            my $cmd = "ssh $user\@$hostname '/usr/local/ariba/bin/app-thread-dump $productName $service $name'";
+            if($debug) {
+                print "$cmd\n";
+            } else {
+                ariba::rc::Utils::executeRemoteCommand($cmd, $password);
+            }
+        }
+
+        #
+        # put these in separate expando to avoid staleness
+        #
+        $sessionsPerRealmQueries{"influx_details"} = { 'measurement' => "session_per_realm" };
+        my $sessionsQM =  ariba::monitor::QueryManager->newWithDetails(
+                "sessions-per-realm", $product->name(), $service, $product->customer(), \%sessionsPerRealmQueries
+        );
+        # have to use processQueries() for this one because these queries
+        # change names as realms become assigned, etc. and become stale otherwise
+        $sessionsQM->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        # separate expando
+        my $sessionsCommunityQM =  ariba::monitor::QueryManager->newWithDetails(
+            "sessions-per-community", $product->name(), $service, $product->customer(), \%sessionsPerCommunityQueries
+        );
+        $sessionsCommunityQM->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        dmail::LockLib::releaselock($lockfile);
+
+    }
+}
+
+
+sub vmMemUsage {
+    my $monitorStats = shift;
+
+    my $memUsage = "";
+
+    my $totalMem = $monitorStats->totalMemory();
+    my $freeMem = $monitorStats->freeMemory();
+
+    if (defined($totalMem) && defined($freeMem) ) {
+        $memUsage = $totalMem - $freeMem; # in KB
+    }
+
+    return $memUsage;
+}
+
+main();

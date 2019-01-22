@@ -1,0 +1,89 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/an/misc-status#16 $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+
+sub main {
+	my $debug = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $queries = {};
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ m/^-d/o) { $debug = 1; }
+		if ($arg =~ m/^-e/o) { $sendEmail = 1; }
+		if ($arg =~ m/^-p/o) { $sendPage = 1; }
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $an = ariba::rc::InstalledProduct->new('an', $me->service());
+
+	my $adminAppURL = $an->default('acadminurlprefix');
+
+	my @communityIds = $an->communityIdsForProduct();
+	my $communitiesList = join(", ", @communityIds);
+
+	$queries->{'Failed SMI Pending Charges'} = {
+		runForCommunities => $communitiesList,
+		info		=> "numrows == 0",
+		crit		=> "numrows > 0",
+		sql		=> "select id as id, schema_community as schema_community from smi_pending_charge where status = -1",
+        inf_tags => qq(type="failed smi"),
+	};
+
+	$queries->{'Stuck SMI Pending Charges'} = {
+		runForCommunities => $communitiesList,
+		info		=> "numrows == 0",
+		warn		=> "numrows > 0 && numrows < 10",
+		crit		=> "numrows > 10",
+		sql		=> "select id as id , schema_community as schema_community from smi_pending_charge where status = 10 and next_attempt_date < (sysdate - (2/24))",
+        inf_tags => qq(type="stuck smi"),
+	};
+
+	my $email = $me->default('notify.email');
+
+    $queries->{influx_details} = { measurement => "an_smi_status" };
+	my $q = ariba::monitor::QueryManager->newWithDetails('smi-status', 'an', $me->service(), $me->customer(), $queries);
+
+	$q->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $q);
+
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+    my $squeries = {};
+
+    $squeries->{'Failed SMI Pending Charges'} = {
+        runForCommunities => $communitiesList,
+        info        => "numrows == 0",
+        crit        => "numrows > 0",
+        sql         => "select count(*) as failed_smi_count from smi_pending_charge where status = -1",
+    };
+    $squeries->{'Stuck SMI Pending Charges'} = {
+        runForCommunities => $communitiesList,
+        info        => "numrows == 0",
+        warn        => "numrows > 0 && numrows < 10",
+        crit        => "numrows > 10",
+        sql         => "select count(*) as stuck_smi_count from smi_pending_charge where status = 10 and next_attempt_date < (sysdate - (2/24))",
+    };
+
+
+    $squeries->{influx_details} = { measurement => "an_smi_status_count" };
+    my $q2 = ariba::monitor::QueryManager->newWithDetails('smi-status', 'an', $me->service(), $me->customer(), $squeries);
+
+    $q2->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $q2);
+
+    $q2->processQueries($debug, $email, $sendEmail, $sendPage);
+
+
+}
+
+main();

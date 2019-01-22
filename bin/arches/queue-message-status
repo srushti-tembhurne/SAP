@@ -1,0 +1,115 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/arches/queue-message-status#5 $
+#
+# Queue message status monitoring for Arches
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Url;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode. 
+    -h        Shows this help.
+    -prod     Product name
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $prodname = 'arches';
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-prod$/o) { $prodname = shift;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled($prodname, $me->service()));
+    my $arches = ariba::rc::InstalledProduct->new($prodname, $me->service());
+    my $cluster = $arches->currentCluster();
+    my %queries;
+
+    my $warn = "answer > 100000";
+    my $crit = "answer > 500000";
+
+    for my $instance ($arches->appInstancesInCluster($cluster)) {
+        next unless $instance->isTomcatApp();
+        my $statusUrl = $instance->archesQueueMessageGetURL();
+
+        debug("Checking $statusUrl");
+
+        my $url = ariba::monitor::Url->new($statusUrl);
+        my $response = $url->request();
+        my ($urlError, $result);
+
+        if ($url->error()) {
+            $urlError = $url->error();
+            debug("Error: $urlError");
+            $result = $urlError;
+        } else {
+            $result = $response;
+        }
+        $queries{"Total Queue Messages"} = {
+            recordMaxResults  => 36000,
+            recordDataType    => "gauge",
+            graphRecorded     => 1,
+            warn  => $warn || $urlError,
+            crit  => $crit,
+            perl  => sub { return $result; }, 
+            description => 'Checks total arches queue messages', 
+            correctiveActions   => [
+                Ops => 'Follow up with engineering',
+            ],
+            inf_field   => "total_queue_message",
+            inf_default => 0,
+        }; 
+        last;
+    }
+
+    my $email = $me->default('notify.email');
+    $queries{'influx_details'} = { measurement => 'arches_health_check'};
+    my $qm = ariba::monitor::QueryManager->newWithDetails('health-check', $arches->name(), $arches->service(), undef, $cluster, \%queries);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+sub debug {
+    print "(debug) @_\n" if ($debug);
+}
+
+#
+# sample output DEV8 service
+# http://app470.lab1.ariba.com:43000/Arches/api/queuemessage/getallcount
+#
+# 157
+#
+
+main(@ARGV);
+
+__END__

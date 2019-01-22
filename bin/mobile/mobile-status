@@ -1,0 +1,956 @@
+#!/usr/local/tools/perl-5.22.1/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Long qw(:config bundling no_ignore_case_always no_getopt_compat require_order);
+use Data::Dumper;
+use JSON;
+use File::Slurp;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib/perl";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::misc;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::HTTP;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+
+use JMX::Jmx4Perl;
+use JMX::Jmx4Perl::Request;
+use JMX::Jmx4Perl::Agent;
+
+use Scalar::Util qw(looks_like_number);
+
+# This function is defined in this file, after the "main" code, so must be declared to be recognized as a function.
+sub mkhash;
+
+# This will *only* activate if using the Perl debugger (perl -d ...) and is needed in lieu of the 'sub main', in order to get the
+# debugger to stop here.  Some Ariba modules, like ProductAPIExtensions.pm, use the 'INIT{}' compilation subroutine, which will
+# cause the debugger to stop in the module's INIT code.  Simply type 'c' to continue, and it will then stop here, auto-magically.
+# For scripts with a 'sub main', a 'c main::main' achieves the same thing.
+if (defined $DB::single)
+{
+    $DB::single = 1;
+}
+
+my $debug = 0;
+
+my $sendEmail = 0;
+my $sendPage  = 0;
+my $cluster;
+my $test = 0;
+
+# Must remember to process args !!!
+GetOptions(
+           'debug|d'     => \$debug,
+           'sendemail|e' => \$sendEmail,
+           'sendpage|p'  => \$sendPage,
+           'test|t'      => \$test,
+           'cluster|c'   => \$cluster,
+          );
+
+my $monProduct = ariba::rc::InstalledProduct->new();
+my $product    = ariba::rc::InstalledProduct->new('mobile', $monProduct->service());
+my $name       = $product->name();
+my $service    = $product->service();
+my $email      = $product->default('notify.email');
+my $customer   = $product->customer() || undef;
+
+# This is for determining the proper path name to the etc for a product/build:
+my $etc = $monProduct->installDir() . '/etc';
+
+unless ($cluster)
+{
+    $cluster = $product->currentCluster() || 'primary';
+}
+
+my @instances = $product->appInstancesInCluster($cluster);
+
+# Config file name needed later for monitoring error.
+my $config_file;
+
+my %statusMap = eval {
+
+    # $config_file = $ENV{MOBILE_STATUS_CONFIG_FILE} || '/var/local/collectors/mobile/mobile-status.conf';
+    $config_file = $ENV{MOBILE_STATUS_CONFIG_FILE} || "$etc/query/mobile-status.conf";
+    my $contents = read_file($config_file) or die "failed to read_file $config_file: $!";
+    my $config = decode_json $contents or die "failed to decode_json the contents of $config_file";
+    return %$config;
+};
+my %msg;
+if ($@)
+{
+    %msg = (ConfigReadERROR => "$@");
+}
+
+# Need to iterate over the instance names, and branch to different opperations based on the name.  For example, /^Redis-/ should
+# be handled by the netcat branch, but has its own set of attributes as well, different from /^RedisSentinel-/.
+# NOTE & NOTE!!!  Jolokia URL REQUIRES a terminating slash:
+#                   http://app830:17002/jolokia/
+
+my %queries;
+
+# If the %statusMap retrieval above failed, it makes no sense to try to build up anything for queries, for which there is no
+# configuration information.  But, we need to have some sort of query object, so the error is reported to monitoring.
+if (%msg)    # msg was populated above.
+{
+    $queries{"MOBILE 2.0 Config FAILED!"} = {
+        crit   => "answer =~ /FAILED/",
+        uiHint => "MOBILE 2.0",
+        perl   => sub {
+            return "Open/DeCode of $config_file failed:  $msg{ConfigReadERROR}";
+        },
+        ticketOwner                  => 'unassigned-sre',
+        ticketOnWarnOpenAfterMinutes => 1,
+        severity                     => 0,
+        description                  => "This errro will only appear if the script fails to load it's config file.",
+        correctiveActions            => [
+                              Ops => "Open a Sev 0 ticket with Ops.",
+                             ],
+        inf_field => "mobile_2_0_config_status",
+        inf_tags => qq|uiHint="MOBILE 2.0"|,
+    };
+}
+else
+{
+    # Remove the file /var/mon/query-storage/mobile/MOBILE_2.0_Config_FAILED_.query if it exists, because it is a one time (we hope) error
+    # that will not be valid if we get here, anyway.  Also need to remove the file '/var/mon/qm-storage/mobile/mobile-2.0-api-response-counts.qm'
+    # so the mobile product web monitor page will not display an empty white line for the "missing" *.query file.
+    if (-f '/var/mon/query-storage/mobile/MOBILE_2.0_Config_FAILED_.query')
+    {
+        unlink '/var/mon/query-storage/mobile/MOBILE_2.0_Config_FAILED_.query';
+        unlink '/var/mon/qm-storage/mobile/mobile-2.0-api-response-counts.qm';
+    }
+
+    # Determine some "constant" values, such as the amount of memory installed, number of CPUs, ...??
+    my $hostMachine = ariba::Ops::Machine->new(ariba::Ops::NetworkUtils::hostname());
+
+    # The "default" of 8192 is taken from httpd-process-watcher.
+    my $totalMemory = ($hostMachine->memorySize() || 8192) * 1024;
+
+  INSTANCE:
+    foreach my $instance (@instances)
+    {
+        my $instanceName = $instance->instanceName();
+
+        # This is any leading characters up to but not including the first dash found.
+        my $host = $instance->host();
+
+        # port[12] is for processing Zookeeper which has both a leader and a peer port.  Not sure how this should work, yet.  And, on
+        # checking how others do this, it looks like the base base port is used for checking.
+        my (@attributes, $port, $port1, $port2, $url, $description, $action, $sub, $keyName,);
+
+        # For each instance name, there will be different descriptions, possibly actions, notes and certainly perl code to use.  Each of
+        # these 4 items needs to be set up in the appropriate branch of the if/else, for use in creating the queris.
+        if ($instanceName =~ /^Redis-/)    # Uses netcat (nc) to extract
+        {
+            @attributes = keys %{$statusMap{Redis}};
+            my $attrPattern = '^(                       # check at the beginning for any of the following strings,' . "\n" . join ('|', @attributes) . "\n" . '):                      # and followed by a colon.  ';
+            $port = $instance->port;
+            print "\nHOSTCHK $instanceName $host $port\n" if $debug or $test;
+            my $cmd = "(echo info; sleep 0.5) | nc $host $port";
+            if (open my $DATA, '-|', $cmd)
+            {
+                my @data = <$DATA>;
+                close $DATA;
+                if (@data)
+                {
+                    # The data from netcat is <cr><lf> terminated, can remove the lf with chomp, need something else for cr.  And, there
+                    # will be empty elements and comment elements, but these should be removed by the mkhash pattern.
+                    chomp @data;
+                    @data = map {substr ($_, 0, -1)} @data;
+
+                    #Data format must be field:value, only one colon, so we get 2 * elements, for the hash.
+                    %msg = mkhash $attrPattern, @data;
+                }
+                else
+                {
+                    %msg = ("Redis", "ERROR:  No DATA returned!!!");
+                }
+            }
+            else
+            {
+                %msg = ("Redis", "ERROR:  netcat failed to run");
+            }
+            $keyName     = "$instanceName";
+            $description = 'Redis status for ';
+            $action      = 'Open a ticket with the Mobile 2.0 team';
+        }
+        elsif ($instanceName =~ /^RedisSentinel-/)    # Uses netcat (nc) to extract
+        {
+            @attributes = keys %{$statusMap{RedisSentinel}};
+            $port       = $instance->port;
+            print "\nHOSTCHK $instanceName $host $port\n" if $debug or $test;
+            my $cmd = "(echo info; sleep 0.5) | nc $host $port";
+            if (open my $DATA, '-|', $cmd)
+            {
+                my @data = <$DATA>;
+                close $DATA;
+                if (@data)
+                {
+                    # The data from netcat is <cr><lf> terminated, can remove the lf with chomp, need something else for cr.
+                    chomp @data;
+                    @data = map {substr ($_, 0, -1)} @data;
+
+                    # Only interested in a single element, to be split.  Unfortunately, the data contains two colons, so a simple
+                    # 'split' on it won't work ;<
+                    %msg = map /^(master0):(.*)/, grep /^master0:/, @data;
+                }
+                else
+                {
+                    %msg = ("RedisSentinel", "ERROR:  No DATA returned!!!");
+                }
+            }
+            else
+            {
+                %msg = ("RedisSentinel", "ERROR:  netcat failed to run");
+            }
+            $keyName     = "$instanceName";
+            $description = "RedisSentinel status for ";
+            $action      = 'Open a ticket with the Mobile 2.0 team';
+        }
+        elsif ($instanceName =~ /^Nginx-/)    # HTTP request
+        {
+            # The nginx port is a 'constant' defined in DeploymentDefaults.xml and is extracted from the 'mobile'
+            # product object.
+            $port = $product->default('Nginx.Mobile.Port');
+
+            # These are the print commands from 'awk' line in monitor.sh file for nginx:
+            # print "active_connections="$1
+            # print "total_accepted_connections="$2
+            # print "total_handled_connections="$3
+            # print "total_client_requests="$4
+            # print "curr_reading_connections="$5
+            # print "curr_writing_connections="$6
+            # print "curr_waiting_connections="$7
+
+            # We hard code the key names, but do it in the configuration file, so the hash and keyname array can be kept
+            # together and in sync if needed.
+            @attributes = @{${$statusMap{Nginx}}{keyNamesArray}};
+
+            # Get the data from the host:port:
+            my $response;
+            eval {
+                my $httpObj = ariba::Ops::HTTP->new("http://$host:$port/nginx_status");
+                $response   = $httpObj->get_data();
+            };
+            if ($@)
+            {
+                chomp $@;
+
+                # Substitute any possible internal new lines before using the $@ value.
+                $@ =~ s/\n/--/g;
+                %msg = ("Nginx", "connect to $host:$port for '$instanceName':  $@");
+            }
+            else
+            {
+                # The processing here is based on code for shell and curl to access the servers.  For details see,
+                # "aribamobile.devops/monitoring/monitors/*", which is found in the Mobile 2.0 git repository.  The 'curl' output
+                # was piped to this sequence of commands to create a single line with the data elements to process:
+                # "tr -d '[a-zA-Z:\n.]' |tr -s ' '", which deletes all non-numeric data and squezes multiple spaces to one.  To do
+                # this in Perl, simplest is to use the split operator to create an array, using all the undesireable characters as
+                # separators.
+                my @results = split /[^\d]+/, $response;
+
+                # Any 'empty' trailing fields are stripped, but leading ones are preserved.  In this case, there
+                # is at least a single empty leading element, which must be shifted off the array to make it match the
+                # list of attributes.  But to be safe and to deal with possibly having more than one, check first to be sure
+                # the items are in fact empty.  So iterate from the beginning, as long as the element is empty.
+                while (!$results[0])
+                {
+                    shift @results;
+                }
+
+                print "\nHOSTCHK $instanceName $host $port\n" if $debug or $test;
+
+                # Now, do something with the results.
+                foreach my $number (0 .. $#attributes)
+                {
+                    $msg{$attributes[$number]} = $results[$number];
+                }
+            }
+            $keyName     = "$instanceName";
+            $description = "Nginx status for ";
+            $action      = 'Open a ticket with the Mobile 2.0 team';
+        }
+        elsif ($instanceName =~ /^Oauth-/)    # Jolokia/JVM
+        {
+            @attributes = keys %{$statusMap{Oauth}};
+            $port       = $instance->jolokiaPort;
+            %msg        = ("$instanceName", "$host $port");
+            print "\nHOSTCHK $instanceName $host $port\n" if $debug or $test;
+            $keyName     = "$instanceName";
+            $description = "Oauth status for ";
+            $action      = 'Open a ticket with the Mobile 2.0 team';
+        }
+        elsif ($instanceName =~ /^Kafka-/)    # Jolokia/JVM
+        {
+            # Abhay says the Kafka consumer/producer pair should be part of general notifications, only the kafka server
+            # goes here.  The instance name, 'Kafka-######', is specific to the kafka server.
+            @attributes = keys %{$statusMap{Kafka}};
+            $port       = $instance->jolokiaPort;
+            print "\nHOSTCHK $instanceName $host $port\n" if $debug or $test;
+            $keyName     = "$instanceName";
+            $description = "Kafka status for ";
+            $action      = 'Open a ticket with the Mobile 2.0 team';
+        }
+        elsif ($instanceName =~ /^Notification-/)    # Jolokia/JVM
+        {
+            # This now processes all 'notification' keys, as well as kafka-consumer and kafka-producer.  This is all handled
+            # in the configuration file.
+            @attributes = keys %{$statusMap{Notification}};
+            $port       = $instance->jolokiaPort;
+            %msg        = ("$instanceName", "$host $port");
+            print "\nHOSTCHK $instanceName $host $port\n" if $debug or $test;
+            $keyName     = "$instanceName";
+            $description = "Notification status for ";
+            $action      = 'Open a ticket with the Mobile 2.0 team';
+        }
+        elsif ($instanceName =~ /^Zookeeper-/)
+        {
+            @attributes = keys %{$statusMap{Zookeeper}};
+            $port       = $instance->port;
+            $port1      = $instance->zkleaderPort;                          # I don't know what to do with this,
+            $port2      = $instance->zkpeerPort;                            # or with this, if anything.
+            %msg        = ("$instanceName", "$host $port $port1 $port2");
+            print "\nHOSTCHK $instanceName $host $port $port1 $port2\n" if $debug or $test;
+            $keyName     = "$instanceName";
+            $description = "ZooKeeper status for ";
+            $action      = 'Open a ticket with the Mobile 2.0 team';
+        }
+
+        # END OF IFs
+
+        # At this point, depending on the instance name, there is a full url or at least a host/port to go with the instance,
+        # and data (which needs to be formatted such that it can be dealt with here).  Now loop over the status values defined
+        # for the instance name in the status map hash, extract the crit/warn values, and build queries.  But the instance
+        # name must first be truncated to just the static prefix, everything before the dash.
+        my $namePrefix = substr $instanceName, 0, (index $instanceName, '-');
+
+        $action = 'Open a ticket with the team responsible for the Mobile 2.0 API' unless $action;
+
+        # The loop to use to process the status depends on whether the instance uses Jolokia/JMX for monitoring, or something else.
+        if ($namePrefix =~ /^(Nginx|Redis)/)
+        {
+            foreach my $status (keys %{$statusMap{$namePrefix}})
+            {
+                # Need to skip any keys that should not process, such as 'keyNamesArray'.
+                next if $status eq 'keyNamesArray';
+                my $crit;
+                my $warn;
+                $crit = $statusMap{$namePrefix}->{$status}->{crit} if defined $statusMap{$namePrefix}->{$status}->{crit};
+                $warn = $statusMap{$namePrefix}->{$status}->{warn} if defined $statusMap{$namePrefix}->{$status}->{warn};
+                my $info = $statusMap{$namePrefix}->{$status}->{info} if defined $statusMap{$namePrefix}->{$status}->{info};
+
+                print "INSTCHK $instanceName Keyname:  $keyName Status:  $status Value:  ", (defined $msg{$status}) ? $msg{$status} : 'UNDEFINED', "\n"
+                  if $debug or $test;
+
+                my $message;
+                if (defined $msg{$status})
+                {
+                    $message = $msg{$status};
+                }
+                elsif ($msg{Nginx})
+                {
+                    $message = $msg{Nginx};
+                }
+                else
+                {
+                    $message = "UNDEFINED";
+                }
+
+                # To handle special cases, such as memory, cpu use, etc.
+                if ($namePrefix eq 'Redis' && $status =~ /^used_memory/)    # Either basic used memory, or used_memory_rss (3 of them):
+                {
+                    # $crit and $warn are numeric, as is $message, unless it contains some error condition string.
+                    # c for crit, w for warn.
+                    my ($c, $w, $error_msg);
+                    if (looks_like_number($message))
+                    {
+                        # we have numeric answer
+                        # some ^used_memory (there are more that one defined in the json conf file) do not have crit and warn defined
+                        # so use the answer+1 for crit/warn so it will not trip alert/threshold in stratus
+                        $c = (defined $crit) ? ($totalMemory * $crit) : $message +1;
+                        $w = (defined $warn) ? ($totalMemory * $warn) : $message +1;
+                        $error_msg = " ";
+                    }
+                    else
+                    {
+                        # we got a string answer, this is probably an error message.  In this case
+                        # lets return -1 for answer
+                        $c = -1;
+                        $w = -1;
+                        $error_msg = $message;
+                        $message = -1;
+                    }
+
+                    # The desire here is to return messages and thresholds, based on the actual memory installed on the system, a value which
+                    # may be different on different machines.
+                    $queries{"$keyName $status"} = {
+                        crit   => $c,
+                        warn   => $w,
+                        uiHint => "$namePrefix/$host",
+                        perl   => sub { return $message; },
+                        ticketOwner                  => 'unassigned-sre',
+                        ticketOnWarnOpenAfterMinutes => 1,
+                        severity                     => 1,
+                        description                  => "$description $status",
+                        correctiveActions            => [
+                                              Ops => $action,
+                                             ],
+                        inf_field   => "count",
+                        inf_default => 0,
+                        inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                        group_by    => "$keyName,$status",
+                                                   };
+                    $queries{"$keyName $status warnthreshold"} = {
+                                                         uiHint      => "$namePrefix/$host",
+                                                         perl        => sub {return $w},
+                                                         inf_field   => "warn_threshold",
+                                                         inf_default => 0,
+                                                         inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                         group_by    => "$keyName,$status",
+                                                        };
+                    $queries{"$keyName $status critthreshold"} = {
+                                                         uiHint      => "$namePrefix/$host",
+                                                         perl        => sub {return $c},
+                                                         inf_field   => "crit_threshold",
+                                                         inf_default => 0,
+                                                         inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                         group_by    => "$keyName,$status",
+                                                        };
+                    $queries{"$keyName $status errormsg"} = {
+                                                         uiHint      => "$namePrefix/$host",
+                                                         perl        => sub {$error_msg =~ s/\"//g; return $error_msg;},
+                                                         inf_field   => "error_msg",
+                                                         inf_default => 0,
+                                                         inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                         group_by    => "$keyName,$status",
+                                                        };
+                }
+                elsif ($namePrefix eq 'RedisSentinel')
+                {
+                    my $message = 0;
+
+                    # The string returned looks like:  name=matrix_master,status=ok,address=10.163.5.152:11006,slaves=1,sentinels=3
+                    # Check for status=ok, if not there, set warning, if not there twice, set critical.
+                    ($msg{master0} && $msg{master0} =~ /,status=ok,/) or $message = 'notOK';
+
+                    # Check for special case messages in %msg:
+                    $message = "$msg{RedisSentinel} $message" if $msg{RedisSentinel};
+
+                    # $crit and $warn are numeric, as is $message, unless it contains some error condition string.
+                    # c for crit, w for warn.
+                    my ($c, $w, $error_msg);
+                    if (looks_like_number($message))
+                    {
+                        # we have numeric answer
+                        $c = $crit;
+                        $w = $warn;
+                        $error_msg = " ";
+                    }
+                    else
+                    {
+                        # we got a string answer, this is probably an error message.  In this case
+                        # lets return -1 for answer
+                        $c = -1;
+                        $w = -1;
+                        $error_msg = $message;
+                        $message = -1;
+                    }
+
+                    # Note the values here for $crit and $warn arc actually the same.  Criticality is set when the previous and current
+                    # answer are both "notOK", or if the connection failed.
+                    $queries{"$keyName $status"} = {
+                        crit   => "(answer eq $crit && previousAnswer eq $crit) || answer =~ /Connection refused|UNDEFINED/",
+                        warn   => "answer eq $warn",
+                        uiHint => "$namePrefix/$host",
+                        perl   => sub { return $message; },
+                        ticketOwner                  => 'unassigned-sre',
+                        ticketOnWarnOpenAfterMinutes => 1,
+                        severity                     => 1,
+                        description                  => "$description $status",
+                        correctiveActions            => [
+                                              Ops => $action,
+                                             ],
+                        inf_field   => "count",
+                        inf_default => 0,
+                        inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                        group_by    => "$keyName,$status",
+                                                   };
+                    $queries{"$keyName $status warnthreshold"} = {
+                                                         uiHint      => "$namePrefix/$host",
+                                                         perl        => sub {return $w},
+                                                         inf_field   => "warn_threshold",
+                                                         inf_default => 0,
+                                                         inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                         group_by    => "$keyName,$status",
+                                                        };
+                    $queries{"$keyName $status critthreshold"} = {
+                                                         uiHint      => "$namePrefix/$host",
+                                                         perl        => sub {return $c},
+                                                         inf_field   => "crit_threshold",
+                                                         inf_default => 0,
+                                                         inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                         group_by    => "$keyName,$status",
+                                                        };
+                    $queries{"$keyName $status errormsg"} = {
+                                                         uiHint      => "$namePrefix/$host",
+                                                         perl        => sub {$error_msg =~ s/\"//g; return $error_msg;},
+                                                         inf_field   => "error_msg",
+                                                         inf_default => 0,
+                                                         inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                         group_by    => "$keyName,$status",
+                                                                                            };
+                }
+                else
+                {
+                    # Here, need to determine if we have info, warn+crit, or all three, so each gets set up separately, to prevent uninit'd
+                    # errors for the parts that are not set.  Note also all these tests must use 'defined' because it's possible one or
+                    # another of the threshholds is set to zero.
+                    if (defined $warn && defined $crit && defined $info)
+                    {
+                        my ($c, $w, $error_msg);
+                        if (looks_like_number($message))
+                        {
+                            # we have numeric answer
+                            $c = $crit;
+                            $w = $warn;
+                            $error_msg = " ";
+                        }
+                        else
+                        {
+                            # we got a string answer, this is probably an error message.  In this case
+                            # lets return -1 for answer
+                            $c = -1;
+                            $w = -1;
+                            $error_msg = $message;
+                            $message = -1;
+                        }
+                        my $critical = ($crit =~ /^\d+$/) ? 'answer >= $crit' : 'answer =~ /Connection refused|UNDEFINED/';
+
+                        $queries{"$keyName $status"} = {
+                            crit   => $critical,
+                            warn   => "answer >= $warn",
+                            info   => "$info",
+                            uiHint => "$namePrefix/$host",
+                            perl   => sub { return $message; },
+                            ticketOwner                  => 'unassigned-sre',
+                            ticketOnWarnOpenAfterMinutes => 1,
+                            severity                     => 1,
+                            description                  => "$description $status",
+                            correctiveActions            => [
+                                                  Ops => $action,
+                                                 ],
+                            inf_field   => "count",
+                            inf_default => 0,
+                            inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                            group_by    => "$keyName,$status",
+                                                       };
+                        $queries{"$keyName $status warnthreshold"} = {
+                                                             uiHint      => "$namePrefix/$host",
+                                                             perl        => sub {return $w},
+                                                             inf_field   => "warn_threshold",
+                                                             inf_default => 0,
+                                                             inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                             group_by    => "$keyName,$status",
+                                                            };
+                        $queries{"$keyName $status critthreshold"} = {
+                                                             uiHint      => "$namePrefix/$host",
+                                                             perl        => sub {return $c},
+                                                             inf_field   => "crit_threshold",
+                                                             inf_default => 0,
+                                                             inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                             group_by    => "$keyName,$status",
+                                                            };
+                        $queries{"$keyName $status errormsg"} = {
+                                                             uiHint      => "$namePrefix/$host",
+                                                             perl        => sub {$error_msg =~ s/\"//g; return $error_msg;},
+                                                             inf_field   => "error_msg",
+                                                             inf_default => 0,
+                                                             inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                             group_by    => "$keyName,$status",
+                                                                                                };
+                    }
+                    elsif (defined $warn && defined $crit)
+                    {
+                        my ($c, $w, $error_msg);
+                        if (looks_like_number($message))
+                        {
+                            # we have numeric answer
+                            $c = $crit;
+                            $w = $warn;
+                            $error_msg = " ";
+                        }
+                        else
+                        {
+                            # we got a string answer, this is probably an error message.  In this case
+                            # lets return -1 for answer
+                            $c = -1;
+                            $w = -1;
+                            $error_msg = $message;
+                            $message = -1;
+                        }
+                        my $critical = (looks_like_number($crit)) ? 'answer >= $crit' : 'answer =~ /Connection refused|UNDEFINED/';
+
+                        $queries{"$keyName $status"} = {
+                            crit   => $critical,
+                            warn   => "answer >= $warn",
+                            uiHint => "$namePrefix/$host",
+                            perl   => sub { return $message; },
+                            ticketOwner                  => 'unassigned-sre',
+                            ticketOnWarnOpenAfterMinutes => 1,
+                            severity                     => 1,
+                            description                  => "$description $status",
+                            correctiveActions            => [
+                                                  Ops => $action,
+                                                 ],
+                            inf_field   => "count",
+                            inf_default => 0,
+                            inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                            group_by    => "$keyName,$status",
+                                                       };
+                        $queries{"$keyName $status warnthreshold"} = {
+                                                             uiHint      => "$namePrefix/$host",
+                                                             perl        => sub {return $w},
+                                                             inf_field   => "warn_threshold",
+                                                             inf_default => 0,
+                                                             inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                             group_by    => "$keyName,$status",
+                                                            };
+                        $queries{"$keyName $status critthreshold"} = {
+                                                             uiHint      => "$namePrefix/$host",
+                                                             perl        => sub {return $c},
+                                                             inf_field   => "crit_threshold",
+                                                             inf_default => 0,
+                                                             inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                             group_by    => "$keyName,$status",
+                                                            };
+                        $queries{"$keyName $status errormsg"} = {
+                                                             uiHint      => "$namePrefix/$host",
+                                                             perl        => sub {$error_msg =~ s/\"//g; return $error_msg;},
+                                                             inf_field   => "error_msg",
+                                                             inf_default => 0,
+                                                             inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                             group_by    => "$keyName,$status",
+                                                                                                };
+                    }
+                    elsif (defined $info)
+                    {
+                        my ($c, $w, $error_msg);
+                        if (looks_like_number($message))
+                        {
+                            # we have numeric answer - but since we do not have warn and crit, make then same as numeric $answer +1
+                            # so stratus will not fire alert/threshold
+                            $c = $message + 1;
+                            $w = $message + 1;
+                            $error_msg = " ";
+                        }
+                        else
+                        {
+                            # we got a string answer, this is probably an error message.  In this case
+                            # lets return -1 for answer
+                            $c = -1;
+                            $w = -1;
+                            $error_msg = $message;
+                            $message = -1;
+                        }
+                        $queries{"$keyName $status"} = {
+                            info   => $info,
+                            uiHint => "$namePrefix/$host",
+                            perl   => sub { return $message; },
+                            ticketOwner                  => 'unassigned-sre',
+                            ticketOnWarnOpenAfterMinutes => 1,
+                            severity                     => 1,
+                            description                  => "$description $status",
+                            correctiveActions            => [
+                                                  Ops => $action,
+                                                 ],
+                            inf_field   => "count",
+                            inf_default => 0,
+                            inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                            group_by    => "$keyName,$status",
+                                                       };
+                        $queries{"$keyName $status warnthreshold"} = {
+                                                             uiHint      => "$namePrefix/$host",
+                                                             perl        => sub {return $w},
+                                                             inf_field   => "warn_threshold",
+                                                             inf_default => 0,
+                                                             inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                             group_by    => "$keyName,$status",
+                                                            };
+                        $queries{"$keyName $status critthreshold"} = {
+                                                             uiHint      => "$namePrefix/$host",
+                                                             perl        => sub {return $c},
+                                                             inf_field   => "crit_threshold",
+                                                             inf_default => 0,
+                                                             inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                             group_by    => "$keyName,$status",
+                                                            };
+                        $queries{"$keyName $status errormsg"} = {
+                                                             uiHint      => "$namePrefix/$host",
+                                                             perl        => sub {$error_msg =~ s/\"//g; return $error_msg;},
+                                                             inf_field   => "error_msg",
+                                                             inf_default => 0,
+                                                             inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                             group_by    => "$keyName,$status",
+                                                                                                };
+
+                    }
+
+                    # Don't know if there should ever be an 'else' case here, where none of the three are set?
+                }
+            }
+        }
+        elsif ($namePrefix =~ /^Zookeeper/)
+        {
+            foreach my $status (keys %{$statusMap{$namePrefix}})
+            {
+                print "ZOO INSTCHK $instanceName:  Keyname:  $keyName Status:  $status Value:  it depends\n" if $debug or $test;
+                my $c = 1;
+                my $w = 1;
+                my ($answer, $error_msg) = eval {checkZooKeeperStatus($host, $port)};
+                $error_msg =~ s/\s+//g;
+                $error_msg = ($error_msg eq '') ? " " : $error_msg;
+                if (not defined $answer) {
+                  # no answer?  there must have been a serious problem - set to -1 so it will fire alert in stratus
+                  $answer = -1;
+                  $c = -1;
+                  $w = -1;
+                  $error_msg = ($error_msg eq ' ') ? "unknown error!!" : $error_msg;
+                }
+
+                $queries{"$keyName $status"} = {
+                    warn        => 'answer ne 0',
+                    crit        => '(previousAnswer ne 0 && answer ne 0) || answer =~ /Connection refused|none|ERROR:\s\s/',
+                    perl        => sub {return $answer},
+                    severity    => 1,
+                    uiHint      => "$namePrefix/$host",
+                    description => 'Sends a "ruok" (are you ok) message to the zookeeper node. If it is working properly,
+                                it will respond with "imok".',
+                    correctiveActions => [
+                                          Ops => 'Check the kr log for details on why the zookeeper node is not ok. In a cluster setup, '
+                                            . 'zookeeper must have majority of its nodes up and running to work. Ex. If there are 3 '
+                                            . 'nodes, then at least 2 nodes must be up. If only one node is up, it will not work. '
+                                            . 'Escalate to Tools if needed.',
+                                          Tools => 'Troubleshoot based on kr log',
+                                         ],
+                    inf_field   => qq(count),
+                    inf_default => 0,
+                    inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                    group_by    => "$keyName,$status",
+                                               };
+                $queries{"$keyName $status warnthreshold "} = {
+                                                      perl        => sub {return $w},
+                                                      uiHint      => "$namePrefix/$host",
+                                                      inf_field   => "warn_threshold",
+                                                      inf_default => "none",
+                                                      inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                      group_by    => "$keyName,$status",
+                                                                                          };
+                $queries{"$keyName $status critthreshold "} = {
+                                                      perl        => sub {return $c},
+                                                      uiHint      => "$namePrefix/$host",
+                                                      inf_field   => "crit_threshold",
+                                                      inf_default => "none",
+                                                      inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                      group_by    => "$keyName,$status",
+                                                                                          };
+                $queries{"$keyName $status errormsg"} = {
+                                                     uiHint      => "$namePrefix/$host",
+                                                     perl        => sub {$error_msg =~ s/\"//g; return $error_msg;},
+                                                     inf_field   => "error_msg",
+                                                     inf_default => 0,
+                                                     inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                     group_by    => "$keyName,$status",
+                                                                                        };
+            }
+        }
+        else    # All the JVM Jolokia/JMX hosts processed here.
+        {
+            # NOTE:  It is possible that the connection and request will succeed, but the content of the return value is an
+            # error report for the remote Java code.  In this case, the response content will have a status != 200 (400, 500
+            # usually), with an 'error' message and and 'error_type'.  There must be an explicit check for these.
+            my $msg;
+            my $jmx;
+            eval {$jmx = JMX::Jmx4Perl->new(url => "http://$host:$port/jolokia/")};
+            $msg = "ERROR:   $host:$port:  $@" if $@;
+
+            foreach my $status (keys %{$statusMap{$namePrefix}})
+            {
+                my $message;
+
+                my ($crit, $warn, $info);
+                $crit = $statusMap{$namePrefix}->{$status}->{crit} if $statusMap{$namePrefix}->{$status}->{crit};
+                $warn = $statusMap{$namePrefix}->{$status}->{warn} if $statusMap{$namePrefix}->{$status}->{warn};
+                $info = $statusMap{$namePrefix}->{$status}->{info} if $statusMap{$namePrefix}->{$status}->{info};
+
+                my $response;
+                eval {
+                    my $request = JMX::Jmx4Perl::Request->new(
+                                                              READ,
+                                                              {
+                                                               mbean     => $statusMap{$namePrefix}->{$status}->{request}->{mbean},
+                                                               attribute => $statusMap{$namePrefix}->{$status}->{request}->{attribute},
+                                                              }
+                                                             );
+                    $response = $jmx->request($request);
+                };
+                $message = "ERROR:  ${host}:${port}::request:  $@" if $@;
+
+                if ($response && $response->status == 200)
+                {
+                    $message = $response->value;
+                }
+                elsif ($response && $response->{error})
+                {
+                    $message = "ERROR:  " . $response->{error};
+                }
+
+                if (!defined $message)    # Be sure there's a message to report.
+                {
+                    $message = "ERROR:  Connection and request OK but no response from server!";
+                }
+
+                print "JMX INSTCHK $instanceName:  Keyname:  $keyName Status:  $status Value:  ", $message, "\n" if $debug or $test;
+
+                my $critical;
+
+                my ($c, $w, $error_msg);
+                # This should match any floating point or decimal number.
+                if (looks_like_number($message))
+                {
+                    if ($message =~ /^\s*([-+])?(\d+)(\.\d*)?e([-+]?\d+)\s*$/ ) {
+                      # influx will not accept these exponential notation numbers
+                      # so until we have a solution, bypass them
+                      next;
+                    }
+
+                    # we have numeric answer. if we do not have warn/crit defined, make
+                    # them same as answer +1 so we do not trip stratus alert/threshold
+                    $c = (defined $crit) ? $crit : $message +1;
+                    $w = (defined $warn) ? $warn : $message +1;
+                    $error_msg = " ";
+                }
+                else
+                {
+                    # we got a string answer, this is probably an error message.  In this case
+                    # lets return -1 for answer
+                    $c = -1;
+                    $w = -1;
+                    $error_msg = $message;
+                    $message = -1;
+                }
+
+                print "$keyName $status -- $message\n" if defined $DB::single;
+                $queries{"$keyName $status"} = {
+                                                uiHint                       => "$namePrefix/$host",
+                                                perl                         => sub {return $message},
+                                                ticketOwner                  => 'unassigned-sre',
+                                                ticketOnWarnOpenAfterMinutes => 1,
+                                                severity                     => 1,
+                                                description                  => "$description$status",
+                                                correctiveActions            => [
+                                                                      Ops => $action,
+                                                                     ],
+                                                inf_field   => "count",
+                                                inf_default => 0,
+                                                inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                group_by    => "$keyName,$status",
+                                               };
+                $queries{"$keyName $status warnthreshold"} = {
+                                                     uiHint      => "$namePrefix/$host",
+                                                     perl        => sub {return $w},
+                                                     inf_field   => "warn_threshold",
+                                                     inf_default => 0,
+                                                     inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                     group_by    => "$keyName,$status",
+                                                    };
+                $queries{"$keyName $status critthreshold"} = {
+                                                     uiHint      => "$namePrefix/$host",
+                                                     perl        => sub {return $c},
+                                                     inf_field   => "crit_threshold",
+                                                     inf_default => 0,
+                                                     inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                     group_by    => "$keyName,$status",
+                                                    };
+                $queries{"$keyName $status errormsg"} = {
+                                                     uiHint      => "$namePrefix/$host",
+                                                     perl        => sub {$error_msg =~ s/\"//g; return $error_msg;},
+                                                     inf_field   => "error_msg",
+                                                     inf_default => 0,
+                                                     inf_tags    => qq(name="$namePrefix",host="$host",node="$keyName",type="$status"),
+                                                     group_by    => "$keyName,$status",
+                                                                                        };
+
+            }
+        }
+    }
+}
+
+$queries{'influx_details'} = {measurement => 'mobile_status'};
+my $q = ariba::monitor::QueryManager->newWithDetails("mobile-2.0-api-response-counts", $name, $service, $customer, $cluster, \%queries);
+
+$q->processQueries($debug, $email, $sendEmail, $sendPage);    # unless $test;
+
+# subs here:
+
+# The input must be a pattern for splitting elements from the remaining array into pairs.  This means there must be only one
+# of the things (a colon) using to split the input.
+sub mkhash
+{
+    # The pattern to search for, leaving the rest available to process with map.
+    my $attrPattern = shift;
+
+    # This seems to be the only way to get 'map' to not return anything for an undesired field.
+    return map {
+        if (/$attrPattern/x)
+        {
+            # Retruns two items.
+            split /:/;
+        }
+        else
+        {
+            # This is a "do nothing" branch, to ignore the unwanted fields.
+        }
+    } @_;
+}
+
+sub checkZooKeeperStatus
+{
+    my $host = shift;
+    my $port = shift;
+
+    my $output;
+
+    # Do a good faith effort to actually connect.
+    for (0 .. 2)
+    {
+        eval {
+            my $telnet = Net::Telnet->new(Host => $host, Port => $port,);
+            $telnet->print("ruok");
+            $output = $telnet->getline();
+            if (not defined $output) {
+              # in we get nothing back, this is a problem
+              return ($output, $@);
+            }
+            $output = $output eq 'imok' ? 0 : 1;
+        };
+        last unless $@;
+        sleep 1;
+    }
+
+    return ($output, $@);
+}
+
+__END__
+
+Error for connection refused with Zookeeper:
+ Zookeeper-2311013@app822.lab1 hostStatus: problem connecting to "app822.lab1.ariba.com", port 11013: Connection refused at ./mobile-status line 730
+
+No change for timeout.  Maybe OK?

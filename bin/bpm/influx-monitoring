@@ -1,0 +1,398 @@
+#!/usr/local/bin/perl
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin";
+
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::CFEngine::MonitoringGlueUtils;
+use ariba::monitor::StatusPage;
+use ariba::rc::Utils;
+use Date::Calc qw(Localtime Delta_Days);
+use Data::Dumper;
+use DateTime;
+use JSON;
+
+our $debug = 0;
+my $influxDBUser;
+my $influxDBPass;
+my $port;
+my %queries;
+
+sub usage
+{
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode.
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit ();
+}
+
+sub main
+{
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    while (my $arg = shift)
+    {
+        if ($arg =~ /^-h/o) {usage();  next;}
+        if ($arg =~ /^-d/o) {$debug++; next;}
+        if ($arg =~ /^-e/o) {$sendEmail = 1; next;}
+        if ($arg =~ /^-p/o) {$sendPage  = 1; next;}
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me      = ariba::rc::InstalledProduct->new();
+    my $product = ariba::monitor::StatusPage::businessProcessProduct();
+    my $service = $me->service();
+    my $monuser = "mon" . $service;
+    my $cipher  = ariba::rc::CipherStore->new($service);
+    my $monpass = $cipher->valueForName($monuser);
+    $main::quiet = 1;
+
+    $influxDBUser = $me->default("dbainfo.bpm.influx.username");
+    $influxDBPass = $me->default("dbainfo.bpm.influx.password");
+    $port         = 8086;
+    usage("influxDBPass not found") unless ($influxDBPass);
+
+    for my $key ("servers", "DRservers")
+    {
+        my $uiHint = $key =~ /^DR/ ? "Secondary US1" : "Primary SNV";
+        my @influxServers = split (" ", $me->default("dbainfo.bpm.$key"));
+
+        my @license;
+        my $licenseFile = '/opt/influxdb/license.json';
+        next unless ($influxServers[0]);
+        my $cmd = "ssh $monuser\@$influxServers[0] \'cat $licenseFile\'";
+        ariba::rc::Utils::executeRemoteCommand($cmd, $monpass, 0, undef, undef, \@license);
+        my $liceseExpiryDays =
+          $license[0] =~ /No such file or directory/i
+          ? "License file $licenseFile not exist"
+          : getLiceseExpiryDeltaDays(\@license);
+
+        $queries{"license Expires $influxServers[0]"} = {
+                                                         perl        => sub {return $liceseExpiryDays;},
+                                                         description => "BPM InfluxDB License Expires in",
+                                                         uiHint      => "$uiHint/License/",
+                                                         warn        => "answer > 30 && answer <= 60",
+                                                         crit        => "answer <= 30",
+                                                         inf_field   => "license_expires",
+                                                         inf_default => 0,
+                                                         inf_tags    => qq(dc="$uiHint",type="license",host="$influxServers[0]"),
+                                                         group_by    => qq("license",$uiHint,$influxServers[0]),
+                                                        };
+
+        for my $host (@influxServers)
+        {
+            my @output;
+            my $command = "ssh $monuser\@$host influxd-ctl show";
+            ariba::rc::Utils::executeRemoteCommand($command, $monpass, 0, undef, undef, \@output);
+            print "\n--->", join "\n-", @output if $debug;
+            next if (grep {$_ =~ /Error/i} @output);
+            my ($dn_str, $mn_str) = format_output(\@output);
+            $queries{"Cluster Info - dnstr - $host"} = {
+                                                        perl        => sub {return $dn_str},
+                                                        inf_field   => "data_node",
+                                                        inf_default => "none",
+                                                        inf_tags    => qq(host="$host"),
+                                                        group_by    => $host
+                                                       };
+            $queries{"Cluster Info - mnstr - $host"} = {
+                                                        perl        => sub {return $mn_str},
+                                                        inf_field   => "meta_node",
+                                                        inf_default => "none",
+                                                        inf_tags    => qq(host="$host"),
+                                                        group_by    => $host
+                                                       };
+            last;
+        }
+
+        my $measurementFlag;
+        for my $host (@influxServers)
+        {
+            my $influXDBs = getInfluxDBs($host);
+            my $shards    = getShardDetails($host);
+
+            unless ($influXDBs)
+            {
+                $queries{"Shards in $host"} = {
+                                               perl        => sub {return "None"},
+                                               crit        => "answer =~ /none/i",
+                                               description => "BPM InfluxDB Shard Counts",
+                                               uiHint      => "$uiHint/Shard Count/$host",
+                                               inf_field   => "count",
+                                               inf_default => 0,
+                                               inf_tags    => qq(dc="$uiHint",type="Shard Count",host="$host"),
+                                               group_by    => qq("shard",$uiHint,$host),
+                                              };
+                next;
+            }
+
+            for my $db (@$influXDBs)
+            {
+                unless ($measurementFlag)
+                {
+                    print "influXDB: " . $db->[0] if $debug;
+                    my $dbCount = getMeasurementsCountforDB($host, $db->[0]);
+
+                    $queries{"Measurements Count for $host in $db->[0]"} = {
+                                                                            perl        => sub {return $dbCount},
+                                                                            description => "BPM InfluxDB Measurement Counts",
+                                                                            uiHint      => "$uiHint/Measurement Count",
+                                                                            inf_field   => "count",
+                                                                            inf_default => 0,
+                                                                            inf_tags    => qq(dc="$uiHint",type="Measurement Count",host="$db->[0]"),
+                                                                            group_by    => qq("MC",$uiHint,$db->[0]),
+                                                                           };
+                }
+
+                $queries{"Shards in $host $db->[0]"} = {
+                                                        perl        => sub {return $shards->{$db->[0]};},
+                                                        description => "BPM InfluxDB Shard Counts",
+                                                        uiHint      => "$uiHint/Shard Count/$host",
+                                                        inf_field   => "count",
+                                                        inf_default => 0,
+                                                        inf_tags    => qq(dc="$uiHint",type="Shard Count",host="$host",db="$db->[0]"),
+                                                        group_by    => qq("shard",$uiHint,$host,$db->[0]),
+                                                       };
+            }
+            $measurementFlag = 1;
+        }
+
+        for my $dNode (@influxServers)
+        {
+            my $statRef = getStatsForNode($dNode);
+            my $upTime  = getUpTimeForNode($dNode);
+
+            $queries{"DataNode $dNode: UPTIME"} = {
+                                                   perl        => sub {return $upTime},
+                                                   crit        => 'answer =~ /down/i',
+                                                   description => "BPM InfluxDB Cluster Uptime",
+                                                   uiHint      => "$uiHint/Nodes/UPTimes",
+                                                   inf_field   => "uptime",
+                                                   inf_default => 0,
+                                                   inf_tags    => qq(dc="$uiHint",type="Data Node",node="$dNode"),
+                                                   group_by    => qq("dnode",$uiHint,$dNode,uptime),
+                                                  };
+
+            unless ($statRef)
+            {
+                $queries{"$dNode - Stat"} = {
+                                             perl        => sub {return "None"},
+                                             crit        => "answer =~ /none/i",
+                                             description => "BPM InfluxDB Cluster Stats",
+                                             uiHint      => "$uiHint/Nodes/DataNodes/$dNode",
+                                             inf_field   => "Stat",
+                                             inf_default => 0,
+                                             inf_tags    => qq(dc="$uiHint",type="Data Node",node="$dNode"),
+                                             group_by    => qq("dnode",$uiHint,$dNode),
+                                            };
+                next;
+            }
+            for my $stat (keys %$statRef)
+            {
+                $queries{"$dNode - $stat"} = {
+                                              perl        => sub {return $statRef->{$stat};},
+                                              description => "BPM InfluxDB Cluster Stats",
+                                              uiHint      => "$uiHint/Nodes/DataNodes/$dNode",
+                                              inf_field   => $stat,
+                                              inf_default => 0,
+                                              inf_tags    => qq(dc="$uiHint",type="Data Node",node="$dNode"),
+                                              group_by    => qq("dnode",$uiHint,$dNode),
+                                             };
+            }
+        }
+
+        for my $mNodes (@influxServers)
+        {
+            my @output;
+            my $cmd = "ssh $monuser\@$mNodes \"ps -wwef | grep influxd-meta | grep config | grep -v grep \"";
+            ariba::rc::Utils::executeRemoteCommand($cmd, $monpass, 0, undef, undef, \@output);
+
+            my $metaPid;
+            if (@output)
+            {
+                my @temp = split /\s+/, $output[0];
+                $metaPid = 'UP' . ', Pid: ' . $temp[1];
+            }
+            else
+            {
+                $metaPid = "DOWN";
+            }
+
+            print "metaPid: $metaPid\n" if $debug;
+            $queries{"MetaNode $mNodes"} = {
+                                            perl        => sub {return $metaPid;},
+                                            crit        => 'answer =~ /down/i',
+                                            description => "BPM InfluxDB MetaNodes",
+                                            uiHint      => "$uiHint/Nodes/MetaNodes",
+                                            inf_field   => "stat",
+                                            inf_default => 0,
+                                            inf_tags    => qq(dc="$uiHint",type="Meta Node",node="$mNodes"),
+                                            group_by    => qq("mnode",$uiHint,$mNodes),
+                                           };
+        }
+    }
+
+    $main::quiet = 0;
+    print Dumper(\%queries) if $debug;
+    my $email = ariba::Ops::Constants->operationsPagerAddress();
+    $queries{influx_details} = {measurement => 'bpm_influxdb'};
+    my $qm = ariba::monitor::QueryManager->newWithDetails("InfluxDB", $product, $service, undef, \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+}
+
+sub getLiceseExpiryDeltaDays
+{
+    my $outputRef = shift;
+
+    my ($licenseExpDate) = grep {$_ =~ /expires_at/i} @$outputRef;
+    ($licenseExpDate) = $licenseExpDate =~ /"expires_at": "(.*?)T/isg;
+    print "licenseExpDate: $licenseExpDate\n" if $debug;
+
+    my ($year1, $month1, $day1) = Localtime();
+    my ($year2, $month2, $day2) = split ("-", $licenseExpDate);
+    my $Dd = Delta_Days($year1, $month1, $day1, $year2, $month2, $day2);
+
+    return $Dd;
+}
+
+sub getUpTimeForNode
+{
+    my $node = shift;
+
+    #http://influxdb01.snv.ariba.com:8086/query?u=system&p=password&q=SHOW%20DIAGNOSTICS
+    my $cmd = "curl -s -G 'http://$node:$port/query?u=$influxDBUser&p=$influxDBPass&q=SHOW%20DIAGNOSTICS'";
+    my $ret = `$cmd`;
+    return "DOWN" unless ($ret);
+    my $jsonVal   = from_json($ret);
+    my $uptimeref = $jsonVal->{'results'}->[0]->{'series'};
+
+    for my $db (@$uptimeref)
+    {
+        next if ($db->{'name'} ne 'system');
+        if (defined $db->{'values'})
+        {
+            return pop @{$db->{'values'}->[0]};
+        }
+        else
+        {
+            return "DOWN";
+        }
+    }
+}
+
+sub getStatsForNode
+{
+    my $node = shift;
+
+    #http://influxdb01.snv.ariba.com:8086/query?u=system&p=password&q=SHOW%20STATS
+    my $cmd = "curl -s -G 'http://$node:$port/query?u=$influxDBUser&p=$influxDBPass&q=SHOW%20STATS'";
+    my $ret = `$cmd`;
+    return unless ($ret);
+    my $jsonVal  = from_json($ret);
+    my $statsRef = $jsonVal->{'results'}->[0]->{'series'};
+    my $stats;
+
+    for my $type (@$statsRef)
+    {
+        if ($type->{'name'} eq 'rpc')
+        {
+            my $cols   = $type->{'columns'};
+            my $values = $type->{'values'};
+            for (my $i = 0; $i < scalar (@$cols); $i++)
+            {
+                $stats->{$cols->[$i]} = $values->[0]->[$i];
+            }
+        }
+    }
+
+    return $stats;
+}
+
+sub getMeasurementsCountforDB
+{
+    my ($host, $dbName) = @_;
+
+    ##"http://influxdb01.snv.ariba.com:8086/query?u=system&p=password&db=BPM_TEST&q=SHOW%20MEASUREMENTS"
+    my $cmd      = "curl -s -G 'http://$host:$port/query?u=$influxDBUser&p=$influxDBPass&db=$dbName&q=SHOW%20MEASUREMENTS'";
+    my $ret      = `$cmd`;
+    my $jsonVal  = from_json($ret);
+    my $measures = $jsonVal->{'results'}->[0]->{'series'}->[0]->{'values'};
+
+    defined $measures ? return scalar (@$measures) : return 0;
+}
+
+sub getInfluxDBs
+{
+    my $host = shift;
+
+    ##http://influxdb01.snv.ariba.com:8086/query?u=system&p=password&q=SHOW%20DATABASES
+    my $cmd = "curl -s -G 'http://$host:$port/query?u=$influxDBUser&p=$influxDBPass&q=SHOW%20DATABASES'";
+    print "cmd for getInfluxDBs $cmd\n" if $debug;
+    my $ret = `$cmd`;
+    return unless ($ret);
+    my $jsonVal   = from_json($ret);
+    my $influXDBs = $jsonVal->{'results'}->[0]->{'series'}->[0]->{'values'};
+
+    return $influXDBs;
+}
+
+sub getShardDetails
+{
+    my $host = shift;
+
+    ##http://influxdb01.snv.ariba.com:8086/query?u=system&p=password&q=SHOW%20SHARDS
+    my $cmd = "curl -s -G 'http://$host:$port/query?u=$influxDBUser&p=$influxDBPass&q=SHOW%20SHARDS'";
+    my $ret = `$cmd`;
+    return unless ($ret);
+    my $jsonVal  = from_json($ret);
+    my $shardRes = $jsonVal->{'results'}->[0]->{'series'};
+
+    my $shards;
+    for my $db (@$shardRes)
+    {
+        my $scount = 0;
+        if (defined $db->{'values'})
+        {
+            $scount = scalar @{$db->{'values'}};
+        }
+        else
+        {
+            $scount = 0;
+        }
+        $shards->{$db->{'name'}} = $scount;
+    }
+
+    return $shards;
+}
+
+sub format_output
+{
+    my $data = shift;
+
+    my ($index) = grep {$data->[$_] eq ''} (0 .. @$data - 1);
+    my @data    = @{$data};
+    my @dn      = @data[3 .. $index - 1];
+    my @mn      = @data[$index + 4 .. scalar (@data) - 1];
+
+    return ((join ';', @dn), (join ';', @mn));
+}
+
+main(@ARGV);
+
+__END__

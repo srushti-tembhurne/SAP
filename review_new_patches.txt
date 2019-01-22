@@ -1,0 +1,705 @@
+./bin/an/datalink-status
+./bin/an/discovery-status
+./bin/an/edi-interchange-status
+./bin/an/edi-queue-status
+./bin/an/esig-status
+./bin/an/exchange-rate-status
+./bin/an/flowExtension
+./bin/an/intermedia-status
+./bin/an/messaging-queue-status
+./bin/an/micro-queue-status
+./bin/an/order-methods
+./bin/an/order-status
+./bin/an/payments-an
+./bin/an/replication-status
+./bin/an/rfx-digest-status
+./bin/an/rfx-notification
+./bin/an/smi-status
+./bin/an/supplierTracker
+./bin/clean-archivelogs-hana
+./bin/common/aql-metrics
+./bin/common/cds-health
+x ./bin/common/client-cert-expire
+./bin/common/current-activity
+./bin/common/dr-product-status
+./bin/common/encryption-length-hwm-stats
+./bin/common/http-watcher
+./bin/common/logsize-watcher
+./bin/common/node-status
+./bin/common/product-filesystem-check
+./bin/common/realm-community-mapping
+./bin/common/realm-delete-status
+./bin/common/realm-schema-mapping
+./bin/common/ws-cert-expire
+./bin/control-deployment
+./bin/everywhere/httpd-process-watcher
+./bin/geturl
+./bin/hadoop/checkpoint-health
+./bin/hadoop/cleanup-hbase-snapshots
+./bin/hadoop/hbase-status
+./bin/hadoop/hdfs-export
+./bin/hadoop/hdfs-health
+./bin/hadoop/hdfs-replication
+./bin/hadoop/heap-usage
+./bin/hadoop/job-status
+./bin/hadoop/mr-health
+./bin/hadoop/name-node-consistency
+./bin/hadoop/node-status
+./bin/hadoop/veritas-cluster-status
+x ./bin/hadoop/zookeeper-status
+./bin/mobile/an-mobile-status
+./bin/mon/kr-status
+./bin/s4/esignature-status
+./bin/s4/intermedia-index-health
+./bin/startup
+./bin/ws/cache-and-log-size
+./bin/ws/modjk-worker-status
+x ./lib/FCGI.pm
+x ./lib/ariba/HTTPWatcherPlugin/SSRealms.pm
+./lib/ariba/HTTPWatcherPlugin/TomcatAppInstance.pm
+x ./lib/ariba/Ops/Constants.pm
+x ./lib/ariba/Ops/ControlDeploymentHelper.pm
+x ./lib/ariba/Ops/DatasetManager.pm
+./lib/ariba/Ops/DateTime.pm
+x ./lib/ariba/Ops/FileSystemUtils.pm
+x ./lib/ariba/Ops/HanaControl.pm
+x ./lib/ariba/Ops/MCL/BaseAction.pm
+x ./lib/ariba/Ops/MCL/HadoopAction.pm
+x ./lib/ariba/Ops/MCL/HbaseAction.pm
+x ./lib/ariba/Ops/MCL/MCLAction.pm
+x ./lib/ariba/Ops/MCL/ShellAction.pm
+x ./lib/ariba/Ops/NetworkDevice/BaseDevice.pm
+x ./lib/ariba/Ops/NetworkDevice/inserv.pm
+x ./lib/ariba/Ops/NetworkDevice/ontap.pm
+./lib/ariba/Ops/OracleClient.pm
+x ./lib/ariba/Ops/ProductConfig/Constants.pm
+x ./lib/ariba/Ops/ProductConfig/Hana.pm
+x ./lib/ariba/Ops/ProductConfig/Oracle.pm
+x ./lib/ariba/Ops/ProductConfig/Utils.pm
+x ./lib/ariba/Ops/Startup/Common.pm
+x ./lib/ariba/Ops/Startup/StartupHooks.pm
+x ./lib/ariba/Ops/Startup/Tomcat.pm
+x ./lib/ariba/monitor/BusinessObjects.pm
+./lib/ariba/monitor/Query.pm
+./lib/ariba/monitor/QueryManager.pm
+x ./lib/ariba/monitor/TlsSecurityUtil.pm
+x ./lib/ariba/rc/AUCSolrAppInstance.pm
+x ./lib/ariba/rc/CipherStore.pm
+./lib/ariba/rc/Globals.pm
+x ./lib/ariba/rc/Passwords.pm
+x ./lib/ariba/rc/Product.pm
+x ./lib/ariba/rc/ProductsCfg.pm
+x ./lib/ariba/rc/ServicesCfg.pm
+x ./lib/ariba/rc/SpringbootAppInstance.pm
+./lib/ariba/rc/Utils.pm
+./lib/ariba/rc/expect-covers.pl
+./lib/ariba/util/Crontab.pm
+./lib/ariba/util/Encryption.pm
+./bin/arches/health-check
+./bin/auc/auc-cache-status
+./bin/auc/current-memcached-connections
+./bin/auc/memcached-status
+./bin/common/redis-status-embedded
+./bin/mobile/mobile-oauth-check
+./bin/mobile/mobile-status
+./bin/spotbuy/ebay-watcher
+./bin/ws/http-connection-status
+./bin/ws/realm-community-map-file
+./lib/ariba/Ops/HanaClient.pm
+./lib/ariba/Ops/Utils.pm
+./bin/auc/auc-balancer-status
+./bin/auc/auc-clamAV-status
+./bin/auc/auc-comm-content-import-status
+./bin/auc/auc-notifications-status
+./bin/auc/auc-siebel-routing
+./bin/auc/auc-solr-status
+./bin/auc/auc-validateLinks-status
+./bin/common/sizeof-bulk-allocated-resources
+./bin/sdb/sdb-activity
+./lib/ariba/Ops/DatacenterController.pm
+./lib/ariba/Ops/Startup/Hadoop.pm
+./lib/ariba/Ops/Startup/Monitoring.pm
+./bin/an/daily-order-status
+./bin/an/legal-queues
+./bin/an/misc-status
+./bin/an/misc-status-account
+./bin/an/misc-status-account-deprecated
+./bin/an/queue-status
+./bin/an/schedule-task-failure
+./bin/an/scheduled-tasks
+./bin/arches/arches-node-health
+./bin/arches/index-manager
+./bin/arches/nrt-metrics-status
+./bin/arches/queue-message-status
+./bin/arches/search-index
+./bin/arches/shard-status
+./bin/arches/system-rebuild
+./bin/auc/auc-comm-creation-monitoring
+./bin/boe/boe-status
+./bin/bpm/invoice
+./bin/bpm/purchase-order
+./bin/buyer/catalog-status
+./bin/buyer/queue-status
+./bin/buyer/usage-status
+./bin/common/3par-status
+./bin/common/an-on-hana
+./bin/common/cert-bundle-expire
+./bin/common/cgroups-status
+./bin/common/check-console-hostnames
+./bin/common/conversational-api-status
+./bin/common/db-conn-status
+./bin/common/downtimedb-status
+./bin/common/focus-customers
+./bin/common/hana-multipath-status
+./bin/common/instance-heap-usage
+./bin/common/integration-events
+./bin/common/machine-watcher
+./bin/common/mail-cert-expire
+./bin/common/master-data-service-monitoring
+./bin/common/mem-watcher
+./bin/common/netapp-cluster-status
+./bin/common/netapp-domain
+./bin/common/netapp-latency
+./bin/common/node-health
+./bin/common/numa-status
+./bin/common/persisted-mail-queue
+./bin/common/persistent-queue
+./bin/common/physical-dataguard-gap-delay
+./bin/common/query-frequency
+./bin/common/scheduled-tasks
+./bin/common/sendmail-queue
+./bin/common/sendmail-status
+./bin/common/state-of-machine-db
+./bin/common/veritas-disk-state
+./bin/common/veritas-failover-node-state
+./bin/dba/alert-log
+./bin/dba/check-oracle-version
+./bin/dba/listener-log
+./bin/dba/listener-status
+./bin/dba/memory
+./bin/dba/oracle-version
+./bin/dba/stats-job-status
+./bin/ebs/ebs-database
+./bin/ebs/filesys-queue-status
+./bin/everywhere/check-omniback-result
+./bin/everywhere/diskstats-watcher
+./bin/everywhere/iostat-data
+./bin/everywhere/monitor-clamav-definitions-status
+./bin/everywhere/monitor-clamav-processes-always
+./bin/everywhere/monitor-safeguard
+./bin/everywhere/per-cpu-usage
+./bin/mobile/ANmobile-backend-stats
+./bin/mon/fyst-status
+./bin/mon/monitor-daemon-watcher
+./bin/mon/record-pagerequest-volume
+./bin/mon/record-vm-tab-status
+./bin/mon/spew-status
+./bin/network/bgp
+./bin/network/etherchannel-status
+./bin/network/latency-and-loss
+./bin/network/network-bad-duplex
+./bin/network/network-errors
+./bin/network/object-tracking
+./bin/network/os-revision
+./bin/network/power
+./bin/network/redundancy-check
+./bin/network/switch-port-name
+./bin/network/switch-usage
+./bin/network/vip-pool
+./bin/redis/redis-db-stats
+./bin/redis/redis-nodes-status
+./bin/s4/activity-stats-lli
+./bin/s4/sizeof-bulk-allocated-resources
+./bin/sysadmin/spare-check
+./bin/visualizer/current-activity
+./bin/ws/generate-reports
+./bin/ws/modjk-workers-consistency
+./lib/ariba/HTTPWatcherPlugin/DeploymentDefaultsUrls.pm
+./lib/ariba/HTTPWatcherPlugin/WOFAppInstance.pm
+./lib/ariba/Oncall/Schedule_v2.pm
+./lib/ariba/Ops/CommonMachineMethods.pm
+./lib/ariba/Ops/DBConnection.pm
+./lib/ariba/Ops/FileSystemUtilsRPC.pm
+./lib/ariba/Ops/MCL.pm
+./lib/ariba/Ops/MigrationHelper.pm
+./lib/ariba/Ops/NetworkDeviceManager.pm
+./lib/ariba/Ops/ServiceController.pm
+./lib/ariba/Ops/Startup/Apache.pm
+./lib/ariba/Ops/Startup/Arches.pm
+./lib/ariba/Ops/Startup/OSGI.pm
+./lib/ariba/Ops/Sybase/Utils.pm
+./lib/ariba/Ops/VaultAccess.pm
+./lib/ariba/SNMP/Session.pm
+./lib/ariba/monitor/Bpm.pm
+./lib/ariba/monitor/ProductStatus.pm
+./lib/ariba/monitor/StatusPage.pm
+./lib/ariba/monitor/Utils.pm
+./lib/ariba/rc/AppInstanceManager.pm
+./lib/ariba/rc/TomcatAppInstance.pm
+***** 20180131 *****
+./bin/all-diskstats-watcher
+./bin/an/daily-order-status
+./bin/an/legal-queues
+./bin/an/datalink-status
+./bin/an/discovery-status
+./bin/an/edi-interchange-status
+./bin/an/esig-status
+./bin/an/edi-queue-status
+./bin/an/intermedia-status
+./bin/an/messaging-queue-status
+./bin/an/micro-queue-status
+./bin/an/misc-status-account
+./bin/an/misc-status
+./bin/an/misc-status-account-deprecated
+./bin/an/order-status
+./bin/an/queue-status
+./bin/an/replication-status
+./bin/an/rfx-digest-status
+./bin/an/rfx-notification
+./bin/an/schedule-task-failure
+./bin/an/scheduled-tasks
+./bin/an/smi-status
+./bin/an/supplierTracker
+./bin/arches/arches-node-health
+./bin/arches/health-check
+./bin/arches/index-manager
+./bin/arches/nrt-metrics-status
+./bin/arches/queue-message-status
+./bin/arches/search-index
+./bin/arches/shard-status
+./bin/arches/system-rebuild
+./bin/auc/auc-comm-creation-monitoring
+./bin/auc/auc-balancer-status
+./bin/auc/auc-cache-status
+./bin/auc/auc-notifications-status
+./bin/auc/auc-siebel-routing
+./bin/auc/auc-solr-status
+./bin/auc/current-memcached-connections
+./bin/auc/memcached-status
+./bin/boe/boe-status
+./bin/bpm/invoice
+./bin/bpm/purchase-order
+./bin/buyer/catalog-status
+./bin/buyer/queue-status
+./bin/buyer/usage-status
+./bin/clean-archivelogs-hana
+./bin/common/cds-health
+./bin/common/cert-bundle-expire
+./bin/common/cgroups-status
+./bin/common/check-console-hostnames
+./bin/common/conversational-api-status
+./bin/common/db-conn-status
+./bin/common/downtimedb-status
+./bin/common/client-cert-expire
+./bin/common/current-activity
+./bin/common/focus-customers
+./bin/common/hana-multipath-status
+./bin/common/instance-heap-usage
+./bin/common/integration-events
+./bin/common/logsize-watcher
+./bin/common/product-filesystem-check
+./bin/common/realm-community-mapping
+./bin/common/realm-schema-mapping
+./bin/control-deployment
+./bin/common/mail-cert-expire
+./bin/common/master-data-service-monitoring
+./bin/common/http-watcher
+./bin/common/mem-watcher
+./bin/common/netapp-cluster-status
+./bin/common/netapp-domain
+./bin/common/netapp-latency
+./bin/common/node-health
+./bin/common/numa-status
+./bin/common/persisted-mail-queue
+./bin/common/persistent-queue
+./bin/common/physical-dataguard-gap-delay
+./bin/common/query-frequency
+./bin/common/scheduled-tasks
+./bin/common/sendmail-queue
+./bin/common/sendmail-status
+./bin/common/state-of-machine-db
+./bin/common/veritas-disk-state
+./bin/common/veritas-failover-node-state
+./bin/dba/check-oracle-version
+./bin/dba/listener-log
+./bin/dba/oracle-version
+./bin/dba/memory
+./bin/dba/listener-status
+./bin/dba/stats-job-status
+./bin/ebs/ebs-database
+./bin/ebs/filesys-queue-status
+./bin/everywhere/check-omniback-result
+./bin/everywhere/diskstats-watcher
+./bin/everywhere/iostat-data
+./bin/everywhere/monitor-clamav-processes-always
+./bin/everywhere/monitor-safeguard
+./bin/everywhere/monitor-clamav-definitions-status
+./bin/everywhere/per-cpu-usage
+./bin/mobile/ANmobile-backend-stats
+./bin/mon/fyst-status
+./bin/mon/record-pagerequest-volume
+./bin/mon/monitor-daemon-watcher
+./bin/mon/record-vm-tab-status
+./bin/mon/spew-status
+./bin/network/bgp
+./bin/network/etherchannel-status
+./bin/network/latency-and-loss
+./bin/network/network-bad-duplex
+./bin/network/object-tracking
+./bin/network/os-revision
+./bin/network/power
+./bin/network/redundancy-check
+./bin/network/switch-port-name
+./bin/network/switch-usage
+./bin/network/vip-pool
+./bin/redis/redis-db-stats
+./bin/redis/redis-nodes-status
+./bin/s4/activity-stats-lli
+./bin/s4/sizeof-bulk-allocated-resources
+./bin/sysadmin/spare-check
+./bin/visualizer/current-activity
+./bin/ws/generate-reports
+./bin/ws/modjk-worker-status
+./bin/sdb/sdb-activity
+./bin/geturl
+./bin/hadoop/checkpoint-health
+./lib/ariba/HTTPWatcherPlugin/DeploymentDefaultsUrls.pm
+./lib/ariba/HTTPWatcherPlugin/WOFAppInstance.pm
+./lib/ariba/Oncall/Schedule_v2.pm
+./lib/ariba/Ops/CommonMachineMethods.pm
+./lib/ariba/Ops/DBConnection.pm
+./lib/ariba/Ops/FileSystemUtilsRPC.pm
+./lib/ariba/Ops/MigrationHelper.pm
+./lib/ariba/Ops/DatasetManager.pm
+./lib/ariba/Ops/ServiceController.pm
+./lib/ariba/Ops/Startup/Apache.pm
+./lib/ariba/Ops/Startup/Arches.pm
+./lib/ariba/Ops/Startup/OSGI.pm
+./lib/ariba/SNMP/Session.pm
+./lib/ariba/monitor/StatusPage.pm
+./lib/ariba/monitor/Utils.pm
+./lib/ariba/monitor/QueryManager.pm
+./lib/ariba/monitor/ProductStatus.pm
+./lib/ariba/rc/SpringbootAppInstance.pm
+./bin/hadoop/hbase-status
+./bin/hadoop/hdfs-health
+./bin/hadoop/hdfs-replication
+./bin/hadoop/mr-health
+./bin/hadoop/node-status
+./bin/hadoop/veritas-cluster-status
+./bin/hadoop/zookeeper-status
+./bin/mobile/an-mobile-status
+./bin/s4/esignature-status
+./bin/mon/kr-status
+./bin/hadoop/heap-usage
+./bin/hadoop/job-status
+./bin/hadoop/name-node-consistency
+./bin/mobile/mobile-oauth-check
+./bin/mobile/mobile-status
+./bin/spotbuy/ebay-watcher
+./bin/network/network-errors
+./bin/common/an-on-hana
+./bin/common/3par-status
+./bin/common/node-status
+./bin/common/realm-delete-status
+./bin/common/redis-status-embedded
+./bin/common/sizeof-bulk-allocated-resources
+./bin/dba/alert-log
+./bin/ws/modjk-workers-consistency
+./lib/ariba/Ops/Utils.pm
+./lib/ariba/HTTPWatcherPlugin/TomcatAppInstance.pm
+./bin/startup
+./bin/common/machine-watcher
+./lib/ariba/monitor/Bpm.pm
+./bin/common/sizeof-bulk-allocated-resources
+./lib/ariba/Ops/MCL.pm
+./lib/ariba/Ops/QualManager.pm
+./lib/ariba/Ops/Sybase/Utils.pm
+./lib/ariba/Ops/VaultAccess.pm
+***** 20180206 *****
+./lib/ariba/Ops/MCL.pm
+./lib/ariba/Ops/QualManager.pm
+./lib/ariba/Ops/VaultAccess.pm
+./bin/an/discovery-status
+./bin/an/exchange-rate-status
+./bin/common/sizeof-bulk-allocated-resources
+***** 20180208 *****
+./bin/an/datalink-status
+./bin/an/edi-interchange-status
+./bin/an/edi-queue-status
+./bin/an/esig-status
+./bin/an/intermedia-status
+./bin/an/messaging-queue-status
+./bin/an/micro-queue-status
+./bin/an/replication-status
+./bin/an/rfx-notification
+./bin/an/smi-status
+./bin/an/supplierTracker
+./bin/arches/health-check
+./bin/arches/index-manager
+./bin/arches/nrt-metrics-status
+./bin/arches/search-index
+./bin/auc/auc-balancer-status
+./bin/auc/auc-cache-status
+./bin/auc/auc-notifications-status
+./bin/auc/auc-siebel-routing
+./bin/auc/auc-solr-status
+./bin/auc/current-memcached-connections
+./bin/auc/memcached-status
+./bin/clean-archivelogs-hana
+./bin/common/3par-status
+./bin/common/cds-health
+./bin/common/cert-bundle-expire
+./bin/common/client-cert-expire
+./bin/common/current-activity
+./bin/common/http-watcher
+./bin/common/logsize-watcher
+./bin/common/machine-watcher
+./bin/common/netapp-latency
+./bin/common/node-status
+./bin/common/product-filesystem-check
+./bin/common/realm-community-mapping
+./bin/common/realm-delete-status
+./bin/common/realm-schema-mapping
+./bin/common/redis-status-embedded
+./bin/control-deployment
+./bin/hadoop/checkpoint-health
+./bin/hadoop/hbase-status
+./bin/hadoop/hdfs-health
+./bin/hadoop/hdfs-replication
+./bin/hadoop/heap-usage
+./bin/hadoop/job-status
+./bin/hadoop/mr-health
+./bin/hadoop/name-node-consistency
+./bin/hadoop/node-status
+./bin/hadoop/veritas-cluster-status
+./bin/hadoop/zookeeper-status
+./bin/mobile/mobile-status
+./bin/network/object-tracking
+./bin/s4/esignature-status
+./bin/startup
+./lib/ariba/monitor/QueryManager.pm
+***** 20180209 *****
+./bin/arches/nrt-metrics-status
+./bin/common/3par-vv-cache-stats
+./bin/mobile/mobile-status
+x ./bin/common/machine-watcher
+x ./bin/network/etherchannel-status -- Merged cookies changes
+x ./bin/network/os-revision -- Merged cookies changes
+x ./bin/network/power -- Merged cookies changes
+x ./bin/startup -- Merged cookies changes
+x ./lib/ariba/Ops/NetworkDeviceManager.pm -- Merged cookies changes
+./bin/an/aribapay-status
+./bin/auc/learning-center-status
+./bin/buyer/contract-status
+./bin/common/cpu-watcher
+./bin/common/disk-usage
+./bin/common/dns-watcher
+./bin/common/durable-email-monitoring
+./bin/common/hana-isup
+./bin/common/load-average-watcher
+./bin/common/oracle-long-running-transactions
+./bin/common/reporting-job-stats
+./bin/dba/db-locking-check
+./bin/dba/db-sequence-check
+./bin/dba/physical-dataguard-status-replicated
+./bin/dms/dms-metrices
+./bin/s4/activity-stats
+./lib/ariba/Automation/CleanAction.pm
+./lib/ariba/DBA/SampleSQLQueries.pm
+./lib/ariba/HTTPWatcherPlugin/Community.pm
+./lib/ariba/Ops/CFEngine/MonitoringGlueUtils.pm
+./lib/ariba/Ops/CFEngine/PackageHelper.pm
+./lib/ariba/Ops/DatabasePeers.pm
+./lib/ariba/Ops/MCL/Step.pm
+./lib/ariba/Ops/NetworkUtils.pm
+./lib/ariba/Ops/Page.pm
+./lib/ariba/Ops/ProductAPIExtensions.pm
+./lib/ariba/monitor/misc.pm
+./lib/ariba/rc/Patch.pm
+./lib/ariba/rc/RolesManager.pm
+***** 20180725 *****
+patching file stratus-develop/./bin/all-diskstats-watcher
+patching file stratus-develop/./bin/an/aribapay-status
+patching file stratus-develop/./bin/an/discovery-status
+patching file stratus-develop/./bin/an/edi-interchange-status
+patching file stratus-develop/./bin/an/edi-queue-status
+patching file stratus-develop/./bin/an/esig-status
+patching file stratus-develop/./bin/an/intermedia-status
+patching file stratus-develop/./bin/an/micro-queue-status
+patching file stratus-develop/./bin/an/order-methods
+patching file stratus-develop/./bin/an/queue-status
+patching file stratus-develop/./bin/an/scheduled-tasks
+patching file stratus-develop/./bin/an/smi-status
+patching file stratus-develop/./bin/arches/health-check
+patching file stratus-develop/./bin/arches/index-manager
+patching file stratus-develop/./bin/arches/nrt-metrics-status
+patching file stratus-develop/./bin/arches/queue-message-status
+patching file stratus-develop/./bin/arches/search-index
+patching file stratus-develop/./bin/arches/shard-status
+patching file stratus-develop/./bin/arches/system-rebuild
+patching file stratus-develop/./bin/auc/auc-balancer-status
+patching file stratus-develop/./bin/auc/auc-clamAV-status
+patching file stratus-develop/./bin/auc/auc-comm-content-import-status
+patching file stratus-develop/./bin/auc/auc-comm-creation-monitoring
+patching file stratus-develop/./bin/auc/auc-solr-status
+patching file stratus-develop/./bin/auc/auc-validateLinks-status
+patching file stratus-develop/./bin/auc/current-memcached-connections
+patching file stratus-develop/./bin/auc/learning-center-status
+patching file stratus-develop/./bin/auc/memcached-status
+patching file stratus-develop/./bin/bpm/invoice
+patching file stratus-develop/./bin/bpm/purchase-order
+patching file stratus-develop/./bin/buyer/catalog-status
+patching file stratus-develop/./bin/buyer/contract-status
+patching file stratus-develop/./bin/buyer/queue-status
+patching file stratus-develop/./bin/common/3par-status
+patching file stratus-develop/./bin/common/3par-vv-cache-stats
+patching file stratus-develop/./bin/common/an-on-hana
+patching file stratus-develop/./bin/common/cert-bundle-expire
+patching file stratus-develop/./bin/common/cgroups-status
+patching file stratus-develop/./bin/common/check-console-hostnames
+patching file stratus-develop/./bin/common/client-cert-expire
+patching file stratus-develop/./bin/common/conversational-api-status
+patching file stratus-develop/./bin/common/cpu-watcher
+patching file stratus-develop/./bin/common/current-activity
+patching file stratus-develop/./bin/common/db-conn-status
+patching file stratus-develop/./bin/common/disk-usage
+patching file stratus-develop/./bin/common/dns-watcher
+patching file stratus-develop/./bin/common/durable-email-monitoring
+patching file stratus-develop/./bin/common/focus-customers
+patching file stratus-develop/./bin/common/hana-isup
+patching file stratus-develop/./bin/common/hana-multipath-status
+patching file stratus-develop/./bin/common/http-watcher
+patching file stratus-develop/./bin/common/instance-heap-usage
+patching file stratus-develop/./bin/common/integration-events
+patching file stratus-develop/./bin/common/load-average-watcher
+patching file stratus-develop/./bin/common/machine-watcher
+patching file stratus-develop/./bin/common/mail-cert-expire
+patching file stratus-develop/./bin/common/mem-watcher
+patching file stratus-develop/./bin/common/netapp-cluster-status
+patching file stratus-develop/./bin/common/netapp-domain
+patching file stratus-develop/./bin/common/netapp-latency
+patching file stratus-develop/./bin/common/node-health
+patching file stratus-develop/./bin/common/oracle-long-running-transactions
+patching file stratus-develop/./bin/common/persistent-queue
+patching file stratus-develop/./bin/common/physical-dataguard-gap-delay
+patching file stratus-develop/./bin/common/query-frequency
+patching file stratus-develop/./bin/common/realm-community-mapping
+patching file stratus-develop/./bin/common/realm-delete-status
+patching file stratus-develop/./bin/common/realm-schema-mapping
+patching file stratus-develop/./bin/common/redis-status-embedded
+patching file stratus-develop/./bin/common/reporting-job-stats
+patching file stratus-develop/./bin/common/scheduled-tasks
+patching file stratus-develop/./bin/common/sendmail-status
+patching file stratus-develop/./bin/common/sizeof-bulk-allocated-resources
+patching file stratus-develop/./bin/common/veritas-failover-node-state
+patching file stratus-develop/./bin/common/ws-cert-expire
+patching file stratus-develop/./bin/control-deployment
+patching file stratus-develop/./bin/dba/alert-log
+patching file stratus-develop/./bin/dba/db-locking-check
+patching file stratus-develop/./bin/dba/db-sequence-check
+patching file stratus-develop/./bin/dba/listener-log
+patching file stratus-develop/./bin/dba/listener-status
+patching file stratus-develop/./bin/dba/memory
+patching file stratus-develop/./bin/dba/physical-dataguard-status-replicated
+patching file stratus-develop/./bin/dba/stats-job-status
+Hunk #2 FAILED at 135.
+1 out of 2 hunks FAILED -- saving rejects to file stratus-develop/./bin/dba/stats-job-status.rej
+patching file stratus-develop/./bin/dms/dms-metrices
+patching file stratus-develop/./bin/ebs/ebs-database
+patching file stratus-develop/./bin/everywhere/check-omniback-result
+patching file stratus-develop/./bin/everywhere/iostat-data
+patching file stratus-develop/./bin/everywhere/monitor-clamav-definitions-status
+patching file stratus-develop/./bin/everywhere/monitor-clamav-processes-always
+patching file stratus-develop/./bin/everywhere/per-cpu-usage
+patching file stratus-develop/./bin/hadoop/checkpoint-health
+patching file stratus-develop/./bin/hadoop/hdfs-health
+patching file stratus-develop/./bin/hadoop/hdfs-replication
+patching file stratus-develop/./bin/hadoop/heap-usage
+patching file stratus-develop/./bin/hadoop/name-node-consistency
+patching file stratus-develop/./bin/hadoop/node-status
+patching file stratus-develop/./bin/hadoop/zookeeper-status
+patching file stratus-develop/./bin/mobile/ANmobile-backend-stats
+patching file stratus-develop/./bin/mobile/an-mobile-status
+patching file stratus-develop/./bin/mobile/mobile-status
+patching file stratus-develop/./bin/mon/fyst-status
+patching file stratus-develop/./bin/mon/kr-status
+patching file stratus-develop/./bin/mon/monitor-daemon-watcher
+patching file stratus-develop/./bin/mon/record-pagerequest-volume
+patching file stratus-develop/./bin/mon/record-vm-tab-status
+patching file stratus-develop/./bin/mon/spew-status
+patching file stratus-develop/./bin/network/bgp
+patching file stratus-develop/./bin/network/etherchannel-status
+patching file stratus-develop/./bin/network/latency-and-loss
+Reversed (or previously applied) patch detected!  Assume -R? [n] 
+Apply anyway? [n] 
+Skipping patch.
+2 out of 2 hunks ignored -- saving rejects to file stratus-develop/./bin/network/latency-and-loss.rej
+patching file stratus-develop/./bin/network/network-bad-duplex
+patching file stratus-develop/./bin/network/network-errors
+patching file stratus-develop/./bin/network/object-tracking
+patching file stratus-develop/./bin/network/os-revision
+patching file stratus-develop/./bin/network/power
+patching file stratus-develop/./bin/network/redundancy-check
+patching file stratus-develop/./bin/network/switch-usage
+patching file stratus-develop/./bin/network/vip-pool
+patching file stratus-develop/./bin/redis/redis-db-stats
+patching file stratus-develop/./bin/redis/redis-nodes-status
+patching file stratus-develop/./bin/s4/activity-stats
+patching file stratus-develop/./bin/s4/activity-stats-lli
+patching file stratus-develop/./bin/s4/esignature-status
+patching file stratus-develop/./bin/s4/intermedia-index-health
+patching file stratus-develop/./bin/sdb/sdb-activity
+patching file stratus-develop/./bin/spotbuy/ebay-watcher
+patching file stratus-develop/./bin/startup
+patching file stratus-develop/./bin/sysadmin/spare-check
+patching file stratus-develop/./bin/visualizer/current-activity
+patching file stratus-develop/./bin/ws/cache-and-log-size
+patching file stratus-develop/./bin/ws/generate-reports
+patching file stratus-develop/./bin/ws/http-connection-status
+patching file stratus-develop/./bin/ws/modjk-workers-consistency
+patching file stratus-develop/./bin/ws/realm-community-map-file
+patching file stratus-develop/./lib/ariba/Automation/CleanAction.pm
+patching file stratus-develop/./lib/ariba/DBA/SampleSQLQueries.pm
+patching file stratus-develop/./lib/ariba/HTTPWatcherPlugin/Community.pm
+patching file stratus-develop/./lib/ariba/HTTPWatcherPlugin/SSRealms.pm
+patching file stratus-develop/./lib/ariba/Ops/CFEngine/MonitoringGlueUtils.pm
+patching file stratus-develop/./lib/ariba/Ops/CFEngine/PackageHelper.pm
+patching file stratus-develop/./lib/ariba/Ops/CommonMachineMethods.pm
+patching file stratus-develop/./lib/ariba/Ops/Constants.pm
+patching file stratus-develop/./lib/ariba/Ops/DBConnection.pm
+patching file stratus-develop/./lib/ariba/Ops/DatabasePeers.pm
+patching file stratus-develop/./lib/ariba/Ops/DatacenterController.pm
+patching file stratus-develop/./lib/ariba/Ops/DatasetManager.pm
+patching file stratus-develop/./lib/ariba/Ops/HanaClient.pm
+patching file stratus-develop/./lib/ariba/Ops/HanaControl.pm
+patching file stratus-develop/./lib/ariba/Ops/MCL/Step.pm
+patching file stratus-develop/./lib/ariba/Ops/MigrationHelper.pm
+patching file stratus-develop/./lib/ariba/Ops/NetworkDevice/BaseDevice.pm
+patching file stratus-develop/./lib/ariba/Ops/NetworkDevice/inserv.pm
+patching file stratus-develop/./lib/ariba/Ops/NetworkDevice/ontap.pm
+patching file stratus-develop/./lib/ariba/Ops/NetworkUtils.pm
+patching file stratus-develop/./lib/ariba/Ops/Page.pm
+patching file stratus-develop/./lib/ariba/Ops/ProductAPIExtensions.pm
+patching file stratus-develop/./lib/ariba/Ops/ProductConfig/Constants.pm
+patching file stratus-develop/./lib/ariba/Ops/ProductConfig/Hana.pm
+patching file stratus-develop/./lib/ariba/Ops/ServiceController.pm
+patching file stratus-develop/./lib/ariba/Ops/Startup/Apache.pm
+patching file stratus-develop/./lib/ariba/Ops/Startup/Common.pm
+patching file stratus-develop/./lib/ariba/Ops/Startup/Monitoring.pm
+patching file stratus-develop/./lib/ariba/Ops/Startup/Tomcat.pm
+patching file stratus-develop/./lib/ariba/Ops/Utils.pm
+patching file stratus-develop/./lib/ariba/monitor/Bpm.pm
+patching file stratus-develop/./lib/ariba/monitor/Query.pm
+patching file stratus-develop/./lib/ariba/monitor/QueryManager.pm
+patching file stratus-develop/./lib/ariba/monitor/StatusPage.pm
+patching file stratus-develop/./lib/ariba/monitor/Utils.pm
+patching file stratus-develop/./lib/ariba/monitor/misc.pm
+patching file stratus-develop/./lib/ariba/rc/Patch.pm
+patching file stratus-develop/./lib/ariba/rc/Product.pm
+patching file stratus-develop/./lib/ariba/rc/RolesManager.pm
+patching file stratus-develop/./lib/ariba/rc/ServicesCfg.pm
+patching file stratus-develop/./lib/ariba/rc/SpringbootAppInstance.pm
+patching file stratus-develop/./lib/ariba/rc/TomcatAppInstance.pm
+patching file stratus-develop/./lib/ariba/rc/Utils.pm
+patching file stratus-develop/./lib/ariba/util/Crontab.pm

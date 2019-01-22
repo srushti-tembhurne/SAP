@@ -1,0 +1,112 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/dba/oracle-version#5 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::Ops::DBConnection;
+use ariba::Ops::ProductAPIExtensions;
+
+my $debug = 0;
+
+sub usage {
+	my $error = shift; 
+
+	print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+	-e    Enables sending of email for monitor query.
+	-p    Enables sending of pages for monitor query.
+	-d    Turns on debug mode. 
+	-h    Shows this help.
+
+USAGE
+
+	print "(error) $error\n" if ($error);
+
+	exit();
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while (my $arg = shift) {
+		if ($arg =~ /^-h$/o) { usage(); next; }
+		if ($arg =~ /^-d$/o) { $debug++; next; }
+		if ($arg =~ /^-e$/o) { $sendEmail = 1; next; }
+		if ($arg =~ /^-p$/o) { $sendPage = 1; next; }
+
+		usage("Invalid argument: $arg");
+	}
+
+	my $me		= ariba::rc::InstalledProduct->new();
+	my @products	= ariba::rc::InstalledProduct->installedProductsList($me->service());
+	my $email	= $me->default('notify.email');
+	my $host	= ariba::Ops::Machine->new(ariba::Ops::NetworkUtils::hostname());
+	my $datacenter	= $host->datacenter();
+	my $tab		= ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+	my $cluster	= $me->currentCluster();
+	my %queries;
+
+	foreach my $p (@products) {
+		my @dbcsp = ariba::Ops::DBConnection->connectionsFromProducts($p);
+		my @dbcs = ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbcsp);
+
+		my $product;
+		my $activeHost;
+		my $productName;
+		my $sid;
+		my %versionDB = ();
+        my $path = "http://ops.ariba.com/documentation/prodops/common/OracleVersionCheck.txt";
+
+		foreach my $dbc (@dbcs) {
+			$product = $dbc->product();
+			$activeHost = $product->activeHostForVirtualHostInCluster($dbc->host(), $cluster);
+			$productName = $product->name();
+			$sid = uc($dbc->sid());
+
+			my $qname = "$tab/Oracle_Version_for_";
+			$qname .= "$sid" . "_on_" . "$activeHost";
+
+			my $query = ariba::monitor::Query->new($qname);
+			my $version = $query->results();
+			($versionDB{$version} = 1) if $version;
+		}
+
+		foreach my $key (keys %versionDB) {
+			print "Checking Oracle Version across product $productName key: $key\n" if $debug;
+			$queries{"Oracle versions for $productName" } = {
+				'info'          => 1,
+				'uiHint'        => "version",
+				'perl'          => sub { checkVersion(\%versionDB); },
+                "inf_field"     => "DBVersion",
+                "inf_tags"      => "datacenter=\"$datacenter\",productName=\"$productName\",uiHint=\"version\"",
+                "inf_default"   => 0,
+                "group_by"      => "$datacenter,$productName",
+			};
+		}
+	}
+    $queries{"influx_details"} = {measurement => "dba"};
+	my $qm = ariba::monitor::QueryManager->newWithDetails("dba", $tab, $me->service(), $me->customer(), \%queries);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+sub checkVersion {
+	my $thisVersion = shift;
+	my $result;
+
+	foreach my $key(keys(%$thisVersion)) {
+		$result .= "$key\n";
+	}
+	$result; 
+}
+
+main(@ARGV);
+
+__END__

@@ -1,0 +1,207 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use ariba::monitor::QueryManager;
+use ariba::Ops::NetworkDeviceManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use ariba::SNMP::Session;
+
+my $debug = 0;
+
+sub main {
+
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage  = 1; };
+		if ($arg =~ /^-d/o) { $debug++; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $email = $me->default('notify.email');
+
+	my $cipherStore    = ariba::rc::CipherStore->new($me->service());
+	my $accessPasswordFromCS = $cipherStore->valueForName('networkAccess');
+
+	if (!$accessPasswordFromCS) {
+		print "Unable to get access password from cipher store\n";
+		exit;
+	}
+
+	for my $datacenter ( ariba::Ops::ProductAPIExtensions::datacentersForProducts($me) ) {
+
+
+		my %matchDatacenter = (
+			'datacenter' => $datacenter,
+			'providesServices' => 'ipsla',
+			'status'	   => 'inservice',
+			'monitoringDatacenter' => '',
+		);
+
+		my %matchMonitoringDatacenter = (
+			'providesServices' => 'ipsla',
+                        'status'           => 'inservice',
+                        'monitoringDatacenter' => $datacenter,
+                );
+
+
+		my @routers = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+		@routers = (@routers, ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+		my %queries  = ();
+		my ($n3PrimaryState,$n3SecondaryState,$n3PrimaryStateDesc,$n3SecondaryStateDesc);
+
+		for my $router (@routers) {
+
+			my $routerName    = $router->hostname();
+			my $tier = ariba::Ops::NetworkUtils::hostnameToTier($routerName);
+			my $networkDevice = ariba::Ops::NetworkDeviceManager->newFromMachine($router);
+			my $snmp          = ariba::SNMP::Session->newFromMachine($router);
+
+			print "checking $routerName, debug value is $debug\n" if $debug;
+			print "router in tier: $tier\n" if $debug;
+
+			$networkDevice->setAccessPassword($accessPasswordFromCS);
+			$networkDevice->setDebug($debug) if $debug > 1;
+
+			my %objectStatus;
+
+			if ($tier == 4 || $tier == 5) {
+
+				my $trafficFlow;
+				$trafficFlow = "Path from $datacenter to corp" if $tier == 4;
+				$trafficFlow = "Path from corp to $datacenter" if $tier == 5;
+
+				# login 
+				print "Trying to connect to $routerName\n" if $debug;
+				$networkDevice->connect() || do {
+					$queries{"$routerName - $trafficFlow"} = {
+						crit => "answer =~ /Failed/",
+						error => "Failed to log into router $routerName",
+						perl => "return qq(Failed to log into router $routerName)",
+						inf_field => "error",
+						inf_default => "none",
+						inf_tags => qq|datacenter="$datacenter",routerName="$routerName",trafficFlow="$trafficFlow"|,	
+					};
+					next;
+				};
+
+				# Assumes that Primary provider is tracked via object 10
+				# and secondary provider is track via object 20
+
+				%objectStatus = $networkDevice->getObjectStatus();
+
+				my $primaryState = $objectStatus{10};
+				my $primaryStateDesc = setStateDescription ($primaryState) ;
+
+				my $secondaryState = $objectStatus{20}; 
+				my $secondaryStateDesc = setStateDescription ($secondaryState) ;
+
+				$queries{"$routerName - $trafficFlow"} = {
+					info => "\"$primaryState\" == 1 && \"$secondaryState\" == 1",
+					warn => " (\"$primaryState\" == 1 && \"$secondaryState\" == undef) ||
+						  (\"$primaryState\" == undef && \"$secondaryState\" == 1)",
+ 					crit => "\"$primaryState\" == 0 || \"$secondaryState\" == 0",
+					perl => "return qq(Primary Provider: $primaryStateDesc, Secondary Provider: $secondaryStateDesc)",
+					inf_field => "stateInfo",
+					inf_tags => qq|datacenter="$datacenter",routerName="$routerName",trafficFlow="$trafficFlow"|,
+					inf_default => 0,
+					group_by => "$datacenter,$routerName,$trafficFlow",
+				};
+			} elsif ($tier ==3) {
+
+				# Change the query name based on datacenter;
+				my $queryName = "unknow path";
+				if ( $datacenter =~ /^opslab$/ || $datacenter =~ /^snv$/ ) {
+					$queryName = "VPN path from $datacenter to backup";
+				} elsif ( $datacenter =~ /^opslabdr$/ || $datacenter =~ /^us1$/ ) {
+					$queryName = "VPN path from $datacenter to primary";
+				}
+
+				# login 
+				print "Trying to connect to $routerName\n" if $debug;
+				$networkDevice->connect() || do {
+					$queries{"$queryName"} = {
+						crit => 1,
+						error => "Failed to log into router $routerName",
+						perl => "return qq(Failed to log into router $routerName)",
+						inf_field => "connectionFailedMessage",
+						inf_tags => qq|datacenter="$datacenter",routerName="$routerName",trafficFlow="$queryName"|,
+						inf_default => 0,
+						group_by => "$datacenter,$routerName,$queryName",
+					};
+					next;
+				};
+
+				# Only ipsla objects being track in n3 are vpn
+				# each VPN device has only one object (ID - 10)
+				%objectStatus = $networkDevice->getObjectStatus();
+				my $state = $objectStatus{10};
+			
+				# Need to record the state of the objects in this teir.
+				if ( $routerName =~ /-1/) {
+					$n3PrimaryState = $state;
+					$n3PrimaryStateDesc = setStateDescription ($n3PrimaryState);
+				} elsif ( $routerName =~ /-2/) {
+					$n3SecondaryState = $state;
+					$n3SecondaryStateDesc = setStateDescription ($n3SecondaryState);
+				}
+
+				$queries{"$queryName"} = {
+					info => " \"$n3PrimaryState\" == 1 && \"$n3SecondaryState\" == 1",
+					warn => " (\"$n3PrimaryState\" == 1 && \"$n3SecondaryState\" == undef) ||
+						  (\"$n3PrimaryState\" == undef && \"$n3SecondaryState\" == 1)",
+ 					crit => "\"$n3PrimaryState\" == 0 || \"$n3SecondaryState\" == 0",
+					perl => "return qq(Primary Provider: $n3PrimaryStateDesc, Secondary Provider: $n3SecondaryStateDesc)",
+					inf_field => "stateInfo",
+					inf_tags => qq|datacenter="$datacenter",routerName="$routerName",trafficFlow="$queryName"|,
+					inf_default => 0,
+					group_by => "$datacenter,$routerName,$queryName",
+				};
+			} else {
+				$queries{"$routerName - is running unknown ipsla"} = {
+					warn => 1,
+					perl => sub {return "is running unknown ipsla"},
+					inf_field => "stateInfo",
+					inf_tags => qq|datacenter="$datacenter",routerName="$routerName",trafficFlow="running unknown ipsla"|,
+					inf_default => 0,
+					group_by => "$datacenter,$routerName,running unknown ipsla",
+				};
+			}
+		}
+
+		if (%queries) {
+			$queries{influx_details} = {measurement => "Network-Path"};
+			my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+			my $qm = ariba::monitor::QueryManager->newWithDetails(
+				'Network Path', $pn, $me->service(), $me->customer(), \%queries
+			);
+			$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+		}
+	}
+}
+
+sub setStateDescription {
+
+	my $state = shift;
+	my $stateDescription = 'Unknown';
+
+	return $stateDescription if !defined($state);
+
+	if ($state == 1) {
+		$stateDescription = 'Up';	
+	} elsif ( $state == 0 ) {
+		$stateDescription = 'Down';	
+	}
+
+	return $stateDescription;
+}
+
+main();

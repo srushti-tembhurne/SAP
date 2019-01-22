@@ -1,0 +1,496 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/etc/monitor-query-template#6 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::DBConnection;
+use ariba::Ops::OracleClient;
+
+use Data::Dumper;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $me = ariba::rc::InstalledProduct->new('an', $mon->service());
+    my @products;
+    push @products, $me;
+    my %queries;
+    my @dbConnections = ariba::Ops::DBConnection->connectionsFromProducts(@products);
+
+    my $maxResults = 4 * 24 * 365; ## 1 year at 4 times per hour
+
+    foreach my $dbc ( @dbConnections ){
+
+        my $oc = ariba::Ops::OracleClient->newFromDBConnection($dbc);
+        $oc->setDebug($debug);
+        $oc->connect() or die "Error connecting to DB: ", $oc->error(), "\n";
+        my @results = $oc->executeSql("select owner from ALL_OBJECTS where object_name = 'DOCUMENT_SCHED_Q'");
+        next unless scalar @results;
+        print Dumper \@results if $debug;
+        my $instance = uc($dbc->sid());
+        my $hostname= $dbc->host();
+
+        ## Ugghhhh this is going to be UGLY ...
+        ## I tried to abstract this into a loop, the SQL is all very similar except for the index names
+        ## and these are very specific ... It's easier to just hard code them than to try further
+        ## to find a cleaner way to do this ... Hard-coding 18 queries ... Yaayyy!!!
+
+        
+        foreach my $rec ( @results ){
+
+            my $owner = $rec->{'OWNER'};
+            $queries{'Legal Artifact Queue'} = {
+                warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                   select /* + INDEX($owner.legal_artifact_q IND_1F10AE86_17279066) */ count(id) as queue_cnt from $owner.legal_artifact_q where status=4; 
+                ",
+                description => 'Legal Artifact Queue Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="legal artifact queue"),
+                group_by => qq($owner,$hostname,$instance,"legal artifact queue"),
+            };
+            
+            $queries{'Legal Artifact Queue > 1 hour'} = {
+                warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                   select /*+ INDEX($owner.legal_artifact_q IND_1F10AE86_17279066) */ id as id, item as item, decode(status, 1, 'Queued', 2, 'Processing', 'Unknown' || status)as status, round((1420559474 - (status_changed/1000))/3600) stuck_time from $owner.legal_artifact_q where status in (1, 2) and 1420559474 - (status_changed/1000) > 3600
+                ",
+                description => 'Legal Artifact Queue > 1 hour Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="legal artifact queue",subtype="more than 1 hour"),
+                group_by => qq($owner,$hostname,$instance,"legal artifact queue","more than 1 hour"),
+            };
+            
+            $queries{'Legal Disp Queue - Length'} = {
+                warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                    SELECT /*+ INDEX($owner.legal_disp_queue IND_1F7A44AF_CD3323B5)*/ count(id) as length
+                    FROM $owner.legal_disp_queue
+                    WHERE status in (1, 2);
+                ",
+                description => 'Legal Disp Queue - Length Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="legal disp queue"),
+                group_by => qq($owner,$hostname,$instance,"legal disp queue"),
+            };
+            
+            $queries{'Legal Disp Queue - # of Failed Items'} = {
+                warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                    SELECT /*+ INDEX($owner.legal_disp_queue IND_1F7A44AF_B1A4A7A0)*/ count(id) as failed_items_cnt
+                    FROM $owner.legal_disp_queue
+                    WHERE status=4;
+                ",
+                description => 'Legal Disp Queue - # of Failed Items Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="legal disp queue"),
+                group_by => qq($owner,$hostname,$instance,"legal disp queue"),
+            };
+            
+            $queries{'Legal Disp Queue - # of items in queue > 1 hour'} = {
+                warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                   SELECT /*+ INDEX($owner.legal_disp_queue IND_1F7A44AF_B1A4A7A0)*/ id as id, item as item, decode(status, 1, 'New', 
+                              2, 'Processing', 'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time 
+                   FROM $owner.legal_disp_queue
+                   WHERE status IN (1, 2) 
+                   AND status_changed < 1420558874000;
+                ",
+                description => 'Legal Disp Queue - # of items in queue > 1 hour Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="legal disp queue",subtype="more than 1 hour"),
+                group_by => qq($owner,$hostname,$instance,"legal disp queue","more than 1 hour"),
+            };
+            
+            $queries{'Legal Disp Queue - # of items in queue > 2 hours'} = {
+                #warn    => 'numrows > 0',
+                ## Per requirements this should crit if >0 ...
+                crit    => 'numrows > 0',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                    SELECT /*+ INDEX($owner.legal_disp_queue IND_1F7A44AF_B1A4A7A0)*/ id as id, item as item, decode(status, 1, 'New',
+                              2, 'Processing', 'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time
+                    FROM $owner.legal_disp_queue 
+                    WHERE status IN (1, 2)
+                    AND status_changed < 1420552274000;
+                ",
+                description => 'Legal Disp Queue - # of items in queue > 2 hours Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="legal disp queue",subtype="more than 2 hour"),
+                group_by => qq($owner,$hostname,$instance,"legal disp queue","more than 2 hour"),
+            };
+            
+            $queries{'Document Disp Queue - Length'} = {
+                #warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                    SELECT /*+ INDEX($owner.document_disp_q IND_AEA66A_CD3323B5)*/ count(id) as length  FROM $owner.document_disp_q WHERE status in (1, 2);
+                ",
+                description => 'Document Disp Queue - Length Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc disp queue"),
+                group_by => qq($owner,$hostname,$instance,"doc disp queue"),
+            };
+            
+            $queries{'Document Disp Queue - # of Failed Items'} = {
+                #warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                    SELECT /*+ INDEX($owner.document_disp_q IND_AEA66A_CD3323B5)*/ count(id) as failed_items_cnt FROM $owner.document_disp_q WHERE status=4;
+                ",
+                description => 'Document Disp Queue - # of Failed Items Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc disp queue"),
+                group_by => qq($owner,$hostname,$instance,"doc disp queue")
+            };
+            
+            $queries{'Document Disp Queue - # of items in queue > 10 Minutes'} = {
+                warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                    SELECT /*+ INDEX($owner.document_disp_q IND_AEA66A_B1A4A7A0)*/ id as id, item as items, decode(status, 1,
+                        'New',  2, 'Processing', 'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time  
+                    FROM $owner.document_disp_q WHERE status IN (1, 2) 
+                    AND status_changed < 1420558874000;
+                ",
+                description => 'Document Disp Queue - # of items in queue > 10 Minutes Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc disp queue",subtype="more than 10 mins"),
+                group_by => qq($owner,$hostname,$instance,"doc disp queue","more than 10 mins")
+            };
+            
+            $queries{'Document Disp Queue - # of items in queue > 2 Hours'} = {
+                warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                    SELECT /*+ INDEX($owner.document_disp_q IND_AEA66A_B1A4A7A0)*/ id as id, item as item, decode(status, 1,
+                        'New', 2, 'Processing',    'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time 
+                    FROM $owner.document_disp_q 
+                    WHERE status IN (1, 2) 
+                    AND status_changed < 1420552274000;
+                ",
+                description => 'Document Disp Queue - # of items in queue > 2 Hours Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc disp queue",subtype="more than 2 hours"),
+                group_by => qq($owner,$hostname,$instance,"doc disp queue","more than 2 hours")
+            };
+            
+            $queries{'Document Out Disp Queue - Length'} = {
+                #warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                    SELECT /*+ INDEX($owner.doc_out_disp_q IND_357A851C_CD3323B5)*/ count(id) as length
+                    FROM $owner.doc_out_disp_q WHERE status in (1, 2);
+                ",
+                description => 'Document Out Disp Queue - Length Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc out disp queue"),
+                group_by => qq($owner,$hostname,$instance,"doc out disp queue")
+            };
+            
+            $queries{'Document Disp Queue - # of Failed Items'} = {
+                #warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                    SELECT /*+ INDEX($owner.doc_out_disp_q IND_357A851C_CD3323B5)*/ count(id) as failed_items_cnt
+                    FROM $owner.doc_out_disp_q WHERE status=4;
+                ",
+                description => 'Document Disp Queue - # of Failed Items Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc out disp queue"),
+                group_by => qq($owner,$hostname,$instance,"doc out disp queue")
+            };
+            
+            $queries{'Document Out Disp Queue - # of items in queue > 10 Minutes'} = {
+                warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                    SELECT /*+ INDEX($owner.doc_out_disp_q IND_357A851C_B1A4A7A0)*/ id as id, item as item, decode(status, 1,
+                        'New',  2, 'Processing',  'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time 
+                    FROM $owner.doc_out_disp_q
+                    WHERE status IN (1, 2)
+                    AND status_changed < 1420558874000;
+                ",
+                description => 'Document Out Disp Queue - # of items in queue > 10 Minutes Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc out disp queue",subtype="more than 10 mins"),
+                group_by => qq($owner,$hostname,$instance,"doc out disp queue","more than 10 mins")
+            };
+            
+            $queries{'Document Out Disp Queue - # of items in queue > 2 Hours'} = {
+                warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                    SELECT /*+ INDEX($owner.doc_out_disp_q IND_357A851C_B1A4A7A0)*/ id as id, item as item, decode(status, 1,
+                        'New', 2, 'Processing', 'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time
+                    FROM $owner.doc_out_disp_q
+                    WHERE status IN (1, 2)
+                    AND status_changed < 1420552274000;
+                ",
+                description => 'Document Out Disp Queue - # of items in queue > 2 Hours Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc out disp queue",subtype="more than 2 hours"),
+                group_by => qq($owner,$hostname,$instance,"doc out disp queue","more than 2 hours")
+            };
+            
+            $queries{'Document Sched Queue - Length'} = {
+                #warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                    SELECT /*+ INDEX($owner.document_sched_q IND_427F3D96_CD3323B5) */ count(id) as length
+                    FROM $owner.document_sched_q WHERE status in (1, 2);
+                ",
+                description => 'Document Sched Queue - Length Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc sched queue"),
+                group_by => qq($owner,$hostname,$instance,"doc sched queue"),
+            };
+            
+            $queries{'Document Sched Queue - # of Failed Items'} = {
+                #warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                    SELECT /*+ INDEX($owner.document_sched_q IND_427F3D96_CD3323B5)*/ count(id) as failed_items_cnt
+                    FROM $owner.document_sched_q WHERE status=4;
+                ",
+                description => 'Document Sched Queue - # of Failed Items Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc sched queue"),
+                group_by => qq($owner,$hostname,$instance,"doc sched queue"),
+            };
+            
+            $queries{'Document Sched Queue - # of items in queue > 10 Minutes'} = {
+                warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                    SELECT /*+ INDEX($owner.document_sched_q IND_427F3D96_B1A4A7A0)*/ id as id, item as item, decode(status, 1,
+                        'New',  2, 'Processing',  'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time
+                    FROM $owner.document_sched_q
+                    WHERE status IN (1, 2)
+                    AND status_changed < 1420558874000;
+                ",
+                description => ' Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc sched queue",subtype="more than 10 mins"),
+                group_by => qq($owner,$hostname,$instance,"doc sched queue","more than 10 mins"),
+            };
+            
+            $queries{'Document Sched Queue - # of items in queue > 2 Hours'} = {
+                warn    => 'numrows > 0',
+                #crit    => 'numrows > 20',
+                uiHint  => "$hostname/$instance",
+                #ticketOnWarnOpenAfterMinutes    => 1,
+                ticketOwner => 'unassigned-sre',
+                severity    => 1,
+                recordDataType => "counter",
+                recordMaxResults => $maxResults,
+                sql         => "
+                    SELECT /*+ INDEX($owner.document_sched_q IND_427F3D96_B1A4A7A0)*/ id as id, item as item, decode(status, 1,
+                        'New', 2, 'Processing', 'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time
+                    FROM $owner.document_sched_q
+                    WHERE status IN (1, 2)
+                    AND status_changed < 1420552274000; 
+                ",
+                description => ' Monitoring',
+                correctiveActions => [
+                    Ops => 'Report to AN team', 
+                ],
+                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc sched queue",subtype="more than 2 hours"),
+                group_by => qq($owner,$hostname,$instance,"doc sched queue","more than 2 hours"),
+            };
+
+            my $email = $mon->default('notify.email');
+
+            my $qm = ariba::monitor::QueryManager->newWithDetails('legal-queues', $me->name(), $me->service(), $me->customer(), \%queries);
+
+            my $user = "system";
+            my $pass = $mon->default("dbainfo.$user.password");
+
+            $queries{influx_details} = {measurement => 'an_legal_queues'};
+            $qm->setSQLConnectInfo($user, $pass, $instance, $hostname);
+            $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+        }
+    }
+}
+
+main(@ARGV);
+
+__END__

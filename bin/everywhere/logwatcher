@@ -1,0 +1,408 @@
+#!/usr/local/bin/perl -w
+
+# $Id$
+
+# fix sending off all the log up to the certain point in logwatcher
+
+use strict;
+use Data::Dumper;
+use File::Tail;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use ariba::LogWatcher::Conf;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::NotificationRequest;
+use ariba::Ops::CFEngine::MonitoringGlueUtils;
+use ariba::Ops::Constants;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::StatusPage;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+BEGIN { fork && exit }
+
+my $hostname = ariba::Ops::NetworkUtils::hostname();
+my $machine  = ariba::Ops::Machine->new($hostname);
+my $product  = ariba::monitor::StatusPage::fakeProductNameForDatacenter($machine->datacenter());
+
+my $debug       = 0;
+my $sendEmail   = 0;
+my $sendPage    = 0;
+my $syslogConf  = '/etc/syslog.conf';
+$syslogConf  = '/etc/rsyslog.conf' unless ( -e $syslogConf );
+my $progName    = 'logwatcher';
+my $pidfile     = "/var/tmp/$progName.pid";
+
+my @matchesToWaitOn  = ();
+my %eventsPerLogFile;
+
+$SIG{'HUP'} = sub {
+    print STDERR "Reloading config and file list..\n";
+    fork && exit;
+};
+
+sub main {
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-d/o) { $debug++; };
+        if ($arg =~ /^-e/o) { $sendEmail = 1; };
+        if ($arg =~ /^-p/o) { $sendPage = 1; };
+    }
+
+    my $effectiveUser = getpwuid($>);
+
+    if ($effectiveUser eq 'root') {
+        print "$progName should not be run as root! Exiting!\n";
+        exit -1;
+    }
+
+    open  PID, ">$pidfile" or warn $!;
+    print PID $$;
+    close PID;
+
+    my ($logWatchConf, $matchesToWaitOn);
+    $SIG{'USR1'} = sub { print STDERR Dumper($logWatchConf) };
+
+    ($logWatchConf, $matchesToWaitOn) = parseConf();
+    my %watchFiles                    = tailFiles($logWatchConf);
+
+    if ($debug >= 2) {
+        print "Config hash:\n";
+        print Dumper($logWatchConf);
+        print "List of wait matches:\n";
+        map { print Dumper($_) } @$matchesToWaitOn;
+    }
+
+    my %queries;
+    my $queryLastResetTime = 0;
+    my $queryResetInterval = 60 * 60; # How often to reset all queries to info status. At least 30 mins is needed for openTicketOnWarn to work, but Jarek suggested 1 hour so that the query will remain in crit/warn long enough to avoid the confusion that the problem fixed itself when someone views the mon page.
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $email = $me->default('notify.email');
+    my @services = $machine->providesServices();
+
+    while (1) {
+
+        if (time() - $queryLastResetTime > $queryResetInterval) {
+            print "Resetting all queries to info status\n" if ($debug);
+            resetQueries(\%queries, $logWatchConf, \%watchFiles);
+            $queryLastResetTime = time();
+        }
+
+        my ($numberFound,$left,@pendingTailFiles) = File::Tail::select
+            (undef,undef,undef,60, values %watchFiles);
+
+        # check the wait_throttle for pending items
+        # this is a hack. it'd be sure nice if perl's threads could 
+        # set a sigalarm per thread, instead of having a global.
+        foreach my $match (@matchesToWaitOn) {
+
+            # abort if we haven't even seen the match.
+            next unless $match->{'count'} > 0;
+
+            print "wait checking on: $match->{'logFile'} - " if $debug;
+            print "count is: $match->{'count'}\n" if $debug;
+
+            if ((time - $match->{'last_checked'}) >= $match->{'wait_throttle'}) {
+                updateQueryForMatch(\%queries, $match, 'wait');
+                $match->{'last_checked'} = time;
+                $queryLastResetTime = time;
+            }
+        }
+
+        foreach my $fileToTail (@pendingTailFiles) {
+
+            my (@tailOutput) = $fileToTail->read();
+            next unless $fileToTail->predict();
+
+            my $fileName = $fileToTail->{'input'};
+            my $conf  = $logWatchConf->{$fileName} || next;
+
+            print "Checking $fileName.\n" if $debug;
+
+            foreach my $match (@$conf) {
+                my $regex = $match->{'regex'};
+                my $matchCount = 0;
+                my $myService = $match->{ "myService" };
+                print "regex: $regex, myService: $myService\n" if $debug >= 2;
+                
+                # will initialize all servers in $match->{ 'last_seen' }->{ $hostname } = currentTime
+                populateServers( $match ) if ( $match->{ "absence_check" } && 
+                                               $myService &&
+                                               grep( /$myService/, @services ) && # making sure I'm providing syslog service, in case of kernel mark
+                                               $match->{ "remoteProvidesServices" } &&
+                                               !$match->{ 'last_seen' } );
+                
+                foreach my $line (@tailOutput) {
+                    print "matching \'$line\' to \'$regex\'.\n" if $debug >= 2;
+                    next unless $line =~ /$regex/;
+
+                    if ( !$match->{ 'absence_check' } ) {
+                       $matchCount = ++$match->{'count'};
+                       $match->{'last_checked'} = time;
+                       push @{ $match->{'data'} }, $line;
+                    }
+                    else {
+                        my ( $ip ) = $line =~ /\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b/;
+                        next unless $ip;
+                        my $hostname = ariba::Ops::NetworkUtils::addrToHost( $ip );
+                        
+                        # last_seen must be compiled beforehand via populateServers() which enforces conditions
+                        # such as "inservice", "db" etc.  You can't tell this information from parsing the actual logs.
+                        next unless ( $hostname && exists( $match->{ 'last_seen' }->{ $hostname } ) );
+                        $match->{ 'last_seen' }->{ $hostname } = time; # updating the last_seen time for a host
+                        print Dumper( $match->{ 'last_seen' } ) if $debug >= 2;
+                    }
+                }
+
+                if ( !$match->{ 'absence_check' } ) {
+                    if ( $matchCount < $match->{'seen_throttle'} ) {
+                       print "regex: \'$regex\', matchCount: $matchCount < seen_throttle: ", $match->{'seen_throttle'}, ", skipping.\n" if $debug;
+                       next;
+                    }
+                    else {
+                       print "sending alert on \'$regex\'\n" if $debug;
+                       updateQueryForMatch(\%queries, $match, 'seen');
+                       $queryLastResetTime = time;
+                    }
+                }
+                else {
+                    my @badHosts;
+                    
+                    foreach my $host ( keys %{ $match->{ 'last_seen' } } ) {
+                        my $last_seen = $match->{ 'last_seen' }->{ $host };
+                        my $seen_interval = $match->{ 'seen_interval' };
+                        my $time = time;
+                        
+                        print "host: $host, last_seen: $last_seen, seen_interval: $seen_interval, time: $time\n" if $debug >= 2;
+                        
+                        if ( $time >= $last_seen + $seen_interval ) {
+                            push @badHosts, $host;
+                        }
+                    }
+                    
+                    if ( @badHosts ) {
+                        updateQueryForAbsenceCheck( \%queries, $match, \@badHosts );
+                        $queryLastResetTime = time;
+                    }
+                }
+            }
+        }
+
+        $queries{influx_details} = {measurement => "log-watcher"};
+        my $qm = ariba::monitor::QueryManager->newWithDetails("log-watcher", $product, $me->service(), undef, \%queries);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+main();
+
+
+sub tailFiles {
+    my $logWatchConf = shift;
+    my %available = map { $_, 1 } keys %$logWatchConf;
+    my %watchFiles;
+
+    foreach my $file (@{ readSyslogConf($syslogConf) }) {
+        next unless defined $available{$file};
+
+        eval {
+            my $tail = File::Tail->new(
+                    'name'      => $file,
+                    'reset_tail'    => 0,
+                    ) or warn $!;
+
+            if (defined $tail) {
+                $watchFiles{$file} = $tail;
+                print "Tailing file: [$file]\n" if $debug;
+            }
+        };
+    }
+
+    return %watchFiles;
+}
+
+sub parseConf {
+    my ($logWatchConf,$include,$regex) = ariba::LogWatcher::Conf->new;
+
+    foreach my $logFile (keys %$logWatchConf) {
+
+        # poor man's object.
+        foreach my $match (@{$logWatchConf->{$logFile}}) {
+
+            # shortcut for not duplicating entire match entries for 
+            # different logfile names.
+            if (exists $match->{'include'}) {
+
+                # do nasty deref so we have unique copies
+                for my $inc (@{$include->{$match->{'include'}}}) {
+                    push @{$logWatchConf->{$logFile}}, { %{ $inc } };
+                }
+
+                shift @{$logWatchConf->{$logFile}};
+                next;
+            }
+        
+            # Set the default values.
+            $match->{'seen_throttle'} ||= 1;
+            $match->{'logFile'}       = $logFile;
+            $match->{'count'}         = 0;
+            $match->{'crit'}          ||= 0;
+            $match->{'seen_interval'} ||= 0;
+            $match->{'absence_check'} ||= 0;
+
+            push @matchesToWaitOn, $match if defined $match->{'wait_throttle'};
+
+            # yank the regex definition out of the $regex structure, 
+            # if the match is not an inline regex.
+            if (defined $match->{'regex'}) {
+                if (exists $regex->{$match->{'regex'}}) {
+                    $match->{'regex'} = $regex->{$match->{'regex'}};
+                }
+            }
+        }
+    }
+    return ($logWatchConf, \@matchesToWaitOn);
+}
+
+sub readSyslogConf {
+    my $file = shift;
+    my @syslog_files = ();
+
+    open F, $file or die "Can't open [$file] : $!";
+    while(<F>) {
+        next if /^(?:#|\s+)/;
+        chomp(my $logfile = (split /\s+/)[1]);
+        next unless $logfile =~ m|^/[\w/_-]+$|;
+        next unless -f $logfile;
+        push @syslog_files, $logfile;
+    }
+    close F;
+
+    return \@syslog_files;
+}
+
+sub updateQueryForMatch {
+    my $queriesRef = shift;
+    my $match = shift;
+    my $type = shift;
+    my $message = '';
+
+    # spew the logfile data
+    $message = sprintf "\tpattern: /$match->{'regex'}/\n";
+    $message .= sprintf "\thas hit or exceeded the $type throttle of %d", $match->{"${type}_throttle"};
+    $message .= sprintf " seconds" if $type eq 'wait';
+    $message .= sprintf ".\n\tseen count is: $match->{'count'}\n";
+    $message .= sprintf "\nresetting match throttle.\n";
+
+    my $subject = $match->{'mailsubj'} || "Regex matched: $match->{'regex'}";
+    my $queryName = queryNameForFileAndSubject($match->{'logFile'}, $subject);
+    my $uiHint = $match->{'logFile'} =~ /([^\/]+)$/ && $1 || undef;
+
+    my @data = @{ $match->{'data'} };
+    $queriesRef->{$queryName} = {
+        info => 1,
+        warn => $match->{'mail'} ? 'numrows > 0' : 0,
+        crit => $match->{'crit'} ? 'numrows > 0' : 0,
+        #perl => sub { return join("\n", @data); },
+        perl => sub { return scalar @data; },
+        uiHint => $uiHint,
+        ticketOnWarnOpenAfterMinutes => !$match->{'crit'},
+        note => "<html><pre>$message</pre></html>",
+        inf_tags => qq|dataDescription="$queryName",uihint="$uiHint"|,
+        inf_field => "matchErrorCount",
+        inf_default => 0,
+        group_by =>"$uiHint",
+    };
+
+    $match->{'count'} = 0;
+    $match->{'data'}  = ();
+}
+
+sub updateQueryForAbsenceCheck {
+    my $queriesRef = shift;
+    my $match = shift;
+    my $badHostsRef = shift;
+    my $message = '';
+    
+    my $badHostsString = join( " ", @{ $badHostsRef } );
+    
+    # spew the logfile data
+    $message = sprintf "\tpattern: /$match->{'regex'}/\n";
+    $message .= sprintf "\thas been missing from ${badHostsString} for longer than $match->{'seen_interval'} seconds\n";
+    
+    my $subject = $match->{'mailsubj'} || "Regex not seen: $match->{'regex'}";
+    my $queryName = queryNameForFileAndSubject($match->{'logFile'}, $subject);
+    my $uiHint = $match->{'logFile'} =~ /([^\/]+)$/ && $1 || undef;
+
+    $queriesRef->{$queryName} = {
+        info => 1,
+        warn => $match->{'mail'} ? 'numrows > 0' : 0,
+        crit => $match->{'crit'} ? 'numrows > 0' : 0,
+        #perl => sub { return join( "\n", @{ $badHostsRef } ); },
+        perl => sub { return scalar @{ $badHostsRef } ; },
+        uiHint => $uiHint,
+        ticketOnWarnOpenAfterMinutes => !$match->{'crit'},
+        note => "<html><pre>$message</pre></html>",
+        inf_tags => qq|dataDescription="$queryName",uihint="$uiHint"|,
+        inf_field => "AbstractErrorCount",
+        inf_default => 0,
+        group_by =>"$uiHint",
+    };
+}
+
+sub resetQueries {
+    my $queriesRef = shift;
+    my $logWatchConf = shift; 
+    my $watchFilesRef = shift;
+
+    foreach my $file (keys %$logWatchConf) {
+        next unless ($watchFilesRef->{$file});
+        foreach my $conf (@{$logWatchConf->{$file}}) {
+            my $subject = $conf->{'mailsubj'} || "Regex matched: $conf->{'regex'}";
+            my $queryName = queryNameForFileAndSubject($file, $subject);
+            my $uiHint = $file =~ /([^\/]+)$/ && $1 || undef;
+            $queriesRef->{$queryName} = {
+                info => 1,
+                warn => $conf->{'mail'} ? 'numrows > 0' : 0,
+                crit => $conf->{'crit'} ? 'numrows > 0' : 0,
+                perl => sub { return; },
+                uiHint => $uiHint,
+                ticketOnWarnOpenAfterMinutes => 0,
+                note => '',
+            };
+        }
+    }
+}
+
+sub queryNameForFileAndSubject {
+    my $file = shift;
+    my $subject = shift; 
+
+    return "$file $subject";
+}
+
+#    function: initializes list of servers for absence_check, so that we can detect broken servers from the get go
+#   arguments: match object with 'absence_check' and 'remoteProvidesServices' elements; and not having 'last_seen' element
+#     returns: none; the subroutine initializes 'last_seen' element with key-value pairs of hostname and current timestamp
+sub populateServers {
+    my $match = shift;
+
+    my %hash = (
+        'datacenter' => $machine->datacenter(),
+        'providesServices' => $match->{ 'remoteProvidesServices' },
+        'status' => $match->{ 'remoteStatus' },
+    );
+
+    my @machines = ariba::Ops::Machine->machinesWithProperties( %hash );
+    
+    foreach my $machine ( @machines ) {
+        my $hostname = $machine->hostname();
+        next if ( $hostname =~ /storadmin/ );
+        
+        $match->{ 'last_seen' }->{ $hostname } = time;
+    }
+}
+
+__END__

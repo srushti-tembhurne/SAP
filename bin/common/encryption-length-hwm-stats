@@ -1,0 +1,91 @@
+#!/usr/local/bin/perl
+#
+# $Id:$
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DBConnection;
+use ariba::rc::InstalledProduct;
+
+my $product;
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h|-prod]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode.
+    -h    Shows this help.
+    -prod product name
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+    exit();
+}
+
+sub main {
+    my $debug = 0;
+    my $quiet = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $productName;
+
+    while(my $arg=shift(@ARGV)){
+            if($arg =~ /^-h$/o) { usage(); next;}
+            if($arg =~ /^-d/o){ $debug=1; next;}
+            if($arg =~ /^-e/o){ $sendEmail=1; next;};
+            if($arg =~ /^-p$/o){ $sendPage=1; next;};
+            if($arg =~ /^-prod/o){ $productName=shift(@ARGV); next;};
+            usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $service = $me->service();
+
+    unless (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
+        print "Unable to find product: $productName\n";
+        exit(0);
+    }
+    $product = ariba::rc::InstalledProduct->new($productName, $service);
+
+    my %queries  = ();
+
+    $queries{"Encryption Length HWM (Realm Name, ClusterRoot/BaseObject,Field Name,
+    OverFlowCount)"} = {
+        'rowCountLimit' => 4000,
+        'info'          => 1,
+        'sql'           => "select realm as realm_name,clusterroot as cluster_root,fieldname as field_name,sum(overflowcount) as overflow_count
+        from EncryptionLengthHWMTab GROUP BY realm,clusterroot,fieldname",
+    };
+
+    my $email = $me->default('notify.email');
+    $queries{influx_details} = { measurement => 'encr_len_stats' };
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails(
+        "encryption-length-hwm-stats", $product->name(), $service, $product->customer(), \%queries
+    );
+    
+    my ($dbType, $user, $password, $sid, $host, $port) = $product->connectInfoWithDBType();
+    if ($dbType eq ariba::Ops::DBConnection->hanaDBServerType()) {
+         $qm->setSQLConnectInfoForHana($user, $password, $host, $port);
+    }
+    else {
+         $qm->setSQLConnectInfo($user, $password, $sid, $host);
+    }
+         
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();
+
+

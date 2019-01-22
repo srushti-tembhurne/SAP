@@ -1,0 +1,299 @@
+#!/usr/local/bin/perl
+
+use warnings;
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::rc::InstalledProduct;
+use ariba::rc::TomcatAppInstance;
+use ariba::Ops::Url;
+use XML::XPath;
+use XML::XPath::XMLParser;
+
+my $debug = 0;
+
+my $connectionError;
+
+sub main
+{
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $productName;
+
+    my %queries = ();
+
+    while (my $arg = shift (@ARGV))
+    {
+        print STDERR "parsing arg $arg\n" if $debug;
+        if ($arg =~ /^-d/o)    {$debug       = 1;}
+        if ($arg =~ /^-e/o)    {$sendEmail   = 1;}
+        if ($arg =~ /^-p$/o)   {$sendPage    = 1;}
+        if ($arg =~ /^-prod/o) {$productName = shift (@ARGV);}
+    }
+
+    my $me      = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+
+    unless (ariba::rc::InstalledProduct->isInstalled($productName, $service))
+    {
+        exit (0);
+    }
+
+    my $product = ariba::rc::InstalledProduct->new($productName, $service);
+
+    for my $instance ($product->appInstancesWithNameInCluster("Manager", $cluster))
+    {
+
+        my $instanceName  = $instance->instanceName();
+        my $persistentUrl = $instance->persistentQueueURL();
+
+        print "checking node: $instanceName\n" if ($debug);
+
+        my ($error, $xp) = processUrl($persistentUrl);
+        $error = -1 if ( $error );
+
+        my $queueStatusSet = $xp->find('//queueStatus') unless $error;
+
+        my $oldWarn    = 6 * 60 * 60;
+        my $oldCrit    = 12 * 60 * 60;
+        my $oldWarnIPQ = 30 * 60;
+        my $oldCritIPQ = 60 * 60;
+
+        $queries{"dead letter status errors"} = {
+                                                 noRowCount    => 1,
+                                                 format        => "%s\n",
+                                                 warn          => "answer > 5",
+                                                 crit          => "answer > 10",
+                                                 error         => $error,
+                                                 noCritOnError => 1,
+                                                 url           => $persistentUrl,
+                                                 perl          => sub {return ($error || deadLetterStatus($xp));},
+                                                 inf_field     => "dead_letter_status",
+                                                 inf_default   => 0,
+                                                 inf_tags      => qq(type="summary"),
+                                                 group_by      => "summary",
+                                                };
+
+        unless ($error)
+        {
+
+            foreach my $node ($queueStatusSet->get_nodelist)
+            {
+                my $rcvErrors        = $node->getAttribute('rcvErrors');
+                my $confirmErrors    = $node->getAttribute('confirmErrors');
+                my $rollbackErrors   = $node->getAttribute('rollbackErrors');
+                my $newCount         = $node->getAttribute('newCount');
+                my $pendingCount     = $node->getAttribute('pendingCount');
+                my $longPendingCount = $node->getAttribute('longPendingCount');
+                my $oldest           = ($node->getAttribute('oldest')) / 1000;
+                my $name             = $node->getAttribute('name');
+
+                if ($name =~ m/PortletFetchWork$/)
+                {
+                    my $portletFetchWorkValue = 'normal';
+                    if (($pendingCount > 0) && ($oldest > 10 * 60))
+                    {
+                        $portletFetchWorkValue = 'super long running';
+                    }
+                    elsif (($newCount > 0) || ($pendingCount > 0))
+                    {
+                        $portletFetchWorkValue = 'long running';
+                    }
+
+                    $queries{"$name Aysnc portlet fetch status"} = {
+                                                                    noRowCount  => 1,
+                                                                    severity    => 2,
+                                                                    format      => "%s</td><td></td><td>",
+                                                                    warn        => "answer eq 'long running'",
+                                                                    crit        => "answer eq 'super long running'",
+                                                                    uiHint      => "queue status",
+                                                                    perl        => sub {return $portletFetchWorkValue},
+                                                                    inf_field   => "aysnc_portlet_fetch_status",
+                                                                    inf_default => "none",
+                                                                    inf_tags    => qq(type="$name"),
+                                                                    group_by    => $name,
+                                                                   };
+                }
+
+                my $queueStatusCount = $rcvErrors + $confirmErrors + $rollbackErrors;
+
+                # We don't want to crit on anything but ScheduleTasksWork, tmid: 143507
+                # We don't want to page for ScheduleTasksWork, just Tow. tmid: 145672
+                my $warnValue = undef;
+                my $critValue = undef;
+                my $warnCritFlag = 0;
+
+                if ($name =~ m/ScheduleTasksWork$/)
+                {
+                    $warnValue = "answer >= 1000 or $oldest >= $oldCrit or $longPendingCount > 0";
+                    $warnCritFlag = 1  if ( $oldest >= $oldCrit or $longPendingCount > 0 );
+                }
+                if ($name =~ m/IPQ:/)
+                {
+                    $warnValue = "answer >= 1000 or $oldest >= $oldWarnIPQ or $longPendingCount > 0";
+                    $critValue = "answer >= 1000 or $oldest >= $oldCritIPQ or $longPendingCount > 0";
+                    $warnCritFlag = 1  if ( $oldest >= $oldWarnIPQ or $longPendingCount > 0 );
+                    $warnCritFlag = 2  if ( $oldest >= $oldCritIPQ or $longPendingCount > 0 );
+                }
+
+                $queries{"$name errors"} = {
+                                            noRowCount                   => 1,
+                                            format                       => "%s</td><td>long pending:</td><td>$longPendingCount</td><td>oldest:</td><td>scaleTime($oldest)",
+                                            warn                         => $warnValue,
+                                            crit                         => $critValue,
+                                            ticketOnWarnOpenAfterMinutes => 1,
+                                            uiHint                       => "queue status",
+                                            correctiveActions            => [
+                                                                  Ops  => 'Open S2 CR for Engineering',
+                                                                  Engr => 'The corrective action is rollback the stuck message (which can be done via DF or by recycling the task nodes in the community named in the queue that has the problem.)',
+                                                                 ],
+                                            perl        => sub {return $queueStatusCount},
+                                            inf_field   => "errors",
+                                            inf_default => 0,
+                                            inf_tags    => qq(type="$name"),
+                                            group_by    => $name,
+                                           };
+                $queries{"$name long_pending"} = {
+                                                  warn        => $warnValue,
+                                                  crit        => $critValue,
+                                                  perl        => sub {return $longPendingCount},
+                                                  inf_field   => "long_pending",
+                                                  inf_default => 0,
+                                                  inf_tags    => qq(type="$name"),
+                                                  group_by    => $name,
+                                                 };
+                $queries{"$name oldest"} = {
+                                            warn        => $warnValue,
+                                            crit        => $critValue,
+                                            perl        => sub {return ($oldest);},
+                                            inf_field   => "oldest",
+                                            inf_default => 0,
+                                            inf_tags    => qq(type="$name"),
+                                            group_by    => $name,
+                                           };
+                $queries{"$name warncrit flag"} = {
+                    perl      => sub { $warnCritFlag },
+                    inf_field => "warncrit_flag",
+                    inf_tags  => qq(type="$name"),
+                    group_by  => $name,
+                };
+            }
+            last;
+        }
+    }
+
+    my $email = $me->default('notify.email');
+    $queries{influx_details} = {measurement => "persistent_queue"};
+    my $qm = ariba::monitor::QueryManager->newWithDetails("persistent-queue", $product->name(), $service, $product->customer(), \%queries);
+
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+}
+
+# sample xml
+# <xml><Description>QueueManager server monitoring info</Description>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://durableQueue"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://buyerserver1/ScheduleTasksWork"/>
+# <deadLetterStatus pendingCount="0" rcvErrors="0" confirmErrors="0" rollbackErrors="0" newCount="0" oldest="0"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://Community1/TestingWorkResults2"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://sendAndRollBackQueue"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://buyerserver3/ScheduleTasksWork"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://Community1/TestingWorkResults1"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="2729" name="queue://durableRetryQueue"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://buyerserver2/TaskEventResponse"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://simpleStorageQueue"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://buyerserver3/TaskEventResponse"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://Community0/ScheduleTasksWork"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://buyerserver1/TaskEventResponse"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://simpleStringQueue"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="108955" name="queue://Community1/TestingWork1"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://buyerserver2/ScheduleTasksWork"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="79760729" name="queue://Community1/ScheduleTasksResult"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="17074729" name="queue://Community1/ScheduleTasksWork"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://nonDurableRetryQueue"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://bigTaskDurableQueue"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="87044729" name="queue://Community0/ScheduleTasksResult"/>
+# <queueStatus rcvErrors="0" confirmErrors="0" rollbackErrors="0" oldest="0" name="queue://nonDurableQueue"/>
+# <SessionCount>3</SessionCount>
+# <ExceptionCount>0</ExceptionCount>
+# <ProcessingCount>1</ProcessingCount>
+# <portStatus name="port://oneDurableQueue" sendFailures="0"/>
+# <portStatus name="port://durableRetryQueue" sendFailures="0"/>
+# <portStatus name="port://prealm_1/ScheduleTasksWork" sendFailures="0"/>
+# <portStatus name="port://nonDurableRetryQueue" sendFailures="0"/>
+# <portStatus name="port://buyerserver2/TaskEventResponse" sendFailures="0"/>
+# <portStatus name="port://twoDurableQueue" sendFailures="0"/>
+# <portStatus name="port://partition1/TestingWork1" sendFailures="0"/>
+# <portStatus name="port://durableQueue" sendFailures="22"/>
+# <portStatus name="port://buyerserver1/TaskEventResponse" sendFailures="0"/>
+# <portStatus name="port://simpleStringQueue" sendFailures="0"/>
+# <portStatus name="port://None/ScheduleTasksWork" sendFailures="0"/>
+# <portStatus name="port://partition2/TestingWork1" sendFailures="0"/>
+# <portStatus name="port://buyerserver3/TaskEventResponse" sendFailures="0"/>
+# <portStatus name="port://twoNonDurableQueue" sendFailures="0"/>
+# <ClientSessionCount>0</ClientSessionCount>
+# <ClientExceptionCount>0</ClientExceptionCount>
+# </xml>
+
+sub processUrl
+{
+
+    my $persistentUrl = shift;
+    my $xp;
+    my $eMessage;
+
+    my $persistentStatus = ariba::monitor::Url->new($persistentUrl);
+    $persistentStatus->setUseOutOfBandErrors(1);
+
+    if (defined $persistentStatus->error())
+    {
+        $eMessage = "ERROR: $persistentStatus->error()\n";
+
+        return ($eMessage, $xp);
+    }
+    my $timeout   = 180;
+    my $xmlString = $persistentStatus->request($timeout);
+    $xp = XML::XPath->new(xml => $xmlString);
+
+    eval {
+        my $parseThis = new XML::Parser;
+        $parseThis->parse($xmlString);
+    };
+
+    if ($@)
+    {
+        $eMessage = "ERROR: XML Parsing failed\n";
+    }
+    else
+    {
+        $eMessage = "ERROR: Invalid xml data as queueStatus is missing: $xmlString\n"      unless ($xmlString =~ m/queueStatus/);
+        $eMessage = "ERROR: Invalid xml data as deadLetterStatus is missing: $xmlString\n" unless ($xmlString =~ m/deadLetterStatus/);
+    }
+
+    print "$eMessage\n" if $debug && $eMessage;
+
+    return ($eMessage, $xp);
+}
+
+sub deadLetterStatus
+{
+
+    my $xp = shift;
+
+    my $rcvErrors      = int ($xp->findvalue('//deadLetterStatus/@rcvErrors'));
+    my $confirmErrors  = int ($xp->findvalue('//deadLetterStatus/@confirmErrors'));
+    my $pendingCount   = int ($xp->findvalue('//deadLetterStatus/@pendingCount'));
+    my $newCount       = int ($xp->findvalue('//deadLetterStatus/@newCount'));
+    my $rollbackErrors = int ($xp->findvalue('//deadLetterStatus/@rollbackErrors'));
+
+    my $deadLetterStatusCount = $rcvErrors + $confirmErrors + $pendingCount + $newCount + $rollbackErrors;
+
+    return $deadLetterStatusCount;
+}
+
+main();

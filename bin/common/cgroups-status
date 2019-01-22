@@ -1,0 +1,464 @@
+#!/usr/local/bin/perl
+
+use warnings;
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use dmail::LockLib;
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::monitor::AppRecycleOutage;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::Url;
+
+my $debug = 0;
+my $quiet = 0;
+
+my $LOCKFILE = '/tmp/stratus-cgroups-status';
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $productName;
+
+    my %queries = ();
+
+    while ( my $arg = shift(@ARGV) ) {
+        print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+        if ( $arg =~ /^-d/o )    { $debug       = 1; }
+        if ( $arg =~ /^-e/o )    { $sendEmail   = 1; }
+        if ( $arg =~ /^-p$/o )   { $sendPage    = 1; }
+        if ( $arg =~ /^-prod/o ) { $productName = shift(@ARGV); }
+    }
+
+    my $mon     = ariba::rc::InstalledProduct->new();
+    my $cluster = $mon->currentCluster();
+    my $service = $mon->service();
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList( $service, $productName );
+
+    unless (@products) {
+        exit(0);
+    }
+
+    dmail::LockLib::forceQuiet() unless $debug;
+
+    for my $product (@products) {
+
+        my $productLock = "$LOCKFILE-" . $product->name();
+        $productLock .= "-" . $product->customer() if $product->customer();
+        next unless ( dmail::LockLib::requestlock( $productLock, 1 ) );
+
+        my @appInstances = grep { $_->isTomcatApp() } $product->appInstances();
+
+        my %cgroupsStatsByGroup = ();
+
+        for my $instance (@appInstances) {
+
+            my $xmlString;
+            my $url;
+            fetchCGroupsStatus( $instance, \$xmlString, \$url );
+
+            generateCGroupsQueries( $xmlString, $instance, $url, \%queries, \%cgroupsStatsByGroup );
+
+        }
+
+        #generateCGroupsAggregatedQueries(\%queries, \%cgroupsStatsByGroup);
+
+        my $email = $mon->default('notify.email');
+        $queries{influx_details} = { measurement => 's4_cgroups_stats' };
+        my $qm = ariba::monitor::QueryManager->newWithDetails( "cgroups-status",
+            $product->name(), $service, $product->customer(), \%queries );
+
+        $qm->processQueries( $debug, $email, $sendEmail, $sendPage );
+
+        dmail::LockLib::releaselock($productLock);
+    }
+}
+
+my $RELIABLE_PACKETS_DROPPED_FROM_OUTBOUND = "Reliable Packets dropped from outbound queue";
+my $RELIABLE_PACKETS_LOST_FROM_INBOUND     = "Reliable Packets lost from inbound queue";
+my $RELIABLE_PACKETS_LOST_DUE_SATURATION   = "Reliable packets lost due to saturation";
+my $RELIABLE_MSG_QUEUE_SIZE_OUTBOUND       = "Reliable Message Queue size outbound (fragmented packets)";
+
+my $DROPS_RECEIVED           = "Drops Received";
+my $RELIABLE_PACKETS_EXPIRED = "Reliable Packets expired";
+my $PACKETS_RESENT           = "Packets Resent";
+
+my $TOTAL_PACKETS_RECEIVED      = "Packets Received";          # FIXME not sure if this is correct (reliable?)
+my $TOTAL_PACKETS_RELIABLE_SENT = "Packets Sent (Reliable)";
+
+# hash key constants
+my $PERNODE   = 'pernode';
+my $AGGREGATE = 'aggregate';
+
+sub generateCGroupsAggregatedQueries {
+    my $queriesRef             = shift;
+    my $cgroupsStatsByGroupRef = shift;
+
+    for my $statsKey ( keys %{ $cgroupsStatsByGroupRef->{$AGGREGATE} } ) {
+
+        my $uiHint = "stats/$statsKey";
+
+        for my $cgroupsMonItem ( keys %{ $cgroupsStatsByGroupRef->{$AGGREGATE}->{$statsKey} } ) {
+            my $value = $cgroupsStatsByGroupRef->{$AGGREGATE}->{$statsKey}->{$cgroupsMonItem};
+            my ( $warn, $crit );
+
+            $queriesRef->{"$statsKey $cgroupsMonItem"} = {
+                recordMaxResults => 30000,
+                recordDataType   => "gauge",
+
+                info => 1,
+                crit => $crit,
+                warn => $warn,
+
+                uiHint => $uiHint,
+
+                perl => sub { return $value; },
+            };
+        }
+
+        addCompoundQueries( $queriesRef, $cgroupsStatsByGroupRef, $statsKey, $uiHint );
+    }
+
+}
+
+sub addCompoundQueries {
+    my $queriesRef             = shift;
+    my $cgroupsStatsByGroupRef = shift;
+    my $statsKey               = shift;
+    my $uiHint                 = shift;
+    my $nodeName               = shift;
+    my $inf_tags               = shift;
+
+    my $prefix = $statsKey;
+    $prefix = "$nodeName $prefix" if $nodeName;
+
+    my $cgroupsStatsHashRef;
+    if ($nodeName) {
+        $cgroupsStatsHashRef =
+          $cgroupsStatsByGroupRef->{$PERNODE}->{$nodeName}->{$statsKey};
+    }
+    else {
+        $cgroupsStatsHashRef = $cgroupsStatsByGroupRef->{$AGGREGATE}->{$statsKey};
+    }
+
+    #
+    # for the queries calculating a percentage, institute a lower
+    # bound to not crit/warn at node startup time, where percentage
+    # could be high because total packets sent is low
+    #
+    my $total_sent_threshold = 100;
+
+    my $totalPacketsSent        = $cgroupsStatsHashRef->{$TOTAL_PACKETS_RELIABLE_SENT};
+    my $packetsLostToSaturation = $cgroupsStatsHashRef->{$RELIABLE_PACKETS_LOST_DUE_SATURATION};
+    my $packetsResent           = $cgroupsStatsHashRef->{$PACKETS_RESENT};
+    my $packetsDroppedFromOutQ  = $cgroupsStatsHashRef->{$RELIABLE_PACKETS_DROPPED_FROM_OUTBOUND};
+
+    my ( $p1, $p2 ) = split( /\s/, $prefix );
+    $prefix = $p1;
+    $queriesRef->{"$prefix percent reliable packets dropped due to saturation"} = {
+        recordMaxResults => 30000,
+        recordDataType   => "gauge",
+
+        info => 1,
+        warn => "answer && $totalPacketsSent && ($totalPacketsSent > $total_sent_threshold) && answer >= 10",
+        crit => "answer && $totalPacketsSent && ($totalPacketsSent > $total_sent_threshold) && answer >= 20",
+
+        uiHint => $uiHint,
+        format => "%d%%",
+
+        perl => sub {
+
+            if ( !$totalPacketsSent ) {
+                return 0;
+            }
+
+            return ( ( $packetsLostToSaturation / $totalPacketsSent ) * 100 );
+        },
+        inf_field   => "percent_packets_dropped",
+        inf_default => 0,
+        inf_tags    => $inf_tags,
+        group_by    => $inf_tags,
+    };
+    $queriesRef->{"total_packets_sent"} = {
+        inf_field => "total_packets_sent",
+        perl => sub {return $totalPacketsSent},
+        inf_tags => "$inf_tags",
+        group_by => "$inf_tags",
+        inf_default => 0,
+    };
+
+    $queriesRef->{"$prefix percent reliable packets resent"} = {
+        recordMaxResults => 30000,
+        recordDataType   => "gauge",
+
+        info => 1,
+
+        # disabled for now, see TMID 92274
+        #
+        #warn => "answer && $totalPacketsSent && ($totalPacketsSent > $total_sent_threshold) && answer >= 30",
+        #crit => "answer && $totalPacketsSent && ($totalPacketsSent > $total_sent_threshold) && answer >= 50",
+
+        uiHint => $uiHint,
+        format => "%d%%",
+
+        perl => sub {
+
+            if ( !$totalPacketsSent ) {
+                return 0;
+            }
+            return ( ( $packetsResent / $totalPacketsSent ) * 100 );
+        },
+        inf_field   => "percent_packets_resent",
+        inf_default => 0,
+        inf_tags    => $inf_tags,
+        group_by    => $inf_tags,
+    };
+
+    $queriesRef->{"$prefix percent reliable packets dropped from outbound queue"} = {
+        recordMaxResults => 30000,
+        recordDataType   => "gauge",
+
+        info => 1,
+        warn => "answer && $totalPacketsSent && ($totalPacketsSent > $total_sent_threshold) && answer >= 10",
+        crit => "answer && $totalPacketsSent && ($totalPacketsSent > $total_sent_threshold) && answer >= 20",
+
+        uiHint => $uiHint,
+        format => "%d%%",
+
+        perl => sub {
+
+            if ( !$totalPacketsSent ) {
+                return 0;
+            }
+            return ( ( $packetsDroppedFromOutQ / $totalPacketsSent ) * 100 );
+        },
+        inf_field   => "percent_outbound_dropped_packets",
+        inf_default => 0,
+        inf_tags    => $inf_tags,
+        group_by    => $inf_tags,
+    };
+
+}
+
+sub generateCGroupsQueries {
+    my $xmlResultString        = shift;
+    my $instance               = shift;
+    my $url                    = shift;
+    my $queriesRef             = shift;
+    my $cgroupsStatsByGroupRef = shift;
+
+    my ($xmlResult);
+
+    my $community = $instance->community();
+
+    my @groupTypes;
+    if ($community) {
+        @groupTypes = ( 'Community', 'Global' );
+    }
+    else {
+        @groupTypes = 'Global';
+    }
+
+    unless ( $url->error() ) {
+        my $xmlParser = XML::Simple->new(
+            ForceArray     => [ 'Metric', 'Singleton' ],
+            KeyAttr        => { Metric => 'Name', Singleton => 'Name' },
+            NormaliseSpace => 1
+        );
+        $xmlResult = $xmlParser->XMLin($xmlResultString);
+    }
+
+    my $nodeName = $instance->instanceName();
+    $nodeName = $instance->logicalName() if $instance->logicalName();
+
+    #
+    # collect metrics from each node, and collate them for
+    # per-community aggregated view
+    #
+
+    for my $groupType (@groupTypes) {
+
+        my $statsKey;
+        my $uiHint;
+        my $inf_tags;
+
+        if ( $groupType eq 'Community' ) {
+            $statsKey = "Community $community";
+            $uiHint   = "stats/Community $community/$nodeName";
+            $inf_tags = qq(type="Community $community",node_name="$nodeName");
+        }
+        else {
+            $statsKey = "Global";
+            if ($community) {
+                $uiHint   = "stats/Global/Community $community/$nodeName";
+                $inf_tags = qq(type="Global Community $community",node_name="$nodeName");
+            }
+            else {
+                $uiHint   = "stats/Global/Community default/$nodeName";
+                $inf_tags = qq(type="Global Community default",node_name="$nodeName");
+            }
+        }
+
+        #
+        # first add a fetch-status query so it's obvious when we can't
+        # connect
+        my $connectError   = $url->error();
+        my $appRecycleNote = '';
+
+        $connectError = $xmlResult unless ( $connectError || ref($xmlResult) );
+
+        if ($connectError) {
+            my $outageName =
+              ariba::monitor::AppRecycleOutage->instanceName( $instance->productName(), $instance->instanceName() );
+            if ( ariba::monitor::AppRecycleOutage->objectWithNameExists($outageName) ) {
+                my $outage = ariba::monitor::AppRecycleOutage->new($outageName);
+                $appRecycleNote = 'app recycle' if ($outage);
+            }
+        }
+
+        $queriesRef->{"$nodeName $statsKey cgroups stats url"} = {
+            info => 1,
+            warn => ( !$appRecycleNote && $connectError ? 1 : 0 ),
+            note => $appRecycleNote,
+
+            url    => $url->instance(),
+            uiHint => $uiHint,
+
+            perl        => sub { return ( $connectError || "OK" ); },
+            inf_field   => "cgroups_stats",
+            inf_default => "none",
+            inf_tags    => $inf_tags,
+            group_by    => $inf_tags,
+        };
+
+        # url query above will provide a clue to what is going on
+        next if $url->error();
+        my %inf_db_cols = (
+            $RELIABLE_MSG_QUEUE_SIZE_OUTBOUND   => 'msg_que_outbound_size',
+            $RELIABLE_PACKETS_EXPIRED           => 'packets_expired',
+            $RELIABLE_PACKETS_LOST_FROM_INBOUND => 'packets_lost_from_inbound_que'
+        );
+
+        my $cgroupsResults = $xmlResult->{$groupType}->{'Metric'};
+        for my $cgroupsMonItem ( keys %$cgroupsResults ) {
+
+            my $value = $cgroupsResults->{$cgroupsMonItem}->{'Value'};
+
+            # generate aggregate status per community / global from
+            # this hash
+            $cgroupsStatsByGroupRef->{$AGGREGATE}->{$statsKey}->{$cgroupsMonItem} += $value;
+            $cgroupsStatsByGroupRef->{$PERNODE}->{$nodeName}->{$statsKey}->{$cgroupsMonItem} = $value;
+
+            my $warn;
+            my $crit;
+
+            if ( $cgroupsMonItem eq $RELIABLE_MSG_QUEUE_SIZE_OUTBOUND ) {
+                $warn = "answer && answer > (.75 * 4000)";
+
+            }
+            elsif ( $cgroupsMonItem eq $RELIABLE_PACKETS_LOST_FROM_INBOUND ) {
+                $warn = "answer && answer > 100";
+
+            }
+            elsif ( $cgroupsMonItem eq $RELIABLE_PACKETS_EXPIRED ) {
+                $warn = "answer && answer > 10";
+            }
+            else {
+
+                # skip items we don't warn/crit on
+                next;
+            }
+
+            my $inf_field = $inf_db_cols{$cgroupsMonItem};
+            $queriesRef->{"$nodeName $statsKey $cgroupsMonItem"} = {
+                recordMaxResults => 30000,
+                recordDataType   => "gauge",
+
+                info => 1,
+                crit => $crit,
+                warn => $warn,
+
+                uiHint => $uiHint,
+
+                perl        => sub { return $value; },
+                inf_field   => $inf_field,
+                inf_default => 0,
+                inf_tags    => $inf_tags,
+                group_by    => $inf_tags,
+            };
+        }
+        addCompoundQueries( $queriesRef, $cgroupsStatsByGroupRef, $statsKey, $uiHint, $nodeName, $inf_tags );
+    }
+
+    # disable singleton display for now
+    if ( 0 && $xmlResult ) {
+
+        # Singletons
+        my $statsKey;
+        if ($community) {
+            $statsKey = "Community $community";
+        }
+        else {
+            $statsKey = "Global";
+        }
+
+        my $singletonResultsRef = $xmlResult->{'Singletons'}->{'Singleton'};
+        for my $name ( keys %$singletonResultsRef ) {
+
+            my $dbValue = $singletonResultsRef->{$name}->{'DBValue'};
+            $queriesRef->{"$nodeName $statsKey $name DBValue"} = {
+                info   => 1,
+                uiHint => "singletons/$statsKey/$nodeName",
+                perl   => sub { return $dbValue; }
+            };
+
+            my $value = $singletonResultsRef->{$name}->{'Value'};
+            $queriesRef->{"$nodeName $statsKey $name Value"} = {
+                info   => 1,
+                uiHint => "singletons/$statsKey/$nodeName",
+                perl   => sub { return $value; }
+            };
+
+            my $status = $singletonResultsRef->{$name}->{'Status'};
+            $queriesRef->{"$nodeName $statsKey $name Status"} = {
+                info   => 1,
+                uiHint => "singletons/$statsKey/$nodeName",
+                perl   => sub { return $status; }
+            };
+        }
+    }
+
+}
+
+sub fetchCGroupsStatus {
+    my $instance     = shift;
+    my $xmlStringRef = shift;
+    my $urlRef       = shift;
+
+    my $timeout = 6;
+
+    my $clusterGroupStatusURL = ariba::Ops::Url->new( $instance->clusterGroupStatusURL() );
+    $clusterGroupStatusURL->setDebug($debug);
+
+    $$urlRef = $clusterGroupStatusURL;
+
+    $$xmlStringRef = $clusterGroupStatusURL->request($timeout);
+
+    if ( $clusterGroupStatusURL->error() ) {
+        print "Error fetching task errors from "
+          . $instance->instanceName() . ":"
+          . $clusterGroupStatusURL->error() . "\n"
+          if $debug;
+        return;
+    }
+
+    return 1;
+}
+
+main();

@@ -1,0 +1,136 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/mon/record-vm-tab-status#9 $
+#
+# Record the value of ops tabs from vm over time
+# Used to compute a global metric of Ops "goodness" over time
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::ProductStatus;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+
+sub main {
+	my $debug     = 0;
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+	my %queries   = ();
+
+        while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-d/o) { $debug = 1; }
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; };
+        }
+
+	my $me = ariba::rc::InstalledProduct->new();
+	
+	my @productNames = ariba::monitor::StatusPage::monitoredProductNames();
+
+	exit unless @productNames;
+
+	my $total = 0;
+	my $numberOfProducts = 0;
+	my $service = $me->service();
+
+	for my $productName (@productNames) {
+
+		# we don't want to track status of a tab if that product is planned down	
+		my $nextProduct     = 0;
+
+		my @productStatuses = ariba::monitor::ProductStatus->objectsWithProperties(
+			'productName' => $productName,
+			'service'     => $service
+		);
+
+		# Loop over this list in the case of multiple customers per product.
+		for my $productStatus (@productStatuses) {
+
+			if ($productStatus->inPlannedDownTime()) {
+				$nextProduct = 1;
+				last;
+			}
+		}
+
+		next if $nextProduct;
+
+		#
+		my $productStatus = ariba::monitor::ProductStatus->newWithDetails($productName, $service);
+		my ($status, $lastChange) = $productStatus->statusAndLastChange();
+
+		my $statusValue = ariba::monitor::StatusPage::statusToValue($status) || 
+				  ariba::monitor::StatusPage::statusToValue("default");
+
+		$queries{"Tab status for $productName"} = {       
+			recordMaxResults => 9000,
+			recordDataType   => "gauge",
+			perl => "return $statusValue",
+                        inf_field => "tab_status",
+                        inf_tags => "tab_product_name=\"$productName\"",
+		};
+
+		$numberOfProducts++;
+		$total += $statusValue;
+	}
+
+	if ($numberOfProducts) {
+
+		my $average = sprintf("%.3f", $total/$numberOfProducts );
+
+		$queries{"Tab status average"} = {       
+			recordMaxResults => 9000,
+			recordDataType   => "gauge",
+			perl => "return $average",
+                        inf_field => "tab_status_average",
+                        inf_tags => "tab_product_name=tab_average",
+		};
+	}
+
+        $queries{influx_details} = {measurement => "vm_tab_status"};
+	
+	my $q = ariba::monitor::QueryManager->newWithDetails("vm-tab-status", "mon", $me->service(), $me->customer(), \%queries);
+
+	my $email = $me->default('notify.email');
+
+	$q->setUiHint("ignore");
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+	# Reset queries here for different queries.
+	%queries = ();
+
+        my $days = 7;
+        my $samples = $days * 24;
+
+        for my $productName (@productNames) {
+
+                $queries{"$days day moving avg for tab $productName"} = {
+			info   => "answer >= 0",
+			format => "%0.2f\n",
+			extractRecorded => "average(mon/Tab_status_for_$productName, $samples)",
+                        inf_field => "${days}_moving_average_tab_status",
+                        inf_tags => "tab_product_name=\"${productName}_moving_average\"",
+                };
+        }
+
+        $queries{"$days day moving avg for all tabs"} = {
+		info   => "answer >= 0",
+		format => "%0.2f\n",
+		extractRecorded => "average(mon/Tab_status_average, $samples)",
+                inf_field => "${days}_moving_avg_for_all_tabs",
+                inf_tags => "tab_product_name=all_tabs_average",
+        };
+
+
+        $queries{influx_details} = {measurement => "vm-tab-status-moving-averages"};
+
+        $q = ariba::monitor::QueryManager->newWithDetails(
+		"vm-tab-status-moving-averages", "mon", $me->service(), $me->customer(), \%queries
+	);
+
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main();

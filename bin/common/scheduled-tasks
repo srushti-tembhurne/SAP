@@ -1,0 +1,822 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/common/scheduled-tasks#27 $
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::Url;
+use ariba::monitor::QueryManager;
+use ariba::Ops::OracleClient;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+use Data::Dumper;
+
+#
+#    /* @aribaapi ariba */
+#
+#    public static final int StatusNotRun  = 0;
+#
+#    /* @aribaapi ariba */
+#
+#    public static final int StatusRunning = 1;
+#
+#    /* @aribaapi ariba */
+#
+#    public static final int StatusError   = 2;
+#
+#    /* @aribaapi ariba */
+#
+#    public static final int StatusComplete = 3;
+#
+my $StatusNotRun  = 0;
+my $StatusRunning = 1;
+my $StatusError   = 2;
+my $StatusComplete = 3;
+
+sub main {
+    my $debug = 0;
+    my $quiet = 0;
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $productName;
+
+    while(my $arg=shift(@ARGV)){
+            print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+            if($arg =~ /^-d/o){ $debug=1; }
+            if($arg =~ /^-e/o){ $sendEmail=1; };
+            if($arg =~ /^-p$/o){ $sendPage=1; };
+            if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $cluster = $me->currentCluster();
+    my $service = $me->service();
+    my $email = $me->default('notify.email');
+
+    my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+
+    map { print $_->name() . "\n"; } @products if $debug;
+    unless (@products) {
+        exit(0);
+    }
+
+    for my $product (@products) {
+
+        my $skip = 0;
+        next unless ( $product->name() =~ /(?:buyer|s4|an)/i );
+        print "* Product: '" . $product->name() . "' **\n" if $debug;
+
+        my %queries  = ();
+        my %communitiesDone;
+        my $savedAppInstance;
+        for my $instance ($product->appInstancesInCluster($cluster)) {
+            my $instanceName = $instance->instanceName();
+
+            #
+            # Do not attempt to get scheduled task status from
+            # UI nodes (although we can), as it causes bunch
+            # of objects to be loaded on UI node that dont
+            # need to be. Just ask one of the task nodes instead
+            #
+            # isDispatcher check does not always work as for some
+            # products (buyer for ex.) we have TaskCXML node that
+            # combines dispatcher and processor like operations.
+            #
+            if ( $product->name() eq 'an' ) {
+                next unless ($instance->isDispatcher() || $instance->appName() =~ /GlobalTask/);
+            } else { ## We are buyer or s4
+                next unless ($instance->appName() =~ /GlobalTask/);
+            }
+
+            print "** Checking '" . $instance->appName() . "' **\n" if $debug;
+            $savedAppInstance = $instance;
+
+            my $url = $instance->scheduledTasksMonitorURL();
+
+            my $uiHint = undef;
+            my $inCommunity = "";
+            my $forCommunity = "";
+            my $community = "none";
+            if ($product->isASPProduct()) {
+                $uiHint = $instance->appName();
+            } else {
+                $community = $instance->community();
+                if ($community) {
+                    $community = "community $community";
+                } else {
+                    $community = "default community";
+                }
+
+                next if ($communitiesDone{$community});
+                $communitiesDone{$community} = 1;
+
+                $uiHint = $community;
+
+                $inCommunity = " in $community";
+                $forCommunity = " for $community";
+            }
+
+            print "url = $url\n" if ($debug);
+
+            my $scheduledTasksStat = ariba::monitor::Url->new($url);
+
+            my @results = $scheduledTasksStat->request(45);
+
+            my ($scheduledTasksDetails, $errorTasks, $stuckTasks,
+                    $runningTooLongTasks, $healthyTasks) = scheduledTasksSummary(\@results);
+
+            my @tasks_in_error_state = main::displayTaskDetails($scheduledTasksDetails, $errorTasks,"tasks_in_error_state");
+            $queries{"Tasks in error state$inCommunity"} = {
+                'info' => "numrows > -1",
+                'skip' => $skip,
+                'warn' => "numrows > 5",
+                #'error' => "numrows > 5",
+                'uiHint' => $uiHint,
+                'perl' => sub { return scalar(@tasks_in_error_state) },
+                inf_field => "value",
+                inf_default => 0,
+                inf_tags  => qq(community="$community",description="Number of tasks in error state"),
+                group_by => qq(community="$community",description="Number of tasks in error state"),
+            };
+        
+            foreach my $line(@tasks_in_error_state)
+            {
+                my ($p1, $p2 ) = split(/\s+/,$line,2);
+                my @fields = split(/\,/,$p2);
+                foreach my $field ( @fields )
+                {
+                    my ($key,$val) = split(/=/,$field);
+                    $queries{"Tasks in error state$inCommunity - $p1 $key"} = {
+                        perl => sub { return $val},
+                        inf_field => $key,
+                        inf_tags  => qq($p1,community="$inCommunity"),
+                        group_by => qq($p1,$inCommunity),
+                    };
+                };
+            };
+            
+            my @stuck_tasks = main::displayTaskDetails($scheduledTasksDetails, $stuckTasks,"tasks_in_stuck_state");
+            $queries{"Tasks that did not run as expected$inCommunity"} = {
+                'info' => "numrows > -1",
+                'skip' => $skip,
+                'warn' => "numrows > 5",
+                #'error' => "numrows > 5",
+                'uiHint' => $uiHint,
+                'perl' => sub { return scalar(@stuck_tasks) },
+                inf_field => "value",
+                inf_default => 0,
+                inf_tags  => qq(community="$community",description="Number of unexpected non-running tasks"),
+                group_by => qq(community="$community",description="Number of unexpected non-running tasks"),
+            };
+
+            foreach my $line(@stuck_tasks)
+            {
+                my ($p1, $p2 ) = split(/\s+/,$line,2);
+                my @fields = split(/\,/,$p2);
+                foreach my $field ( @fields )
+                {
+                    my ($key,$val) = split(/=/,$field);
+                    $queries{"Tasks that did not run as expected $inCommunity - $p1 $key"} = {
+                        perl => sub { return $val},
+                        inf_field => $key,
+                        inf_tags  => qq($p1,community="$inCommunity"),
+                        group_by => qq($p1,$inCommunity),
+                    };
+                };
+            };
+            
+            my @running_too_long = main::displayTaskDetails($scheduledTasksDetails, $runningTooLongTasks,"tasks_running_too_long");
+            $queries{"Tasks that are running for longer than expected$inCommunity"} = {
+                'info' => "numrows > -1",
+                'skip' => $skip,
+                'warn' => "numrows > 5",
+                #'error' => "numrows > 5",
+                'uiHint' => $uiHint,
+                'perl' => sub { return scalar(@running_too_long) },
+                inf_field => "value",
+                inf_default => 0,
+                inf_tags  => qq(community="$community",description="Number of unexpected long running tasks"),
+                group_by => qq(community="$community",description="Number of unexpected long running tasks"),
+            };
+
+            foreach my $line(@running_too_long)
+            {
+                my ($p1, $p2 ) = split(/\s+/,$line,2);
+                my @fields = split(/\,/,$p2);
+                foreach my $field ( @fields )
+                {
+                    my ($key,$val) = split(/=/,$field);
+                    $queries{"Tasks that are running for longer than expected $inCommunity - $p1 $key"} = {
+                        perl => sub { return $val},
+                        inf_field => $key,
+                        inf_tags  => qq($p1,community="$inCommunity"),
+                        group_by => qq($p1,$inCommunity),
+                    };
+                };
+            };
+            
+            my @success = main::displayTaskDetails($scheduledTasksDetails, $healthyTasks,"successful_tasks");
+            $queries{"Tasks that were successful$inCommunity"} = {
+                'info' => "numrows > -1",
+                'skip' => $skip,
+                'uiHint' => $uiHint,
+                'perl' => sub { return scalar(@success) },
+                inf_field => "successful_tasks_count",
+                inf_default => 0,
+                inf_tags  => qq(community="$community",description="Number of successful tasks"),
+                group_by => qq(community="$community",description="Number of successful tasks"),
+            };
+
+            foreach my $line(@success)
+            {
+                my ($p1, $p2 ) = split(/\s+/,$line,2);
+                my @fields = split(/\,/,$p2);
+                foreach my $field ( @fields )
+                {
+                    my ($key,$val) = split(/=/,$field);
+                    $queries{"Tasks that were successful $inCommunity - $p1 $key"} = {
+                        perl => sub { return $val},
+                        inf_field => $key,
+                        inf_tags  => qq($p1,community="$inCommunity"),
+                        group_by => qq($p1,$inCommunity),
+                    };
+                };
+            };
+        }
+
+        my $threshold = 20;
+        if($productName eq "buyer") {
+            $threshold = 60;
+        }
+        if($productName eq "s4") {
+            $threshold = 40;
+        }
+
+        my $instance = $savedAppInstance;
+        my $thresholdInSecs = $threshold *60; # 20 mins
+            my $durationInSecs = 48 * 60 * 60; # 48 hours
+            my $url;
+
+        $url = $instance->tasksRanLongerThanThresholdURL();
+        my $seperator = '?';
+        if($url =~ /\?/) {
+            $seperator = '&';
+        }
+        $url .= $seperator . "threshold=$thresholdInSecs&span=$durationInSecs";
+
+        print "url = $url\n" if ($debug);
+
+        my $tasksRanLongerThanThreshold = ariba::monitor::Url->new($url);
+
+        my @tasksRanLongerThanThresholdResults = $tasksRanLongerThanThreshold->request(45);
+        my $inf_field = qq(tasks_ran_longer_than_).$threshold. qq(_min);
+        my @tasks_ran_longer_than_th = main::parseTasksRuntimeDetails(\@tasksRanLongerThanThresholdResults,$inf_field);
+        $queries{"Tasks that ran for longer than $threshold mins"} = {
+            'skip' => $skip,
+            'info' => 1,
+            'perl' => sub { return scalar(@tasks_ran_longer_than_th); },
+            inf_field => "value",
+            inf_tags => qq(community="none",description="Number of tasks that ran for longer than $threshold mins"),
+            group_by =>  qq(community="none",description="Number of tasks that ran for longer than $threshold mins"),
+            inf_default => 0,
+        };
+        foreach my $line(@tasks_ran_longer_than_th)
+        {
+            my ($p1, $p2 ) = split(/\s+/,$line,2);
+            my @fields = split(/\,/,$p2);
+            foreach my $field ( @fields )
+            {
+                my ($key,$val) = split(/=/,$field);
+                $queries{"Tasks that ran for longer than $threshold mins - $p1 $key"} = {
+                    perl => sub { return $val},
+                    inf_field => $key,
+                    inf_tags  => qq($p1),
+                    group_by => qq($p1),
+                };
+            };
+        };
+
+        $url = $instance->tasksRunningLongerThanThresholdURL();
+        $url .= $seperator . "threshold=$thresholdInSecs";
+
+        print "url = $url\n" if ($debug);
+
+        my $tasksRunningLongerThanThreshold = ariba::monitor::Url->new($url);
+
+        my @tasksRunningLongerThanThresholdResults = $tasksRunningLongerThanThreshold->request(45);
+        $inf_field = "tasks_running_longer_than_".$threshold. "_min";
+        my @tasks_running_longer_than_th =  main::parseTasksRuntimeDetails(\@tasksRunningLongerThanThresholdResults,$inf_field);
+        $queries{"Tasks that are running for longer than $threshold mins"} = {
+            'info' => "numrows > -1",
+            'skip' => $skip,
+            'warn' => "numrows > 20",
+            "ticketOnWarnOpenAfterMinutes" => 10,
+            'perl' => sub { return scalar(@tasks_running_longer_than_th); },
+            inf_field => "value",
+            inf_tags => qq(community="none",description="Number of tasks that are running for longer than $threshold mins"),
+            group_by => qq(community="none",description="Number of tasks that are running for longer than $threshold mins"),
+            inf_default => 0,
+        };
+        foreach my $line(@tasks_running_longer_than_th)
+        {
+            my ($p1, $p2 ) = split(/\s+/,$line,2);
+            my @fields = split(/\,/,$p2);
+            foreach my $field ( @fields )
+            {
+                my ($key,$val) = split(/=/,$field);
+                $queries{"Tasks that are running for longer than $threshold mins - $p1 $key"} = {
+                    perl => sub { return $val},
+                    inf_field => $key,
+                    inf_tags  => qq($p1),
+                    group_by => qq($p1),
+                };
+            };
+        };
+
+        my @critical_tasks = main::parseCriticalTasksRuntimeDetails(\@tasksRunningLongerThanThresholdResults);
+        $queries{"Critical tasks that are running for longer than $threshold mins"} = {
+            'info' => "numrows > -1",
+            'skip' => $skip,
+            'crit' => "numrows > 0",
+            'perl' => sub { return scalar(@critical_tasks);},
+            inf_field => "value",
+            inf_tags => qq(community="none",description="Number of critical tasks that are running for longer than $threshold mins"),
+            group_by => qq(community="none",description="Number of critical tasks that are running for longer than $threshold mins"),
+            inf_default => 0,
+            'severity' => 1,
+            'correctiveActions' => [
+                    Ops => 'Identify GT node the task is running on, Take thread dumps, Recycle the node, Check task has been kicked off again, File/update CR'
+                        ],
+        };
+        foreach my $line(@critical_tasks)
+        {
+            my ($p1, $p2 ) = split(/\s+/,$line,2);
+            my @fields = split(/\,/,$p2);
+            foreach my $field ( @fields )
+            {
+                my ($key,$val) = split(/=/,$field);
+                $queries{"Critical tasks that are running for longer than $threshold mins - $p1 $key"} = {
+                    perl => sub { return $val},
+                    inf_field => $key,
+                    inf_tags  => qq($p1),
+                    group_by => qq($p1),
+                };
+            }
+        }
+
+
+        # We want to explicitly monitor and alert for PullTasks that are running longer than 6 hours, tmid: 178611
+        my $pullTaskThreshold = 60 * 6;
+        my $pullTaskThresholdInSecs = $pullTaskThreshold * 60;
+
+        $url = $instance->tasksRunningLongerThanThresholdURL();
+        $url .= $seperator . "threshold=$pullTaskThresholdInSecs";
+
+        print "url = $url\n" if ($debug);
+
+        my $pullTasksRunningLongerThanThreshold = ariba::monitor::Url->new($url);
+        my @pullTasksRunningLongerThanThresholdResults = $pullTasksRunningLongerThanThreshold->request(45);
+
+        my @pull_tasks = main::parsePullTasksRuntimeDetails(\@pullTasksRunningLongerThanThresholdResults);
+        $queries{"Pull tasks that are running for longer than $pullTaskThreshold mins"} = {
+            'info' => "numrows > -1",
+            'crit' => "numrows > 0",
+            'severity' => 1,
+            'perl' => sub { return scalar(@pull_tasks); },
+            inf_field => "value",
+            inf_tags => qq(community="none",description="Number of pull tasks that are running for too long",pull_task_threshold=$pullTaskThreshold),
+            group_by => qq(community="none",description="Number of pull tasks that are running for too long",pull_task_threshold=$pullTaskThreshold),
+            inf_default => 0,
+        };
+        foreach my $line(@pull_tasks)
+        {
+            my ($p1, $p2 ) = split(/\s+/,$line,2);
+            my @fields = split(/\,/,$p2);
+            foreach my $field ( @fields )
+            {
+                my ($key,$val) = split(/=/,$field);
+                $queries{"Pull tasks that are running for longer than $threshold mins - $p1 $key"} = {
+                    perl => sub { return $val},
+                    inf_field => $key,
+                    inf_tags  => qq($p1),
+                    group_by => qq($p1),
+                };
+            };
+        };
+
+        # Monitoring provided by development for problematic task.  See TMID:87856
+        if ( $productName eq "buyer" ) {
+            $queries{"Imported Receipts Proccessing Task Status"} = {
+                'uiHint' => 'Task Specific Monitoring',
+                'skip' => $skip,
+                'warn' => "defined(answer) && defined(previousAnswer) && answer > previousAnswer",
+                        'ticketOnWarnOpenAfterMinutes' => 1,
+                'note' => "Debugging: //ariba/services/operations/documentation/prodops/common/query_notes/imported_receipts.txt",
+                'noRowCount'  => 1,
+                'sql' => q`
+                    SELECT COUNT(*) as value FROM StagedReceiptLineItemTab Sta1
+                        WHERE ((SYSDATE + -19800/86400 - Sta1.strecli_TimeCreated) > 1
+                            AND Sta1.strecli_StatusString = 'Waiting')
+                            AND (Sta1.strecli_Active = 1)
+                            AND (Sta1.strecli_PurgeState = 0)
+                    `,
+                group_by => qq(community="none",description="Number of imported recreipts processing task status"),
+                inf_tags => qq(community="none",description="Number of imported recreipts processing task status"),
+            }
+        }
+
+        my %general_queries;
+        my %scheduler_queries;
+        for my $k (keys %queries) {
+            if ($queries{$k}->{inf_field} eq 'value' || exists $queries{$k}->{sql}) {
+                $general_queries{$k} = $queries{$k};
+                delete $queries{$k};
+            } elsif ($queries{$k}->{inf_tags} =~ /scheduler/){
+                $scheduler_queries{$k} = $queries{$k};
+                delete $queries{$k};
+            }
+        }
+
+        $general_queries{influx_details} = {measurement => 'scheduled_task_summary'};
+
+        my $gq = ariba::monitor::QueryManager->newWithDetails(
+                "scheduled-tasks", $product->name(), $service, $product->customer(), \%general_queries
+                );
+
+        $scheduler_queries{influx_details} = {measurement => 'scheduled_task_duration'};
+
+        my $sq = ariba::monitor::QueryManager->newWithDetails(
+                "scheduled-tasks", $product->name(), $service, $product->customer(), \%scheduler_queries
+                );
+        $sq->processQueries($debug, $email, $sendEmail, $sendPage);
+
+        $queries{influx_details} = { measurement => 'scheduled_tasks' };
+        my $q = ariba::monitor::QueryManager->newWithDetails(
+                "scheduled-tasks", $product->name(), $service, $product->customer(), \%queries
+                );
+
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+#
+#<Scheduler Name=CoreServer-prealm_7>
+#    <Task Name=PurgeExpiredOnlineNotificationsTask>
+#        <Node Name=Task2036138>
+#            <Status>3</Status>
+#            <StartTime>1125388802000</StartTime>
+#            <EndTime>1125388802000</EndTime>
+#            <LastScheduledTime>1125388800000</LastScheduledTime>
+#            <NextScheduledTime>1125432000000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#    <Task Name=NewProjectLocationCreateFoldersTask>
+#        <Node Name=Task2036138>
+#            <Status>3</Status>
+#            <StartTime>1125385800000</StartTime>
+#            <EndTime>1125385800000</EndTime>
+#            <LastScheduledTime>1125385800000</LastScheduledTime>
+#            <NextScheduledTime>1125472200000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#    <Task Name=CleanupInactiveTokens>
+#        <Node Name=Task516139>
+#            <Status>2</Status>
+#            <StartTime>1125388803000</StartTime>
+#            <EndTime>1125388816000</EndTime>
+#            <LastScheduledTime>1125388800000</LastScheduledTime>
+#            <NextScheduledTime>1125432000000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#</Scheduler>
+#<Scheduler Name=CoreServer-prealm_3>
+#    <Task Name=ExpireDelegationsTask>
+#        <Node Name=Task2036138>
+#            <Status>3</Status>
+#            <StartTime>1125388801000</StartTime>
+#            <EndTime>1125388801000</EndTime>
+#            <LastScheduledTime>1125388800000</LastScheduledTime>
+#            <NextScheduledTime>1125432000000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#    <Task Name=IntegrityCheckAndRepairTask>
+#        <Node Name=Task516139>
+#            <Status>3</Status>
+#            <StartTime>1125388800000</StartTime>
+#            <EndTime>1125388801000</EndTime>
+#            <LastScheduledTime>1125388800000</LastScheduledTime>
+#            <NextScheduledTime>1125475200000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#    <Task Name=CleanupInactiveTokens>
+#        <Node Name=Task2036138>
+#            <Status>2</Status>
+#            <StartTime>1125388803000</StartTime>
+#            <EndTime>1125388816000</EndTime>
+#            <LastScheduledTime>1125388800000</LastScheduledTime>
+#            <NextScheduledTime>1125432000000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#    <Task Name=ScheduledNotificationsTask>
+#        <Node Name=Task516139>
+#            <Status>3</Status>
+#            <StartTime>1125428401000</StartTime>
+#            <EndTime>1125428401000</EndTime>
+#            <LastScheduledTime>1125428400000</LastScheduledTime>
+#            <NextScheduledTime>1125471600000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#    <Task Name=FailedDocumentMessagesTask>
+#        <Node Name=Task2036138>
+#            <Status>3</Status>
+#            <StartTime>1125352800000</StartTime>
+#            <EndTime>1125352800000</EndTime>
+#            <LastScheduledTime>1125352800000</LastScheduledTime>
+#            <NextScheduledTime>1125439200000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#</Scheduler>
+#<Scheduler Name=CoreServer-prealm_11>
+#    <Task Name=PurgeExpiredOnlineNotificationsTask>
+#        <Node Name=Task516139>
+#            <Status>3</Status>
+#            <StartTime>1125388802000</StartTime>
+#            <EndTime>1125388802000</EndTime>
+#            <LastScheduledTime>1125388800000</LastScheduledTime>
+#            <NextScheduledTime>1125432000000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#    <Task Name=UpdateContractStatusTask>
+#        <Node Name=Task516139>
+#            <Status>3</Status>
+#            <StartTime>1125385200000</StartTime>
+#            <EndTime>1125385200000</EndTime>
+#            <LastScheduledTime>1125385200000</LastScheduledTime>
+#            <NextScheduledTime>1125471600000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#    <Task Name=NewProjectLocationCreateFoldersTask>
+#        <Node Name=Task516139>
+#            <Status>3</Status>
+#            <StartTime>1125385800000</StartTime>
+#            <EndTime>1125385800000</EndTime>
+#            <LastScheduledTime>1125385800000</LastScheduledTime>
+#            <NextScheduledTime>1125472200000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#    <Task Name=RecurrenceManagementTask>
+#        <Node Name=Task516139>
+#            <Status>3</Status>
+#            <StartTime>1125428401000</StartTime>
+#            <EndTime>1125428401000</EndTime>
+#            <LastScheduledTime>1125428400000</LastScheduledTime>
+#            <NextScheduledTime>1125471600000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#    <Task Name=ExpireDelegationsTask>
+#        <Node Name=Task2036138>
+#            <Status>3</Status>
+#            <StartTime>1125388803000</StartTime>
+#            <EndTime>1125388803000</EndTime>
+#            <LastScheduledTime>1125388800000</LastScheduledTime>
+#            <NextScheduledTime>1125432000000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#    <Task Name=CleanUpTask>
+#        <Node Name=Task516139>
+#            <Status>3</Status>
+#            <StartTime>1125428402000</StartTime>
+#            <EndTime>1125428402000</EndTime>
+#            <LastScheduledTime>1125428400000</LastScheduledTime>
+#            <NextScheduledTime>1125432000000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#    <Task Name=IntegrityCheckAndRepairTask>
+#        <Node Name=Task516139>
+#            <Status>3</Status>
+#            <StartTime>1125388800000</StartTime>
+#            <EndTime>1125388801000</EndTime>
+#            <LastScheduledTime>1125388800000</LastScheduledTime>
+#            <NextScheduledTime>1125475200000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#    <Task Name=CleanupInactiveTokens>
+#        <Node Name=Task2036138>
+#            <Status>2</Status>
+#            <StartTime>1125388803000</StartTime>
+#            <EndTime>1125388815000</EndTime>
+#            <LastScheduledTime>1125388800000</LastScheduledTime>
+#            <NextScheduledTime>1125432000000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#    <Task Name=ScheduledNotificationsTask>
+#        <Node Name=Task516139>
+#            <Status>3</Status>
+#            <StartTime>1125428401000</StartTime>
+#            <EndTime>1125428401000</EndTime>
+#            <LastScheduledTime>1125428400000</LastScheduledTime>
+#            <NextScheduledTime>1125471600000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#    <Task Name=FailedDocumentMessagesTask>
+#        <Node Name=Task2036138>
+#            <Status>3</Status>
+#            <StartTime>1125352800000</StartTime>
+#            <EndTime>1125352800000</EndTime>
+#            <LastScheduledTime>1125352800000</LastScheduledTime>
+#            <NextScheduledTime>1125439200000</NextScheduledTime>
+#        </Node>
+#    </Task>
+#</Scheduler>
+#
+#
+#
+#
+sub scheduledTasksSummary {
+    my $results = shift;
+
+    my $scheduledTasksDetails;
+
+    my $scheduler;
+    my $task;
+    my $node;
+
+    for my $line (@$results) {
+        if ($line =~ /<Scheduler\s*Name=(.*)>/) {
+            $scheduler = $1;
+            next;
+        }
+        if ($line =~ /<Task\s*Name=(.*)>/) {
+            $task = $1;
+            next;
+        }
+        if ($line =~ /<Node\s*Name=(.*)>/) {
+            $node = $1;
+            next;
+        }
+        if ($line =~ /<(Status|StartTime|EndTime|LastScheduledTime|NextScheduledTime)>(.*)<.*>/) {
+            my $property = $1;
+            my $value = $2;
+
+            if ($property =~ m|Time$|) {
+                $value /= 1000;
+            }
+            $scheduledTasksDetails->{"$scheduler.$task.$node"}->{$property} = $value;
+            next;
+        }
+    }
+
+    my $now = time();
+    my $errorTasks;
+    my $stuckTasks;
+    my $runningTooLongTasks;
+    my $healthyTasks;
+
+    for my $key (keys(%$scheduledTasksDetails)) {
+        my $status = $scheduledTasksDetails->{$key}->{Status};
+        my $startTime = $scheduledTasksDetails->{$key}->{StartTime};
+        my $endTime = $scheduledTasksDetails->{$key}->{EndTime};
+        my $lastTime = $scheduledTasksDetails->{$key}->{LastScheduledTime};
+        my $nextTime = $scheduledTasksDetails->{$key}->{NextScheduledTime};
+
+        #
+        # This is sometimes set to -1 or -2 based on some internal
+        # conditions that the app code tries to catch.
+        #
+        next if ($lastTime <= 0);
+
+        #
+        # Scheduled tasks in error state
+        #
+        if ($status == $StatusError) {
+            push(@$errorTasks, $key);
+            next;
+        }
+
+        #
+        # Tasks that were supposed to run, but havent run yet.
+        #
+        if ($status == $StatusNotRun && ($now > $lastTime || $now > $nextTime)) {
+            push(@$stuckTasks, $key);
+            next;
+        }
+
+
+        if ($status == $StatusComplete) {
+            push(@$healthyTasks, $key);
+            next;
+        }
+
+    }
+
+    return ($scheduledTasksDetails, $errorTasks, $stuckTasks, $runningTooLongTasks, $healthyTasks);
+}
+
+sub displayTaskDetails {
+    my $scheduledTasksDetails = shift;
+    my $tasks = shift;
+    my $type = shift;
+
+    my @results;
+
+    for my $key (@$tasks) {
+        my $startTime = ariba::Ops::DateTime::prettyTime($scheduledTasksDetails->{$key}->{StartTime}) || "none";
+        my $endTime = ariba::Ops::DateTime::prettyTime($scheduledTasksDetails->{$key}->{EndTime}) || "none";
+        my $lastTime = ariba::Ops::DateTime::prettyTime($scheduledTasksDetails->{$key}->{LastScheduledTime}) || "none";
+        my $nextTime = ariba::Ops::DateTime::prettyTime($scheduledTasksDetails->{$key}->{NextScheduledTime}) || "none";
+        my $status = $scheduledTasksDetails->{$key}->{Status};
+        my $prettyStatus;
+        if ($status == $StatusNotRun) {
+            $prettyStatus = "NotRun";
+        } elsif ($status == $StatusRunning) {
+            $prettyStatus = "Running";
+        } elsif ($status == $StatusError) {
+            $prettyStatus = "Error";
+        } elsif ($status == $StatusComplete) {
+            $prettyStatus = "Complete";
+        }
+
+        push(@results, qq(type="$type",name="$key" status=$prettyStatus,start=$startTime,end=$endTime,last=$lastTime,next=$nextTime));
+    }
+    return (@results);
+}
+
+#
+#<xml>
+#<Description>Tasks Ran Longer than 60 Secs</Description>
+#<Span>172800 Secs</Span>
+#<Task>ApplicationAdapter-prealm_1, UnitOfMeasureLanguagePull, 276.0</Task>
+#<Task>ApplicationAdapter-prealm_1, SystemCommodityCodePull, 358.0</Task>
+#<Task>ApplicationAdapter-prealm_1, InitDBPull, 360.0</Task>
+#</xml>
+#
+#
+#
+#<xml><Description>Tasks Running Longer than 60 Secs</Description>
+#<Task>CoreServer-prealm_12, CXMLAdvancedShipNoticeLoader, 30045.0</Task>
+#<Task>CoreServer-prealm_12, CXMLOrderStatusUpdateLoader, 26445.0</Task>
+#<Task>CoreServer-prealm_4, CXMLAdvancedShipNoticeLoader, 30045.0</Task>
+#<Task>CoreServer-prealm_4, CXMLOrderStatusUpdateLoader, 26445.0</Task>
+#</xml>
+#
+
+sub parseTasksRuntimeDetails {
+    my $results = shift;
+    my $type = shift;
+    my @output;
+
+    for my $line (@$results) {
+        if ($line =~ m|^<Task>(.*)</Task>|i) {
+            my ($scheduler, $taskName, $duration) = split(/\s*,\s*/, $1, 3);
+            $duration /= 60; # convert secs to mins
+            $duration = int($duration);
+            push(@output, qq(type="$type",scheduler="$scheduler",name="$taskName" duration=$duration));
+        }
+    }
+
+    return (@output);
+}
+
+
+sub parseCriticalTasksRuntimeDetails {
+    my $results = shift;
+    my @output;
+
+    for my $line (@$results) {
+        if ($line =~ m|^<Task>(.*)</Task>|i) {
+            my ($scheduler, $taskName, $duration) = split(/\s*,\s*/, $1, 3);
+            $duration /= 60; # convert secs to mins
+            $duration = int($duration);
+            if ($taskName eq 'UpdateSignatureTasksInSelectedRealms') {
+                push(@output, qq(type="critical_tasks",scheduler="$scheduler",name="$taskName" duration=$duration));
+            }
+        }
+    }
+
+    return (@output);
+}
+
+sub parsePullTasksRuntimeDetails {
+    my $results = shift;
+    my @output;
+
+    for my $line (@$results) {
+        if ($line =~ m|^<Task>(.*)</Task>|i) {
+            my ($scheduler, $taskName, $duration) = split(/\s*,\s*/, $1, 3);
+            $duration /= 60; # convert secs to mins
+            $duration = int($duration);
+            if ($taskName =~ /PullTask$/) {
+                push(@output, qq(type="pull_tasks",scheduler="$scheduler",name="$taskName" duration=$duration));
+            }
+        }
+    }
+
+    return (@output);
+}
+
+main();

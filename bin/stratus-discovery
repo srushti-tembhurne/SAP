@@ -1,0 +1,180 @@
+#!/usr/local/bin/perl
+
+use FindBin;
+use lib "$FindBin::Bin";
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../lib/perl";
+
+use Data::Dumper;
+use ariba::Ops::StratusDiscovery;
+
+my $LINE_SEP = "-"x85 . "\n";
+#my $ins =  new Discovery(product => 'buyer' , datacenter => 'lab1' , product_role => 'archeshosts');
+#my $ins =  new Discovery(product => 'buyer' , datacenter => 'lab1');
+$main::quiet = 1;
+
+sub main {
+    my @supportedDataCenters = ( 'lab1', 'snv', 'us1', 'cn1', 'cn2', 'eu1', 'eu2', 'uae1', 'ksa1', 'ksa2' );
+    my ( $dataCenter, $product, $role, $cluster ) = ( undef, undef, undef, 'primary' );
+    my ( $runOption, $debug ) = ( undef, undef );
+    my ( $drSite, $failover )  = ( 0, 0);
+		
+    while ( my $arg = shift(@ARGV) ) {
+        if ( $arg =~ /^-h/o ) { usage(); next; }
+        if ( $arg =~ /^-dc/o )           { $dataCenter = shift(@ARGV); next; }
+        if ( $arg =~ /^-product$/o )     { $product    = shift(@ARGV); next; }
+        if ( $arg =~ /^-product_role/o ) { $role       = shift(@ARGV); next; }
+        if ( $arg =~ /^-cluster/o )      { $cluster    = shift(@ARGV); next; }
+        if ( $arg =~ /^-showtop/o ) { $runOption = 'show_topology'; next; }
+        if ( $arg =~ /^-status/o )  { $runOption = 'status';        next; }
+        if ( $arg =~ /^-install/o ) { $runOption = 'install';       next; }
+        if ( $arg =~ /^-deploy/o )  { $runOption = 'deploy';        next; }
+        if ( $arg =~ /^-start/o )   { $runOption = 'start';         next; }
+        if ( $arg =~ /^-stop/o )    { $runOption = 'stop';          next; }
+	    
+	if ( $arg =~ /^-drsite/o)   { $drSite    = 1; 		    next; }
+	if ( $arg =~ /^-failover/o) { $failover  = 1;		    next; }
+	
+        if ( $arg =~ /^-debug/o )   { $debug     = 1; }
+
+    }
+    print $LINE_SEP;
+    print "IRIS v0.01\n";
+    print $LINE_SEP;
+    print "Data Center       : $dataCenter\n" if ($dataCenter);
+    print "Data Center       : [none] \n"     if ( !defined $dataCenter );
+    print "Product           : $product\n"    if ($product);
+    print "Product           : [none] \n"     if ( !defined $product );
+    print "Product Role      : $role \n"      if ($role);
+    print "Product Role      : [none] \n"     if ( !defined $role );
+    print "Running in DR site: Yes    \n"     if ($drSite);	
+    print "Running Mode      : $runOption\n";
+    print $LINE_SEP;
+
+    if ( !defined $runOption ) {
+        print "ERROR : No run option selected. Exiting \n";
+        exit(1);
+    }
+    if ( !defined $dataCenter ) {
+        print "ERROR : No data center selected. Exiting \n";
+        exit(1);
+    }
+    else {
+        if ( !( grep( /$dataCenter/, @supportedDataCenters ) ) ) {
+            print "ERROR : Iris is not supported for data center - $dataCenter\n";
+            exit(1);
+        }
+    }
+
+    my $ins = new Discovery(
+        product      => $product,
+        datacenter   => $dataCenter,
+        product_role => $role,
+        cluster      => $cluster,
+	drSite 	     => $drSite,
+	failover     => $failover,
+	debug	     => $debug
+    );
+    if ( $runOption eq 'show_topology' ) {
+        &showTopology($ins);
+    }
+    elsif ( $runOption eq 'status' ) {
+        &showStatus($ins);
+    }
+    elsif ( $runOption eq 'install' ) {
+        print $LINE_SEP;
+        print "Installation\n";
+        print $LINE_SEP;
+        $ins->init();
+        $ins->genConfig();
+        print $LINE_SEP;
+        print "Exporting Configurations \n";
+        print $LINE_SEP;
+        $ins->exportGenFiles();
+        print $LINE_SEP;
+        print "Restarting Agents\n";
+        print $LINE_SEP;
+        $ins->restartAgents();
+        print $LINE_SEP;
+        print "Fetching Agent Run Status\n";
+        print $LINE_SEP;
+
+        &showStatus($ins);
+    }
+    elsif ( $runOption eq 'deploy' ) {
+        print $LINE_SEP;
+        print "Deployment\n";
+        print $LINE_SEP;
+        $ins->init();
+        $ins->genConfig();
+        print $LINE_SEP;
+        print "Exporting Configurations \n";
+        print $LINE_SEP;
+        $ins->exportGenFiles();
+        print $LINE_SEP;
+        print "Restarting Agents\n";
+        print $LINE_SEP;
+        $ins->restartAgents();
+        print $LINE_SEP;
+    }
+    elsif ( $runOption eq 'start' ) {
+        $ins->initNoConfigGen();
+        $ins->startAgent();
+    }
+    elsif ( $runOption eq 'stop' ) {
+        $ins->initNoConfigGen();
+        $ins->stopAgent();
+    }
+}
+
+#----------------------------------------------------------------------------------------------------------------
+# Purpose : Subroutine to tell how to use the proper command line arguments for running
+#----------------------------------------------------------------------------------------------------------------
+sub usage {
+    print "Error: $_[0]\n" if $_[0];
+    print "usage: $0 \n";
+    print "\t[-dc                 : Datacenter to install Iris agents]\n";
+    print "\t[-product            : (Optional) Specify the name of the product for whose hosts Iris agents needs to be installed]\n";
+    print "\t[-product_role       : (Optional) Specify the role of the product for whose hosts Iris agents needs to be installed]\n";
+    print "\t[-showtop            : (Optional) View the hosts where Iris agents will be deployed \n";
+    print "\t[-status             : (Optional) View the status of Iris agents in the servers\n";
+    print "\t[-start              : (Optional) Start the Iris agents in servers\n";
+    print "\t[-stop               : (Optional) Stop the Iris agents in servers\n";
+    print "\t[-configure          : (Optional) Configure Iris \n";
+    print "\t[-deploy             : (Optional) Deploy agent configurations in the server without agent restart\n";
+    print "\t[-install            : (Optional) Deploy agent configurations in the server and do agent restart \n";
+    print "\t[-drsite             : (Optional) When running Discovery in DR site, you must use this option]\n";
+    print "\t[-debug              : (Optional) Enable Debug logs to console\n";	
+}
+
+sub showStatus {
+    my $ins = shift;
+    $ins->initNoConfigGen();
+    my @hostList = @{ $ins->getMacDBHostListClean() };
+    $ins->getRunStatus();
+}
+
+sub showTopology {
+    my $ins = shift;
+    print $LINE_SEP;
+    print "Show Topology \n";
+    print $LINE_SEP;
+    $ins->initNoConfigGen();
+    my @hostList = @{ $ins->getMacDBHostListClean() };
+    print $LINE_SEP;
+    printf( "%s%-40s%s%-20s%s%-20s%s\n",  "|", " Host Name", "|", " Host Type", "|", " Ariba Product", "|" );
+    print $LINE_SEP;
+
+    foreach my $host (@hostList) {
+        printf(
+            "%s%-40s%s%-20s%s%-20s%s\n",
+            "|", " $host->{name}",    "|", " $host->{server_type}",
+            "|", " $host->{product}", "|"
+        );
+
+    }
+    print $LINE_SEP;
+}
+
+&main();
+

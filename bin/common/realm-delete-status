@@ -1,0 +1,159 @@
+#!/usr/local/bin/perl
+#
+# $Id: //ariba/services/monitor/bin/s4/activity-stats#19 $
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::DateTime;
+
+# http://amandal:8080/ACM/Main/ad/realmPurgeStatus/MonitorActions
+# <xml>
+# <CheckTime>1192209871</CheckTime>
+# <MarkForPurgeOperation>NothingMarkedForPurge</MarkForPurgeOperation>
+# <DeleteOperation>NothingToDelete</DeleteOperation>
+# <status>Error:Realm "HP" has not been marked for deletion  has data marked for deletion.See audit log entry "435142" </status>
+# <status>Error:Realm "HP" has not been marked for deletion  has data marked for deletion.See audit log entry "435157" </status>
+# </xml>
+
+sub main {
+	my $debug = 0;
+	my $quiet = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $productName;
+
+	while(my $arg=shift(@ARGV)){
+			print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+			if($arg =~ /^-d/o){ $debug=1; }
+			if($arg =~ /^-e/o){ $sendEmail=1; };
+			if($arg =~ /^-p$/o){ $sendPage=1; };
+			if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $cluster = $me->currentCluster();
+	my $service = $me->service();
+
+	my $product;
+	unless (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
+		exit(0);
+	}
+	$product = ariba::rc::InstalledProduct->new($productName, $service);
+
+	my %queries  = ();
+
+	for my $instance ($product->appInstancesInCluster($cluster)) {
+
+		my $url = $instance->realmPurgeStatusURL();
+		my $realmPurgeStatus = ariba::monitor::Url->new($url);
+		$realmPurgeStatus->setTimeout(30);
+		$realmPurgeStatus->useOutOfBandErrors(1);
+
+		if ($realmPurgeStatus->errors()) {
+			# this app instance had errors, try the next one
+			next;
+		}
+
+		my @response = $realmPurgeStatus->request();
+
+		my $day = 24 * 60 * 60;
+		my $week = 7 * $day;
+
+		#
+		# how long ago did we check the realms marked for delete
+		#
+		$queries{"Realm delete last check time"} = {
+			'info' => 1,
+			'warn' => "defined(answer) && answer >= $day",
+			'crit' => "defined(answer) && answer >= $week",
+			'inf_field' => "delete_check_time",
+			'perl' => sub { main::statusOfRealmDeletion("CheckTime", \@response) || 0 },
+			'processAnswer' => sub { return (main::statusOfRealmDeletion("CheckTime", \@response)); },
+		};
+
+                $queries{"Realm delete last check time seconds"} = {
+                        'info' => 1,
+                        'inf_field' => "delete_check_time_seconds",
+                        'perl' => sub { main::statusOfRealmDeletion("CheckTimeSeconds", \@response) || 0 },
+                        'processAnswer' => sub { return (main::statusOfRealmDeletion("CheckTimeSeconds", \@response)); },
+                };
+
+		$queries{"Realm mark for purge operation status"} = {
+			'info' => 1,
+			'perl' => sub { main::statusOfRealmDeletion("MarkForPurgeOperation", \@response) },
+			'inf_field' => "purge_status",
+			'inf_default' => "none",
+		};
+
+		$queries{"Realm hard delete operation status"} = {
+			'info' => 1,
+			'perl' => sub { main::statusOfRealmDeletion("DeleteOperation", \@response) },
+			'inf_field' => "hard_delete_status",
+			'inf_default' => "none",
+		};
+
+		$queries{"Wrong realm(s) marked for deletion"} = {
+			'info' => 1,
+			'crit' => 'numrows >= 1',
+			'perl' => sub { main::statusOfRealmDeletion("status", \@response) },
+			'inf_field' => "wrong_delete_status",
+			'inf_default' => "none",
+		};
+
+		last; # need to do this only for one appinstance
+
+	}
+
+	exit (0) unless (keys(%queries));
+	my $email = $me->default('notify.email');
+
+	$queries{"influx_details"} = { 'measurement' => "realm_delete_status" };
+	my $q = ariba::monitor::QueryManager->newWithDetails(
+		"realm-delete-status", $product->name(), $service, $product->customer(), \%queries
+	);
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+}
+
+
+sub statusOfRealmDeletion {
+	my $property = shift;
+	my $responseLinesRef = shift;
+
+	my @results;
+	for my $line (@$responseLinesRef) {
+		if ($line =~ m|<$property>(.*)</$property>|i) {
+			push(@results, $1);
+		}
+	}
+
+	#
+	# For status, if its all ok, return undef, else return error lines
+	#
+	if ($property eq "status" && @results && $results[0] !~ /^Error:/i) {
+		return "OK";
+	}
+
+	if ($property eq "CheckTime") {
+		#print "checktime = $results[0] time = ", time(), "\n";
+        my $time = ariba::Ops::DateTime::scaleTime(time() - $results[0]);
+		return $time;
+	}
+
+        if ($property eq "CheckTimeSeconds") {
+                my $time = time() - $results[0];
+                return $time;
+        }
+
+	return (join("\n", @results));
+}
+
+main();

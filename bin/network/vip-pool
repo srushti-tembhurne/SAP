@@ -1,0 +1,89 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/network/redundancy-check#12 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::NetworkDeviceManager;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::SNMP::Session;
+
+my $debug = 0;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+
+    my %poolStates = (
+        '1' => 'online',
+        '3' => 'offline',
+    );
+    my @oids = qw ( 1.3.6.1.4.1.3375.2.2.10.1.2.1.1 1.3.6.1.4.1.3375.2.2.10.13.2.1.2 );
+
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-e/o) { $sendEmail = 1; };
+        if ($arg =~ /^-p/o) { $sendPage  = 1; };
+        if ($arg =~ /^-d/o) { $debug     = 1; };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my $email = $me->default('notify.email');
+
+    for my $dataCenter ( ariba::Ops::ProductAPIExtensions::datacentersForProducts($me) ) {
+        my @f5Devices;
+        my %queries = ();
+
+        my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($dataCenter);
+        my %bigIpProperties = (
+            'datacenter'    => $dataCenter,
+            'status'        => 'inservice',
+            'os'            => 'bigip',
+        );
+        my @machines = ariba::Ops::Machine->machinesWithProperties(%bigIpProperties);
+
+        foreach my $host (@machines) {
+            my $nm = ariba::Ops::NetworkDeviceManager->newFromMachine($host);
+            push(@f5Devices, $nm);
+        }
+
+        foreach my $f5 (@f5Devices) {
+            my $snmp = $f5->snmp();
+            my $hostname = $snmp->hostname();
+
+            my $walked = $snmp->bulkWalkOidsF5(@oids);
+
+            foreach my $ip ( keys %$walked ) {
+                my $name = $walked->{ $ip }->{ name };
+                my $value = $walked->{ $ip }->{ value };
+                my $status = $poolStates{ $value } || 'unknown';
+
+                $queries{ "$hostname:$name is" } = {
+                    info => "answer eq 'online'",
+                    crit => "answer ne 'online'",
+                    perl => "return qq($status)",
+                    inf_field => "status",
+                    inf_tags => qq|datacenter="$dataCenter",hostname="$hostname",IPName="$name"|,
+                    inf_default => 0,
+                    group_by => "$dataCenter,$hostname",
+                };
+            }
+        }
+
+        if (%queries) {
+            $queries{influx_details} = {measurement => "Network-F5-VIP-Pool"};
+            my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($dataCenter);
+            my $qm = ariba::monitor::QueryManager->newWithDetails(
+                'Network F5 VIP Pool', $pn, $me->service(), $me->customer(), \%queries
+            );
+            $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+        }
+    }
+}
+
+main();

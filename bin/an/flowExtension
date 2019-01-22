@@ -1,0 +1,156 @@
+#!/usr/local/bin/perl -w
+
+###############################################################################
+# $Id: //ariba/services/monitor/bin/an/flowExtension#1 $
+# $HeadURL:$
+#
+# Copyright (c) 2013 Ariba
+#
+# flowExtension - Monitor AN flowExtension
+#
+###############################################################################
+
+=head1 NAME
+
+flowExtension - Monitor AN flowExtension 
+
+=head1 SYNOPSIS
+
+payments-an [options]
+
+=head1 OPTIONS
+
+=over
+
+=item B<-help|-h>
+
+Print this usage information and exit.
+
+=item B<-debug|-d>
+
+Enable debugging output / dryrun
+
+=item B<-e>
+
+Enable sending of emails
+
+=item B<-p>
+
+Enable sending of pages
+
+=back
+
+=head1 DESCRIPTION
+
+C<flowExtension> - Monitor AN flowExtension
+
+=cut
+
+=author
+
+Chaitanya Valaparla C<< <chaitanya.valaparla@sap.com> >>
+
+=head1 LICENSE
+
+Copyright 2013 Ariba
+
+=cut
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+
+use Pod::Usage;
+use Getopt::Long;
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    GetOptions(
+        "help|h" => sub { pod2usage(1); },
+        "debug|d+" => \$debug,
+        "e" => \$sendEmail,
+        "p" => \$sendPage,
+    );
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $an = ariba::rc::InstalledProduct->new("an", $mon->service());
+    my $cluster = $mon->currentCluster();
+    my $email = $mon->default('notify.email');
+    my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProduct($an);
+    my $CommunitiesList = join(", ", @communityIds);
+
+    my %queries = ();
+    $queries{influx_details} = { measurement => 'flowextension_status'};
+
+    $queries{"Flow Extension Events in  QUEUED state"} = {
+       crit => "answer > 0",
+       description => "Flow Extension Events in  QUEUED state",
+       severity => 1,
+       runForCommunities => $CommunitiesList,
+       sql => q`SELECT COUNT(*) as queued_state FROM FLOW_EXT_EVENT WHERE (LAST_STATUS_CHANGED + 2/24) < SYSDATE AND STATUS = 'QUEUED'`,
+       inf_default => 0,
+    };
+
+    $queries{"Flow Extension Events in EXPIRED state"} = {
+       crit => "answer > 0",
+       description => "Events in EXPIRED state",
+       severity => 1,
+       runForCommunities => $CommunitiesList,
+       sql => q`SELECT COUNT(*) as expired_state FROM FLOW_EXT_EVENT WHERE (EXPIRY + 8/24) < SYSDATE AND STATUS NOT IN ('EXPIRED', 'ERROR', 'SUCCESSFUL', 'QUEUED', 'RECEIVED')`,
+       inf_default => 0,
+    };
+  
+    $queries{"Flow Extension Events in PREPARED state with warn"} = {
+       warn => "answer > 0",
+       description => "Events in PREPARED state with warn",
+       runForCommunities => $CommunitiesList,
+       sql => q`SELECT COUNT(*) as prepared_state_warn FROM FLOW_EXT_EVENT WHERE (LAST_STATUS_CHANGED + 1) < SYSDATE AND STATUS = 'PREPARED'`,
+       inf_default => 0,
+    };
+
+    $queries{"Flow Extension Events in PREPARED state with crit"} = {
+       crit => "answer > 0",
+       description => "Events in PREPARED state with crit",
+       severity => 1,
+       runForCommunities => $CommunitiesList,
+       sql => q`SELECT COUNT(*) as prepared_state_crit FROM FLOW_EXT_EVENT WHERE (LAST_STATUS_CHANGED + 2) < SYSDATE AND STATUS = 'PREPARED'`,
+       inf_default => 0,
+    };
+
+    $queries{"Flow Extension Events in RECEIVED state with warn"} = {
+       warn => "answer > 0",
+       description => "Events in RECEIVED state with warn",
+       runForCommunities => $CommunitiesList,
+       sql => q`SELECT COUNT(*) as received_state_warn FROM FLOW_EXT_EVENT WHERE (LAST_STATUS_CHANGED + 2/24) < SYSDATE AND STATUS = 'RECEIVED'`,
+       inf_default => 0,
+    };
+
+    $queries{"Flow Extension Events in RECEIVED state with crit"} = {
+       crit => "answer > 0",
+       description => "Events in RECEIVED state with crit",
+       severity => 1,
+       runForCommunities => $CommunitiesList,
+       sql => q`SELECT COUNT(*) as received_state_crit FROM FLOW_EXT_EVENT WHERE (LAST_STATUS_CHANGED + 4/24) < SYSDATE AND STATUS = 'RECEIVED'`,
+       inf_default => 0,
+    };
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('FlowExtension', $an->name(), $mon->service(), undef, \%queries);
+    $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+    ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+main(@ARGV);
+
+__END__

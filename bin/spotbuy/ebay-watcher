@@ -1,0 +1,187 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/etc/monitor-query-template#6 $
+
+use strict;
+use FindBin;
+use Data::Dumper;
+use XML::Simple;
+
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+require "geturl";
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new();
+    my $me = ariba::rc::InstalledProduct->new('spotbuy', $mon->service());
+
+    my $frontdoor = $me->default( 'VendedUrls.FrontDoorTopLevel' );
+    ## handle an extra possible trailing slash:
+    $frontdoor =~ s/\/$//;
+
+    ## https://<hostname>/Spotbuy/service/webresources/monitor/ebay
+    my $url = "$frontdoor/Spotbuy/service/webresources/monitor/ebay";
+
+    my $data = gatherData( $url );
+
+    my %queries;
+    my $ca = "This monitors eBay, there's probably not much we can do except know it's down.  Let the SpotBuy engineering team know.";
+
+    $queries{'eBay Ping Status'} = {
+        crit    => 'answer ne "OK" && previousAnswer ne "OK"',
+        perl    => sub { return main::checkCode( $data ); },
+        ticketOwner => 'unassigned-sre',
+        severity    => 2,
+        description => 'Monitor eBay is reachable',
+        correctiveActions => [
+            Ops => $ca,
+            Engr => '',
+        ],
+        inf_field => "ping_status",
+        inf_default => "none",
+    };
+
+    $queries{'eBay Enabled Status'} = {
+        crit    => 'answer ne "OK" && previousAnswer ne "OK"',
+        perl    => sub { return main::checkEnabled( $data ); },
+        ticketOwner => 'unassigned-sre',
+        severity    => 2,
+        description => 'Monitor eBay API is enabled',
+        correctiveActions => [
+            Ops => $ca,
+            Engr => '',
+        ],
+        inf_field => "enabled_status",
+        inf_default => "none",
+    };
+
+    my $email = $mon->default('notify.email');
+    $queries{'influx_details'} = { measurement => 'spotbuy_ebay_status'};
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('ebay-status', $me->name(), $me->service(), $me->customer(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+sub gatherData {
+    my $url = shift;
+
+    my $timeout = 20;
+
+#    if ( $debug ){
+#        print "Fetching: '$url'\n";
+#    }
+
+    my @output;
+    my @errors;
+    eval {
+        geturl( '-e', '-q', '-results', \@output, '-errors', \@errors, '-timeout', $timeout, $url );
+    };
+
+    if ( scalar @errors ){
+        print "Errors returned from '$url':\n";
+        foreach my $err ( @errors ){
+            chomp $err;
+            print "Error: '$err'\n";
+        }
+    }
+
+    ## Output should look like:
+    ## <xml>
+    ##     <StatusCode>500</StatusCode>
+    ##     <ErrorMessages>
+    ##         <ErrorType>Error</ErrorType>
+    ##         <Message>Error while processing search request to provider</Message>
+    ##     </ErrorMessages>
+    ##     <DebugInfo/>
+    ##     <ebay>
+    ##         <search>500</search>
+    ##         <spotBuyEnabled>true</spotBuyEnabled>
+    ##     </ebay>
+    ## </xml>
+
+    my $xs  = XML::Simple->new();
+    my $xml = eval { $xs->XMLin( join "", @output ) };
+
+    ## After parsing, print Dumper $xml:
+    ## $VAR1 = {
+    ## 'ebay' => {
+    ##     'search' => '500',
+    ##     'spotBuyEnabled' => 'true'
+    ## },
+    ## 'StatusCode' => '500',
+    ## 'ErrorMessages' => {
+    ##     'Message' => 'Error while processing search request to provider',
+    ##     'ErrorType' => 'Error'
+    ## },
+    ## 'DebugInfo' => {}
+
+    return $xml;
+}
+
+sub checkCode {
+    my $xml = shift; ## This is pre-parsed XML
+    my $ret = 'NOT OK';
+
+    ## NOTE: If the format of the XML changes, this 'if' will need to be adjusted accordingly
+    if ( $xml->{ 'ebay' }->{ 'search' } == 200 ){
+        $ret = 'OK';
+    } else {
+        $ret .= ": ($xml->{ 'ebay' }->{ 'search' }) $xml->{ 'ErrorMessages' }->{ 'Message' }";
+    }
+
+    return qq($ret);
+}
+
+sub checkEnabled {
+    my $xml = shift; ## This is pre-parsed XML
+    my $ret = 'NOT OK';
+
+    ## NOTE: If the format of the XML changes, this 'if' will need to be adjusted accordingly
+    if ( $xml->{ 'ebay' }->{ 'spotBuyEnabled' } eq 'true' ){
+        $ret = 'OK';
+    } else {
+        $ret .= ": $xml->{ 'ErrorMessages' }->{ 'Message' }";
+    }
+
+    return qq($ret);
+}
+
+main(@ARGV);
+
+__END__

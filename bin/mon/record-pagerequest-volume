@@ -1,0 +1,193 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/mon/record-pagerequest-volume#8 $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::Ops::PageRequest;
+
+my $debug = 0;
+
+
+
+sub analyzePagesForProductNameAndServiceNameAndCustomerName {
+	my $productName = shift;
+	my $serviceName = shift;
+	my $customerName = shift;
+
+
+	# Page requests during last shift
+	my @pages = ariba::Ops::PageRequest->recentPageRequests();
+
+	
+	my $matchingPages = 0;
+	foreach my $page (@pages) {
+
+		next unless ($page->product());
+
+		# Discard different products
+		next if ($page->product() ne $productName);
+
+		# Discard different services
+		next if ($page->service() ne $serviceName);
+
+		# Discard different customers
+		next if ($page->customer() && $customerName && ($page->customer() ne $customerName));
+		next if (!defined($page->customer()) && defined($customerName));
+
+		$matchingPages++;
+	}
+
+
+	return $matchingPages;
+}
+
+
+
+sub main {
+	while(my $arg=shift(@ARGV) ){
+		if($arg =~ /^-d$/o){ $debug = 1; }
+	}
+	
+	my $me = ariba::rc::InstalledProduct->new();
+
+	my @pageRequests = ariba::Ops::PageRequest->recentPageRequests();
+
+	my $pageRequests = scalar(@pageRequests);
+	my $pageRequestsSentAsPages = 0;
+	my $pageRequestsSentAsPagesAndEscalated = 0;
+
+	for my $pageRequest ( @pageRequests ) {
+		my @pagesForRequest = $pageRequest->pages();
+
+		my $pageCount = 0;
+
+		for my $page (@pagesForRequest) {
+			$pageCount++;
+		}
+
+		if ( $pageCount > 0 ) {
+			$pageRequestsSentAsPages++;
+		}
+
+		if ( $pageCount > 1 ) {
+			$pageRequestsSentAsPagesAndEscalated++;
+		}
+	}
+
+	my $week = 7;
+	my $month = 30;
+
+	my %queries = (
+		"number of page requests during last shift" => {
+			recordMaxResults => 1000,
+			recordDataType => "gauge",
+		  	noRowCount => 1,
+		  	info => "numrows > -1",
+		  	timeout => 120,
+		  	perl => "$pageRequests",
+                        inf_field => "page_request_during_last_shift",
+                        group_by => "1",
+		},
+
+		"number of page requests sent as pages during last shift" => {
+			recordMaxResults => 1000,
+			recordDataType => "gauge",
+		  	noRowCount => 1,
+		  	info => "numrows > -1",
+		  	timeout => 120,
+		  	perl => "$pageRequestsSentAsPages",
+                        inf_field => "page_requests_sent_during_last_shift",
+                        group_by => "1",
+		},
+
+		"number of page requests sent as pages and escalated during last shift" => {
+			recordMaxResults => 1000,
+			recordDataType => "gauge",
+		  	noRowCount => 1,
+		  	info => "numrows > -1",
+		  	timeout => 120,
+		  	perl => "$pageRequestsSentAsPagesAndEscalated",
+                        inf_field => "escalated_pages_during_last_shift",
+                        group_by => "1",
+		},
+
+                "moving avg ($week days) for page requests sent as pages" => {
+			recordMaxResults => 1000,
+			recordDataType => "gauge",
+			info   => "answer >= 0",
+			format => "%d\n",
+			extractRecorded => "average(mon/number_of_page_requests_sent_as_pages_during_last_shift, $week)",
+                        inf_field => "${week}_days_moving_avg_pages_sent",
+                        group_by => "1",
+                },
+
+                "moving avg ($month days) for page requests sent as pages" => {
+			recordMaxResults => 1000,
+			recordDataType => "gauge",
+			info   => "answer >= 0",
+			format => "%d\n",
+			extractRecorded => "average(mon/number_of_page_requests_sent_as_pages_during_last_shift, $month)",
+                        inf_field => "${month}_days_moving_avg_pages_sent",
+                        group_by => "1",
+                },
+	);
+
+
+
+	my @products = ariba::rc::InstalledProduct->installedProductsList($me->service());		
+
+	my %ASPProducts;
+
+	for my $product (@products) {
+
+		
+		my $customer = "";
+		$customer = " / " . $product->customer() if ($product->customer());
+
+		$queries{"Recent page requests for " . $product->name() . " " . $customer} = {
+			recordMaxResults => "1000",
+			info => "1",
+			perl => sub {analyzePagesForProductNameAndServiceNameAndCustomerName($product->name(), $product->service(), $product->customer());},
+                        inf_field => "recent_page_requests",
+                        inf_tags => 'page_group="' . $product->name() . " " . $customer . '"',
+		};
+
+		# We want to go through an asp customer only once
+		if ($product->customer() && !exists($ASPProducts{$product->name()})) {
+
+			$queries{"Recent page requests for " . $product->name() } = {
+				recordMaxResults => "1000",
+				info => "1",
+				perl => sub {analyzePagesForProductNameAndServiceNameAndCustomerName($product->name(), $product->service(), undef);},
+                                inf_field => "recent_page_requests",
+                                inf_tags => "page_group=" . $product->name(),
+			};
+		
+			$ASPProducts{$product->name()} = 1;
+		}
+
+
+	}
+
+
+        $queries{influx_details} = {measurement => "page_metrics"};
+
+  	my $qm = ariba::monitor::QueryManager->newWithDetails(
+  		"page-metrics", 
+  		$me->name(),
+  		$me->service(), 
+  		undef,
+  		\%queries, 
+  		undef
+	);
+
+	$qm->processQueries($debug);
+}
+
+main();

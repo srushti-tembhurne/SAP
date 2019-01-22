@@ -1,0 +1,25 @@
+#!/usr/local/bin/perl
+#
+# Test tool: Publishes dummy data to RC Dashboard via HTTP API
+#
+
+$|++;
+use strict;
+use warnings;
+use Carp;
+use Data::Dumper;
+use FindBin;
+use lib '/home/rc/lib/perl';
+use ariba::rc::dashboard::Client;
+
+my $client = new ariba::rc::dashboard::Client();
+$client->{'verbose'} = 1;
+my $res = $client->running ("DashboardTest-12", "push", '/home/rc/logs/dashboard.log','buyer','//branch/in/perforce/path','12s1','dev3');
+print Dumper ($res);
+sleep 5;
+$res = $client->running ("DashboardTest-12", "push", '/home/rc/logs/dashboard.log','buyer','//branch/in/perforce/path','12s1','dev3');
+print Dumper ($res);
+sleep 5;
+$res = $client->postQuality ("DashboardTest-12", "push", 'dev3', 'happy');
+print Dumper ($res);
+print $client->get_last_error();

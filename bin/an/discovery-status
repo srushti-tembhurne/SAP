@@ -1,0 +1,327 @@
+#!/usr/local/bin/perl
+#
+# $Id: $
+#
+# This script monitors the health of AN Buyer-Supplier Discovery
+#
+# This monitoring includes health of the indexing nodes, search nodes, 
+# and fail-over status
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Url;
+use Data::Dumper;
+
+use DateTime::Format::HTTP;
+
+#
+# search node types
+#
+my $SEARCH_UPDATER = 'SearchUpdater'; # indexer node
+my $SEARCH = 'Search';                # search node
+
+#
+# Currently AN has 2 index types
+#
+my @INDEXES = ('quote', 'supplier');
+
+# how may results to keep in the CDBs
+my $RECORD_MAX_RESULTS = 26000;
+
+sub main {
+	my $debug = 0;
+	my $quiet = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+
+	while(my $arg=shift(@ARGV)){
+		print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+		if($arg =~ /^-d/o){ $debug=1; }
+		if($arg =~ /^-e/o){ $sendEmail=1; };
+		if($arg =~ /^-p$/o){ $sendPage=1; };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $cluster = $me->currentCluster();
+	my $service = $me->service();
+
+	my $an = ariba::rc::InstalledProduct->new('an', $service);
+
+	my %queries             = ();
+    my %search_queries      = ();
+    $queries{"influx_details"} = { 'measurement' => "an_discovery_status_search_updater"};
+    $search_queries{"influx_details"} = { 'measurement' => "an_discovery_status_search"};
+
+	my @instances = $an->appInstancesInCluster($cluster);
+	for my $instance (@instances) {
+
+		my $appName = $instance->appName();
+		next unless ($appName eq $SEARCH || $appName eq $SEARCH_UPDATER);
+
+		my $urlString = $instance->monitorStatsURL();
+		my $instanceId = $instance->instanceName();
+
+		my $monUrl = fetchUrl($urlString);
+		my $error = $monUrl->error();
+
+		my $nowTime = time();
+
+		my $uiHint = $appName; 
+		for my $index (@INDEXES) {
+			if ($appName eq $SEARCH_UPDATER) {
+				$queries{"$instanceId is primary"} = {
+					info => "answer",
+					warn => "previousAnswer ne answer",
+					url => $urlString,
+					uiHint => $uiHint,
+					error => $error,
+					recordMaxResults => $RECORD_MAX_RESULTS,
+					perl => sub { return $monUrl->isPrimary(); },
+					inf_tags    => "node=\"$instanceId\"",
+					inf_field   => "primary",
+					inf_default => 0,
+					group_by    => $instanceId,
+				};
+				if ($monUrl->isPrimary() eq "true") {
+
+					my $crawlInterval = $an->default("Solr.CrawledSites.Supplier.URL.crawlInterval");
+					$crawlInterval /= 1000;
+					
+					$queries{"$instanceId $index time since last crawl"} = {
+						info => "answer",
+						warn => "answer > $crawlInterval * 1.5",
+						crit => "answer eq '' || answer > $crawlInterval * 2",
+						url => $urlString,
+						format => "scaleTime(answer)",
+						uiHint => $uiHint,
+						error => $error,
+						recordMaxResults => $RECORD_MAX_RESULTS,
+						perl => sub { return main::timeSince($monUrl->attribute("${index}CrawlTime")); },
+						inf_tags  => "node=\"$instanceId\"",
+						inf_field => $index."_since_last_crawl",
+						inf_default => 0,
+						group_by  => $instanceId,
+					};
+					$queries{"$instanceId $index crawl total"} = {
+						info => 1,
+						crit => 'answer eq ""',
+						url => $urlString,
+						uiHint => $uiHint,
+						error => $error,
+						recordMaxResults => $RECORD_MAX_RESULTS,
+						perl => sub { return $monUrl->attribute("${index}CrawlTotal"); },
+						inf_tags  => "node=\"$instanceId\"",
+						inf_field => $index."_crawl_total",
+						inf_default => 0,
+						group_by  => $instanceId,
+					};
+					$queries{"$instanceId $index crawl number"} = {
+						info => 1,
+						crit => 'answer eq ""',
+						url => $urlString,
+						uiHint => $uiHint,
+						error => $error,
+						recordMaxResults => $RECORD_MAX_RESULTS,
+						perl => sub { return $monUrl->attribute("${index}CrawlNumber"); },
+						inf_tags  => "node=\"$instanceId\"",
+						inf_field => $index."_crawl_number",
+						inf_default => 0,
+						group_by  => $instanceId,
+					};
+
+				} else {
+
+					my $replicatorPullInterval = $an->default("Solr.Replicator.Backup.PullInterval");
+					$replicatorPullInterval *= 60;
+					
+					$queries{"$instanceId $index time since last backup"} = {
+						info => 1,
+						warn => "answer > $replicatorPullInterval * 1.5",
+						crit => "answer eq '' || answer > $replicatorPullInterval * 2",
+						url => $urlString,
+						format => "scaleTime(answer)",
+						uiHint => $uiHint,
+						error => $error,
+						recordMaxResults => $RECORD_MAX_RESULTS,
+						perl => sub { return main::timeSince($monUrl->attribute("${index}BackupTime")); },
+						inf_tags  => "node=\"$instanceId\"",
+						inf_field => $index."_since_last_backup",
+						inf_default => 0,
+						group_by  => $instanceId,
+					};
+					$queries{"$instanceId $index backup number"} = {
+						info => 1,
+						url => $urlString,
+						uiHint => $uiHint,
+						error => $error,
+						recordMaxResults => $RECORD_MAX_RESULTS,
+						perl => sub { return $monUrl->attribute("${index}BackupNumber"); },
+						inf_tags  => "node=\"$instanceId\"",
+						inf_field => $index."_backup_number",
+						inf_default => 0,
+						group_by  => $instanceId,
+					};
+				}
+			} else { # $type eq $SEARCH
+
+				my $clientPullInterval = $an->default("Solr.Replicator.Client.PullInterval") || 3;
+				$clientPullInterval *= 60;
+
+				$search_queries{"$instanceId $index time since last pull"} = {
+					info => 1,
+					warn => "answer > $clientPullInterval * 5",
+					crit => "answer eq '' || answer > $clientPullInterval * 40",
+					url => $urlString,
+					format => "scaleTime(answer)",
+					uiHint => $uiHint,
+					error => $error,
+					recordMaxResults => $RECORD_MAX_RESULTS,
+					perl => sub { return main::timeSince($monUrl->attribute("${index}PullTime")); },
+					inf_tags  => "node=\"$instanceId\"",
+					inf_field => $index."_time_since_last_pull",
+					inf_default => 0,
+					group_by  => $instanceId,
+				};
+				$search_queries{"$instanceId $index time since last pull warn threshold"} = {
+					perl => sub { return $clientPullInterval * 5 },
+					inf_tags  => "node=\"$instanceId\"",
+					inf_field => $index."_time_since_last_pull_warn_threshold",
+					group_by  => $instanceId,
+				};
+				$search_queries{"$instanceId $index time since last pull crit threshold"} = {
+					perl => sub { return $clientPullInterval * 40 },
+					inf_tags  => "node=\"$instanceId\"",
+					inf_field => $index."_time_since_last_pull_crit_threshold",
+					group_by  => $instanceId,
+				};
+				$search_queries{"$instanceId $index pull number"} = {
+					info => 1,
+					url => $urlString,
+					uiHint => $uiHint,
+					error => $error,
+					recordMaxResults => $RECORD_MAX_RESULTS,
+					perl => sub { return $monUrl->attribute("${index}PullNumber"); },
+					inf_tags    => "node=\"$instanceId\"",
+					inf_field   => $index ."_pull_number",
+					inf_default => 0,
+					group_by    => $instanceId,
+				};
+			}
+		}
+	}
+
+	my $email = $me->default('notify.email');
+
+	my $q = ariba::monitor::QueryManager->newWithDetails( "discovery-status", $an->name(), $service, undef, \%queries);
+	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+	my $sq = ariba::monitor::QueryManager->newWithDetails( "discovery-status", $an->name(), $service, undef, \%search_queries);
+	$sq->processQueries($debug, $email, $sendEmail, $sendPage);
+
+}
+
+#
+# monitoring url output looks something like:
+#
+# <XML>
+# <MonitorStatus>
+# <ApplicationName>Search</ApplicationName>
+# <ApplicationNumber>651248</ApplicationNumber>
+# <ProcessId>unavailable</ProcessId>
+# <IsRefusingNewSessions>false</IsRefusingNewSessions>
+# <ActiveSessionCount>0</ActiveSessionCount>
+# <TotalSessionsServed>0</TotalSessionsServed>
+# <TotalRequestsServed>164</TotalRequestsServed>
+# <CurrentRequestTimeInterval>0</CurrentRequestTimeInterval>
+# <CurrentFreeMemory>488676376</CurrentFreeMemory>
+# <CurrentTotalMemory>518979584</CurrentTotalMemory>
+# <CurrentMemoryCommitted></CurrentMemoryCommitted>
+# <CurrentMemoryReserved></CurrentMemoryReserved>
+# <UpSince>Wed Jul 16 23:20:55 PDT 2008</UpSince>
+# <UpTimeSeconds>56655</UpTimeSeconds>
+# <AsynchronousResponseManagerMaximumMillisInQueue>0</AsynchronousResponseManagerMaximumMillisInQueue>
+# <SupplierPullNumber>315</SupplierPullNumber>
+# <AsynchronousResponseManagerUnknownTokenCount>0</AsynchronousResponseManagerUnknownTokenCount>
+# <AsynchronousResponseManagerAverageMillisInQueue>0</AsynchronousResponseManagerAverageMillisInQueue>
+# <QuotePullTime>Thu Jul 17 15:02:59 PDT 2008</QuotePullTime>
+# <QuotePullNumber>315</QuotePullNumber>
+# <AsynchronousResponseManagerMinimumMillisInQueue>0</AsynchronousResponseManagerMinimumMillisInQueue>
+# <SupplierPullTime>Thu Jul 17 15:02:59 PDT 2008</SupplierPullTime>
+# <AsynchronousResponseManagerExpiredResponseCount>0</AsynchronousResponseManagerExpiredResponseCount>
+# <AsynchronousResponseManagerRejectedResponseCount>0</AsynchronousResponseManagerRejectedResponseCount>
+# <AsynchronousResponseManagerHandledResponseCount>0</AsynchronousResponseManagerHandledResponseCount>
+# </MonitorStatus>
+# </XML>
+#
+
+sub fetchUrl {
+    my $url = shift;
+    my $timeout = shift || 45;
+
+    my $monUrl = ariba::monitor::Url->new($url);
+    $monUrl->setTimeout($timeout);
+    my @results = $monUrl->request();
+
+    my $property;
+    my $value;
+
+    #
+    # Handle the case of url being down
+    #
+    my $error = $monUrl->error();
+    if ($error) {
+        $monUrl->setIsDown(1);
+        return $monUrl;
+    }
+
+    $monUrl->setIsDown(0);
+    for my $line (@results) {
+
+        if ($line =~ m|<(\w+)>\s*(.*)\s*</(\w+)>|i) {
+            next if ($1 ne $3);
+
+            $property = lcfirst($1);
+            $value = $2;
+
+            $monUrl->setAttribute($property, $value);
+        } elsif ($line !~ m/<|>/) {
+            chomp($line);
+            $monUrl->setResults($line);
+        }
+    }
+
+    return $monUrl;
+}
+
+sub timeSince {
+	my $timeString = shift;
+
+	my $timeInSec;
+	my $now = time();
+
+	if ($timeString) {
+		$timeInSec = $now - parseUnixTime($timeString);
+	}
+
+	return $timeInSec;
+}
+
+my $TZ = 'US/Pacific';
+sub parseUnixTime {
+	my $timeString = shift;
+
+	my $unixTime;
+	if ($timeString) {
+		$timeString =~ s/P[SD]T //;
+		$unixTime = DateTime::Format::HTTP->parse_datetime($timeString, $TZ)->epoch();
+	}
+
+	return $unixTime;
+}
+
+main();

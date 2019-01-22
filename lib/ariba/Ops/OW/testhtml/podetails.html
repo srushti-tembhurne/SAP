@@ -1,0 +1,3148 @@
+<html xmlns:v="urn:schemas-microsoft-com:vml"
+xmlns:o="urn:schemas-microsoft-com:office:office"
+xmlns:x="urn:schemas-microsoft-com:office:excel"
+xmlns="http://www.w3.org/TR/REC-html40">
+
+<head>
+<meta http-equiv=Content-Type content="text/html; charset=windows-1252">
+<meta name=ProgId content=Excel.Sheet>
+<meta name=Generator content="Microsoft Excel 9">
+<!--[if !mso]>
+<style>
+v\:* {behavior:url(#default#VML);}
+o\:* {behavior:url(#default#VML);}
+x\:* {behavior:url(#default#VML);}
+.shape {behavior:url(#default#VML);}
+</style>
+<![endif]--><!--[if gte mso 9]><xml>
+ <o:DocumentProperties>
+  <o:Author>Ariba Network Operations</o:Author>
+  <o:LastAuthor>Ariba Network Operations</o:LastAuthor>
+  <o:Created>2003-07-11T19:01:37Z</o:Created>
+  <o:LastSaved>2003-07-11T19:58:36Z</o:LastSaved>
+  <o:Company>Ariba</o:Company>
+  <o:Version>9.4402</o:Version>
+ </o:DocumentProperties>
+ <o:OfficeDocumentSettings>
+  <o:DownloadComponents/>
+  <o:LocationOfComponents HRef="file:E:\msowc.cab"/>
+ </o:OfficeDocumentSettings>
+</xml><![endif]-->
+<style>
+
+<OWVar 
+	id=title
+	value=PO Details
+	nodisplay=1 
+/>
+
+<OWVar 
+	id=num-records
+	value=*scalar(ariba::monitor::CircularDB->new("an/business-metrics/documents/pos/volume/email")->readRecords())*
+	nodisplay=1 
+/>
+
+<OWVar 
+	id=header-row
+	value=75
+	nodisplay=1 
+/>
+
+<OWVar 
+	id=first-row
+	value=76
+	nodisplay=1 
+/>
+
+<OWVar 
+	id=last-row
+	value=*ariba::Ops::OW::Var->new("first-row")->value()+ariba::Ops::OW::Var->new("num-records")->value()-1*
+	nodisplay=1 
+/>
+
+
+<!--table
+	{mso-displayed-decimal-separator:"\.";
+	mso-displayed-thousand-separator:"\,";}
+@page
+	{margin:1.0in .75in 1.0in .75in;
+	mso-header-margin:.5in;
+	mso-footer-margin:.5in;}
+tr
+	{mso-height-source:auto;}
+col
+	{mso-width-source:auto;}
+br
+	{mso-data-placement:same-cell;}
+.style0
+	{mso-number-format:General;
+	text-align:general;
+	vertical-align:bottom;
+	white-space:nowrap;
+	mso-rotate:0;
+	mso-background-source:auto;
+	mso-pattern:auto;
+	color:windowtext;
+	font-size:10.0pt;
+	font-weight:400;
+	font-style:normal;
+	text-decoration:none;
+	font-family:Arial;
+	mso-generic-font-family:auto;
+	mso-font-charset:0;
+	border:none;
+	mso-protection:locked visible;
+	mso-style-name:Normal;
+	mso-style-id:0;}
+td
+	{mso-style-parent:style0;
+	padding:0px;
+	mso-ignore:padding;
+	color:windowtext;
+	font-size:10.0pt;
+	font-weight:400;
+	font-style:normal;
+	text-decoration:none;
+	font-family:Arial;
+	mso-generic-font-family:auto;
+	mso-font-charset:0;
+	mso-number-format:General;
+	text-align:general;
+	vertical-align:bottom;
+	border:none;
+	mso-background-source:auto;
+	mso-pattern:auto;
+	mso-protection:locked visible;
+	white-space:nowrap;
+	mso-rotate:0;}
+.xl24
+	{mso-style-parent:style0;
+	mso-number-format:"mmm\\-yy";}
+.xl25
+	{mso-style-parent:style0;
+	font-weight:700;
+	font-family:Arial, sans-serif;
+	mso-font-charset:0;
+	text-align:center;}
+-->
+</style>
+<!--[if gte mso 9]><xml>
+ <x:ExcelWorkbook>
+  <x:ExcelWorksheets>
+   <x:ExcelWorksheet>
+    <x:Name>*ariba::Ops::OW::Var->new("title")->value()*</x:Name>
+    <x:WorksheetOptions>
+     <x:Print>
+      <x:ValidPrinterInfo/>
+      <x:HorizontalResolution>600</x:HorizontalResolution>
+      <x:VerticalResolution>600</x:VerticalResolution>
+     </x:Print>
+     <x:Selected/>
+     <x:Panes>
+      <x:Pane>
+       <x:Number>3</x:Number>
+       <x:ActiveRow>21</x:ActiveRow>
+      </x:Pane>
+     </x:Panes>
+     <x:ProtectContents>False</x:ProtectContents>
+     <x:ProtectObjects>False</x:ProtectObjects>
+     <x:ProtectScenarios>False</x:ProtectScenarios>
+    </x:WorksheetOptions>
+   </x:ExcelWorksheet>
+  </x:ExcelWorksheets>
+  <x:WindowHeight>12150</x:WindowHeight>
+  <x:WindowWidth>16140</x:WindowWidth>
+  <x:WindowTopX>120</x:WindowTopX>
+  <x:WindowTopY>75</x:WindowTopY>
+  <x:ProtectStructure>False</x:ProtectStructure>
+  <x:ProtectWindows>False</x:ProtectWindows>
+ </x:ExcelWorkbook>
+</xml><![endif]--><!--[if gte mso 9]><xml>
+ <o:shapedefaults v:ext="edit" spidmax="1033"/>
+</xml><![endif]--><!--[if gte mso 9]><xml>
+ <o:shapelayout v:ext="edit">
+  <o:idmap v:ext="edit" data="1"/>
+ </o:shapelayout></xml><![endif]-->
+</head>
+
+<body link=blue vlink=purple>
+
+<table x:str border=0 cellpadding=0 cellspacing=0 width=2465 style='border-collapse:
+ collapse;table-layout:fixed;width:1853pt'>
+ <col width=145 span=28 style='mso-width-source:userset;mso-width-alt:5302;
+ width:109pt'>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 width=145 style='height:12.75pt;width:109pt' align=left
+  valign=top><!--[if gte vml 1]><v:shapetype id="_x0000_t201" coordsize="21600,21600"
+   o:spt="201" path="m0,0l0,21600,21600,21600,21600,0xe">
+   <v:stroke joinstyle="miter"/>
+   <v:path shadowok="f" o:extrusionok="f" strokeok="f" fillok="f"
+    o:connecttype="rect"/>
+   <o:lock v:ext="edit" shapetype="t"/>
+  </v:shapetype><v:shape id="_x0000_s1031" type="#_x0000_t201" style='position:absolute;
+   margin-left:0;margin-top:0;width:435.75pt;height:255.75pt;z-index:7'
+   fillcolor="window [78]" strokecolor="windowText [77]" o:insetmode="auto">
+   <v:fill color2="windowText [77]"/>
+   <o:lock v:ext="edit" rotation="t" text="t"/>
+   <x:ClientData ObjectType="Chart">
+    <x:WebChart>
+     <x:Scaling>
+      <x:ScaleID>0</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>1</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>3</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>4</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Chart>
+      <x:Name>Chart 7</x:Name>
+      <x:Title>
+       <x:Caption>
+        <x:DataSource>-1</x:DataSource>
+        <x:Data>&quot;<x:B>PO Volume and Spend&#10;By Month</x:B>&quot;</x:Data>
+       </x:Caption>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>10</x:Size>
+        <x:B/>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Border>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Interior>
+      </x:Title>
+      <x:Options>
+       <x:SizeWithWindow/>
+      </x:Options>
+      <x:PageSetup>
+       <x:ChartSize>FullPage</x:ChartSize>
+      </x:PageSetup>
+      <x:Font>
+       <x:FontName>Arial</x:FontName>
+       <x:Size>8.5</x:Size>
+       <x:AutoScale/>
+      </x:Font>
+      <x:Left>-14.9853515625</x:Left>
+      <x:Top>-14.9853515625</x:Top>
+      <x:Width>8744.9853515625</x:Width>
+      <x:Height>5144.9853515625</x:Height>
+      <x:ChartGrowth>
+       <x:HorzGrowth>1</x:HorzGrowth>
+       <x:VertGrowth>1</x:VertGrowth>
+      </x:ChartGrowth>
+      <x:PlotArea>
+       <x:Left>196.76217041015624</x:Left>
+       <x:Top>695.85926879882811</x:Top>
+       <x:Width>8530.7332104492179</x:Width>
+       <x:Height>4231.7504516601566</x:Height>
+       <x:Border>
+        <x:ColorIndex>15</x:ColorIndex>
+        <x:LineStyle>Solid</x:LineStyle>
+        <x:Weight>Narrow</x:Weight>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>14</x:ColorIndex>
+        <x:BGColorIndex>Neutral</x:BGColorIndex>
+       </x:Interior>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>8.5</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>0</x:ScaleID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:Series>
+         <x:Index>0</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$P$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>Total Volume</x:Name>
+         <x:Category>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$A$*ariba::Ops::OW::Var->new("first-row")->value()*:$A$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Category>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$P$*ariba::Ops::OW::Var->new("first-row")->value()*:$P$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>3</x:ScaleID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Series>
+         <x:Index>1</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$Q$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>Total Spend</x:Name>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$Q$*ariba::Ops::OW::Var->new("first-row")->value()*:$Q$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Axis>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>0</x:AxisID>
+        <x:ScaleID>0</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Months</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+        </x:Title>
+        <x:CrossingAxis>1</x:CrossingAxis>
+        <x:Alignment>
+         <x:Rotation>45</x:Rotation>
+        </x:Alignment>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.5</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:FormatString>mmm\-yy</x:FormatString>
+        </x:Number>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>1</x:AxisID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:MajorGridlines/>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Volume</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>87.449853515624994</x:Left>
+         <x:Top>-374.29768432617186</x:Top>
+         <x:Width>43.724926757812497</x:Width>
+         <x:Height>64.31231689453125</x:Height>
+        </x:Title>
+        <x:CrossingAxis>0</x:CrossingAxis>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.5</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:BuiltInFormat>0</x:BuiltInFormat>
+        </x:Number>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Thousands</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>8</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+       <x:Axis>
+        <x:Delete/>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>3</x:AxisID>
+        <x:ScaleID>3</x:ScaleID>
+        <x:CrossingAxis>4</x:CrossingAxis>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>4</x:AxisID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Spend</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Alignment>
+          <x:Horizontal>Center</x:Horizontal>
+          <x:Vertical>Center</x:Vertical>
+          <x:Rotation>90</x:Rotation>
+         </x:Alignment>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>83.077360839843749</x:Left>
+         <x:Top>-362.72146728515622</x:Top>
+         <x:Width>43.724926757812497</x:Width>
+         <x:Height>52.736099853515626</x:Height>
+        </x:Title>
+        <x:CrossingAxis>3</x:CrossingAxis>
+        <x:CrossesAt>Maximum</x:CrossesAt>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.5</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:FormatString>&quot;$&quot;#,##0.00</x:FormatString>
+        </x:Number>
+        <x:MajorTick>Cross</x:MajorTick>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Millions</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>8.25</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+      </x:PlotArea>
+      <x:Legend>
+       <x:Type>Vertical</x:Type>
+       <x:Placement>Top</x:Placement>
+       <x:Left>5828.5327368164062</x:Left>
+       <x:Top>14.148709716796875</x:Top>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>8.5</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+      </x:Legend>
+     </x:Chart>
+    </x:WebChart>
+   </x:ClientData>
+  </v:shape><![endif]--><![if !vml]><span style='mso-ignore:vglayout;
+  position:absolute;z-index:6;margin-left:0px;margin-top:0px;width:583px;
+  height:343px'><![endif]><![if !excel]><img width=583 height=343
+  v:shapes="_x0000_s1031"
+  class=shape v:dpi="96"><![endif]><![if !vml]></span><![endif]><span
+  style='mso-ignore:vglayout2'>
+  <table cellpadding=0 cellspacing=0>
+   <tr>
+    <td height=17 class=xl24 width=145 style='height:12.75pt;width:109pt'></td>
+   </tr>
+  </table>
+  </span></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt' align=left valign=top><!--[if gte vml 1]><v:shape
+   id="_x0000_s1025" type="#_x0000_t201" style='position:absolute;
+   margin-left:.75pt;margin-top:0;width:433.5pt;height:255.75pt;z-index:1'
+   fillcolor="window [78]" strokecolor="windowText [77]" o:insetmode="auto">
+   <v:fill color2="windowText [77]"/>
+   <o:lock v:ext="edit" rotation="t" text="t"/>
+   <x:ClientData ObjectType="Chart">
+    <x:WebChart>
+     <x:Scaling>
+      <x:ScaleID>0</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>1</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>3</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>4</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Chart>
+      <x:Name>Chart 1</x:Name>
+      <x:Title>
+       <x:Caption>
+        <x:DataSource>-1</x:DataSource>
+        <x:Data>&quot;<x:B>cXML Volume and Spend&#10;By Month</x:B>&quot;</x:Data>
+       </x:Caption>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>10</x:Size>
+        <x:B/>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Border>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Interior>
+      </x:Title>
+      <x:Options>
+       <x:SizeWithWindow/>
+      </x:Options>
+      <x:PageSetup>
+       <x:ChartSize>FullPage</x:ChartSize>
+      </x:PageSetup>
+      <x:Font>
+       <x:FontName>Arial</x:FontName>
+       <x:Size>8.5</x:Size>
+       <x:AutoScale/>
+      </x:Font>
+      <x:Left>0</x:Left>
+      <x:Top>-14.9853515625</x:Top>
+      <x:Width>8685</x:Width>
+      <x:Height>5144.9853515625</x:Height>
+      <x:ChartGrowth>
+       <x:HorzGrowth>1.60546875</x:HorzGrowth>
+       <x:VertGrowth>1.1122894287109375</x:VertGrowth>
+      </x:ChartGrowth>
+      <x:PlotArea>
+       <x:Left>204.0975</x:Left>
+       <x:Top>666.27560302734378</x:Top>
+       <x:Width>8463.5324999999993</x:Width>
+       <x:Height>4254.9028857421872</x:Height>
+       <x:Border>
+        <x:ColorIndex>15</x:ColorIndex>
+        <x:LineStyle>Solid</x:LineStyle>
+        <x:Weight>Narrow</x:Weight>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>14</x:ColorIndex>
+        <x:BGColorIndex>Neutral</x:BGColorIndex>
+       </x:Interior>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>9.5</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>0</x:ScaleID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:Series>
+         <x:Index>0</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$B$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>cXML volume</x:Name>
+         <x:Category>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$A$*ariba::Ops::OW::Var->new("first-row")->value()*:$A$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Category>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$B$*ariba::Ops::OW::Var->new("first-row")->value()*:$B$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>3</x:ScaleID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Series>
+         <x:Index>1</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$C$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>cXML spend</x:Name>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$C$*ariba::Ops::OW::Var->new("first-row")->value()*:$C$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Axis>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>0</x:AxisID>
+        <x:ScaleID>0</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Months</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>9.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+        </x:Title>
+        <x:CrossingAxis>1</x:CrossingAxis>
+        <x:Alignment>
+         <x:Rotation>45</x:Rotation>
+        </x:Alignment>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>9.5</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:FormatString>mmm\-yy</x:FormatString>
+        </x:Number>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>1</x:AxisID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:MajorGridlines/>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Volume</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>9.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>86.85</x:Left>
+         <x:Top>-374.29768432617186</x:Top>
+         <x:Width>45.596249999999998</x:Width>
+         <x:Height>64.31231689453125</x:Height>
+        </x:Title>
+        <x:CrossingAxis>0</x:CrossingAxis>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>9.5</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:BuiltInFormat>0</x:BuiltInFormat>
+        </x:Number>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Thousands</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>10</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+       <x:Axis>
+        <x:Delete/>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>3</x:AxisID>
+        <x:ScaleID>3</x:ScaleID>
+        <x:CrossingAxis>4</x:CrossingAxis>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>4</x:AxisID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Spend</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>9.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Alignment>
+          <x:Horizontal>Center</x:Horizontal>
+          <x:Vertical>Center</x:Vertical>
+          <x:Rotation>90</x:Rotation>
+         </x:Alignment>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>82.507499999999993</x:Left>
+         <x:Top>-362.72146728515622</x:Top>
+         <x:Width>45.596249999999998</x:Width>
+         <x:Height>54.02234619140625</x:Height>
+        </x:Title>
+        <x:CrossingAxis>3</x:CrossingAxis>
+        <x:CrossesAt>Maximum</x:CrossesAt>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>9.5</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:FormatString>&quot;$&quot;#,##0.00</x:FormatString>
+        </x:Number>
+        <x:MajorTick>Cross</x:MajorTick>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Millions</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>9.25</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+      </x:PlotArea>
+      <x:Legend>
+       <x:Type>Vertical</x:Type>
+       <x:Placement>Top</x:Placement>
+       <x:Left>5621.36625</x:Left>
+       <x:Top>14.148709716796875</x:Top>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>8.5</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+      </x:Legend>
+     </x:Chart>
+    </x:WebChart>
+   </x:ClientData>
+  </v:shape><![endif]--><![if !vml]><span style='mso-ignore:vglayout;
+  position:absolute;z-index:0;margin-left:1px;margin-top:0px;width:580px;
+  height:343px'><![endif]><![if !excel]><img width=580 height=343
+  v:shapes="_x0000_s1025"
+  class=shape v:dpi="96"><![endif]><![if !vml]></span><![endif]><span
+  style='mso-ignore:vglayout2'>
+  <table cellpadding=0 cellspacing=0>
+   <tr>
+    <td height=17 width=145 style='height:12.75pt;width:109pt'></td>
+   </tr>
+  </table>
+  </span></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt' align=left valign=top><!--[if gte vml 1]><v:shape
+   id="_x0000_s1026" type="#_x0000_t201" style='position:absolute;
+   margin-left:0;margin-top:.75pt;width:434.25pt;height:255pt;z-index:2'
+   fillcolor="window [78]" strokecolor="windowText [77]" o:insetmode="auto">
+   <v:fill color2="windowText [77]"/>
+   <o:lock v:ext="edit" rotation="t" text="t"/>
+   <x:ClientData ObjectType="Chart">
+    <x:WebChart>
+     <x:Scaling>
+      <x:ScaleID>0</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>1</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>3</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>4</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Chart>
+      <x:Name>Chart 2</x:Name>
+      <x:Title>
+       <x:Caption>
+        <x:DataSource>-1</x:DataSource>
+        <x:Data>&quot;<x:B>EDI Volume and Spend&#10;By Month</x:B>&quot;</x:Data>
+       </x:Caption>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>10</x:Size>
+        <x:B/>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Border>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Interior>
+      </x:Title>
+      <x:Options>
+       <x:SizeWithWindow/>
+      </x:Options>
+      <x:PageSetup>
+       <x:ChartSize>FullPage</x:ChartSize>
+      </x:PageSetup>
+      <x:Font>
+       <x:FontName>Arial</x:FontName>
+       <x:Size>8.5</x:Size>
+       <x:AutoScale/>
+      </x:Font>
+      <x:Left>-2189.99267578125</x:Left>
+      <x:Top>0</x:Top>
+      <x:Width>10889.97802734375</x:Width>
+      <x:Height>5114.99267578125</x:Height>
+      <x:ChartGrowth>
+       <x:HorzGrowth>1</x:HorzGrowth>
+       <x:VertGrowth>1</x:VertGrowth>
+      </x:ChartGrowth>
+      <x:PlotArea>
+       <x:Left>247.74700012207032</x:Left>
+       <x:Top>694.36025573730467</x:Top>
+       <x:Width>10620.451071166992</x:Width>
+       <x:Height>4204.5239794921872</x:Height>
+       <x:Border>
+        <x:ColorIndex>15</x:ColorIndex>
+        <x:LineStyle>Solid</x:LineStyle>
+        <x:Weight>Narrow</x:Weight>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>14</x:ColorIndex>
+        <x:BGColorIndex>Neutral</x:BGColorIndex>
+       </x:Interior>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>8.5</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>0</x:ScaleID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:Series>
+         <x:Index>0</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$D$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>edi volume</x:Name>
+         <x:Category>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$A$*ariba::Ops::OW::Var->new("first-row")->value()*:$A$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Category>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$D$*ariba::Ops::OW::Var->new("first-row")->value()*:$D$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>3</x:ScaleID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Series>
+         <x:Index>1</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$E$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>edi spend</x:Name>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$E$*ariba::Ops::OW::Var->new("first-row")->value()*:$E$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Axis>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>0</x:AxisID>
+        <x:ScaleID>0</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Months</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+        </x:Title>
+        <x:CrossingAxis>1</x:CrossingAxis>
+        <x:Alignment>
+         <x:Rotation>45</x:Rotation>
+        </x:Alignment>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.5</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:FormatString>mmm\-yy</x:FormatString>
+        </x:Number>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>1</x:AxisID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:MajorGridlines/>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Volume</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>108.8997802734375</x:Left>
+         <x:Top>-372.11571716308595</x:Top>
+         <x:Width>54.44989013671875</x:Width>
+         <x:Height>63.937408447265625</x:Height>
+        </x:Title>
+        <x:CrossingAxis>0</x:CrossingAxis>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.5</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:BuiltInFormat>0</x:BuiltInFormat>
+        </x:Number>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Thousands</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>8</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+       <x:Axis>
+        <x:Delete/>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>3</x:AxisID>
+        <x:ScaleID>3</x:ScaleID>
+        <x:CrossingAxis>4</x:CrossingAxis>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>4</x:AxisID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Spend</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Alignment>
+          <x:Horizontal>Center</x:Horizontal>
+          <x:Vertical>Center</x:Vertical>
+          <x:Rotation>90</x:Rotation>
+         </x:Alignment>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>103.45479125976563</x:Left>
+         <x:Top>-360.60698364257814</x:Top>
+         <x:Width>54.44989013671875</x:Width>
+         <x:Height>52.428674926757814</x:Height>
+        </x:Title>
+        <x:CrossingAxis>3</x:CrossingAxis>
+        <x:CrossesAt>Maximum</x:CrossesAt>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.5</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:FormatString>&quot;$&quot;#,##0.00</x:FormatString>
+        </x:Number>
+        <x:MajorTick>Cross</x:MajorTick>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Millions</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>8.25</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+      </x:PlotArea>
+      <x:Legend>
+       <x:Type>Vertical</x:Type>
+       <x:Placement>Top</x:Placement>
+       <x:Left>7511.3623443603519</x:Left>
+       <x:Top>14.066229858398437</x:Top>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>8.5</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+      </x:Legend>
+     </x:Chart>
+    </x:WebChart>
+   </x:ClientData>
+  </v:shape><![endif]--><![if !vml]><span style='mso-ignore:vglayout;
+  position:absolute;z-index:1;margin-left:0px;margin-top:1px;width:581px;
+  height:342px'><![endif]><![if !excel]><img width=581 height=342
+  v:shapes="_x0000_s1026"
+  class=shape v:dpi="96"><![endif]><![if !vml]></span><![endif]><span
+  style='mso-ignore:vglayout2'>
+  <table cellpadding=0 cellspacing=0>
+   <tr>
+    <td height=17 width=145 style='height:12.75pt;width:109pt'></td>
+   </tr>
+  </table>
+  </span></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 class=xl24 style='height:12.75pt'></td>
+  <td colspan=16 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=102 style='height:76.5pt;mso-xlrowspan:6'>
+  <td height=102 colspan=17 style='height:76.5pt;mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 style='height:12.75pt' align=left valign=top><!--[if gte vml 1]><v:shape
+   id="_x0000_s1027" type="#_x0000_t201" style='position:absolute;
+   margin-left:0;margin-top:0;width:435.75pt;height:255.75pt;z-index:3'
+   fillcolor="window [78]" strokecolor="windowText [77]" o:insetmode="auto">
+   <v:fill color2="windowText [77]"/>
+   <o:lock v:ext="edit" rotation="t" text="t"/>
+   <x:ClientData ObjectType="Chart">
+    <x:WebChart>
+     <x:Scaling>
+      <x:ScaleID>0</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>1</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>3</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>4</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Chart>
+      <x:Name>Chart 3</x:Name>
+      <x:Title>
+       <x:Caption>
+        <x:DataSource>-1</x:DataSource>
+        <x:Data>&quot;<x:B>edifact Volume and Spend&#10;By Month</x:B>&quot;</x:Data>
+       </x:Caption>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>10</x:Size>
+        <x:B/>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Border>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Interior>
+      </x:Title>
+      <x:Options>
+       <x:SizeWithWindow/>
+      </x:Options>
+      <x:PageSetup>
+       <x:ChartSize>FullPage</x:ChartSize>
+      </x:PageSetup>
+      <x:Font>
+       <x:FontName>Arial</x:FontName>
+       <x:Size>8.5</x:Size>
+       <x:AutoScale/>
+      </x:Font>
+      <x:Left>-14.9853515625</x:Left>
+      <x:Top>0</x:Top>
+      <x:Width>8744.9853515625</x:Width>
+      <x:Height>5130</x:Height>
+      <x:ChartGrowth>
+       <x:HorzGrowth>1</x:HorzGrowth>
+       <x:VertGrowth>1</x:VertGrowth>
+      </x:ChartGrowth>
+      <x:PlotArea>
+       <x:Left>196.76217041015624</x:Left>
+       <x:Top>693.83249999999998</x:Top>
+       <x:Width>8530.7332104492179</x:Width>
+       <x:Height>4219.4250000000002</x:Height>
+       <x:Border>
+        <x:ColorIndex>15</x:ColorIndex>
+        <x:LineStyle>Solid</x:LineStyle>
+        <x:Weight>Narrow</x:Weight>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>14</x:ColorIndex>
+        <x:BGColorIndex>Neutral</x:BGColorIndex>
+       </x:Interior>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>8.5</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>0</x:ScaleID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:Series>
+         <x:Index>0</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$F$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>edifact volume</x:Name>
+         <x:Category>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$A$*ariba::Ops::OW::Var->new("first-row")->value()*:$A$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Category>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$F$*ariba::Ops::OW::Var->new("first-row")->value()*:$F$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>3</x:ScaleID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Series>
+         <x:Index>1</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$G$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>edifact spend</x:Name>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$G$*ariba::Ops::OW::Var->new("first-row")->value()*:$G$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Axis>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>0</x:AxisID>
+        <x:ScaleID>0</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Months</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+        </x:Title>
+        <x:CrossingAxis>1</x:CrossingAxis>
+        <x:Alignment>
+         <x:Rotation>45</x:Rotation>
+        </x:Alignment>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.5</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:FormatString>mmm\-yy</x:FormatString>
+        </x:Number>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>1</x:AxisID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:MajorGridlines/>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Volume</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>87.449853515624994</x:Left>
+         <x:Top>-373.20749999999998</x:Top>
+         <x:Width>43.724926757812497</x:Width>
+         <x:Height>64.125</x:Height>
+        </x:Title>
+        <x:CrossingAxis>0</x:CrossingAxis>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.5</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:BuiltInFormat>0</x:BuiltInFormat>
+        </x:Number>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Thousands</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>8</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+       <x:Axis>
+        <x:Delete/>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>3</x:AxisID>
+        <x:ScaleID>3</x:ScaleID>
+        <x:CrossingAxis>4</x:CrossingAxis>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>4</x:AxisID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Spend</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Alignment>
+          <x:Horizontal>Center</x:Horizontal>
+          <x:Vertical>Center</x:Vertical>
+          <x:Rotation>90</x:Rotation>
+         </x:Alignment>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>83.077360839843749</x:Left>
+         <x:Top>-361.66500000000002</x:Top>
+         <x:Width>43.724926757812497</x:Width>
+         <x:Height>52.582500000000003</x:Height>
+        </x:Title>
+        <x:CrossingAxis>3</x:CrossingAxis>
+        <x:CrossesAt>Maximum</x:CrossesAt>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.5</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:FormatString>&quot;$&quot;#,##0.00</x:FormatString>
+        </x:Number>
+        <x:MajorTick>Cross</x:MajorTick>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Millions</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>8.25</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+      </x:PlotArea>
+      <x:Legend>
+       <x:Type>Vertical</x:Type>
+       <x:Placement>Top</x:Placement>
+       <x:Left>5957.5212707519531</x:Left>
+       <x:Top>14.1075</x:Top>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>8.5</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+      </x:Legend>
+     </x:Chart>
+    </x:WebChart>
+   </x:ClientData>
+  </v:shape><![endif]--><![if !vml]><span style='mso-ignore:vglayout;
+  position:absolute;z-index:2;margin-left:0px;margin-top:0px;width:583px;
+  height:343px'><![endif]><![if !excel]><img width=583 height=343
+  v:shapes="_x0000_s1027"
+  class=shape v:dpi="96"><![endif]><![if !vml]></span><![endif]><span
+  style='mso-ignore:vglayout2'>
+  <table cellpadding=0 cellspacing=0>
+   <tr>
+    <td height=17 width=145 style='height:12.75pt;width:109pt'></td>
+   </tr>
+  </table>
+  </span></td>
+  <td colspan=4 style='mso-ignore:colspan'></td>
+  <td colspan=5 rowspan=21 height=357 width=725 style='mso-ignore:colspan-rowspan;
+  height:267.75pt;width:545pt'><!--[if gte vml 1]><v:shape id="_x0000_s1028"
+   type="#_x0000_t201" style='position:absolute;margin-left:0;margin-top:.75pt;
+   width:434.25pt;height:256.5pt;z-index:4' fillcolor="window [78]"
+   strokecolor="windowText [77]" o:insetmode="auto">
+   <v:fill color2="windowText [77]"/>
+   <o:lock v:ext="edit" rotation="t" text="t"/>
+   <x:ClientData ObjectType="Chart">
+    <x:WebChart>
+     <x:Scaling>
+      <x:ScaleID>0</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>1</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>3</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>4</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Chart>
+      <x:Name>Chart 4</x:Name>
+      <x:Title>
+       <x:Caption>
+        <x:DataSource>-1</x:DataSource>
+        <x:Data>&quot;<x:B>email Volume and Spend&#10;By Month</x:B>&quot;</x:Data>
+       </x:Caption>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>10</x:Size>
+        <x:B/>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Border>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Interior>
+      </x:Title>
+      <x:Options>
+       <x:SizeWithWindow/>
+      </x:Options>
+      <x:PageSetup>
+       <x:ChartSize>FullPage</x:ChartSize>
+      </x:PageSetup>
+      <x:Font>
+       <x:FontName>Arial</x:FontName>
+       <x:Size>8.75</x:Size>
+       <x:AutoScale/>
+      </x:Font>
+      <x:Left>0</x:Left>
+      <x:Top>0</x:Top>
+      <x:Width>8699.9853515625</x:Width>
+      <x:Height>5144.9853515625</x:Height>
+      <x:ChartGrowth>
+       <x:HorzGrowth>1</x:HorzGrowth>
+       <x:VertGrowth>1</x:VertGrowth>
+      </x:ChartGrowth>
+      <x:PlotArea>
+       <x:Left>197.92466674804689</x:Left>
+       <x:Top>679.13806640625</x:Top>
+       <x:Width>8484.6607141113273</x:Width>
+       <x:Height>4249.7579003906249</x:Height>
+       <x:Border>
+        <x:ColorIndex>15</x:ColorIndex>
+        <x:LineStyle>Solid</x:LineStyle>
+        <x:Weight>Narrow</x:Weight>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>14</x:ColorIndex>
+        <x:BGColorIndex>Neutral</x:BGColorIndex>
+       </x:Interior>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>8.75</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>0</x:ScaleID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:Series>
+         <x:Index>0</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$H$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>email volume</x:Name>
+         <x:Category>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$A$*ariba::Ops::OW::Var->new("first-row")->value()*:$A$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Category>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$H$*ariba::Ops::OW::Var->new("first-row")->value()*:$H$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>3</x:ScaleID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Series>
+         <x:Index>1</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$I$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>email spend</x:Name>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$I$*ariba::Ops::OW::Var->new("first-row")->value()*:$I$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Axis>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>0</x:AxisID>
+        <x:ScaleID>0</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Months</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+        </x:Title>
+        <x:CrossingAxis>1</x:CrossingAxis>
+        <x:Alignment>
+         <x:Rotation>45</x:Rotation>
+        </x:Alignment>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.75</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:FormatString>mmm\-yy</x:FormatString>
+        </x:Number>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>1</x:AxisID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:MajorGridlines/>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Volume</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>86.999853515625006</x:Left>
+         <x:Top>-374.29768432617186</x:Top>
+         <x:Width>43.499926757812503</x:Width>
+         <x:Height>64.31231689453125</x:Height>
+        </x:Title>
+        <x:CrossingAxis>0</x:CrossingAxis>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.75</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:BuiltInFormat>0</x:BuiltInFormat>
+        </x:Number>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Thousands</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>8</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+       <x:Axis>
+        <x:Delete/>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>3</x:AxisID>
+        <x:ScaleID>3</x:ScaleID>
+        <x:CrossingAxis>4</x:CrossingAxis>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>4</x:AxisID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Spend</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Alignment>
+          <x:Horizontal>Center</x:Horizontal>
+          <x:Vertical>Center</x:Vertical>
+          <x:Rotation>90</x:Rotation>
+         </x:Alignment>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>82.649860839843754</x:Left>
+         <x:Top>-362.72146728515622</x:Top>
+         <x:Width>43.499926757812503</x:Width>
+         <x:Height>52.736099853515626</x:Height>
+        </x:Title>
+        <x:CrossingAxis>3</x:CrossingAxis>
+        <x:CrossesAt>Maximum</x:CrossesAt>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.75</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:FormatString>&quot;$&quot;#,##0.00</x:FormatString>
+        </x:Number>
+        <x:MajorTick>Cross</x:MajorTick>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Millions</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>8.25</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+      </x:PlotArea>
+      <x:Legend>
+       <x:Type>Vertical</x:Type>
+       <x:Placement>Top</x:Placement>
+       <x:Left>5594.0905810546874</x:Left>
+       <x:Top>12.86246337890625</x:Top>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>8.75</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+      </x:Legend>
+     </x:Chart>
+    </x:WebChart>
+   </x:ClientData>
+  </v:shape><![endif]--><![if !vml]><span style='mso-ignore:vglayout'>
+  <table cellpadding=0 cellspacing=0>
+   <tr>
+    <td width=0 height=1></td>
+   </tr>
+   <tr>
+    <td></td>
+    <td><![endif]><![if !excel]><img width=581 height=344
+    v:shapes="_x0000_s1028"
+    class=shape v:dpi="96"><![endif]><![if !vml]></td>
+    <td width=144></td>
+   </tr>
+   <tr>
+    <td height=12></td>
+   </tr>
+  </table>
+  </span><![endif]><!--[if !mso & vml]><span style='width:543.75pt;height:267.75pt'></span><![endif]--></td>
+  <td colspan=5 rowspan=21 height=357 width=725 style='mso-ignore:colspan-rowspan;
+  height:267.75pt;width:545pt'><!--[if gte vml 1]><v:shape id="_x0000_s1029"
+   type="#_x0000_t201" style='position:absolute;margin-left:1.5pt;margin-top:0;
+   width:433.5pt;height:257.25pt;z-index:5' fillcolor="window [78]"
+   strokecolor="windowText [77]" o:insetmode="auto">
+   <v:fill color2="windowText [77]"/>
+   <o:lock v:ext="edit" rotation="t" text="t"/>
+   <x:ClientData ObjectType="Chart">
+    <x:WebChart>
+     <x:Scaling>
+      <x:ScaleID>0</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>1</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>3</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>4</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Chart>
+      <x:Name>Chart 5</x:Name>
+      <x:Title>
+       <x:Caption>
+        <x:DataSource>-1</x:DataSource>
+        <x:Data>&quot;<x:B>fax Volume and Spend&#10;By Month</x:B>&quot;</x:Data>
+       </x:Caption>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>10</x:Size>
+        <x:B/>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Border>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Interior>
+      </x:Title>
+      <x:Options>
+       <x:SizeWithWindow/>
+      </x:Options>
+      <x:PageSetup>
+       <x:ChartSize>FullPage</x:ChartSize>
+      </x:PageSetup>
+      <x:Font>
+       <x:FontName>Arial</x:FontName>
+       <x:Size>8.75</x:Size>
+       <x:AutoScale/>
+      </x:Font>
+      <x:Left>22154.9853515625</x:Left>
+      <x:Top>6359.9853515625</x:Top>
+      <x:Width>-13469.9853515625</x:Width>
+      <x:Height>-1199.99267578125</x:Height>
+      <x:ChartGrowth>
+       <x:HorzGrowth>1</x:HorzGrowth>
+       <x:VertGrowth>1</x:VertGrowth>
+      </x:ChartGrowth>
+      <x:PlotArea>
+       <x:Left>-306.44216674804687</x:Left>
+       <x:Top>-187.49885559082031</x:Top>
+       <x:Width>-13136.603214111328</x:Width>
+       <x:Height>-962.39412597656246</x:Height>
+       <x:Border>
+        <x:ColorIndex>15</x:ColorIndex>
+        <x:LineStyle>Solid</x:LineStyle>
+        <x:Weight>Narrow</x:Weight>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>14</x:ColorIndex>
+        <x:BGColorIndex>Neutral</x:BGColorIndex>
+       </x:Interior>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>8.75</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>0</x:ScaleID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:Series>
+         <x:Index>0</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$J$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>fax volume</x:Name>
+         <x:Category>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$A$*ariba::Ops::OW::Var->new("first-row")->value()*:$A$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Category>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$J$*ariba::Ops::OW::Var->new("first-row")->value()*:$J$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>3</x:ScaleID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Series>
+         <x:Index>1</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$K$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>fax spend</x:Name>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$K$*ariba::Ops::OW::Var->new("first-row")->value()*:$K$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Axis>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>0</x:AxisID>
+        <x:ScaleID>0</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Months</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+        </x:Title>
+        <x:CrossingAxis>1</x:CrossingAxis>
+        <x:Alignment>
+         <x:Rotation>45</x:Rotation>
+        </x:Alignment>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.75</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:FormatString>mmm\-yy</x:FormatString>
+        </x:Number>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>1</x:AxisID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:MajorGridlines/>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Volume</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>-134.69985351562499</x:Left>
+         <x:Top>87.299467163085936</x:Top>
+         <x:Width>-67.349926757812497</x:Width>
+         <x:Height>-14.999908447265625</x:Height>
+        </x:Title>
+        <x:CrossingAxis>0</x:CrossingAxis>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.75</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:BuiltInFormat>0</x:BuiltInFormat>
+        </x:Number>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Thousands</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>8</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+       <x:Axis>
+        <x:Delete/>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>3</x:AxisID>
+        <x:ScaleID>3</x:ScaleID>
+        <x:CrossingAxis>4</x:CrossingAxis>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>4</x:AxisID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Spend</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.25</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Alignment>
+          <x:Horizontal>Center</x:Horizontal>
+          <x:Vertical>Center</x:Vertical>
+          <x:Rotation>90</x:Rotation>
+         </x:Alignment>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>-127.96486083984375</x:Left>
+         <x:Top>84.599483642578122</x:Top>
+         <x:Width>-67.349926757812497</x:Width>
+         <x:Height>-12.299924926757813</x:Height>
+        </x:Title>
+        <x:CrossingAxis>3</x:CrossingAxis>
+        <x:CrossesAt>Maximum</x:CrossesAt>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.75</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:FormatString>&quot;$&quot;#,##0.00</x:FormatString>
+        </x:Number>
+        <x:MajorTick>Cross</x:MajorTick>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Millions</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>8.25</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+      </x:PlotArea>
+      <x:Legend>
+       <x:Type>Vertical</x:Type>
+       <x:Placement>Top</x:Placement>
+       <x:Left>-9028.2576818847665</x:Left>
+       <x:Top>-1.19999267578125</x:Top>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>8.75</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+      </x:Legend>
+     </x:Chart>
+    </x:WebChart>
+   </x:ClientData>
+  </v:shape><![endif]--><![if !vml]><span style='mso-ignore:vglayout'>
+  <table cellpadding=0 cellspacing=0>
+   <tr>
+    <td width=2 height=0></td>
+   </tr>
+   <tr>
+    <td></td>
+    <td><![endif]><![if !excel]><img width=580 height=345
+    v:shapes="_x0000_s1029"
+    class=shape v:dpi="96"><![endif]><![if !vml]></td>
+    <td width=143></td>
+   </tr>
+   <tr>
+    <td height=12></td>
+   </tr>
+  </table>
+  </span><![endif]><!--[if !mso & vml]><span style='width:543.75pt;height:267.75pt'></span><![endif]--></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=2 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=68 style='height:51.0pt;mso-xlrowspan:4'>
+  <td height=68 colspan=17 style='height:51.0pt;mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 style='height:12.75pt' align=left valign=top><!--[if gte vml 1]><v:shape
+   id="_x0000_s1030" type="#_x0000_t201" style='position:absolute;
+   margin-left:.75pt;margin-top:.75pt;width:435.75pt;height:258pt;z-index:6'
+   fillcolor="window [78]" strokecolor="windowText [77]" o:insetmode="auto">
+   <v:fill color2="windowText [77]"/>
+   <o:lock v:ext="edit" rotation="t" text="t"/>
+   <x:ClientData ObjectType="Chart">
+    <x:WebChart>
+     <x:Scaling>
+      <x:ScaleID>0</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>1</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>3</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>4</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Chart>
+      <x:Name>Chart 6</x:Name>
+      <x:Title>
+       <x:Caption>
+        <x:DataSource>-1</x:DataSource>
+        <x:Data>&quot;<x:B>html Volume and Spend&#10;By Month</x:B>&quot;</x:Data>
+       </x:Caption>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>10.25</x:Size>
+        <x:B/>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Border>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Interior>
+      </x:Title>
+      <x:Options>
+       <x:SizeWithWindow/>
+      </x:Options>
+      <x:PageSetup>
+       <x:ChartSize>FullPage</x:ChartSize>
+      </x:PageSetup>
+      <x:Font>
+       <x:FontName>Arial</x:FontName>
+       <x:Size>8.75</x:Size>
+       <x:AutoScale/>
+      </x:Font>
+      <x:Left>0</x:Left>
+      <x:Top>0</x:Top>
+      <x:Width>8730</x:Width>
+      <x:Height>5175</x:Height>
+      <x:ChartGrowth>
+       <x:HorzGrowth>1</x:HorzGrowth>
+       <x:VertGrowth>1</x:VertGrowth>
+      </x:ChartGrowth>
+      <x:PlotArea>
+       <x:Left>196.42500000000001</x:Left>
+       <x:Top>686.98125000000005</x:Top>
+       <x:Width>8516.1149999999998</x:Width>
+       <x:Height>4271.9624999999996</x:Height>
+       <x:Border>
+        <x:ColorIndex>15</x:ColorIndex>
+        <x:LineStyle>Solid</x:LineStyle>
+        <x:Weight>Narrow</x:Weight>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>14</x:ColorIndex>
+        <x:BGColorIndex>Neutral</x:BGColorIndex>
+       </x:Interior>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>8.75</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>0</x:ScaleID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:Series>
+         <x:Index>0</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$L$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>html volume</x:Name>
+         <x:Category>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$A$*ariba::Ops::OW::Var->new("first-row")->value()*:$A$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Category>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$L$*ariba::Ops::OW::Var->new("first-row")->value()*:$L$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>3</x:ScaleID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Series>
+         <x:Index>1</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$M$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>html spend</x:Name>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$M$*ariba::Ops::OW::Var->new("first-row")->value()*:$M$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Axis>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>0</x:AxisID>
+        <x:ScaleID>0</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Months</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.5</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+        </x:Title>
+        <x:CrossingAxis>1</x:CrossingAxis>
+        <x:Alignment>
+         <x:Rotation>45</x:Rotation>
+        </x:Alignment>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.75</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:FormatString>mmm\-yy</x:FormatString>
+        </x:Number>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>1</x:AxisID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:MajorGridlines/>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Volume</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.5</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>87.3</x:Left>
+         <x:Top>-376.48124999999999</x:Top>
+         <x:Width>43.65</x:Width>
+         <x:Height>64.6875</x:Height>
+        </x:Title>
+        <x:CrossingAxis>0</x:CrossingAxis>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.75</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:BuiltInFormat>0</x:BuiltInFormat>
+        </x:Number>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Thousands</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>8</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+       <x:Axis>
+        <x:Delete/>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>3</x:AxisID>
+        <x:ScaleID>3</x:ScaleID>
+        <x:CrossingAxis>4</x:CrossingAxis>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>4</x:AxisID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Spend</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.5</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Alignment>
+          <x:Horizontal>Center</x:Horizontal>
+          <x:Vertical>Center</x:Vertical>
+          <x:Rotation>90</x:Rotation>
+         </x:Alignment>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>82.935000000000002</x:Left>
+         <x:Top>-364.83749999999998</x:Top>
+         <x:Width>43.65</x:Width>
+         <x:Height>53.043750000000003</x:Height>
+        </x:Title>
+        <x:CrossingAxis>3</x:CrossingAxis>
+        <x:CrossesAt>Maximum</x:CrossesAt>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.75</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:FormatString>&quot;$&quot;#,##0.00</x:FormatString>
+        </x:Number>
+        <x:MajorTick>Cross</x:MajorTick>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Millions</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>8.5</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+      </x:PlotArea>
+      <x:Legend>
+       <x:Type>Vertical</x:Type>
+       <x:Placement>Top</x:Placement>
+       <x:Left>5650.4925000000003</x:Left>
+       <x:Top>12.9375</x:Top>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>8.75</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+      </x:Legend>
+     </x:Chart>
+    </x:WebChart>
+   </x:ClientData>
+  </v:shape><![endif]--><![if !vml]><span style='mso-ignore:vglayout;
+  position:absolute;z-index:5;margin-left:1px;margin-top:1px;width:583px;
+  height:346px'><![endif]><![if !excel]><img width=583 height=346
+  v:shapes="_x0000_s1030"
+  class=shape v:dpi="96"><![endif]><![if !vml]></span><![endif]><span
+  style='mso-ignore:vglayout2'>
+  <table cellpadding=0 cellspacing=0>
+   <tr>
+    <td height=17 width=145 style='height:12.75pt;width:109pt'></td>
+   </tr>
+  </table>
+  </span></td>
+  <td colspan=4 style='mso-ignore:colspan'></td>
+  <td colspan=5 rowspan=21 height=357 width=725 style='mso-ignore:colspan-rowspan;
+  height:267.75pt;width:545pt'><!--[if gte vml 1]><v:shape id="_x0000_s1032"
+   type="#_x0000_t201" style='position:absolute;margin-left:0;margin-top:0;
+   width:436.5pt;height:258.75pt;z-index:8' fillcolor="window [78]"
+   strokecolor="windowText [77]" o:insetmode="auto">
+   <v:fill color2="windowText [77]"/>
+   <o:lock v:ext="edit" rotation="t" text="t"/>
+   <x:ClientData ObjectType="Chart">
+    <x:WebChart>
+     <x:Scaling>
+      <x:ScaleID>0</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>1</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>3</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Scaling>
+      <x:ScaleID>4</x:ScaleID>
+      <x:Orientation>MinMax</x:Orientation>
+     </x:Scaling>
+     <x:Chart>
+      <x:Name>Chart 8</x:Name>
+      <x:Title>
+       <x:Caption>
+        <x:DataSource>-1</x:DataSource>
+        <x:Data>&quot;<x:B>EDIGateway Volume and &#10;Spend By Month</x:B>&quot;</x:Data>
+       </x:Caption>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>10.25</x:Size>
+        <x:B/>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Border>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>None</x:ColorIndex>
+       </x:Interior>
+      </x:Title>
+      <x:Options>
+       <x:SizeWithWindow/>
+      </x:Options>
+      <x:PageSetup>
+       <x:ChartSize>FullPage</x:ChartSize>
+      </x:PageSetup>
+      <x:Font>
+       <x:FontName>Arial</x:FontName>
+       <x:Size>8.75</x:Size>
+       <x:AutoScale/>
+      </x:Font>
+      <x:Left>-4365</x:Left>
+      <x:Top>0</x:Top>
+      <x:Width>13109.9853515625</x:Width>
+      <x:Height>5189.9853515625</x:Height>
+      <x:ChartGrowth>
+       <x:HorzGrowth>1</x:HorzGrowth>
+       <x:VertGrowth>1</x:VertGrowth>
+      </x:ChartGrowth>
+      <x:PlotArea>
+       <x:Left>294.97467041015625</x:Left>
+       <x:Top>686.37556274414067</x:Top>
+       <x:Width>12788.790710449219</x:Width>
+       <x:Height>4288.225396728516</x:Height>
+       <x:Border>
+        <x:ColorIndex>15</x:ColorIndex>
+        <x:LineStyle>Solid</x:LineStyle>
+        <x:Weight>Narrow</x:Weight>
+       </x:Border>
+       <x:Interior>
+        <x:ColorIndex>14</x:ColorIndex>
+        <x:BGColorIndex>Neutral</x:BGColorIndex>
+       </x:Interior>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>8.75</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>0</x:ScaleID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:Series>
+         <x:Index>0</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$N$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>EDIGateway volume</x:Name>
+         <x:Category>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$A$*ariba::Ops::OW::Var->new("first-row")->value()*:$A$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Category>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$N$*ariba::Ops::OW::Var->new("first-row")->value()*:$N$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Graph>
+        <x:Type>Line</x:Type>
+        <x:SubType>Standard</x:SubType>
+        <x:SubType>Marker</x:SubType>
+        <x:ScaleID>3</x:ScaleID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Series>
+         <x:Index>1</x:Index>
+         <x:Caption>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$O$*ariba::Ops::OW::Var->new("header-row")->value()*</x:Data>
+         </x:Caption>
+         <x:Name>EDIGateway Spend</x:Name>
+         <x:Value>
+          <x:DataSource>0</x:DataSource>
+          <x:Data>'*ariba::Ops::OW::Var->new("title")->value()*'!$O$*ariba::Ops::OW::Var->new("first-row")->value()*:$O$*ariba::Ops::OW::Var->new("last-row")->value()*</x:Data>
+         </x:Value>
+        </x:Series>
+        <x:PlotVisible/>
+       </x:Graph>
+       <x:Axis>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>0</x:AxisID>
+        <x:ScaleID>0</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Months</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.5</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+        </x:Title>
+        <x:CrossingAxis>1</x:CrossingAxis>
+        <x:Alignment>
+         <x:Rotation>45</x:Rotation>
+        </x:Alignment>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.75</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:FormatString>mmm\-yy</x:FormatString>
+        </x:Number>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>1</x:AxisID>
+        <x:ScaleID>1</x:ScaleID>
+        <x:MajorGridlines/>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Volume</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.5</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>131.099853515625</x:Left>
+         <x:Top>-377.57143432617187</x:Top>
+         <x:Width>65.5499267578125</x:Width>
+         <x:Height>64.87481689453125</x:Height>
+        </x:Title>
+        <x:CrossingAxis>0</x:CrossingAxis>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.75</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:SourceLinked/>
+         <x:BuiltInFormat>0</x:BuiltInFormat>
+        </x:Number>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Thousands</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>8</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+       <x:Axis>
+        <x:Delete/>
+        <x:Placement>Bottom</x:Placement>
+        <x:AxisID>3</x:AxisID>
+        <x:ScaleID>3</x:ScaleID>
+        <x:CrossingAxis>4</x:CrossingAxis>
+        <x:Type>Automatic</x:Type>
+       </x:Axis>
+       <x:Axis>
+        <x:Placement>Left</x:Placement>
+        <x:AxisID>4</x:AxisID>
+        <x:ScaleID>4</x:ScaleID>
+        <x:Title>
+         <x:Caption>
+          <x:DataSource>-1</x:DataSource>
+          <x:Data>&quot;<x:B>Spend</x:B>&quot;</x:Data>
+         </x:Caption>
+         <x:Font>
+          <x:FontName>Arial</x:FontName>
+          <x:Size>8.5</x:Size>
+          <x:B/>
+          <x:AutoScale/>
+         </x:Font>
+         <x:Alignment>
+          <x:Horizontal>Center</x:Horizontal>
+          <x:Vertical>Center</x:Vertical>
+          <x:Rotation>90</x:Rotation>
+         </x:Alignment>
+         <x:Border>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Border>
+         <x:Interior>
+          <x:ColorIndex>None</x:ColorIndex>
+         </x:Interior>
+         <x:Left>124.54486083984375</x:Left>
+         <x:Top>-365.89396728515624</x:Top>
+         <x:Width>65.5499267578125</x:Width>
+         <x:Height>53.197349853515625</x:Height>
+        </x:Title>
+        <x:CrossingAxis>3</x:CrossingAxis>
+        <x:CrossesAt>Maximum</x:CrossesAt>
+        <x:CrossBetween>Between</x:CrossBetween>
+        <x:Font>
+         <x:FontName>Arial</x:FontName>
+         <x:Size>8.75</x:Size>
+         <x:AutoScale/>
+        </x:Font>
+        <x:Number>
+         <x:FormatString>&quot;$&quot;#,##0.00</x:FormatString>
+        </x:Number>
+        <x:MajorTick>Cross</x:MajorTick>
+        <x:Type>Value</x:Type>
+        <x:DisplayUnits>
+         <x:Value>Millions</x:Value>
+         <x:LabelEntry>
+          <x:Border>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Border>
+          <x:Font>
+           <x:FontName>Arial</x:FontName>
+           <x:Size>8.5</x:Size>
+           <x:B/>
+           <x:AutoScale/>
+          </x:Font>
+          <x:Interior>
+           <x:ColorIndex>None</x:ColorIndex>
+          </x:Interior>
+          <x:Number>
+           <x:SourceLinked/>
+           <x:BuiltInFormat>0</x:BuiltInFormat>
+          </x:Number>
+         </x:LabelEntry>
+        </x:DisplayUnits>
+       </x:Axis>
+      </x:PlotArea>
+      <x:Legend>
+       <x:Type>Vertical</x:Type>
+       <x:Placement>Top</x:Placement>
+       <x:Left>8537.8779602050781</x:Left>
+       <x:Top>12.974963378906249</x:Top>
+       <x:Font>
+        <x:FontName>Arial</x:FontName>
+        <x:Size>8.75</x:Size>
+        <x:AutoScale/>
+       </x:Font>
+      </x:Legend>
+     </x:Chart>
+    </x:WebChart>
+   </x:ClientData>
+  </v:shape><![endif]--><![if !vml]><span style='mso-ignore:vglayout'>
+  <table cellpadding=0 cellspacing=0>
+   <tr>
+    <td width=0 height=0></td>
+   </tr>
+   <tr>
+    <td></td>
+    <td><![endif]><![if !excel]><img width=584 height=347
+    v:shapes="_x0000_s1032"
+    class=shape v:dpi="96"><![endif]><![if !vml]></td>
+    <td width=141></td>
+   </tr>
+   <tr>
+    <td height=10></td>
+   </tr>
+  </table>
+  </span><![endif]><!--[if !mso & vml]><span style='width:543.75pt;height:267.75pt'></span><![endif]--></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=17 style='height:12.75pt'>
+  <td height=17 colspan=5 style='height:12.75pt;mso-ignore:colspan'></td>
+  <td colspan=7 style='mso-ignore:colspan'></td>
+ </tr>
+ <tr height=68 style='height:51.0pt;mso-xlrowspan:4'>
+  <td height=68 colspan=17 style='height:51.0pt;mso-ignore:colspan'></td>
+ </tr>
+ <tr class=xl25 height=17 style='height:12.75pt'>
+  <td height=17 class=xl25 style='height:12.75pt'>Date</td>
+  <td class=xl25>cXML volume</td>
+  <td class=xl25>cXML spend</td>
+  <td class=xl25>edi volume</td>
+  <td class=xl25>edi spend</td>
+  <td class=xl25>edifact volume</td>
+  <td class=xl25>edifact spend</td>
+  <td class=xl25>email volume</td>
+  <td class=xl25>email spend</td>
+  <td class=xl25>fax volume</td>
+  <td class=xl25>fax spend</td>
+  <td class=xl25>html volume</td>
+  <td class=xl25>html spend</td>
+  <td class=xl25>EDIGateway volume</td>
+  <td class=xl25>EDIGateway Spend</td>
+  <td class=xl25>Total Volume</td>
+  <td class=xl25>Total Spend</td>
+ </tr>
+
+ <OWParallelRepetition
+	list0=*ariba::monitor::CircularDB->new("an/business-metrics/documents/pos/volume/cXML")->readRecords()*
+	list1=*ariba::monitor::CircularDB->new("an/business-metrics/documents/pos/spend/cXML")->readRecords()*
+	list2=*ariba::monitor::CircularDB->new("an/business-metrics/documents/pos/volume/edi")->readRecords()*
+	list3=*ariba::monitor::CircularDB->new("an/business-metrics/documents/pos/spend/edi")->readRecords()*
+	list4=*ariba::monitor::CircularDB->new("an/business-metrics/documents/pos/volume/edifact")->readRecords()*
+	list5=*ariba::monitor::CircularDB->new("an/business-metrics/documents/pos/spend/edifact")->readRecords()*
+	list6=*ariba::monitor::CircularDB->new("an/business-metrics/documents/pos/volume/email")->readRecords()*
+	list7=*ariba::monitor::CircularDB->new("an/business-metrics/documents/pos/spend/email")->readRecords()*
+	list8=*ariba::monitor::CircularDB->new("an/business-metrics/documents/pos/volume/fax")->readRecords()*
+	list9=*ariba::monitor::CircularDB->new("an/business-metrics/documents/pos/spend/fax")->readRecords()*
+	list10=*ariba::monitor::CircularDB->new("an/business-metrics/documents/pos/volume/html")->readRecords()*
+	list11=*ariba::monitor::CircularDB->new("an/business-metrics/documents/pos/spend/html")->readRecords()*
+	list12=*ariba::monitor::CircularDB->new("an/business-metrics/documents/pos/volume/EDIGateway")->readRecords()*
+	list13=*ariba::monitor::CircularDB->new("an/business-metrics/documents/pos/spend/EDIGateway")->readRecords()*
+
+	list14=*(ariba::Ops::OW::Var->new("first-row")->value() ..  ariba::Ops::OW::Var->new("last-row")->value())*
+  >
+
+  <tr height=17 style='height:12.75pt'>
+	<td align=right x:str>*POSIX::strftime('%b-%y',localtime($$currentItem0[0]-2332800))*</td>
+	<td x:num>*$$currentItem0[1]*</td>
+	<td x:num>*$$currentItem1[1]*</td>
+	<td x:num>*$$currentItem2[1]*</td>
+	<td x:num>*$$currentItem3[1]*</td>
+	<td x:num>*$$currentItem4[1]*</td>
+	<td x:num>*$$currentItem5[1]*</td>
+	<td x:num>*$$currentItem6[1]*</td>
+	<td x:num>*$$currentItem7[1]*</td>
+	<td x:num>*$$currentItem8[1]*</td>
+	<td x:num>*$$currentItem9[1]*</td>
+	<td x:num>*$$currentItem10[1]*</td>
+	<td x:num>*$$currentItem11[1]*</td>
+	<td x:num>*$$currentItem12[1]*</td>
+	<td x:num>*$$currentItem13[1]*</td>
+
+	<td align=right x:num x:fmla="=SUM(B*$currentItem14*,D*$currentItem14*,F*$currentItem14*,H*$currentItem14*,J*$currentItem14*,L*$currentItem14*,N*$currentItem14*)"></td>
+  <td align=right x:num x:fmla="=SUM(C*$currentItem14*,E*$currentItem14*,G*$currentItem14*,I*$currentItem14*,K*$currentItem14*,M*$currentItem14*,O*$currentItem14*)"></td>
+
+  </tr>
+
+ </OWParallelRepetition>
+
+
+ <![if supportMisalignedColumns]>
+ <tr height=0 style='display:none'>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+  <td width=145 style='width:109pt'></td>
+ </tr>
+ <![endif]>
+</table>
+
+</body>
+
+</html>

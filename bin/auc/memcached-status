@@ -1,0 +1,244 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/common/memcached-status#1 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use IO::Socket;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Url;
+
+my $debug = 0;
+
+sub usage {
+	my $error = shift; 
+
+	print <<USAGE;
+Usage: $0 [-e|-p|-d|-h] -product  <<product name>>
+
+	-e    Enables sending of email for monitor query.
+	-p    Enables sending of pages for monitor query.
+	-d    Turns on debug mode. 
+	-h    Shows this help.
+	-product <<product name>>
+
+USAGE
+
+	print "(error) $error\n" if ($error);
+
+	exit();
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $productName;
+	my $isRunningCCM = "";
+
+	while (my $arg = shift) {
+		if ($arg =~ m/^-h$/o) { usage();		next; }
+		if ($arg =~ m/^-d$/o) { $debug++; 		next; }
+		if ($arg =~ m/^-e$/o) { $sendEmail = 1;	next; }
+		if ($arg =~ m/^-p$/o) { $sendPage = 1; 	next; }
+		if ($arg =~ m/^-product$/o) { $productName = shift; next; }
+
+		usage("Invalid argument: $arg");
+	}
+	
+	unless ( defined($productName) ) {
+		usage("Product name required");
+	}
+
+	my $mon = ariba::rc::InstalledProduct->new();
+	exit(0) unless ariba::rc::InstalledProduct->isInstalled($productName, $mon->service());
+
+	my $me = ariba::rc::InstalledProduct->new($productName, $mon->service());
+
+	my $memCachedExe = $me->default('AUC.Memcached.Exe') || $me->default('Memcached.Exe');
+	my $memCachedPort = $me->default('AUC.Memcached.Port') || $me->default('Memcached.Port') || 11211;
+
+	# Exit cleanly if Community is not configured for memcached
+	exit(0) unless $memCachedExe;
+
+	my %queries = ();
+    my @hosts;
+    if ( $productName eq 'community' ) { 
+        @hosts = $me->hostsForRoleInCluster("communityapp");
+    } else {
+        @hosts = $me->hostsForRoleInCluster("memcached");
+    }
+
+	for my $memCacheHost (@hosts) {
+		my $stats = ();
+
+		my $remote = IO::Socket::INET->new("$memCacheHost:$memCachedPort");
+		#$remote->timeout(15);
+
+
+		my $memCachedDown;
+		unless ( defined($remote) ) {
+			$memCachedDown = 1;
+			$queries{"$memCacheHost memcached isup"} = {
+				uiHint => "$memCacheHost",
+				crit => 1,
+				perl => sub { return "down" },
+                inf_field   => "is_up",
+                inf_tags    => "mem_cache_host=\"$memCacheHost\"",
+                group_by    => $memCacheHost,
+			};
+		} else {
+			$remote->autoflush(1);
+			print $remote "stats\n";
+
+			while ( defined ( my $line = <$remote> ) ) {
+				last if ( $line =~ /END/ );
+				chomp $line;
+				my ($key, $value) = $line =~ /STAT (\S+)\s+(\S+)/;
+				$stats->{$key} = $value;
+			}
+
+			$queries{"$memCacheHost memcached isup"} = {
+				uiHint => "$memCacheHost",
+				info => 1,
+				perl => sub { return "ok" },
+                inf_field   => "is_up",
+                inf_tags    => "mem_cache_host=\"$memCacheHost\"",
+                group_by    => $memCacheHost,
+			};
+		}
+
+		$queries{"$memCacheHost current number of cached items"} = {
+				uiHint => "$memCacheHost",
+				recordMaxResults => 110000,
+				recordDataType => "gauge",
+				info => "numrows > -1",
+				warn => $memCachedDown,
+				perl => sub { return $stats->{'curr_items'} },
+                inf_field   => "num_cached_items",
+                inf_default => 0,
+                inf_tags    => "mem_cache_host=\"$memCacheHost\"",
+                group_by    => $memCacheHost,
+		};
+
+		$queries{"$memCacheHost total number of connections"} = {
+				noRowCount => 1,
+				uiHint => "$memCacheHost",
+				recordMaxResults => 110000,
+				recordDataType => "gauge",
+				warn => $memCachedDown,
+				perl => sub { return $stats->{'total_connections'} },
+                inf_field   => "total_connections",
+                inf_default => 0,
+                inf_tags    => "mem_cache_host=\"$memCacheHost\"",
+                group_by    => $memCacheHost,
+		};
+
+		$queries{"$memCacheHost memcached bytes read"} = {
+				uiHint => "$memCacheHost",
+				recordMaxResults => 110000,
+				recordDataType => "counter",
+				info => "numrows > -1",
+				warn => $memCachedDown,
+				perl => sub { return $stats->{'bytes_read'} },
+                inf_field   => "bytes_read",
+                inf_default => 0,
+                inf_tags    => "mem_cache_host=\"$memCacheHost\"",
+                group_by    => $memCacheHost,
+		};
+
+		$queries{"$memCacheHost memcached bytes written"} = {
+				uiHint => "$memCacheHost",
+				recordMaxResults => 110000,
+				recordDataType => "counter",
+				info => "numrows > -1",
+				warn => $memCachedDown,
+				perl => sub { return $stats->{'bytes_written'} },
+                inf_field   => "bytes_written",
+                inf_default => 0,
+                inf_tags    => "mem_cache_host=\"$memCacheHost\"",
+                group_by    => $memCacheHost,
+		};
+
+		$queries{"$memCacheHost memcached store size in bytes"} = {
+				uiHint => "$memCacheHost",
+				recordMaxResults => 110000,
+				recordDataType => "gauge",
+				info => "numrows > -1",
+				warn => $memCachedDown,
+				perl => sub { return $stats->{'bytes'} },
+                inf_field   => "store_size",
+                inf_default => 0,
+                inf_tags    => "mem_cache_host=\"$memCacheHost\"",
+                group_by    => $memCacheHost,
+		};
+
+		my $percentAvail;
+		unless ($memCachedDown) {
+			$percentAvail = (($stats->{'limit_maxbytes'} - $stats->{'bytes'}) / $stats->{'limit_maxbytes'})*100;
+		} 
+		$queries{"$memCacheHost memcached store percent available"} = {
+				uiHint => "$memCacheHost",
+				recordMaxResults => 110000,
+				recordDataType => "gauge",
+				format => "%6.1f%%",
+				info => "numrows > -1",
+				warn => "!defined(answer) || answer eq '' || answer < 10",
+				perl => sub { return $percentAvail },
+                inf_field   => "percent_available",
+                inf_default => 0,
+                inf_tags    => "mem_cache_host=\"$memCacheHost\"",
+                group_by    => $memCacheHost,
+		};
+
+		$queries{"$memCacheHost memcached get misses"} = {
+				uiHint => "$memCacheHost",
+				recordMaxResults => 110000,
+				recordDataType => "counter",
+				info => "numrows > -1",
+				warn => $memCachedDown,
+				perl => sub { return $stats->{'get_misses'} },
+                inf_field   => "misses_cnt",
+                inf_default => 0,
+                inf_tags    => "mem_cache_host=\"$memCacheHost\"",
+                group_by    => $memCacheHost,
+		};
+
+		$queries{"$memCacheHost memcached get hits"} = {
+				uiHint => "$memCacheHost",
+				recordMaxResults => 110000,
+				recordDataType => "counter",
+				info => "numrows > -1",
+				warn => $memCachedDown,
+				perl => sub { return $stats->{'get_hits'} },
+                inf_field   => "hits_cnt",
+                inf_default => 0,
+                inf_tags    => "mem_cache_host=\"$memCacheHost\"",
+                group_by    => $memCacheHost,
+		};
+
+		$queries{"$memCacheHost memcached evictions"} = {
+				uiHint => "$memCacheHost",
+				recordMaxResults => 110000,
+				recordDataType => "counter",
+				info => "numrows > -1",
+				warn => "!defined(answer) || answer eq '' || answer > 1",
+				perl => sub { return $stats->{'evictions'} },
+                inf_field   => "evitions_cnt",
+                inf_default => 0,
+                inf_tags    => "mem_cache_host=\"$memCacheHost\"",
+                group_by    => $memCacheHost,
+		};
+	}
+
+    $queries{'influx_details'} = { measurement => 'memcached_status'};
+	my $q = ariba::monitor::QueryManager->newWithDetails( "Memcached Status", $me->name(), $me->service(), $me->customer(), \%queries);
+	my $ret = $q->processQueries($debug, $me->default('notify.email'), $sendEmail, $sendPage);
+
+}
+
+main(@ARGV);
+
+__END__

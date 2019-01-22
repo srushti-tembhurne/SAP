@@ -1,0 +1,172 @@
+#!/usr/local/bin/perl 
+
+###############################################################################
+# $Id: //ariba/services/monitor/bin/mobile/ANmobile-backend-stats#1 $
+# $HeadURL:$
+#
+# Copyright (c) 2016 SAP Ariba
+#
+# ANmobile-backend-stats : Counts of API response statuses over 5 minute period
+#
+
+###############################################################################
+
+=head1 NAME
+
+ANmobile-backend-stats - Monitor Counts of API response statuses over 5 minute period
+
+=head1 SYNOPSIS
+
+ANmobile-backend-stats [options]
+
+=head1 OPTIONS
+
+=over
+
+=item B<-help|-h>
+
+Print this usage information and exit.
+
+=item B<-debug|-d>
+
+Enable debugging output / dryrun
+
+=item B<-e>
+
+Enable sending of emails
+
+=item B<-p>
+
+Enable sending of pages
+
+=back
+
+=head1 DESCRIPTION
+
+C<ANmobile-backend-stats> - Monitor Counts of API response statuses over 5 minute period
+
+=cut
+
+=head1 AUTHOR
+
+Narenthiran Rajaram<< narenthiran dot rajaram at sap dot com >>
+
+=head1 LICENSE
+
+Copyright 2016 SAP Ariba
+
+=cut
+
+use strict;
+use FindBin qw($Bin);
+use lib "$Bin/../../lib";
+use lib "$Bin/../../bin";
+use ariba::monitor::QueryManager;
+use ariba::monitor::Query;
+use ariba::monitor::Url;
+use ariba::rc::InstalledProduct;
+use XML::Simple;
+use Pod::Usage;
+use Getopt::Long;
+
+sub main
+{
+
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $debug     = 0;
+
+    GetOptions(
+               "help|h"   => sub {pod2usage(1);},
+               "debug|d+" => \$debug,
+               "e"        => \$sendEmail,
+               "p"        => \$sendPage,
+              );
+
+    my $monProduct = ariba::rc::InstalledProduct->new();
+    my $product    = ariba::rc::InstalledProduct->new('an', $monProduct->service());
+    my $cluster    = $product->currentCluster() || 'primary';
+    my $email      = $product->default('notify.email');
+    my $name       = $product->name();
+    my $service    = $product->service();
+    my $customer   = $product->customer() || undef;
+    my %queries;
+
+    for my $instance ($product->appInstancesInCluster($cluster))
+    {
+        next unless $instance->appName() eq 'BuyerMobileApp';
+        my $instanceName = $instance->instance();
+        my $host         = $instance->host();
+        my $xml          = {};
+        my $error        = -1;
+        my %indicator    = ();
+
+        eval {
+            my $monURL = ariba::monitor::Url->new($instance->mobileBackendMonitorURL());
+            $monURL->setTryCount(3);
+            $monURL->setTimeout(30);
+            my $tmp = $monURL->request();
+            $xml = XMLin($tmp);
+            %indicator = %{ $xml->{'MonitorStatus'}{'ResponseCounts'}{'entry'} };
+        };
+        if ($@)
+        {
+            #$error = "Error in fetching:".$instance->mobileBackendMonitorURL();
+            # make sure we have at least one fake HTTP code in case of fetching error
+            $indicator{99} = {
+                content => $error,
+                warn    => $error,
+                crit    => 1,
+            };
+        }
+
+        printf ("fetched:%s\n", $instance->mobileBackendMonitorURL()) if $debug;
+        foreach my $code ( keys %indicator )
+        {
+            my $qname = "Mobile Backend Stats ($host $code)";
+            my $value = int( $indicator{$code}{'content'} // $error );
+            my $warn  = int( $indicator{$code}{warn} || 0 );
+            my $crit  = int( $indicator{$code}{crit} || 0 );
+
+            $queries{$qname} = {
+                uiHint            => "$instanceName",
+                recordMaxResults  => 25920,
+                correctiveActions => [Ops => 'Warn:If many nodes are in warn condition, ops should confirm node health and open ticket with engineering if no problem is found, Crit/Page:Open CIRS'],
+                description       => "Counts of API response statuses over 5 minute period",
+                perl              => sub { $value },
+                inf_tags          => qq(host="$host",instance_name="$instanceName"),
+                inf_field         => qq(code_$code),
+                inf_default       => 0,
+                group_by          => $host,
+            };
+            $queries{"$qname warn threshold"} = {
+                perl      => sub { $warn },
+                inf_field => qq(code_${code}_warn_threshold),
+                inf_tags  => qq(host="$host",instance_name="$instanceName"),
+                group_by  => $host,
+            };
+            $queries{"$qname crit threshold"} = {
+                perl      => sub { $crit },
+                inf_field => qq(code_${code}_crit_threshold),
+                inf_tags  => qq(host="$host",instance_name="$instanceName"),
+                group_by  => $host,
+            };
+
+            if ($code == 500 || $code == 404)
+            {
+                $queries{$qname}{'crit'} = "answer >= $crit";
+                $queries{$qname}{'warn'} = "answer >= $warn or answer == $error";
+            }
+            else
+            {
+                $queries{$qname}{'warn'} = "answer == $error";
+            }
+        }
+    }
+    $queries{influx_details} = {measurement => 'an_mobile_backend'};
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('AN Mobile Backend', $name, $service, $customer, \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+}
+main();

@@ -1,0 +1,356 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/auc/auc-solr-status#1 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+use ariba::monitor::Url;
+use Data::Dumper;
+use JSON;
+use XML::Simple;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift; 
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e    Enables sending of email for monitor query.
+    -p    Enables sending of pages for monitor query.
+    -d    Turns on debug mode. 
+    -s    service
+    -h    Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $service;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $mon = ariba::rc::InstalledProduct->new('mon');
+
+    $service = $mon->service();
+
+    die "Community is not installed in $service!!\n" 
+        unless ariba::rc::InstalledProduct->isInstalled( 'community', $service );
+
+    my $me  = ariba::rc::InstalledProduct->new('community', $service);
+
+    my %queries;
+
+    my $twentyfourHours = 60 * 60 * 24;
+    my $fortyeightHours = 2 * $twentyfourHours;
+
+    $queries{'Indexer Status'} = {
+        crit    => 'answer eq "Down"',
+        info    => 'answer eq "Up"',
+        perl    => sub { return main::checkIndexerStatus($me); },
+        ticketOwner => 'unassigned-sre',
+	    uiHint => 'Search handler status',
+        severity    => 1,
+        description => 'Check the status of the AUC SOLR Indexer node(s)', 
+        correctiveActions => [
+            Ops => 'Raise CR and assign to AUC support team', 
+        ],
+        inf_field => "indexer_status",
+        inf_tags  => qq(uihint="search handler status"),
+        group_by => 'search_handler_status',
+    };
+
+  
+    $queries{'Search Status'} = {
+        crit    => 'answer eq "Down"',
+        info    => 'answer eq "Up"',
+        perl    => sub { return main::checkSearchStatus($me); },
+        ticketOwner => 'unassigned-sre',
+	    uiHint => 'Search handler status',
+        severity    => 1,
+        description => 'Check the status of the AUC SOLR Search node(s)', 
+        correctiveActions => [
+            Ops => 'Raise CR and assign to AUC support team', 
+        ],
+        inf_field => "search_status",
+        inf_tags  => qq(uihint="search handler status"),
+        group_by => 'search_handler_status',
+    };
+
+
+    $queries{'Search Handler Status'} = {
+        crit    => 'answer eq "Down"',
+        info    => 'answer eq "Up"',
+        perl    => sub { return main::checkSearchHandlerStatus($me); },
+        ticketOwner => 'unassigned-sre',
+	    uiHint => 'Solr Node Status',
+        severity    => 1,
+        description => 'Check the status of the AUC SOLR Search Handler',
+        recordMaxResults => 25920,
+        correctiveActions => [
+            Ops => '1)  Kill the java processes running on solr search nodes one at a time, so that a new process will spawn from keepRunning 2) Send email to AUC Community alias DL ARB AUC_Eng (External) <DL_5419DA6CFD84A00838000005@exchange.sap.corp> ',
+        ],
+        inf_field => "search_handler_status",
+        inf_tags  => qq(uihint="solr node status"),
+        group_by => 'solr_node_status',
+    };
+
+    my @instances = $me->appInstancesInCluster( $me->currentCluster() );
+    foreach my $inst ( @instances ){
+        next unless ( $inst->appType() =~ /AUCSolr/i ); ## Only monitor AUCSolr instances
+
+        print Dumper $inst if ( $debug > 1 );
+
+        my $hostname = $inst->host(); ## XXXXXXXXX@host
+        $hostname =~ s/\.ariba\.com//; ## Some configs have the /ariba.com, some don't.  Remove it if there, we'll add it back later
+        my $port     = $inst->port();
+        my $instUrl  = "http://$hostname.ariba.com:$port/solr/";
+        my $logUrl   = "http://$hostname.ariba.com:61502/lspatapache/community/";
+
+        print "** Instance URL: '$instUrl' **\n" if $debug;
+
+        my $response;
+        my $url = ariba::monitor::Url->new( $instUrl );
+        my $retried = 0;
+
+        while ( $retried <= 1 ){
+            ## Solr reloads index every 15 minutes causing down/up flap, this retry should fix that
+            $url->setError( '' );
+            $response= $url->request();
+            if ( $url->error() ){
+                $retried++;
+                sleep 60;
+            } else {
+                last;
+            }
+        }
+
+        $queries{"Solr Node Status [$hostname:$port]"} = {
+            crit    => 'answer eq "Down"',
+            info    => 'answer eq "Up"',
+            perl    => sub { return $url->error() ? 'Down' : 'Up'; },
+            ticketOwner => 'unassigned-sre',
+	        uiHint => 'Search handler status',
+            severity    => 1,
+            logURL      => $logUrl,
+            description => 'Check the status of the AUC SOLR Search node(s)',
+            correctiveActions => [
+                Ops => 'Raise CR and assign to AUC support team',
+            ],
+            inf_field => "solr_node_status",
+            inf_tags  => qq(uihint="search handler status",host="$hostname:$port"),
+            group_by => qq(search_handler_status,"$hostname:$port"),
+        };
+        
+	    my $new_instUrl  = "http://$hostname.ariba.com:$port/solr/admin/cores?action=STATUS&core=auc_core&wt=json";
+        my $new_logUrl   = "http://$hostname.ariba.com:61502/lspatapache/community/";
+
+        print "** New Instance URL: '$new_instUrl' **\n" if $debug;
+
+        my $new_response;
+        my $new_url = ariba::monitor::Url->new( $new_instUrl );
+        my $new_retried = 0;
+
+        while ( $new_retried <= 1 ){
+            ## Solr reloads index every 15 minutes causing down/up flap, this retry should fix that
+            $new_url->setError( '' );
+            $new_response= $new_url->request();
+            print "New Instance URL : $new_instUrl --> response : $new_response \n" if($debug>1);
+            if ( $new_url->error() ){
+                $new_retried++;
+                sleep 60;
+            } else {
+                last;
+            }
+        }
+
+        $queries{"Solr Node Status[$hostname:$port]"} = {
+            crit    => 'answer ne "Up"',
+            info    => 'answer eq "Up"',
+            perl    => sub { return main::checkSolrNodeStatus($new_response); },
+            ticketOwner => 'unassigned-sre',
+	        uiHint => 'Solr Node Status',
+            severity    => 1,
+            logURL      => $logUrl,
+            description => 'Check the status of the AUC SOLR Search node(s)',
+                        recordMaxResults => 25920,
+            correctiveActions => [
+                Ops => '1)      Kill the java processes running on solr search nodes one at a time, so that a new process will spawn from keepRunning    2)     Send email to AUC Community alias DL ARB AUC_Eng (External) <DL_5419DA6CFD84A00838000005@exchange.sap.corp> ',
+            ],
+            inf_field => "solr_node_status",
+            inf_tags  => qq(uihint="solr node status",host="$hostname:$port"),
+            group_by => qq("solr_node_status,"$hostname:$port"),
+        };
+
+    }
+
+#    $queries{'Index Update Status'} = {
+#        crit    => "answer > $fortyeightHours",
+#        warn    => "answer > $twentyfourHours && answer <= $fortyeightHours",
+#        info    => "answer <= $twentyfourHours",
+#        sql     => "",
+#        ticketOwner => 'unassigned-sre',
+#        severity    => 1,
+#        description => 'Check the status of the AUC SOLR Indexer node(s)', 
+#        correctiveActions => [
+#            Ops => 'Raise CR and assign to AUC support team', 
+#        ],
+#    };
+
+    my $email = $mon->default('notify.email');
+    $queries{'influx_details'} = { measurement => 'community_solr_status'};
+    my $qm = ariba::monitor::QueryManager->newWithDetails('solr-status', $me->name(), $me->service(), $me->customer(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+sub checkIndexerStatus {
+    my $me = shift; 
+
+    my $siteUrl = $me->default('SiteURLSecure');
+    $siteUrl .= '/indexer/admin/cores?action=STATUS&core=auc_core';
+
+    print "Indexer Site URL: $siteUrl\n" if $debug;
+
+    my $url = ariba::monitor::Url->new( $siteUrl );
+
+    my $response = $url->request();
+
+    if( my $errors = $url->errors() ) {
+    print "URL Errors: ", $errors, "\n";
+        return 'Down';
+    }
+
+    my @status = split /\n/, $response;
+    my $status = 1;
+
+    LINE:
+    foreach my $line ( @status ){
+        print "* Looking at '$line'\n" if ( $debug > 1 );
+        chomp $line;
+        next unless $line =~ /int name=\"status\"/;
+        print "** Looking at '$line'\n" if ( $debug > 1 );
+        $response =~ m/<int name="status">(\d+)<\/int>/;
+        if ( $1 == 0 ){
+            $status = $1;
+            print "Setting \$status to '$1'\n" if $debug;
+            last LINE;
+        }
+    }
+    print "Indexer Status '$status'\n" if $debug;
+
+    return ( $status == 0 ) ? 'Up' : 'Down';
+}
+
+sub checkSearchStatus {
+    my $me = shift; 
+
+    my $siteUrl = $me->default('SiteURLSecure');
+    my $searchUrlPath = $me->default('AUC.Solr.SearchUrlPath') || 'search';
+    $siteUrl .= "/$searchUrlPath/select?q=*";
+
+    print "Search Site URL: $siteUrl\n" if $debug;
+
+    my $url = ariba::monitor::Url->new( $siteUrl );
+
+    my $response = $url->request();
+
+    if( $url->errors() ) {
+        return 'Down';
+    }
+
+    my @status = split /\n/, $response;
+    my $status = 0;
+
+    foreach my $line ( @status ){
+        next unless $line =~ /numFound/;
+        chomp $line;
+    #print "*** Looking at '$line'\n" if $debug;
+        $line =~ m/.*numFound="(\d+)".*/;
+        $status = $1;
+        print "Search Status '$status'\n" if $debug;
+    }
+
+    return ( $status == 0 ) ? 'Down' : 'Up';
+}
+
+
+sub checkSearchHandlerStatus {
+    my $me = shift;
+
+    my $siteUrl = $me->default('SiteURLSecure');
+    my $searchUrlPath = $me->default('AUC.Solr.SearchUrlPath') || 'search';
+    $siteUrl .= "/$searchUrlPath/select?q=*";
+
+    print "Search Site URL: $siteUrl\n" if $debug;
+
+    my $url = ariba::monitor::Url->new( $siteUrl );
+
+    my $response = $url->request();
+
+    if( $url->errors() ) {
+        return 'Down';
+    }
+
+        print "response [ $siteUrl ] : $response \n" if($debug>1);
+
+        my $xml_href;
+    eval {
+        $xml_href = XMLin($response,ForceArray => 1);
+    };
+
+    if( $@ or ref($xml_href) !~/Hash/si ) {
+        return('Down');
+    }
+
+    my $numFound = 0;
+
+    print "value of numFound ".Dumper($xml_href->{'result'}->{'response'}->{'numFound'}) if($debug);
+    print "value of numFound ".Dumper($xml_href) if($debug > 1);
+
+    $numFound = $xml_href->{'result'}->{'response'}->{'numFound'};
+
+    return ( $numFound > 0 ) ? 'Up' : 'Down';
+}
+
+
+sub checkSolrNodeStatus {
+
+        my $response = shift;
+
+        my $json_results = decode_json($response);
+   	    print Dumper($json_results) if($debug > 1);
+
+        print "node status : ",$json_results->{'responseHeader'}->{'status'},"\n" if($debug>1);
+        print "node status errors: ",Dumper($json_results->{'initFailures'}),"\n" if($debug>1);
+
+        my $status = $json_results->{'responseHeader'}->{'status'};
+        my $initFailures = Dumper($json_results->{'initFailures'});
+
+        return ( ($status == 0) && ($initFailures =~/VAR1 = {}/si) ) ? 'Up' : $initFailures;
+}
+
+
+
+main(@ARGV);
+
+__END__
+

@@ -1,0 +1,153 @@
+#!/usr/local/bin/perl -w 
+
+use strict;
+
+use Data::Dumper;
+use JSON;
+
+use FindBin; 
+use lib "$FindBin::Bin/../../lib";
+use ariba::rc::InstalledProduct;
+use ariba::monitor::QueryManager;
+use ariba::monitor::Query;
+use ariba::monitor::Url;
+
+our $quiet = 1; # Suppresses prints in ariba::Ops::Startup::Common.pm
+my $debug = 0;
+
+my %fields = (
+    'LiveNodes'  => 1,
+     'DeadNodes'  => 1,
+     'DecomNodes' => 1,
+ );
+ 
+sub usage {
+     my $error = shift; 
+ 
+     print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+Sends Hadoop nameNode Consistency check information to monitoring.    
+
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode. 
+    -h        Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my %queries;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled('hadoop', $me->service()));
+    my $hadoop = ariba::rc::InstalledProduct->new('hadoop', $me->service());
+
+    my $cluster = $hadoop->currentCluster();
+
+    my @nameNodes = $hadoop->virtualHostsForRoleInCluster('hadoop-name', $cluster);
+
+    my %data;
+
+    foreach my $nn ( @nameNodes ){
+        gatherData( $nn, \%data, $hadoop );
+    }
+
+    foreach my $field ( keys %fields ){
+        $queries{"$field"} = {
+            crit                => 'answer ne "OK"',
+            perl                => sub { processData( $data{$field} ) },
+            description         => qq{ 'Checks and compares host status data (live, dead, decommissioned) across Name Nodes for consistency' },
+            severity            => 1,
+            ticketOwner         => 'unassigned-dba',
+            correctiveActions   => [
+                Ops  => 'Open a ticket with DBAs informing them there is inconsistent data in the Hadoop Namenodes',
+            ],
+            inf_field => "name_node_consistency",
+            inf_default => "none",
+            inf_tags => qq|field="$field"|,
+        };
+    }
+
+    my $email = $me->default('notify.email');
+
+    $queries{"influx_details"} = {measurement => "name_node_consistence"};
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('Namenode Consistency', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+sub processData {
+    my ( $data ) = @_;
+
+    my $ret = 'OK';
+
+    ## MAJOR ASSUMPTION:
+    ## Per Judie, there can/will always ever be 2 name nodes.
+    ## This will need to be rewritten if this assumption either changes or winds up to be incorrect
+    my ( $nn1, $nn2 ) = keys %{ $data };
+    my $nn1val = $data->{ $nn1 };
+    my $nn2val = $data->{ $nn2 };
+
+    $ret = "$nn1: $nn1val\t|\t$nn2: $nn2val" unless $nn1val == $nn2val;
+
+    return $ret;
+}
+
+sub gatherData {
+    ## build URL, scrape, massage into $data
+    my ( $host, $data, $me ) = @_;
+
+    my $port = $me->default( 'Hadoop.DFS.Name.JMXPort' ) || die "Error reading 'Hadoop.DFS.Name.JMXPort'!\n";
+    print "Got port '$port'\n" if $debug;
+
+    my $url = 'http://' . $host . ':' . $port . '/jmx?qry=Hadoop:service=NameNode,name=NameNodeInfo';
+    print "Scraping JMX from '$url'\n" if $debug;
+    my $monUrl = ariba::monitor::Url->new( $url );
+    my $timeout = 15;
+    my $response = $monUrl->request($timeout);
+
+    my $json = JSON->new->ascii->allow_nonref;
+    my $jsonText = $json->decode( $response );
+    
+    my $tmp = $jsonText->{'beans'}[0]; ## This JSON is weird, massaging it :-)
+
+    foreach my $key ( keys %fields ){
+        $data->{ $key }->{ $host } = countHosts( $tmp->{ $key } );
+    }
+}
+
+sub countHosts {
+    ## Lines are like:
+    ## "DeadNodes" : "{}",
+    ## or
+    ## "DeadNodes" : "{\"hdp161.lab1.ariba.com\":{\"lastContact\":1516,\"decommissioned\":false}}",
+    ## Need to just return the count of the individual hosts
+    my ( $line ) = @_;
+    my $count = 0;
+
+    if ( $line ne '{}' ){
+        ## Parse and count hosts
+        my @tmp = split /"},"/, $line;
+        $count = scalar @tmp;
+    }
+
+    return $count;
+}
+
+main(@ARGV);

@@ -1,0 +1,393 @@
+#!/usr/local/bin/perl
+
+#
+# $Id: //ariba/services/monitor/bin/everywhere/iostat-data#16 $
+#
+
+use strict;
+
+use lib "/usr/local/ariba/lib";
+
+use ariba::monitor::IOStatData;
+use ariba::Veritas::Mapping;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::NetworkUtils;
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::Startup::Common;
+use ariba::Ops::Constants;
+use ariba::rc::Utils;
+use ariba::Ops::CFEngine::MonitoringGlueUtils;
+use dmail::LockLib;
+
+my $debug = 0;
+my $username = (getpwuid($<))[0];
+my $lockfile = "/tmp/iostat-data.${username}.lock";
+my @storeData = qw( averageQueueTimeForRequests megabitsReadPerSecond megabitsWrittenPerSecond readRequestsPerSecond writeRequestsPerSecond );
+my $monServer;
+my $service;
+my $redhatVersion;
+
+open(LOG,"> /var/tmp/iostat-data.${username}.log");
+
+sub logfile {
+	my $str = shift;
+
+	my @time = localtime();
+	my $date = sprintf("%d-%02d-%02d %02d:%02d",
+		$time[5]+1900, $time[4]+1, $time[3], $time[2], $time[1]);
+
+	print LOG $date," : ",$str,"\n";
+}
+
+sub redhatRelease {
+	open(F,"/etc/redhat-release");
+	my $rel = <F>;
+	close(F);
+
+	return($rel);
+}
+
+sub cleanLock {
+	dmail::LockLib::releaselock($lockfile);
+	exit 0;
+}
+
+#
+# This program forks off iostat processes, gathers the data, and aggregates
+# it by veritas storage foundation structure.
+#
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $interval = 300; # 5 mins
+	my $iterations = 12; # 1 hours
+	my $exit = 0;
+
+	my $release = redhatRelease();
+	if($release =~ /release ([\d\.]+)/) {
+		$redhatVersion = $1;
+	} else {
+		$redhatVersion = "unknown";
+	}
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $machine = ariba::Ops::Machine->new($hostname);
+	my $datacenter = $machine->datacenter();
+	$service = (ariba::rc::Globals::servicesForDatacenter($datacenter))[0];
+
+	#
+	# set a lock in case multiple services try to start up this daemon
+	#
+	dmail::LockLib::forceQuiet();
+	unless (dmail::LockLib::requestlock($lockfile,5)) {
+		exit; # it's not an "error" that we don't get a lock -- exit quietly
+	}
+
+	#
+	# Write a PID file
+	#
+	my $pidFile = "/tmp/" . ariba::Ops::Constants->iostatDataPidFile();
+
+	if(open(PID, "> $pidFile")) {
+		print PID "$$\n";
+		close(PID); # this also gives us a time stamp of when we started.
+	}
+
+	#
+	# lookup the monserver for this host
+	#
+	$monServer = ariba::Ops::CFEngine::MonitoringGlueUtils::monitorServer();
+
+	#
+	# clean up lockfile when we exit based on a signal
+	#
+	$SIG{'INT'} = \&cleanLock;
+	$SIG{'TERM'} = \&cleanLock;
+	$SIG{'QUIT'} = \&cleanLock;
+	$SIG{'HUP'} = \&cleanLock;
+
+	#
+	# parse args here -- we should have args for interval, duration, debug, etc
+	#
+	while(my $arg=shift(@_)){
+		if( $arg =~ /^-e/o ) { $sendEmail = 1; };
+		if( $arg =~ /^-p/o ) { $sendPage = 1; };
+		if( $arg =~ /^-d/o ) { $debug = 1; };
+		if( $arg =~ /^-interval/o ) { $interval = shift(@_); };
+		if( $arg =~ /^-iterations/o ) { $iterations = shift(@_); };
+		if( $arg =~ /^-exit/o ) { $exit = 1; };
+	}
+
+	while(1) {
+		logfile("Starting a new iostat process");
+		iostat($interval, $iterations, $sendEmail, $sendPage, $hostname,$datacenter);
+		if($debug || $exit) {
+			dmail::LockLib::releaselock($lockfile);
+			exit(0);
+		}
+	}
+
+}
+
+sub iostat {
+	my $interval = shift;
+	my $iterations = shift;
+	my $sendEmail = shift;
+	my $sendPage = shift;
+	my $hostname = shift;
+    my $datacenter = shift;
+	my $numRecords = 600000; # save about 6 months of data
+	my $skippedFirst = 0;
+	my $data = {};
+
+	#
+	# clear the object cache before we create a new vxMap
+	#
+	ariba::Veritas::Mapping->clearCache();
+	my $vxMap = ariba::Veritas::Mapping->new();
+
+	my $machine = ariba::Ops::Machine->new($hostname);
+
+	my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter(
+		$machine->datacenter()
+	);
+	my $expando = "iostat-data-$hostname";
+
+	$iterations++; # we skip the first one, so we really need to do 1 more
+
+	#
+	# less than 2 iterations is useless since we ignore the first
+	#
+	$iterations = 2 if($iterations < 2);
+
+	my $cmd = "/usr/bin/iostat";
+	if($redhatVersion =~ /^5/) {
+		$cmd .= " -k";
+	}
+	$cmd .= " -d -x $interval $iterations";
+
+	open(FH, "$cmd |");
+
+	#
+	# Parsing output that looks like:
+	#
+	# Device:    rrqm/s wrqm/s   r/s   w/s  rsec/s  wsec/s    rkB/s    wkB/s avgrq-sz avgqu-sz   await  svctm  %util
+	# sda          0.07   0.00  0.02  0.05    0.88    0.86     0.44     0.43    25.27     0.00    1.13   1.12   0.01
+	# (other disks)
+	# (empty line)
+	# (repeat)
+	#
+	while(my $line = <FH>) {
+		chomp $line;
+		next unless($line =~ m/^Device:/); # this starts a new block of data
+		unless($skippedFirst) {
+			$skippedFirst = 1;
+			next;
+		}
+		my $header = $line;
+		my %dataHash;
+		logfile("============================================");
+		my $invalid = 0;
+		while(1) {
+			my $diskData = <FH>;
+			chomp $diskData;
+			logfile(" IN: $diskData");
+			# an empty line ends a block o data
+			last if ($diskData =~ /^$/);
+			$diskData =~ m/^(\w+)/;
+			my $disk = $1;
+			my $vDisk = $vxMap->diskFromOsName($disk);
+
+			my ($type, $device);
+			if($vDisk) {
+				$disk = $vDisk->instance(); # use VX name for disk
+				$type = "disk";
+			} else {
+				$disk = "Local:/dev/$disk";
+				$type = "local disk";
+			}
+			
+			my $dataObj = $data->{$disk};
+			unless($dataObj) {
+				$dataObj = ariba::monitor::IOStatData->new($disk);
+				$dataObj->setType($type);
+				$data->{$disk} = $dataObj;
+			}
+
+			$invalid |= $dataObj->recordData($header, $diskData);
+			$dataHash{$disk} = $diskData;
+		}
+
+		next if($invalid); # we got bogus iostat data back, so skip this pass
+
+		#
+		# now store by plex, volume, diskgroup, and channel
+		#
+		# we are only recording by volume and channelfor now, but let's
+		# gather it all
+		#
+		foreach my $dg ($vxMap->diskGroups()) {
+			my @dat;
+			foreach my $d ($dg->disks()) {
+				push(@dat, $dataHash{$d->instance()}) if($dataHash{$d->instance()});
+			}
+			next unless($#dat >= 0);
+			my $dataObj = $data->{$dg->instance()};
+			unless($dataObj) {
+				$dataObj = ariba::monitor::IOStatData->new($dg->instance());
+				$dataObj->setType("diskGroup");
+				$data->{$dg->instance()} = $dataObj;
+			}
+			$dataObj->recordData($header, @dat);
+		}
+		foreach my $v ($vxMap->volumes()) {
+			#
+			# break volume data out by FC channel
+			#
+			my %dat;
+			my $saveData = 0;
+			foreach my $d ($v->disks()) {
+				logfile($v->instance() . " " . $d->instance() . "?");
+				if($dataHash{$d->instance()}) {
+					logfile($dataHash{$d->instance()});
+					push(@{$dat{'ALL'}}, $dataHash{$d->instance()});
+					push(@{$dat{"FC" .  $d->channel()}},
+						$dataHash{$d->instance()});
+					$saveData = 1;
+				}
+					
+			}
+			next unless($saveData);
+			foreach my $k (keys %dat) {
+				my $key = $v->instance() . " " . $k;
+				my $dataObj = $data->{$key};
+				unless($dataObj) {
+					$dataObj = ariba::monitor::IOStatData->new($key);
+					$dataObj->setType("volume");
+					$dataObj->setVolumeName($v->instance());
+					$dataObj->setChannel($k);
+					$data->{$key} = $dataObj;
+				}
+				$dataObj->recordData($header, @{$dat{$k}});
+			}
+		}
+		foreach my $p ($vxMap->plexes()) {
+			my @dat;
+			foreach my $d ($p->disks()) {
+				push(@dat, $dataHash{$d->instance()}) if($dataHash{$d->instance()});
+			}
+			next unless($#dat >= 0);
+			my $dataObj = $data->{$p->instance()};
+			unless($dataObj) {
+				$dataObj = ariba::monitor::IOStatData->new($p->instance());
+				$dataObj->setType("plex");
+				$data->{$p->instance()} = $dataObj;
+			}
+			$dataObj->recordData($header, @dat);
+		}
+		foreach my $channel ($vxMap->channels()) {
+			my @dat;
+			foreach my $d ($vxMap->disks()) {
+				if($d->channel() eq $channel) {
+					push(@dat, $dataHash{$d->instance()}) if($dataHash{$d->instance()});
+				}
+			}
+			next unless($#dat >= 0);
+			my $channel = "FC" . $channel;
+			my $dataObj = $data->{$channel};
+			unless($dataObj) {
+				$dataObj = ariba::monitor::IOStatData->new($channel);
+				$dataObj->setType("channel");
+				$dataObj->setChannel($channel);
+				$data->{$channel} = $dataObj;
+			}
+			$dataObj->recordData($header, @dat);
+		}
+
+		#
+		# Write the CDB and update the queries here...
+		#
+		# for now we just record based on volume name and by channel
+		#
+		my %queries = ();
+		foreach my $dataObjName (sort keys %{$data}) {
+			my $dataObj = $data->{$dataObjName};
+			next unless($dataObj->type() eq 'volume' || $dataObj->type() eq 'channel' || $dataObj->type() eq 'local disk');
+			my $volume = $vxMap->volumeFromName($dataObj->volumeName());
+			my $channel = $dataObj->channel();
+			my $volName;
+			my $uiVolName;
+			if($volume) {
+				next unless($volume->mountPoint());
+				$volName = $volume->mountPoint();
+				$uiVolName = $volName; # remove the slash from uiHint
+				$uiVolName =~ s|/||g;
+			}
+
+			foreach my $key (@storeData) {
+				my $dataField;
+				my $uiHint;
+				if($dataObj->type() eq 'volume') {
+					if($channel eq 'ALL') {
+						$dataField = "$hostname:$volName : " . ariba::monitor::IOStatData->prettyNameForField($key);
+						$uiHint = $hostname . "/" . $uiVolName;
+					} else {
+						$dataField = "$hostname:$volName:$channel : " . ariba::monitor::IOStatData->prettyNameForField($key);
+						$uiHint = $hostname . "/" . $uiVolName . "/" . $channel;
+					}
+				} elsif($dataObj->type() eq 'channel') {
+					$dataField = "$hostname:$channel : " . ariba::monitor::IOStatData->prettyNameForField($key);
+					$uiHint = $hostname . "/" . $channel;
+				} elsif($dataObj->type() eq 'local disk') {
+					my $diskname = $dataObj->instance();
+					$diskname =~ s|^Local:/dev/||;
+					$diskname =~ s|/|_|g;
+					$dataField = "$hostname:/dev/$diskname : " . ariba::monitor::IOStatData->prettyNameForField($key);
+					$uiHint = $hostname . "/Non Veritas Disks/" . $diskname;
+				}
+
+				my $units = ariba::monitor::IOStatData->unitsForField($key);
+				my $dataValue = $dataObj->$key();
+
+				#
+				# HACK -- uiHints are broken.  For now I'm reducing this to
+				# just hostname to save CPU.  This is a clobber rather than
+				# a logic change so we can revert if we ever fix the expando
+				# code.
+				#
+				$uiHint = $hostname;
+
+				$queries{$dataField} = {
+					info => 1,
+					uiHint => $uiHint,
+					recordMaxResults => $numRecords,
+					recordDataUnits => $units,
+					perl => sub { return $dataValue; },
+                    inf_field => "dataValue",
+                    inf_tags => qq|dataDescription="$dataField",datacenter="$datacenter"|,
+                    group_by => "$datacenter,$uiHint",
+                    inf_default => 0,
+				};
+			}
+		}
+
+		my $email = ariba::Ops::Constants->operationsEmailNotificationAddress();
+
+		#
+		# XXX - HACK! This will reclaim /var/mon -- needed in load since other
+		# services claim the monitor dir on startup, and we need it more  ;)
+		#
+		ariba::Ops::Startup::Common::createMonitoringArchiveDirFromService($service);
+        $queries{influx_details} = {measurement => "iostat-data"};
+		my $q = ariba::monitor::QueryManager->newWithDetails(
+			$expando, $tab, $service, undef, \%queries
+		);
+		$q->setUiManager('iostat-data');
+		$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monServer);
+	}
+	close(FH);
+}
+
+main(@ARGV);

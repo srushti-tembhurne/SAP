@@ -1,0 +1,301 @@
+#!/usr/local/bin/perl
+
+use strict;
+
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::monitor::StatusPage;
+
+my $debug = 0;
+
+my $numactl  = '/usr/bin/numactl';
+my $numastat = '/usr/bin/numastat';
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+	my %queries = ();
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage = 1; };
+		if ($arg =~ /^-d/o) { $debug = 1; };
+	}
+
+	my $me          = ariba::rc::InstalledProduct->new();
+	my $hostname    = ariba::Ops::NetworkUtils::hostname();
+	my $machine     = ariba::Ops::Machine->new($hostname);
+	my $datacenter  = $machine->datacenter();
+	my $tab         = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+	my %properties = (
+		'providesServices' => 'db',
+		'os'               => 'redhat',
+		'status'           => 'inservice',
+	);
+
+	return unless ( $machine->hasProperties(%properties) );
+
+	##########################################
+	#		NUMA Policy
+	##########################################
+
+	$queries{"$hostname NUMA Policy"} = {
+                        uiHint => "$hostname",
+                        info => "numrows > -1",
+                        perl => "main::numaPolicy()",
+                        inf_field => "numa_policy",
+                        inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
+                        inf_default => 0,
+                        group_by => "$datacenter,$hostname",
+	};
+
+	##########################################
+	#		NUMA Memory
+	##########################################
+
+	my $numaMemory = numaMemory();
+
+	foreach my $node (sort keys %$numaMemory) {
+		my $nodeFree = $numaMemory->{$node}->{'free'};
+		my $nodeSize = $numaMemory->{$node}->{'size'};
+
+		$queries{"$hostname $node free memory (absolute)"} = {
+			uiHint => "$hostname/$node",
+			recordDataType => "gauge",
+			recordMaxResults => 110000,
+			info => "numrows > -1",
+			format => "%i MB",
+			perl => "return $nodeFree",
+            inf_field => "absolute_free_memory",
+            inf_tags => qq|datacenter="$datacenter",hostname="$hostname",node="$node"|,
+            inf_default => 0,
+            group_by => "$datacenter,$hostname,$node",
+		};
+
+		$queries{"$hostname $node free memory"} = {
+			uiHint => "$hostname/$node",
+			recordDataType => "gauge",
+			recordMaxResults => 110000,
+			info => "numrows > -1",
+			format => "%d%%\n",
+			perl => "return (($nodeFree / $nodeSize) * 100)",
+            inf_field => "free_memory",
+            inf_tags => qq|datacenter="$datacenter",hostname="$hostname",node="$node"|,
+            inf_default => 0,
+            group_by => "$datacenter,$hostname,$node",
+		};
+
+	}
+
+	##########################################
+	#		NUMA Stats
+	##########################################
+
+	my $numaStat = numaStat();
+
+	my $numa_hit       = $numaStat->{'numa_hit'};
+	my $numa_miss      = $numaStat->{'numa_miss'};
+	my $local_node     = $numaStat->{'local_node'};
+	my $other_node     = $numaStat->{'other_node'};
+	my $node_names     = $numaStat->{'node_names'};
+	my $interleave_hit = $numaStat->{'interleave_hit'};
+
+	my $nodeCount = @$node_names;
+
+	for (my $i=0; $i < $nodeCount; $i++) {
+		my $numaHit       = $numa_hit->[$i];
+		my $numaMiss      = $numa_miss->[$i];
+		my $nodeName      = $node_names->[$i];
+		my $localNode     = $local_node->[$i];
+		my $otherNode     = $other_node->[$i];
+		my $interleaveHit = $interleave_hit->[$i];
+
+		# Change format of node name to match NUMA memory node name for display purposes
+		$nodeName =~ s/(\D+)(\d+)/$1 $2/;
+
+		$queries{"$hostname $nodeName NUMA hit"} = {
+			uiHint => "$hostname/$nodeName",
+			recordDataType => "gauge",
+			recordMaxResults => 110000,
+			info => "numrows > -1",
+			perl => "return $numaHit",
+            inf_field => "numa_hit",
+            inf_tags => qq|datacenter="$datacenter",hostname="$hostname",node="$nodeName"|,
+            inf_default => 0,
+            group_by => "$datacenter,$hostname,$nodeName",
+		};
+
+		$queries{"$hostname $nodeName NUMA miss"} = {
+			uiHint => "$hostname/$nodeName",
+			recordDataType => "gauge",
+			recordMaxResults => 110000,
+			info => "numrows > -1",
+			perl => "return $numaMiss",
+            inf_field => "numa_miss",
+            inf_tags => qq|datacenter="$datacenter",hostname="$hostname",node="$nodeName"|,
+            inf_default => 0,
+            group_by => "$datacenter,$hostname,$nodeName",
+		};
+
+		$queries{"$hostname $nodeName interleave hit"} = {
+			uiHint => "$hostname/$nodeName",
+			recordDataType => "gauge",
+			recordMaxResults => 110000,
+			info => "numrows > -1",
+			perl => "return $interleaveHit",
+            inf_field => "interleave_hit",
+            inf_tags => qq|datacenter="$datacenter",hostname="$hostname",node="$nodeName"|,
+            inf_default => 0,
+            group_by => "$datacenter,$hostname,$nodeName",
+		};
+
+		$queries{"$hostname $nodeName local node"} = {
+			uiHint => "$hostname/$nodeName",
+			recordDataType => "gauge",
+			recordMaxResults => 110000,
+			info => "numrows > -1",
+			perl => "return $localNode",
+            inf_field => "local_node",
+            inf_tags => qq|datacenter="$datacenter",hostname="$hostname",node="$nodeName"|,
+            inf_default => 0,
+            group_by => "$datacenter,$hostname,$nodeName",
+		};
+
+		$queries{"$hostname $nodeName other node"} = {
+			uiHint => "$hostname/$nodeName",
+			recordDataType => "gauge",
+			recordMaxResults => 110000,
+			info => "numrows > -1",
+			perl => "return $otherNode",
+            inf_field => "other_node",
+            inf_tags => qq|datacenter="$datacenter",hostname="$hostname",node="$nodeName"|,
+            inf_default => 0,
+            group_by => "$datacenter,$hostname,$nodeName",
+		};
+	}
+
+
+        $queries{influx_details} = {measurement => "redhat_db_status"};
+        my $q = ariba::monitor::QueryManager->newWithDetails(
+		"Redhat DB Status", $tab, $me->service(), $me->customer(), \%queries
+	);
+
+        if ($debug) {
+                $q->displayToStdout();
+        } else {
+                my $ret = $q->processQueries($debug, 'an_auto_sysadmin@ariba.com', 1, 0);
+                exit($ret);
+        }
+}
+
+sub numaPolicy {
+
+	my $policy = 'Unknown';
+
+	open(NUMA_POLICY, "$numactl -s |") or die "Unable to run cmd: $!";
+	while (my $line = <NUMA_POLICY>) {
+		chomp $line;
+
+		# $ numactl -s
+		# policy: default
+		# preferred node: 0
+		# interleavemask:
+		# interleavenode: 0
+		# nodebind: 0 1 2 3 4 5 6
+		# membind: 0 1 2 3 4 5 6 7
+		# cpubind: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 1024
+
+		if ($line =~ /^policy: (\w+)/) {
+			$policy = $1;
+		}
+		last;
+	}
+	close(NUMA_POLICY);
+
+	return $policy;
+}
+
+sub numaMemory {
+	my $type = shift || 'absolute';
+
+	my %numaMemory = ();
+
+	open(NUMA_HARDWARE, "$numactl --hardware |") or die "Unable to run cmd: $!";
+	while (my $line = <NUMA_HARDWARE>) {
+		chomp $line;
+
+		# $ numactl --ha
+		# available: 8 nodes (0-7)
+		# node 0 size: 33535 MB
+		# node 0 free: 26136 MB
+		# node 1 size: 32767 MB
+		# node 1 free: 28439 MB
+		# node 2 size: 32767 MB
+		# node 2 free: 29039 MB
+		# node 3 size: 32767 MB
+		# node 3 free: 29106 MB
+		# node 4 size: 32767 MB
+		# node 4 free: 29290 MB
+		# node 5 size: 32767 MB
+		# node 5 free: 29331 MB
+		# node 6 size: 32767 MB
+		# node 6 free: 29157 MB
+		# node 7 size: 32767 MB
+		# node 7 free: 28720 MB
+
+		if ($line =~ /(node \d+) (\w+): (\d+)/) {
+			my $node = $1; # node 0, node 1, etc
+			my $type = $2; # 'size' or 'free'
+			my $size = $3; # 32767 (size in MB)
+
+			$numaMemory{$node}{$type} = $size;
+		}
+	}
+	close(NUMA_HARDWARE);
+
+	return \%numaMemory;
+}
+
+sub numaStat {
+	my $header = 1;
+	my %nodeValues = ();
+
+	open(NUMA_STAT, "$numastat |") or die "Unable to run cmd: $!";
+	while (my $line = <NUMA_STAT>) {
+		chomp $line;
+
+		# $ numastat
+		#                          node7         node6         node5         node4         node3         node2         node1         node0
+		# numa_hit             145796142     158914207     166756540     192476882     266196428     437891975     480211298    1388864681
+		# numa_miss                    0             0             0             0             0             0       2708359             0
+		# numa_foreign                 0             0             0             0             0             0             0       2708359
+		# interleave_hit           18717         26823         22726         27229         25724         25119         17328         17508
+		# local_node           144592215     157716072     165576498     191153842     264906266     436520054     478837768    1388386396
+		# other_node             1203927       1198135       1180042       1323040       1290162       1371921       4081889        478285
+
+		$line =~ s/^\s+//;
+		my @parts = split(/\s+/, $line);
+
+		if ($header) {
+			$nodeValues{'node_names'} = \@parts;
+			$header = 0;
+			next;
+		}
+
+		my $fieldName = shift @parts;
+		$nodeValues{$fieldName} = \@parts;
+	}
+	close(NUMA_STAT);
+
+	return \%nodeValues;
+}
+
+main();
+
+__END__

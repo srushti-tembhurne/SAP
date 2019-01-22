@@ -1,0 +1,365 @@
+#!/usr/local/bin/perl -w
+#
+# $Id: //ariba/services/monitor/bin/common/sendmail-queue#29 $
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::monitor::StatusPage;
+use ariba::monitor::QueryManager;
+use ariba::rc::Utils;
+use ariba::rc::CipherStore;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::PageUtils;
+use dmail::LockLib;
+use Log::Log4perl qw (get_logger :levels); # Import the method and level definitions ($INFO, $DEBUG, etc).
+
+my $debug;
+
+my %rolesForMailServer;
+my %messagesInQueue;
+
+# messages from network-accounts@ariba.com from EB app
+my %ebMessagesInQueue;
+
+# this should come from AN's DD.xml, but it's not in there!
+# Right now this is hardcoded in //ariba/network/service/common/ebbusinesslogic/EBConfig.java
+# See defect 116365
+my $ebFromEmailAddress = 'network-accounts@ariba.com';
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $timeout = 0; # No timeout
+	my $maxDisplayedItems = 5;
+	my $lockFile = "/tmp/sorted-sendmail-queue";
+
+	while (my $arg = shift) {
+		if ($arg =~ /^-d/) 			{ $debug++; 					next; }
+		if ($arg =~ /^-e/) 			{ $sendEmail++;	 				next; }
+		if ($arg =~ /^-p/) 			{ $sendPage++; 					next; }
+		if ($arg =~ /^-timeout/) 	{ $timeout = shift;				next; }
+		if ($arg =~ /^-items/)		{ $maxDisplayedItems = shift;	next; }
+		if ($arg =~ /-h/)			{ usage(); 						exit; }
+	}
+
+	exit(0) unless (dmail::LockLib::requestlock($lockFile));
+	
+	my $me = ariba::rc::InstalledProduct->new();
+
+    # This whole directory/file path should actually be in a config somewhere.
+    my $logConfig = $me->installDir . '/etc/sendmail-queue-log.conf';
+    Log::Log4perl::init ($logConfig);
+
+	my $role = "smtp-server";
+	for my $host ($me->hostsForRoleInCluster($role, $me->currentCluster())) {
+		$rolesForMailServer{$host} = "smtp";
+	}
+
+	#
+	# Add AN ebapps role
+	#
+	if (ariba::rc::InstalledProduct->isInstalled('an', $me->service())) {
+		my $an = ariba::rc::InstalledProduct->new('an' , $me->service());
+		my $role = "ebapps";
+		for my $host ($an->hostsForRoleInCluster($role, $me->currentCluster())) {
+			$rolesForMailServer{$host} = $role;
+		}
+	}
+
+	my %queries = ();
+    my $host       =  ariba::Ops::NetworkUtils::hostname();
+    my $machine    = ariba::Ops::Machine->new($host);
+    my $datacenter = $machine->datacenter();
+	my $tab        = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+	my $mailServer = ariba::Ops::NetworkUtils::hostname();
+    my $monserver  = ariba::Ops::PageUtils::monitorServerForDatacenterByProduct( $me );
+
+	$messagesInQueue{$mailServer}   = 0;
+	$ebMessagesInQueue{$mailServer} = 0;
+
+    my $queueSize = main::messagesInQueue('$mailServer') - main::ebMessagesInQueue('$mailServer');
+
+	$queries{"sorted sendmail queue on $mailServer"} = {
+		recordMaxResults => 110000,
+		recordDataType => "gauge",
+		recordItem => "return 0", # Will be overriden in getSortedQ
+		uiHint => $mailServer,
+		noRowCount => 1,
+		info => "numrows > -1",
+		warn => "(main::messagesInQueue('$mailServer') - main::ebMessagesInQueue('$mailServer') > 7000) || answer =~ /^Warning/",
+		crit => "main::messagesInQueue('$mailServer') - main::ebMessagesInQueue('$mailServer') > 10000",
+		timeout => -1,
+		perl => "return $queueSize",
+        inf_field => "queueSize",
+        inf_tags => qq|datacenter="$datacenter",mailServer="$mailServer"|,
+        inf_default => 0,
+        group_by => "$datacenter,$mailServer",
+	};
+
+    $queries{influx_details} = {measurement => "sorted-sendmail-queue"};
+
+	my $q = ariba::monitor::QueryManager->newWithDetails(
+		"sorted-sendmail-queue", 
+		$tab,
+		$me->service(), 
+		undef,
+		\%queries, 
+		undef
+	);
+
+	my $email = $me->default('notify.email');
+	$q->processQueries($debug, $email, $sendEmail, $sendPage, $monserver);
+
+	dmail::LockLib::releaselock($lockFile);
+}
+
+sub getSortedQWithTimeout { 
+	my $mailServer = shift;
+	my $maxDisplayedItems = shift;
+	my $timeout = shift;
+
+	my $error;
+	my @sortedList;
+	my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+	my $codeRef = sub {
+		($error, @sortedList) = getSortedQ($mailServer, $maxDisplayedItems);	
+	};
+
+	my $success;
+	if ($timeout) { 
+		$success = ariba::Ops::Utils::runWithTimeout($timeout, $codeRef);
+		$error ||= "Timed out running getSortedQ after $timeout seconds" unless ($success);
+	} else { 
+		$success = ariba::Ops::Utils::runWithoutTimeout($codeRef);
+		$error ||= "getMailQ error: $@" unless ($success);
+	}
+
+	if ($error) {
+		$query->setNote("<html><div style='white-space:pre; padding-left:5em'>\nLast successful result updated on " . ariba::Ops::DateTime::prettyTime($query->checkTime()) . ".\nTo obtain newer result, try running $0 without timeout.\n\n" . join("\n", $query->results()) . "</div></html>") if (!$query->note() && $query->results());
+		return "Warning: $error";
+	} else {
+		$query->deleteNote(); 
+	}
+
+	return join("\n", @sortedList);
+}
+
+sub getSortedQ {
+	my $mailServer = shift;
+	my $maxDisplayedItems = shift;
+	my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+
+	my ($error, @mailq) = getMailQ(); 
+	return $error if ($error);	
+	
+	my %errors = ();
+	my %errorsCount	= ();
+	my %fromCount = ();
+	my %toCount = ();
+
+	my $to;
+	my $from;
+	my @to;
+	$error = undef;
+
+	# skip the first two lines of the mailq output
+
+	#/var/spool/mqueue (14219 requests)
+	#-----Q-ID----- --Size-- -----Q-Time----- ------------Sender/Recipient-----------
+	my $queueSummary = shift(@mailq);
+	my $header = shift(@mailq);
+
+	#
+	# sortedList is the pretty-printed result for this query
+	#
+	my @sortedList = (); # First row is 'answer' for recordItem
+	my $roles = $rolesForMailServer{$mailServer} || "unknown";
+
+	while ( my $line = shift(@mailq) ) {
+		chomp($line);
+	
+		if ( $line =~ /^\w+/ || $line =~ /Total requests:/ ) {	# new qid line
+			# the previous message
+			if ( $from ) {
+				$to = join(", ", @to);
+				$from = cleanupAddr($from);
+
+				# If there is no error message, just call it 
+				# "Processing". $error is a key in %errors and
+				# can't be undef.
+				$error = 'Processing' if (!$error);
+
+				# How many times have we seen this particular error?
+				$errorsCount{$error}++;
+
+				# How many times have we seen this sender?
+				$fromCount{$from}++;
+
+				# How many times have we seen this receiver?
+				$toCount{$to}++;
+
+				# How many times have we seen this sender/receiver pair?
+				$errors{$error}{"$from -> $to"}++;
+			}
+			last if $line =~ /Total requests:/;
+
+			# parse the qid line
+			#h31Csmed026446  2094499 Tue Apr  1 04:54 <ordersender-qa@ariba.com>
+			#h3LL23MB015829*    1080 Mon Apr 21 14:02 <monlab@opslab.ariba.com>
+			$line =~ /^\w+\**\s+\d+\s+\w+\s\w+\s+\d+\s\d+:\d+(.*)/;
+
+			$from = $1;
+			@to = ();
+			$error = undef;
+
+			# How many messages have we seen?
+			$messagesInQueue{$mailServer}++;
+		} elsif ( $line =~ /\((.*)\)/ ) {
+			$error = $1;	
+		} elsif ( $line =~ /Total requests:/ ) {
+			last;
+		} else {
+			$line = cleanupAddr($line);
+			push(@to, $line);
+		}
+	}
+
+	#
+	# remember the number of EB messages we have in the queue
+	#
+	$ebMessagesInQueue{$mailServer} = $fromCount{$ebFromEmailAddress};
+
+	#
+	# Create lists of senders and receivers, sorted by frequency count
+	#
+	my @fromCount;
+	for my $sender (sort { $fromCount{$b}<=>$fromCount{$a} } keys %fromCount) {
+	  push(@fromCount, "(" . $fromCount{$sender}. ") " . $sender);
+	}
+
+	my @toCount;
+	for my $receiver (sort { $toCount{$b}<=>$toCount{$a} } keys %toCount) {
+	  push(@toCount, "(" . $toCount{$receiver}. ") " . $receiver);
+	}
+
+	$query->setRecordItem("return " . $messagesInQueue{$mailServer});
+	push(@sortedList, $messagesInQueue{$mailServer} ." messages in queue (running role(s): $roles)");
+	push(@sortedList, indent(4) . "Top Senders:") if scalar(@fromCount) > 0;
+
+	for (my $i = 0; $i < $maxDisplayedItems; $i++) {
+		last unless defined $fromCount[$i];
+		push(@sortedList, indent(8) . $fromCount[$i]);
+	}
+
+	push (@sortedList, indent(4) . "Top Receivers:") if scalar(@toCount) > 0;
+
+	for (my $i = 0; $i < $maxDisplayedItems; $i++) {
+		last unless defined $toCount[$i];
+		push(@sortedList, indent(8) . $toCount[$i]);
+	}
+
+	#
+	# For each error, sort sender/receiver pairs by descending frequency count, 
+	# and push the label (error message) and s/r pairs to @sortedList
+	#
+	for my $error (sort { $errorsCount{$b} <=> $errorsCount{$a} } keys %errors) {
+
+		push(@sortedList, indent(4) . "$error (" . $errorsCount{$error} . "):");
+
+		my $numberOfOccurrencesSeen;
+
+		my $i = 0;
+
+		for my $senderAndReceiver (sort { $errors{$error}{$b}<=>$errors{$error}{$a} } keys %{ $errors{$error} } ) {
+
+			push(@sortedList, indent(8) . "(" . $errors{$error}{$senderAndReceiver} . ") " . $senderAndReceiver);
+
+			$numberOfOccurrencesSeen += $errors{$error}{$senderAndReceiver};
+
+			$i++;
+
+			if ($i >= $maxDisplayedItems) {
+				my $occurrencesNotShown = $errorsCount{$error} - $numberOfOccurrencesSeen;
+				push(@sortedList, indent(8) . "Too many items- not displaying $occurrencesNotShown occurrences");
+
+				last;
+			}
+		}
+	}
+
+	return (undef, @sortedList);
+}
+
+# Fetch the output of 'mailq | expand' from the current server
+sub getMailQ {
+	my $command = "/usr/local/sbin/sendmail -bp -OQueueSortOrder=filename | expand";
+	my $error;
+	my @mailq;
+
+	print "DEBUG: Running $command\n" if $debug;
+
+	@mailq = split(/\n/, r($command, 1));
+	my $failed = ($? >> 8) || !@mailq;
+
+	if ($failed) {
+		$error = $! || (!@mailq && "Nothing is returned after running '$command'");
+	} else {
+		shift(@mailq) if $mailq[0] =~ m/^\s*$/; # blanks messes up parsing.
+	}
+
+	return ($error, @mailq);
+}
+
+sub messagesInQueue {
+	my $mailServer = shift;
+
+	return $messagesInQueue{$mailServer} || 0;
+}
+
+sub ebMessagesInQueue {
+	my $mailServer = shift;
+
+	return $ebMessagesInQueue{$mailServer} || 0;
+}
+
+sub cleanupAddr {
+	my $a = shift;
+    my $logger = get_logger ();
+    $logger->debug ("Raw email Address:  $a") if $logger->is_debug();
+
+	$a =~ s/\s*\(.*\)\s*//o;
+
+	1 while $a =~ s/.*<(.*)>.*/$1/o;
+
+	$a =~ s/^\s+//;
+    $a =~ s/\s+$//;
+    $logger->debug ("Cleaned email Address:  $a") if $logger->is_debug();
+
+	return $a;
+}
+
+sub indent {
+	my $size = shift;
+
+	return '&nbsp;' x $size;
+}
+
+sub usage {
+	print "Usage: ./sendmail-queue {options}
+
+	-d          Turn on debug
+	-e          Send email
+	-p          Send page
+	-timeout    Set timeout in seconds. Defaults to 0 (infinite).
+	-items      Number of items to display per section. Defaults to 5.
+	-h          Show this help\n\n";
+}
+
+main(@ARGV);

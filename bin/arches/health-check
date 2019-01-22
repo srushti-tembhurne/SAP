@@ -1,0 +1,243 @@
+#!/usr/local/bin/perl
+
+# $Id: //ariba/services/monitor/bin/arches/health-check#14 $
+#
+# Health check monitoring for Arches
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::Url;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+
+sub usage {
+    my $error = shift;
+
+    print <<USAGE;
+Usage: $0 [-e|-p|-d|-h]
+
+    -e        Enables sending of email for monitor query.
+    -p        Enables sending of pages for monitor query.
+    -d        Turns on debug mode.
+    -h        Shows this help.
+
+USAGE
+
+    print "(error) $error\n" if ($error);
+
+    exit();
+}
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+
+    while (my $arg = shift) {
+        if ($arg =~ /^-h$/o) { usage();         next; }
+        if ($arg =~ /^-d$/o) { $debug++;        next; }
+        if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
+        if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+
+        usage("Invalid argument: $arg");
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    exit unless (ariba::rc::InstalledProduct->isInstalled('arches', $me->service()));
+    my $arches = ariba::rc::InstalledProduct->new('arches', $me->service());
+    my %queries;
+    # As per Jira-Id : HOA-9975,Doing health-check only for primary.
+    my $cluster = "primary";
+
+    my %nameInfo = (
+        lastPublishDurationInMillis => { name => 'last_publish_dur' , desc => 'Check Last Publish Duration In Millis'},
+        lastSearchDurationInMillis => { name => 'last_search_dur', desc => 'Check Last Search Duration In Millis'},
+        lastPublishedTime => { name => 'last_publish_time', desc => 'Checks last publish time' },
+        publishStatus => { name => 'publish_status', desc => 'Checks publish status' },
+        searchStatus => { name => 'search_status', desc => 'Checks search status' },
+        shardStatus => { name => 'shard_status', desc => 'Check Shard Status'},
+        archesMode => { name => 'arches_mode', desc => 'Checks Arches mode' },
+        jobId => { name => 'job_id', desc => 'Check Job ID'},
+    );
+
+    # This is for the "primary" cluster.
+    my $url = $arches->default('VendedUrls.FrontDoorTopLevel') . "/Arches/api/health/get";
+    setQueries ($url, \%queries, $cluster, \%nameInfo);
+
+    my $nrt_publish_get_url_str = $arches->default('VendedUrls.FrontDoorTopLevel') . "/Arches/api/health/nrt_publish_get";
+    my $nrt_publish_get_url = ariba::monitor::Url->new($nrt_publish_get_url_str);
+    my $nrt_publish_get_timeout = 60 * 15;
+    my $nrt_publish_get_response = $nrt_publish_get_url->request($nrt_publish_get_timeout);
+    my $nrt_publish_get_reason = $nrt_publish_get_response;
+    my $healthCheckValue = "";
+    my $healthCheckName = "active_nrt_publish_status";
+    my $healthCheckDesc = "Active NRT Publish Status";
+    if ($nrt_publish_get_url->error()) {
+        $nrt_publish_get_response = $nrt_publish_get_url->error();
+        $healthCheckValue = $nrt_publish_get_response;
+    } else {
+        $healthCheckValue = $nrt_publish_get_response;
+        ( $healthCheckValue ) = $nrt_publish_get_response =~ m|<response>(.*)</response>|;
+        if ($healthCheckValue && $healthCheckValue ne 'OK') {
+            my $healthCheckReason = $nrt_publish_get_reason;
+            ( $healthCheckReason ) = $nrt_publish_get_reason =~ m|<message>(.*)</message>|;
+            $healthCheckValue = ( $healthCheckReason ) ? $healthCheckValue . qq( - ) . $healthCheckReason : undef;
+        }
+    }
+    #Changing the thresholds with reference to HOA-50710
+    my $warn = "answer ne 'OK'";# Keeping warning if the health check is not ok for first time
+    my $crit = "answer ne 'OK' and previousAnswer ne 'OK'";#Set as critical if the health check is not ok for two consecutive times.
+    $queries{$healthCheckName} = {
+        warn => $warn,
+        crit => $crit,
+        perl => sub { return $healthCheckValue; },
+        description => "$healthCheckDesc",
+        correctiveActions   => [
+            Ops => 'Follow up with engineering',
+        ],
+        inf_field => $healthCheckName,
+        inf_default => "none",
+    };
+
+    my $email = $me->default('notify.email');
+    $queries{'influx_details'} = { measurement => 'arches_health_check'};
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('health-check', $arches->name(), $arches->service(), undef, $cluster, \%queries);
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    
+    if($arches->hasSecondaryCluster()) {
+    # This will process the secondary stuff separately.
+        undef %queries;
+        my $app = ($arches->appInstancesLaunchedByRoleInClusterMatchingFilter('indexmgr', 'secondary', 'IndexMgr'))[0];
+        $url = 'http://' . $app->host . ':' . $app->httpPort . '/Arches/api/health/get';
+        $cluster = 'secondary';
+        $queries{'influx_details'} = { measurement => 'arches_health_check'};
+        setQueries ($url, \%queries, $cluster, \%nameInfo);
+
+        $qm = ariba::monitor::QueryManager->newWithDetails('health-check', $arches->name(), $arches->service(), undef, $cluster, \%queries);
+        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    }
+}
+
+sub setQueries {
+    my $url = shift;
+    my $queryHashRef = shift;
+    my $cluster = shift;
+    my $nameInfoHashRef = shift;
+    # All four are required.
+    die "ERROR:  missing required arguments for function setQueries\n"
+        unless $url && $queryHashRef && $cluster && $nameInfoHashRef;
+    # Could also chech for hash ref, but not necessary, really, since this is used only in this script (for now).
+
+    my ($warn, $crit);
+    my ($response, $urlError) = archesHealthStatus($url);
+
+    my $archesHealthInfo = healthInfo($response);
+
+    for my $metric (keys %{$archesHealthInfo}) {
+        if ($response) {
+            my $value = $response;
+
+            unless ($urlError) {
+                $warn = (lc ($archesHealthInfo->{ $metric }->{'color'}) eq 'yellow');
+                $crit = (lc ($archesHealthInfo->{ $metric }->{'color'}) eq 'red');
+            }
+
+            $$queryHashRef{"$$nameInfoHashRef{$metric}->{'name'}"} = {
+                warn => $warn,
+                crit => $crit || $urlError,
+                perl => sub { return $archesHealthInfo->{ $metric }->{'value'}; },
+                description => $$nameInfoHashRef{$metric}->{'desc'},
+                correctiveActions   => [
+                    Ops => 'Follow up with engineering',
+                ],
+                inf_field => $nameInfoHashRef->{$metric}->{'name'},
+                inf_default => "none",
+                inf_tags    => "cluster=\"$cluster\"",
+                group_by    => $cluster,
+            };
+        }
+    }
+}
+
+sub archesHealthStatus {
+    my $statusUrl = shift;
+
+    debug("Checking $statusUrl");
+
+    my $url = ariba::monitor::Url->new($statusUrl);
+    # HOA-591, URL response timeout needs to be increased to 15 minutes.
+    my $timeout = 60 * 15;
+    my $response = $url->request($timeout);
+    debug("Response: $response");
+
+    if ($url->error()) {
+        debug("Error: " . $url->error());
+        return ($url->error(), 1);
+    }
+  
+    return $response;
+}
+
+sub debug {
+    print "(debug) @_\n" if ($debug);
+}
+
+sub healthInfo {
+    my $statsXml = shift;
+    my $error ;
+    my $stats;
+
+    my $xs  = XML::Simple->new();
+    $stats = eval { $xs->XMLin( $statsXml ); };
+
+    $error = "Malformed XML: $@" if $@;
+    print $error, if ( $error && $debug );
+
+    my %healthReport;
+    while (my ($xml, $healthData) = each %{ $stats } ) {
+        $healthReport{$xml}->{'color'} = $stats->{$xml}->{'color'};
+        $healthReport{$xml}->{'value'} = $stats->{$xml}->{'value'};
+    }
+
+    return (\%healthReport);
+}
+
+# sample xml output QA service
+# https://svcqaows.ariba.com/Arches/api/health/get
+#
+#<healthInfo>
+#    <archesMode xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="healthInfoEntry" color="GREEN">
+#        <value xsi:type="archesMode">Normal</value>
+#    </archesMode>
+#    <jobId color="GREEN">
+#        <value xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xs="http://www.w3.org/2001/XMLSchema" xsi:type="xs:string">1424217601626</value>
+#    </jobId>
+#    <lastPublishDurationInMillis color="GREEN">
+#        <value xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xs="http://www.w3.org/2001/XMLSchema" xsi:type="xs:string">601125</value>
+#    </lastPublishDurationInMillis>
+#    <lastPublishedTime color="GREEN">
+#        <value xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xs="http://www.w3.org/2001/XMLSchema" xsi:type="xs:string">2015-02-17 16:10:02 PST</value>
+#    </lastPublishedTime>
+#    <lastSearchDurationInMillis color="GREEN">
+#        <value xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xs="http://www.w3.org/2001/XMLSchema" xsi:type="xs:string">749</value>
+#    </lastSearchDurationInMillis>
+#    <publishStatus color="RED">
+#        <value xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xs="http://www.w3.org/2001/XMLSchema" xsi:type="xs:string">Parsing</value>
+#    </publishStatus>
+#    <searchStatus color="GREEN">
+#        <value xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xs="http://www.w3.org/2001/XMLSchema" xsi:type="xs:string">Success</value>
+#    </searchStatus>
+#    <shardStatus color="GREEN">
+#        <value xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xs="http://www.w3.org/2001/XMLSchema" xsi:type="xs:string">Success</value>
+#    </shardStatus>
+#</healthInfo>
+
+main(@ARGV);
+
+__END__

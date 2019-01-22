@@ -1,0 +1,136 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/network/power#12 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::Ops::NetworkDeviceManager;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::CipherStore;
+use ariba::rc::InstalledProduct;
+
+my $docURL = 'http://ops.ariba.com/documentation/network-admin/docs/network-power.txt';
+
+sub main {
+
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+	my $debug	 = 0;
+
+	while (my $arg = shift(@ARGV)) {
+		if ($arg =~ /^-e/o) { $sendEmail = 1; };
+		if ($arg =~ /^-p/o) { $sendPage  = 1; };
+		if ($arg =~ /^-d/o) { $debug	 = 1; };
+	}
+
+	my $me	= ariba::rc::InstalledProduct->new();
+	my $email = $me->default('notify.email');
+
+	my $cipherStore	= ariba::rc::CipherStore->new($me->service());
+	my $accessPassword = $cipherStore->valueForName('networkAccess');
+
+	for my $datacenter ( ariba::Ops::ProductAPIExtensions::datacentersForProducts($me) ) {
+
+		my %queries = ();
+
+		my %matchDatacenter = (
+			'datacenter' => $datacenter,
+			'providesServices' => 'switch',
+			'os'               => 'catos, ios, ios-xe, IOS-XE',
+			'status'           => 'inservice',
+			'monitoringDatacenter' => '',
+		);
+
+		my %matchMonitoringDatacenter = (
+			'status'		   => 'inservice',
+			'providesServices' => 'switch',
+			'os'               => 'catos, ios, ios-xe, IOS-XE',
+			'monitoringDatacenter' => $datacenter,
+		);
+
+				my @machines = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+				@machines = (@machines , ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+
+		# There is a bug in PersistantObject.pm matching code. 
+		# As a work arounf we get switches first then routers.
+		# see TMID: 70150
+
+		%matchDatacenter = (
+			'datacenter' => $datacenter,
+			'providesServices' => 'router',
+			'os'			   => 'catos, ios',
+			'status'		   => 'inservice',
+			'monitoringDatacenter' => '',
+		);
+
+		%matchMonitoringDatacenter = (
+			'status'		   => 'inservice',
+			'providesServices' => 'router',
+			'os'			   => 'catos, ios',
+			'monitoringDatacenter' => $datacenter,
+		);
+
+				@machines = (@machines , ariba::Ops::Machine->machinesWithProperties(%matchDatacenter));
+				@machines = (@machines , ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+
+		foreach my $machine (@machines) {
+
+			my $hostname = $machine->hostname();
+
+			# Non 7206's and non 3750's don't have any PS information. These
+			# routers also aren't SNMP queryable via the CISCO-STACK-MIB yet?
+			# Adding monitoring for ASR1001|ASR1002 per TMID:127026
+			next if( grep( /^router$/, $machine->providesServices()) &&
+				$machine->hardwareType() !~ /(7206|3750|asr1001|asr1002|asr1004)/);
+
+			# Create a networkDevice, and get the power supply status.
+			my $networkDevice = ariba::Ops::NetworkDeviceManager->newFromMachine($machine);
+
+			$networkDevice->setAccessPassword($accessPassword);
+
+			my %psStatus = $networkDevice->powerSupplyStatus();
+
+			for my $ps (keys %psStatus) {
+
+				$queries{"$hostname power supply status for PS${ps}"} = {
+					noRowCount => 1,
+					info => "answer eq 'ok' || answer eq 'on' || answer eq 'normal'",
+					warn => "answer eq 'unknown' || answer eq 'minorFault' || answer eq 'other'
+						|| answer eq 'notPresent'",
+					crit => "answer eq 'majorFault' || answer eq 'off' || answer eq 'failed'",
+					perl => "return '$psStatus{$ps}'",
+					inf_field => "PS${ps}Status",
+					inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
+					inf_default => 0,
+					group_by => "$datacenter,$hostname",
+				};
+			}
+		}
+
+		# For dev
+		next unless keys %queries;
+
+		#$queries{"For more info about power supplies see"} = {
+		#	perl => "'below'",
+		#	note => "<html><a href=\"$docURL\">$docURL</a></html>",
+		#	info => 1,
+		#};
+
+		$queries{influx_details} = {measurement => "network-power-supply"};
+		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+		my $qm = ariba::monitor::QueryManager->newWithDetails(
+			'network-power-supply', $pn, $me->service(), $me->customer(), \%queries
+		);
+
+		$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+main();
+
+__END__

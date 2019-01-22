@@ -1,0 +1,920 @@
+#!/usr/local/tools/perl-5.22.1/bin/perl -w
+# protocol :// host.domain [: port ]/ path / filename 
+#
+# quick hack by Dan Grillo, dan_grillo@next.com
+# additions from Bill Fenner <fenner@electricrain.com>
+# https added by Dan Sully <dsully@ariba.com>
+#
+# setenv HTTPPROXYSERVER your.proxy.server:port if you need a proxy httpd
+#
+
+package geturl;
+
+use MIME::Base64;
+use File::Basename;
+
+#
+#XXX turn on strict when the few remaining locals below are fixed!
+#
+#use strict;
+
+my $vers = 85;
+
+my $AF_INET = 2;
+my $sockaddr = 'S n a4 x8';
+my $SOCK_STREAM;
+
+if ( -f "/etc/fstab" || -f "/etc/ttys" ){   #BSD, bogus test
+    $SOCK_STREAM = 1;
+} else {            #Solaris
+    $SOCK_STREAM = 2;
+}
+
+my $parseArgs = 1;
+my $loop = 0;
+
+my $debug = 0;
+my $quiet = 0;
+my $redirectCounter = 0;
+my $inlineErrors = 1;
+
+my $require;
+
+local @results;
+local @errors;
+local @postMemory;
+
+my %cookies;
+my $errsToStdout;
+my $incheaders;
+my $post;
+my @httpHeaders;
+my $postFile;
+my $postForm;
+my $contentType;
+my $usememory;
+my $usecookies;
+my $followRedirects;
+my $proxyarg;
+my $timeout;
+my $reload;
+my $open;
+my $openfile;
+my $outputFile;
+my $url;
+my $protocol;
+my $timeoutString;
+my $lfile;
+my $file;
+my $username;
+my $password;
+my $clientCert;
+my $clientCertKey;
+my $clientCertPass;
+my $printurl;
+my $finalurl;
+my $stopFollowingOnPattern;
+my $stopFollowingOnPatternFlag;
+my $referrer;
+my $saveRequest;
+my $requestTextRef:;
+my $vhost;
+my $sessionRef;
+my $tls;
+
+
+my ($this, $that, $proto, $port, $host, $them);
+
+my $userAgent="geturl/$vers";
+
+sub main::geturl {
+    my (@ARGV) = @_;
+
+    my $length = 0;
+
+    local $SIG{'ALRM'} = "geturl::alarm_handler";
+    local $SIG{'PIPE'} = 'IGNORE';
+
+    # don't parse args or urls again if we are in a tight loop like webping
+    # except if we are following a redirect.  then we want to parse the url,
+    # but not the args
+
+    $vhost = undef;
+
+    if( !$parseArgs || !$loop ) {
+        # don't parse args if we are calling ourselves like for a redirect
+
+        # parseArgs really means a new top level call to geturl(),
+        # but NOT in a loop case like webping
+
+        if ( $parseArgs ) {
+            $followRedirects = $contentType = $usememory = $postFile = $url = undef;
+            $quiet = $usecookies = $debug = $post = $printurl = 0;
+            %cookies = ();
+            $redirectCounter = 0;
+            $inlineErrors = 1;
+            $incheaders = 0;
+            $incheadersOnError = 0;
+
+            $username = $password = $clientCert = $clientCertKey = $clientCertPass = undef;
+
+            while( my $arg = shift(@ARGV) ) {
+                print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+                if( $arg =~ /^-loop$/o ){ $loop=1; }
+                if( $arg =~ /^-d/o ){ $debug=1; }
+                if( $arg =~ /^-c$/o ){ $require=0; }
+                if( $arg =~ /^-e$/o ){ $errsToStdout=1; }
+                if( $arg =~ /^-incheaders$/o ){ $incheaders=1; }
+                if( $arg =~ /^-incheadersOnError/oi ){ $incheadersOnError=1; }
+                if( $arg =~ /^-post/o ){ $post=1; }
+                if( $arg =~ /^-postfile/o ){ $post=1; $postFile=shift(@ARGV);}
+                if( $arg =~ /^-post((data)|(form))/o){ $post=1; $postForm=shift(@ARGV);}
+                if( $arg =~ /^-postmemory/o ){ $post=1; *postMemory=shift(@ARGV)}
+                if( $arg =~ /^-contenttype/o ){ $contentType=shift(@ARGV) }
+                if( $arg =~ /^-results/o ){ $usememory=1; *results=shift(@ARGV); @results=()}
+                if( $arg =~ /^-errors/o ){ $usememory=1; $inlineErrors = 0;*errors=shift(@ARGV); @errors=()}
+                if( $arg =~ /^-cookies/o ){ $usecookies = 1; }  
+                if( $arg =~ /^-printurl/o ){ $usememory=1; $printurl = 1; $finalurl = shift(@ARGV); }   
+                if( $arg =~ /^-saveRequest/o ) { $saveRequest = 1; $requestTextRef = shift(@ARGV); $$requestTextRef = ""}
+                if( $arg =~ /^-stopFollowingOnPattern/o ){ $usememory=1; $stopFollowingOnPattern = shift(@ARGV); $stopFollowingOnPatternFlag = shift(@ARGV); }  
+                if( $arg =~ /^-followRedirects/io ){ $followRedirects = 1; }    
+                if( $arg =~ /^-userAgent/io ){ $userAgent=shift(@ARGV); }   
+                if( $arg =~ /^-proxy/o ){ $proxyarg = $postFile=shift(@ARGV); } 
+                if( $arg =~ /^-timeout/o ){ $timeout = shift(@ARGV); }  
+                if( $arg =~ /^-vhost/o ){ $vhost = shift(@ARGV); }
+                if( $arg =~ /^-username/o ){ $username = shift(@ARGV); }    
+                if( $arg =~ /^-password/o ){ $password = shift(@ARGV); }    
+                if( $arg =~ /^-clientcert$/o) { $clientCert = shift(@ARGV); }
+                if( $arg =~ /^-clientcertkey$/o) { $clientCertKey = shift(@ARGV); }
+                if( $arg =~ /^-clientcertkeypassword$/o) { $clientCertPass = shift(@ARGV); }
+                if( $arg =~ /^-referrer$/o) { $referrer = shift(@ARGV); }
+                if( $arg =~ /^-header$/o) { push(@httpHeaders, (shift @ARGV)); next; }
+                if( $arg =~ /^-session/o) { $sessionRef = shift(@ARGV); next; }
+                if( $arg =~ /^-tls/o ){ $tls=1; }
+                if( $arg =~ /^-q/o ){ $quiet=1; }
+                if( $arg =~ /^-r$/o ){ $reload=1; }
+                if( $arg =~ /^-o/o ){ $open=1; }
+                if( $arg =~ /^-O/o ){ $openfile=1; }
+                if( $arg =~ /^-h/o ){ usage(); }
+                if( $arg =~ /^-stdout/o ){ $outputFile="-"; }
+                if( $arg !~ /^-\w/o ){
+                    if( !$url ) {
+                        $url=$arg;
+                    } else {
+                        $outputFile=$arg;
+                    }
+                }
+            }
+
+            if( !$url ) {
+                usage("No http, https, mailto, ftp, or telnet URL!\n");
+            }
+        }
+
+        # this unsets the state set by the last redirect
+        $parseArgs = 1;
+
+        $port = 80;         #XXX compute this!
+    
+        my $what;
+        ($protocol, $what) = split(/:/o, $url, 2);
+
+        $protocol =~ tr/A-Z/a-z/;
+
+        if ( $protocol eq "ftp" ){
+            exec("aftp $url") || die "can't exec aftp\n";
+        } elsif ( $protocol eq "telnet" ){
+            $what=~s|/||g;
+
+            ($what,$port) = split(/:/, $what);
+            $port = $port || "telnet";
+            exec("telnet $what $port") || die "can't exec telnet\n";
+        } elsif ( $protocol eq "mailto" ){
+            exec("mail $what") || die "can't exec mail\n";
+        } elsif ( $protocol eq "https" ) {
+
+            eval { require Net::SSLeay; };
+            if($@ =~ /locate/){
+                print "Can't load Net::SSLeay for https request!\n";
+                exit 1;
+            }
+
+            Net::SSLeay::load_error_strings();
+            Net::SSLeay::SSLeay_add_ssl_algorithms();
+            Net::SSLeay::randomize();   
+            if ( $debug and !$quiet ) {
+                $Net::SSLeay::trace = 3;
+            } else {
+                $Net::SSLeay::trace = 0;
+            }
+
+        } elsif ( $protocol ne "http" ) {
+            warn "Only supports http, https, ftp, mailto or telnet URLs, assuming http!\n" unless $quiet;
+        #na, do what I mean, not what I typed
+            $url="http://".$url;
+        }
+
+        #support geturl's and fetch's proxy ENV vars
+
+        my $origurl = $url;
+        my $prox = $proxyarg || $ENV{'HTTPPROXYSERVER'} || $ENV{'HTTP_PROXY'};
+        if( $prox && $prox ne "" ){
+            $url = "http://" . $prox . "/" . $url;
+            print "Using proxy server $prox\n" unless $quiet;
+        }
+
+        ($protocol, $what) = split(/:/o, $url, 2);
+
+        $what =~ s|^//||o;
+
+        ($host, $file) = split(/\//o, $what, 2);
+
+        if ( $file ) {
+            $file = "/" . $file;
+        } else {
+            $file = "/";
+        }
+    
+        ($them, $port) = split(/:/o,$host,2);
+        $vhost = $them unless($vhost);
+
+        if( $outputFile && $outputFile ne "" ){
+            $lfile = $outputFile;
+        } elsif ( $usememory ) {
+            $lfile = "";
+        } else {
+            $lfile = File::Basename::basename($file);
+        }
+
+        if ( $lfile eq "" || $lfile =~ /^~/o || $lfile =~ m|/$|o ){
+            $lfile = "untitled.html";
+        }
+
+        if ( $protocol eq "http" ){
+            $port = 80 unless $port;
+        } elsif ( $protocol eq "https" ){
+            $port = 443 unless $port;
+        }
+
+        my ($name, $aliases, $type, $len, $thataddr);
+
+        print "making $protocol request to $them port $port\n" unless $quiet;
+
+        if( $port =~ /^\d+$/o ){
+            ($name, $aliases, $proto) = getprotobyname('tcp');
+        } else {
+            ($name, $aliases, $port, $proto) = getservbyname($port,'tcp');
+        }
+
+        if( $them !~ /^[\d\.]+$/o ){
+            ($name, $aliases, $type, $len, $thataddr) = gethostbyname($them);
+        } else {
+            $thataddr = pack('C4',split(/\./o,$them));
+        }
+
+        # If we couldn't resolve the hostname, bounce an error.
+        unless (defined $thataddr) {
+            error("Error: Couldn't resolve [$them] to an IP address: $!");
+            return returnUndef();
+        }
+
+        $this = pack($sockaddr, $AF_INET, 0, "\0\0\0\0");
+        $that = pack($sockaddr, $AF_INET, $port, $thataddr);
+
+        #
+        # This used to support old style netscape 3 cookies. Leaving the code in
+        # for now, but no one uses it anymore.
+        #
+        if( 0 && $usecookies ){
+            #read Netscape 3.x cookie file
+            if( open(COOKIES, "$ENV{'HOME'}/.netscape/cookies") ) {
+                my ($cthem, $cfile) = ($origurl =~ m|http://([^:/]+)(:\d+)?(/.*)?|)[0,2];
+                $cfile = "/" if ($cfile eq "");
+                #" synax highlighting
+                while (<COOKIES>) {
+                    chop;
+                    next if /^#/o;
+                    next if /^\s*$/o;
+                    my ($chost,$ctf1,$cpath,$ctf2,$cunk,$cname,$cvalue) =
+                        split(/\t/,$_,7);
+                    $chost =~ s/\./\\./go;
+                    $cpath =~ s/[[\]\\\.]/\\$1/g;
+                    if ($cthem =~ /$chost$/ && $cfile =~ /^$cpath/){
+                        $cookies{$cname} = $cvalue;
+                    }
+                }
+                close(COOKIES);
+            }
+        }
+
+    } #end !$loop
+
+
+    # record the URL being accessed.  It will be overwritten on
+    # each pass in the case of redirects.
+    $$finalurl = $url if $printurl;
+
+    return undef unless( openSocketToRemoteHost($this, $that, $proto) );
+
+    my $sslNegotiationSucessful = 0;
+    my $ssl;
+    my $ctx;
+
+    if( $protocol eq "https" ){
+
+        # Workaround broken servers that don't negotiatiate SSL_v23
+        # properly. Try that first, then 3, then 2.
+
+        # Need to support tls 1.2 as well, but keep tls 1.0 the default.
+        for my $sslVersion ('tlsv1', 'tlsv1_2', 'tlsv1_1', 'v23', 'v3', 'v2') {
+
+            print "Trying SSL Version: $sslVersion\n" if $debug and !$quiet;
+        
+            my $func = "Net::SSLeay::CTX_${sslVersion}_new";
+            $ctx = &$func();
+
+            unless ($ctx) {
+                error("Error: failed to create SSL_CTX $!");
+                return returnUndef();
+            }
+
+            {   my $ret = Net::SSLeay::CTX_set_options($ctx, Net::SSLeay::OP_ALL() );
+                if ($ret) {
+                   #Perl5.8.3 in RHEL 6 has been recompiled with OpenSSL 1.0 so this empty block is necessary
+                }elsif (isLegacyPerl() and $ret) {
+                    error("Error: unable to set_options() on the SSL CTX: $!");
+                    return returnUndef();
+                }
+            }
+
+            if ($clientCert && $clientCertKey) {
+                if ($debug && !$quiet) {
+                    print "Using Client Cert $clientCert\n";
+                    print "      Client Cert Key $clientCertKey\n";
+                }
+
+                Net::SSLeay::CTX_set_default_passwd_cb($ctx, sub { return $clientCertPass });
+                Net::SSLeay::set_cert_and_key($ctx, $clientCert, $clientCertKey);
+                Net::SSLeay::CTX_set_default_passwd_cb($ctx, undef);
+            }
+
+
+            unless ($ssl = Net::SSLeay::new($ctx)) { 
+                error("Error: failed to create SSL instance from CTX: $!");
+                return returnUndef();
+            }
+
+            Net::SSLeay::set_fd($ssl, fileno(S));
+
+            my $res;
+            unless ( $res = Net::SSLeay::connect($ssl) ) {
+                my $errCode = Net::SSLeay::ERR_get_error();
+                my $errString = "";
+                if ($errCode) {
+                    $errString = Net::SSLeay::ERR_error_string($errCode);
+                }
+
+                # on handshake failure, try the next protocol
+                if($errString =~ /handshake failure/ ) {
+                    print "WARNING: handshake failed for protocol $sslVersion\n" if $debug and !$quiet;
+                }
+            }
+
+            if ( !$res || Net::SSLeay::print_errs() ) {
+
+                print "have errors, cleaning up for next go-round...\n" if $debug and !$quiet;
+
+                # Cleanup for the next go-round
+                Net::SSLeay::free($ssl);
+                Net::SSLeay::CTX_free($ctx);
+
+                # close the open socket to the host.. yes,
+                # this sucks, but the host isn't doing a
+                # renegotiation properly in the first place.
+
+                close(S);
+                return undef unless( openSocketToRemoteHost($this, $that, $proto) );
+
+                next;
+            } 
+
+            my $cert = Net::SSLeay::get_peer_certificate($ssl) or next;
+
+            if ( $debug && !$quiet ) {
+                print "Cipher `" . Net::SSLeay::get_cipher($ssl) . "'\n";
+
+                print "Subject Name: ". Net::SSLeay::X509_NAME_oneline( 
+                    Net::SSLeay::X509_get_subject_name($cert)) . "\n";
+                print "Issuer Name:  ". Net::SSLeay::X509_NAME_oneline( 
+                    Net::SSLeay::X509_get_issuer_name($cert)) . "\n";
+            }
+
+            # break the loop, negotiation successful.
+            $sslNegotiationSucessful = 1;
+            last;
+        }
+    }
+
+    # we weren't able to establish a valid ssl session.
+    if ( $protocol eq 'https' and !$sslNegotiationSucessful ) {
+        error("Error: Couldn't negotitate an SSL connection: $!");
+        return returnUndef();
+    }
+
+    $timeoutString = "read() or write()";
+
+    #select(S); $| = 1; select(STDOUT);
+
+    #proxy cleanup
+    $file =~ s|/http://|http://|o;
+    $file =~ s/ /%20/go;
+
+    #XXX Need to change \n to \r\n
+    #XXX to do real HTTP
+
+    my $gotRedirectURL = 0;
+    my $msg;
+
+    $cookies{'JSESSIONID'} = $$sessionRef if (ref($sessionRef));
+
+    if ( $post ) {
+        my $defaultMimeType;
+
+        if( $postFile ) {
+            $defaultMimeType="application/octet-stream";
+            open(POSTFILE,$postFile); @postMemory = <POSTFILE>; close(POSTFILE);
+        } elsif ( $postForm ) {
+            $defaultMimeType="application/x-www-form-urlencoded";
+            open(POSTFILE, $postForm); @postMemory = <POSTFILE>; close(POSTFILE);
+        } elsif ( $postMemory[0] ){
+            $defaultMimeType="application/octet-stream";
+        } else {
+            $defaultMimeType="application/x-www-form-urlencoded";
+
+            my $type = $contentType || $defaultMimeType;
+
+            print "Enter your $type for $file\n\n" unless $quiet;
+            @postMemory = <STDIN>;
+        }
+        $post = join("", @postMemory);
+        print "Sending ",length($post)," bytes\n" if $debug && !$quiet;
+
+        # build up the message to send.
+        $msg  = "POST $file HTTP/1.0\r\n";
+        $msg .= "Host: $vhost:$port\r\n";
+        $msg .= "User-Agent: $userAgent\r\n";
+        $msg .= "Referer: $referrer\r\n" if $referrer;
+        $msg .= "Accept: */*\r\n";
+        foreach my $head (@httpHeaders) {
+            chomp $head;
+            $msg .= "$head\n"
+        }
+        $msg .= "Authorization: Basic " . MIME::Base64::encode_base64("$username:$password", "\r\n") if $username && $password;
+        $msg .= "Pragma: no-cache\r\n" if ($reload);
+        my @cookies;
+        for my $cname (keys(%cookies)) {
+                my $cvalue = $cookies{$cname};
+                push(@cookies, "$cname=$cvalue");
+        }  
+        $msg .= "Cookie: " . join('; ', @cookies) . "\r\n" if (@cookies);
+
+        if ( $postFile ){
+            my $sn;
+            $sn = $postFile unless ($sn) = $postFile =~ m|/([^/]*)$|o;  
+            $msg .= "Content-Disposition: attachment; filename=$sn\r\n";
+        }
+
+        my $mimeType;   
+        if ( defined($contentType ) ){
+            $mimeType = $contentType;
+        } else {
+            $mimeType = $defaultMimeType;
+        }
+
+        $msg .= "Content-Type: $mimeType\r\n";
+        $msg .= "Content-Length: ".length($post)."\r\n";
+        $msg .= "\r\n";
+        $msg .= $post;
+
+        # Bill asks:
+        # Does "Content-Length:" include the
+        # terminating crlf?  lynx doesn't
+        # think so.
+        #   
+        # Dan comments:
+        # There shouldn't even _be_ a terminating CRLF;
+        # that's a hack that netscape started (maybe to work around
+        # buggy line-oriented servers?) that isn't
+        # in http/1.0.  The 1.1 WG says the CRLF shouldn't
+        # be there; if it is, the content-length must not
+        # include it, and the server needs to ignore it
+        $msg .= "\r\n";         
+
+    } else {
+        print "asking for $file\n" unless $quiet;
+
+        $msg  = "GET $file HTTP/1.0\r\n";
+        $msg .= "Host: $vhost:$port\r\n";
+        $msg .= "User-Agent: $userAgent\r\n";
+        $msg .= "Referer: $referrer\r\n" if $referrer;
+        $msg .= "Accept: */*\r\n";
+        foreach my $head (@httpHeaders) {
+            chomp $head;
+            $msg .= "$head\n"
+        }
+        $msg .= "Authorization: Basic " . MIME::Base64::encode_base64("$username:$password", "\r\n") if $username && $password;
+        $msg .= "Pragma: no-cache\r\n" if ($reload);
+        my @cookies;
+        for my $cname (keys(%cookies)) {
+                my $cvalue = $cookies{$cname};
+                push(@cookies, "$cname=$cvalue");
+        }
+        $msg .= "Cookie: " . join('; ', @cookies) . "\r\n" if (@cookies);
+        $msg .= "\r\n";
+    }
+
+    ###########################
+    # actually send the request
+
+    if ( $debug ) {
+        my $msgCopy = $msg;
+        $msgCopy =~ s/\r//g;
+
+        print "Sending:\n$msgCopy\n";
+
+    }
+
+    if( $protocol eq "https" ){
+        unless ( Net::SSLeay::ssl_write_all($ssl, $msg) ) {
+            error("SSL write");
+            return returnUndef();
+        }
+
+        # I disabled the shutdown of the write part of the socket due to a bug in IIS 
+        # or PHP on IIS that closes the connection when we do that.   See TMID:50783
+        # shutdown S, 1;
+    } else {
+        print S $msg;
+    }
+
+    if ($saveRequest) {
+        if($$requestTextRef) {
+            $$requestTextRef .= "=== (redirect request " . scalar(localtime(time())) . ") ===\n";
+        } else {
+            $$requestTextRef = "=== (initial request " . scalar(localtime(time())) . ") ===\n";
+        }
+        $$requestTextRef .= $msg;
+    }
+
+    flush(S);
+
+    print "Done sending\n" if $debug && !$quiet;
+
+    my $httpVersion = 1.0;
+
+    ###########################
+    #XXX
+    #XXX we could leave dangling alarms if these dies happens in a 
+    #XXX eval when required in a program that runs for a long time afterwards
+    #XXX
+    if( $openfile ){
+        open(LFILE,"| $openfile") || die $!;
+    } elsif (!$usememory) {
+        open(LFILE,"> $lfile") || die "Can't write to [$lfile]: $!";    
+    }
+
+    my $headers = "";
+
+    if( $httpVersion >= 1 ) {
+        print "Getting Headers for $protocol\n" if $debug && !$quiet;
+
+        if ( $protocol eq "https" ){
+            while ( $_ = Net::SSLeay::ssl_read_CRLF($ssl) ) {
+                $headers .= $_;
+                last if /^\cM?$/o;
+            }
+
+        } else {
+            while(<S>){
+                $headers .= $_;
+                last if /^\cM?$/o;
+            }
+        }
+
+        if ( $errsToStdout ) {
+            print $headers if ($debug);
+        } else {
+            print STDERR $headers if ($debug);
+        }
+
+        if ($saveRequest) {
+            $$requestTextRef .= "=== (response " . scalar(localtime(time())) . ") ===\n" if($$requestTextRef);
+            $$requestTextRef .= $headers;
+        }
+
+        if ($incheadersOnError && $headers =~ m|^HTTP/1\.\d\s+(\d+)| ) {
+            my $httpCode = $1; 
+            $incheaders = 1 if ($httpCode >= 500);
+        }
+
+        if( $incheaders && $usememory ){
+            push(@results, $headers);
+        }
+        #
+        # if the headers have content-length, use it
+        #
+        ($length) = ($headers=~/Content-Length:\s*(\d+)/io);
+
+        #
+        # Did we find a redirect?  
+        #
+        if ( $followRedirects && $headers =~ m|^HTTP/1\.\d\s+(\d+)| ) {
+            my $httpCode = $1;
+            if ( $httpCode == "302" || $httpCode == "301" ) {
+                $headers =~ /Location:\s*(.*)/i;
+                my $url = $1;
+                $url =~ s|\r$||;
+
+                #fix up a not fully qualified url
+                if ( $url !~ m|://| ) {
+                    # This won't work will non-fully
+                    # qualified redirect paths like
+                    # Location: foo.html
+                    # Are those legal?
+
+                    # they are not legal per RFC 2616 section 14.30:
+                    # Location       = "Location" ":" absoluteURI 
+                    # but www.ariba.com is returning 302 locations like:
+                    # location: ODSLP05172007.cfm
+
+                    if ( $url !~ m|^/| ) {  
+                        my $newpath = $file;
+                        $newpath =~ s|/[^/]+$||;
+        
+                        $gotRedirectURL = "$protocol://$them:$port$newpath/$url";
+                    } else {
+                        $gotRedirectURL = "$protocol://$them:$port$url";
+                    }
+                } else {
+                    $gotRedirectURL = $url;
+                }
+
+            }
+        }
+
+        if( $usecookies ){
+            my $cookieHeaders = $headers;
+            #Set-Cookie: JSESSIONID=5ECA8962DAF915104B19E97FEB2B81DF.UI1257132; Path=/Buyer; Secure
+            while ( $cookieHeaders =~ s/Set-Cookie:\s*([^;]*).*//i ) {
+                my $cookieString = $1;
+                $cookieString =~ s|\r$||;
+                my ($cname, $cvalue) = split(/=/, $cookieString);
+                $cookies{$cname} = $cvalue;
+                $$sessionRef = $cvalue if (ref($sessionRef) && $cname eq 'JSESSIONID');
+            }
+        }
+
+    }
+
+
+    my $goingToFollowARedirect = $followRedirects && $gotRedirectURL;
+
+
+    if ( defined($length) ){
+        print "Getting Data ($length bytes)\n" if $debug && !$quiet;
+    } else {
+        print "Getting Data (unknown length)\n" if $debug && !$quiet;
+    }
+
+    #XXX these read loops sometimes fail when reading from my
+    #XXX server;  read returns 0 bytes.  Why????
+    #XXX doing <S> always works.
+    my $oldFD = select(STDERR); $|=1; select($oldFD);
+
+    if ($usememory) {
+
+        # line based makes this easier for caller
+        if($protocol eq "https"){
+            # we don't use read_CRLF to work with cgi programs that
+            # written by unix people that just have \n for end of line
+
+            # if the stream emits a single "0", the while loop exits immediately,
+            # thus not capturing the "0" to the results array. The workaround is
+            # "force" the 1st read, outside the while loop.
+            my $read = Net::SSLeay::ssl_read_until($ssl, "\012");
+            push(@results, $read) unless $goingToFollowARedirect;
+
+            while($read = Net::SSLeay::ssl_read_until($ssl, "\012")) {
+                push(@results, $read) unless $goingToFollowARedirect;
+            }
+        } else {
+            if ( $goingToFollowARedirect ) {
+                <S>;
+            } else {
+                push(@results, <S>);
+            }
+        }
+    } else {
+        
+        if($protocol eq "https"){
+            while(my $read = Net::SSLeay::read($ssl)) {
+                print LFILE $read unless $goingToFollowARedirect;
+            }
+        } else {
+            #XXX make this not line based
+            if ( $goingToFollowARedirect ) {
+                <S>;
+            } else {
+                print LFILE <S>;    
+            }
+        }
+    }
+
+    # Close the socket for both reading and writing
+    shutdown(S,2);
+    
+    if($protocol eq "https"){
+        Net::SSLeay::free($ssl);
+        Net::SSLeay::CTX_free($ctx);
+    }
+
+    alarm(0);
+
+    close(S);
+    close(LFILE);
+
+    print "saved in @",*results,"\n" if ( $usememory && !$quiet );
+
+    print "saved as $lfile\n" unless ($quiet || $openfile || $usememory || $lfile eq "-" );
+
+    # if we got a redirect and follow redirects are on, get
+    # the new URL, and start all over
+
+    if ( $goingToFollowARedirect ) {
+        $url = $gotRedirectURL;
+        $parseArgs = 0;
+
+        
+        if ($stopFollowingOnPattern && $url =~ m/$stopFollowingOnPattern/) {
+            $parseArgs = 1;
+            $$stopFollowingOnPatternFlag = 1;
+            return returnUndef();
+        }
+
+        if ( $redirectCounter++ < 10 ) {
+            main::geturl();
+        } else {
+            error("asked to follow too many redirects");
+            $parseArgs = 1;
+            return returnUndef();
+        }
+    }
+
+    if ($open) {
+        system("open $lfile");
+    }
+    #should return size of bytes read
+
+    return 1;
+}
+
+sub alarm_handler {
+    #if we are required and this happens this won't do the right
+    #thing depending on the OS and the sig continue mask
+    error("timed out $timeoutString after $timeout secs, in connecting to [$url]");
+    die "" if $require; #must wrap in eval
+}
+
+sub flush {
+    local(*FD) = $_[0];
+
+    my $oldfd = select(FD);
+    my $oldstate = $|;
+    $| = 1;
+    print "";
+    $| = $oldstate;
+    select($oldfd);
+}
+
+sub openSocketToRemoteHost {
+    my $this = shift;
+    my $that = shift;
+    my $proto = shift;
+
+    if( !socket(S, $AF_INET, $SOCK_STREAM, $proto) ) {
+        error("socket()");
+        return returnUndef();
+    }
+    if ( !bind(S, $this) ) {
+        error("bind()");
+        return returnUndef();
+    }
+    if ( $timeout ) {
+        $!=0;
+        alarm($timeout);
+    }
+    $timeoutString = "connect()";
+
+    if ( !connect(S,$that) ) {
+        error("connect()"); 
+        return returnUndef();
+    }
+
+    return 1;
+}
+
+sub returnUndef {
+    alarm(0);   
+    return undef;
+}
+
+sub error {
+    if( $require ){
+        warn "warning: $_[0] $!\n" if !$quiet;
+        if( $usememory ){
+            if ($inlineErrors) {
+                push(@results,"$_[0] $!\n");
+            } else {
+                push(@errors,"$_[0] $!\n");
+            }
+        }
+    } else {
+        if( $errsToStdout ){
+            print STDOUT "die: $_[0] $!\n";
+        } else {
+            print STDERR "die: $_[0] $!\n";
+        }
+        exit(2);
+    }
+    return 1;
+}
+
+sub usage{
+    my $error = shift;
+
+    print $error if $error;
+    print "geturl version $vers\n";
+    print "usage:\n";
+    print "geturl [flags listed below] URL or pseudo URL [output file]\n";
+    print "       -h this help\n";
+    print "       -d turn debuging on\n";
+    print "       -c die on error when being required\n";
+    print "       -q quiet\n";
+    print "       -e errors go to stdout instead of stderr\n";
+    print "\n";
+    print "       -o do open(1) on output file\n";
+    print "       -O do openfile(1) on output file\n";
+    print "       -r force reload when using a cache\n";
+    print "\n";
+    print "       -stdout write to stdout, same as using - as output file\n";
+    print "       -proxy <server:port> proxy server\n";
+    print "       -timeout <secs> time limit for connect+read\n";
+    print "       -incheaders include headers in -result requests\n";
+    print "       -incheadersOnError include headers in -result requests if 500 error\n";
+    print "       -result \*array  store results in \@array (for require use)\n";
+    print "       -printurl \$finalurl  store final URL (after redirects) in \$finalurl\n";
+    print "\n";
+    print "       -username <username> for basic auth\n";
+    print "       -password <password> for basic auth\n";
+    print "\n";
+    print "       -post read application/x-www-form-urlencoded from stdin and post it\n";
+    print "       -postform <file> post file as application/x-www-form-urlencoded\n";
+    print "       -postfile <file> post file as application/octet-stream\n";
+    print "       -postmemory \*array  post \@array (for require use)\n";
+    print "       -saveRequest \*string  save request and response headers (require use)\n";
+    print "       -header <header> pass HTTP header along with request\n";
+    print "       -contenttype <string> set content-type: for post\n";
+    print "       -useragent <string> overrides User-Agent:\n";
+    print "       -followRedirects follow any returned redirects\n";
+    print "\n";
+    print "       -session \*string Sets or saves the JSESSIONID cookie value\n";
+    print "       -cookies send any persistent cookies for this site, using\n";
+    print "                  Netscape or OmniWeb cookie databases\n";
+    print "\n";
+    print "    By default, will build output filename from URL:\n";
+    print "    http://www/foo.html is saved as foo.html\n";
+    print "\n";
+    print "    setenv HTTPPROXYSERVER your.proxy.server:port if you need a proxy httpd\n";
+
+    exit(1);
+}
+
+if( $0 =~ /geturl/ ){
+    main::geturl(@ARGV);
+} else {
+    $require = 1;
+}
+
+#assumption: we're assuming legacy Perl is 5.8.3
+#we need this so that we can switch on behaviours in standard libraries
+#between those associated with 5.8.3 and newer versions, specifically the
+#5.20.1 (and above) that comes with MonX
+sub isLegacyPerl {
+    my $perlVersion  = sprintf('%vd', $^V);
+    if($perlVersion eq '5.8.3') {
+        return 1;
+    }
+    return 0;
+}
+
+1;

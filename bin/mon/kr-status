@@ -1,0 +1,377 @@
+#!/usr/local/bin/perl 
+
+use strict;
+
+use FindBin;
+use lib (
+	"$FindBin::Bin/../lib/perl",
+	"$FindBin::Bin/../../lib/perl",
+	"$FindBin::Bin/../lib",
+	"$FindBin::Bin/../../lib",
+	"$FindBin::Bin/../../tools/lib/perl",
+	"$FindBin::Bin/../../../tools/lib/perl",
+	"$FindBin::Bin/../../tools/lib",
+	"$FindBin::Bin/../../../tools/lib",
+);
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::Machine;
+use ariba::Ops::NetworkUtils;
+use ariba::Ops::DateTime;
+use ariba::Ops::Constants;
+use ariba::monitor::StatusPage;
+
+my $logfile = ariba::Ops::Constants->keepRunningEventLogFile();
+
+sub dupeCheck {
+        my $events = shift;
+        my $dupeFound = 0;
+        my %tempHash;
+
+        foreach my $event (@{$events}) {
+                if (defined($tempHash{$event->[1]})) {
+                        $dupeFound = 1;
+                        last;
+                } else {
+                        $tempHash{$event->[1]} = {};
+                }
+        }
+        return($dupeFound);
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $debug = 0;
+	my $openError;
+
+	while(my $arg = shift) {
+		if($arg =~ /^-d$/i) { $debug++; }
+		if($arg =~ /^-e$/i)  { $sendEmail=1; }
+		if($arg =~ /^-p$/i)  { $sendPage=1; }
+	}
+
+	my $hostname = ariba::Ops::NetworkUtils::hostname();
+	my $machine = ariba::Ops::Machine->new($hostname);
+	my $tab = ariba::monitor::StatusPage::fakeProductNameForDatacenter($machine->datacenter());
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my @products = ariba::rc::InstalledProduct->installedProductsList();
+	my $email = $me->default('notify.email');
+
+	unless( grep /^syslog$/, $machine->providesServices() ) {
+		print "This script must run on the loghost server.\n";
+		exit;
+	}
+
+	my $now = time();
+	my $oneHourAgo = $now - (60*60);
+
+	my %events;
+	my @logs = ($logfile);
+	if(-C $logfile < 1/24) {
+		if(-f "$logfile.1") {
+			unshift(@logs, "$logfile.1");
+		} elsif(-f "$logfile.1.gz") {
+			unshift(@logs, "$logfile.1.gz");
+		}
+	}
+
+	foreach my $file (@logs) {
+		my $status;
+		if($file =~ m/.gz$/) {
+			$status = open(LOG, '-|', '/usr/local/bin/gzcat', $file);
+		} else {
+			$status = open(LOG, "<", $file);
+		}
+		if($status) {
+			while(my $line = <LOG>) {
+				chomp $line;
+
+				next unless ($line =~ /^(\w+\s+\d+\s+\d+:\d\d:\d\d)/);
+				my $date = $1;
+				my $datestamp = ariba::Ops::DateTime::syslogToTimestamp($date);
+
+				next unless( $datestamp > $oneHourAgo );
+
+				my($instance,$product,$service,$community,$severity,$action,$note);
+				next unless ($line =~ m/\[([^]]+)]: KR\s+(\w+):(\w+):([^:]*?):?(\w+):(\w+) (.*)/);
+				$instance = $1;
+				$product = $2;
+				$service = $3;
+				$community = $4;
+				$severity = lc $5;
+				$action = lc $6;
+				$note = $7;
+
+				# Outside of devlab, skip an entry if the service
+				# doesn't match
+				next if($machine->datacenter() ne "devlab" and $service and $service ne $me->service());
+
+				$events{$product} = [] unless defined($events{$product});
+				push(@{$events{$product}}, [$instance, $community, $severity, $action, $date, $note, $line]);
+			}
+			close(LOG);
+		} else {
+			$openError = $!;
+		}
+	}
+	my %done;
+
+	foreach my $prod (@products) {
+		my $q = {};
+		my $product = $prod->name();
+		my %count = ();
+		my %instanceCount = ();
+		my %communityCount = ();
+		my $restartcrit = 0;
+		my $oomcrit = 0;
+		my $restart = "";
+		my $oom = "";
+		my $dead = "";
+		my $oraerror = "";
+		my $oracrit = "numrows > 0";
+		my @unixFsError;
+		my @socketClosedError;
+		my @appStartupTakesTooLong;
+
+		# don't run twice for a given product name (especially for ASP)
+		next if $done{$product};
+		$done{$product} = 1;
+
+		foreach my $event (@{$events{$product}}) {
+			my($instance, $community, $severity, $action, $date, $note, $line) = @$event;
+			$instance =~ m/(\w+)-/;
+			my $appname = $1;
+
+			$instanceCount{$instance} = {} unless defined($instanceCount{$instance});
+			$instanceCount{$instance}->{$action} = [] unless defined($instanceCount{$instance}->{$action});
+
+			$count{$appname} = {} unless defined($count{$appname});
+			$count{$appname}->{$action} = [] unless defined($count{$appname}->{$action});
+
+			$communityCount{$community} = {} unless defined($communityCount{$community});
+			$communityCount{$community}->{$action} = [] unless defined($communityCount{$community}->{$action});
+
+			push(@{$instanceCount{$instance}->{$action}}, $event);
+			push(@{$count{$appname}->{$action}}, $event);
+			push(@{$communityCount{$community}->{$action}}, $event);
+		}
+
+		foreach my $instance (keys %instanceCount) {
+			if(defined($count{$instance}->{"unixfilesystemerror"})) {
+				my $count = scalar(@{$count{$instance}->{"unixfilesystemerror"}});
+				next unless ($count >= 2);
+				# build unique hash of the errors - we need to report this
+				my %errmsg = ();
+				foreach my $event (@{$count{$instance}->{"unixfilesystemerror"}}) {
+					$errmsg{$event->[5]} = undef;
+				}
+				push(@unixFsError, ($count >= 4 ? 'critical' : 'warning') . ": $instance has total of $count errors, see:\n" .  join("\n", keys %errmsg));	
+			}
+		}
+
+		foreach my $appname (keys %count) {
+			if(defined($count{$appname}->{"restart"})) {
+				my $restartThreshold = 2;
+				if(grep /^$product$/, ("aes", "acm", "anl","buyer","s4")) {
+					$restartThreshold = 1;
+				} elsif ($product eq "an") {
+					$restartThreshold = 5;
+				} elsif (grep /^$appname$/i, ("catsearch")) {
+					$restartThreshold = 1;
+				}
+
+				my $restarted = scalar(@{$count{$appname}->{"restart"}});
+				if($restarted >= $restartThreshold) {
+					$restartcrit = 1;
+					if ($product eq "buyer" || $product eq "s4") {
+						$restartcrit = dupeCheck($count{$appname}->{"restart"});
+					}
+				}
+				foreach my $event (@{$count{$appname}->{"restart"}}) {
+					$restart .= "\n" if $restart;
+					$restart .= $event->[0] . ", " . $event->[1] . " at " . $event->[4];
+				}
+			}
+			if(defined($count{$appname}->{"oom"})) {
+				my $oomThreshold = 2;
+				if(grep /^$product$/, ("aes", "acm", "anl")) {
+					$oomThreshold = 1;
+				}
+				my $oomcount = scalar(@{$count{$appname}->{"oom"}});
+				if($oomcount >= $oomThreshold) {
+					$oomcrit = 1;
+					if ($product eq "buyer" || $product eq "s4") {
+						$oomcrit = dupeCheck($count{$appname}->{"oom"});
+					}
+				}
+				foreach my $event (@{$count{$appname}->{"oom"}}) {
+					$oom .= "\n" if $oom;
+					$oom .= $event->[0] . ", " . $event->[1] . " at " . $event->[4];
+				}
+			}
+			if(defined($count{$appname}->{"dead"})) {
+				foreach my $event (@{$count{$appname}->{"dead"}}) {
+					$dead .= "\n" if $dead;
+					$dead .= $event->[0] . ", " . $event->[1] . " at " . $event->[4];
+				}
+			}
+			if(defined($count{$appname}->{"oracleerror"})) {
+				foreach my $event (@{$count{$appname}->{"oracleerror"}}) {
+					$oraerror .= "\n" if $oraerror;
+					$oraerror .= $event->[0] . ", " . $event->[1] . " at " . $event->[4];
+
+					if(($event->[0] =~ /(?:Admin|EDIDocumentManager)/ && $product eq "an") || $product eq "s4") {
+						$oracrit = undef;
+					}
+				}
+			}
+			if($product eq "s4" && $appname =~ /^GlobalTask/ &&  defined($count{$appname}->{"socketclosederror"})) {
+				foreach my $event (@{$count{$appname}->{"socketclosederror"}}) {
+					my ($instance, $community, $severity, $action, $date, $note, $line) = @$event;
+					push(@socketClosedError, "$instance, $community at $date" );
+				}
+			}
+			if(defined($count{$appname}->{"appstartuptakestoolong"})) {
+				foreach my $event (@{$count{$appname}->{"appstartuptakestoolong"}}) {
+					my ($instance, $community, $severity, $action, $date, $note, $line) = @$event;
+					$note = lc($note);
+
+					push(@appStartupTakesTooLong, "$severity: $instance, $community on $date because $note");
+				}
+			}
+		}	
+
+		foreach my $community (keys %communityCount) {
+			if(defined($communityCount{$community}->{"unixfilesystemerror"})) {
+				my $count = scalar(@{$communityCount{$community}->{"unixfilesystemerror"}});
+				next unless ($count >= 4);
+				# build unique hash of the errors - we need to report this
+				my %errmsg = ();
+				foreach my $event (@{$communityCount{$community}->{"unixfilesystemerror"}}) {
+					$errmsg{$event->[5]} = undef;
+				}
+				push(@unixFsError, ($count >= 6 ? 'critical' : 'warning' ) . " - there were a total of $count errors, see:\n" . join("\n", keys %errmsg));
+			}
+		}
+
+		$q->{"$product instances in $tab restarted in last hour"} = {
+			"severity" => 1,
+			"recordMaxResults" => 11000,
+			"recordDataType" => "gauge",
+			"recordItem" => "numrows",
+			"info" => 1,
+			"crit" => "$restartcrit || numrows >= 5",
+			"perl" => sub { return $restart; },
+			"uiHint" => "$tab",
+			"inf_field" => "restarted_in_last_hour",
+			"inf_default" => "none",
+			"inf_tags" => qq(tab="$tab"),
+			"group_by" => $tab,
+		};
+
+		if($openError) {
+			$q->{"$product instances restarted in last hour"}->{"crit"} = 1;
+			$q->{"$product instances restarted in last hour"}->{"error"} = "Could not open syslog file $logfile: $openError";
+			$q->{"$product instances restarted in last hour"}->{"perl"} = "return 'Could not open syslog file $logfile: $openError'";
+			$openError = undef;
+		}
+			
+		$q->{"$product instances in $tab with OOM in last hour"} = {
+			"severity" => 1,
+			"recordMaxResults" => 11000,
+			"recordDataType" => "gauge",
+			"recordItem" => "numrows",
+			"info" => 1,
+			"warn" => "$oomcrit || numrows >= 5",
+			"perl" => sub { return $oom; },
+			"uiHint" => "$tab",
+			"inf_field" => "oom_in_last_hour",
+			"inf_default" => "none",
+			"inf_tags" => qq(tab="$tab"),
+			"group_by" => $tab,
+		};
+		$q->{"$product instances in $tab dead in last hour"} = {
+			"severity" => 1,
+			"recordMaxResults" => 11000,
+			"recordDataType" => "gauge",
+			"recordItem" => "numrows",
+			"info" => 1,
+			"crit" => "numrows > 0",
+			"perl" => sub { return $dead; },
+			"uiHint" => "$tab",
+			"inf_field" => "dead_in_last_hour",
+			"inf_default" => "none",
+			"inf_tags" => qq(tab="$tab"),
+			"group_by" => $tab,
+		};
+		$q->{"$product instances in $tab with UnixFileSystem stack traces in last hour"} = {
+			severity => 1,
+			"recordMaxResults" => 11000,
+			"recordDataType" => "gauge",
+			"recordItem" => "numrows",
+			"noRowCount" => 1,
+			warn => 'answer =~ /warning/',
+			crit => 'answer =~ /critical/',
+			ticketOnWarnOpenAfterMinutes => 1,
+			perl => sub { return join("\n", sort @unixFsError); },
+			uiHint => $tab,
+			description => 'When netapp has performance problems, apps will take a long time to query or delete ' . 
+				'files on it, which writes out a stack strace for the long running thread that includes the ' . 
+				'java.io.UnixFileSystem class. See TMID 125710 for more info.',
+			correctiveActions => [
+				Ops => 'On warn/ToW, check the corresponding kr logs to verify that it is a long running thread issue ' . 
+					'caused by accessing netapp. If so / crit, follow normal escalation process as it is impacting performance.',
+			],
+			"inf_field" => "unix_fs_stack_traces_in_last_hour",
+			"inf_default" => "none",
+			"inf_tags" => qq(tab="$tab"),
+			"group_by" => $tab,
+		};
+		if ($product eq "s4") {
+			$q->{"$product GlobalTask instances in $tab with Socket Closed stack traces in last hour"} = {
+				severity => 1,
+				warn => "numrows > 0",
+				ticketOnWarnOpenAfterMinutes => 1,
+				ticketOwner => "unassigned-network",
+				perl => sub { return join("\n", sort @socketClosedError); },
+				uiHint => $tab,
+				"inf_field" => "socket_closed_stack_traces_in_last_hour",
+				"inf_default" => "none",
+				"inf_tags" => qq(tab="$tab"),
+				"group_by" => $tab,
+			};
+		}
+
+		my $appStartupTakesTooLong = join("\n", sort @appStartupTakesTooLong);
+		my $severity = ($appStartupTakesTooLong =~ /crit:/) ? 1 : 2;
+		$q->{"$product instances in $tab taking too long to start in last hour"} = {
+			skip		=> $product !~ /^arches/,		# No need to show this in other products 
+			warn		=> 'answer =~ /warn:/',			# as this is enabled on a product by product basis.
+			crit		=> 'answer =~ /crit:/',
+			perl		=> sub { return $appStartupTakesTooLong; },
+			severity	=> $severity,
+			uiHint		=> $tab,
+			ticketOnWarnOpenAfterMinutes	=> 1,
+			ticketDueInDays					=> 1,
+			description => 'Monitors for apps that takes too long to start. Depending on the app, services may
+				become unavailable if startup takes too long.',
+			correctiveActions => [
+				Ops => 'For warn, take thread dump on the node and open an S2 CR for Platform Engineering. ' . 
+					'For crit, do the same thing but with S1 severity and escalate to Engineering for ' . 
+					'immediate investigation.',
+			],
+			"inf_field" => "too_long_to_start_in_last_hour",
+			"inf_default" => "none",
+			"inf_tags" => qq(tab="$tab"),
+			"group_by" => $tab,
+		};
+
+		$q->{influx_details} = { measurement => 'kr_status' };
+		my $qm = ariba::monitor::QueryManager->newWithDetails("keeprunning-status", $product, $me->service(), undef, $prod->currentCluster(), $q);
+		$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
+}
+
+main(@ARGV);

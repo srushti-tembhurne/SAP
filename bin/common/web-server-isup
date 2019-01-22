@@ -1,0 +1,129 @@
+#!/usr/local/bin/perl
+#
+# running from monitor host, this script will 'ping' all the WebHosts
+# for a product/cluster and report if they are up or down.
+#
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../bin";
+
+use ariba::monitor::Url;
+use ariba::monitor::QueryManager;
+use ariba::monitor::AppInstanceStats;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Globals;
+use ariba::Ops::Utils;
+use ariba::Ops::OracleClient;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::Url;
+
+use constant { TRUE => 1, FALSE => 0 };
+
+sub main {
+	my $sendEmail = FALSE;
+	my $sendPage  = FALSE;
+	my $email = '';
+	my $debug = 0;
+	my $productName;
+	my $cluster;
+
+	while(my $arg=shift(@ARGV)){
+			print STDERR "parsing arg $arg\n" if $debug > 1;
+			if($arg =~ /^-d/o){ $debug++; }
+			if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+			if($arg =~ /^-cluster/o){ $cluster=shift(@ARGV); };
+	}
+
+	my $me = ariba::rc::InstalledProduct->new();
+	my $service = $me->service();
+	my %queries;
+	$queries{"influx_details"} = {'measurement' => 'web_server_isup'};
+
+	unless($cluster) {
+		print "Must specify a cluster ('primary' or 'secondary').\n" if( -t STDOUT );
+		exit(0);
+	}
+
+	unless($productName) {
+		print "Must specify a product.\n" if( -t STDOUT );
+		exit(0);
+	}
+
+	unless( grep { $_ eq $productName } (ariba::rc::Globals::sharedServicePlatformProducts(), "an") ) {
+		print "node-status only works for AN and platform shared service products.\n" if( -t STDOUT );
+		exit(0);
+	}
+
+	my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+	unless (@products) {
+		exit(0);
+	}
+	my $down_cnt = 0;
+	my $up_cnt = 0;
+	for my $product (@products) {
+		my $productIdentifier = $product->name();
+		$product->allRolesInCluster($cluster);
+
+ 		my $port = "7443";
+		my %webhosts = %{$product->{'role_details'}->{'httpvendor'}};
+		foreach my $webhost (grep { $webhosts{$_} eq $cluster } keys %webhosts) {
+			my $url = "https://$webhost:$port";
+			my $request = ariba::Ops::Url->new($url);
+			my $results = $request->request(10);
+			if ($request->error()) {
+				buildQuery(\%queries, $productIdentifier, $cluster, $webhost, 1);
+				$down_cnt++
+			} else {
+				buildQuery(\%queries, $productIdentifier, $cluster, $webhost, 0);
+				$up_cnt++
+			}
+		}
+		my %queries_cnt;
+		$queries_cnt{"influx_details"} = {'measurement' => 'web_server_isup_cnt'};
+		$queries_cnt{"Web Server isup count up"} = {
+				perl => sub { return $up_cnt; },
+				inf_field   => "isup_count",
+				inf_default => 0,
+				inf_tags    => qq(product="$productIdentifier",cluster="$cluster"),
+				group_by    => "$productIdentifier,$cluster"
+		};
+		$queries_cnt{"Web Server isup count down"} = {
+				perl => sub { return $down_cnt; },
+				inf_field   => "isdown_count",
+				inf_default => 0,
+				inf_tags    => qq(product="$productIdentifier",cluster="$cluster"),
+				group_by    => "$productIdentifier,$cluster"
+		};
+		my $qm = ariba::monitor::QueryManager->newWithDetails('web_server_isup', $productIdentifier, $service, '', \%queries);
+		$qm->processQueries();
+		my $qm_cnt = ariba::monitor::QueryManager->newWithDetails('web_server_isup_cnt', $productIdentifier, $service, '', \%queries_cnt);
+		$qm_cnt->processQueries();
+	}
+}
+
+sub buildQuery {
+	 my $queries = shift;
+	 my $productname = shift;
+	 my $cluster = shift;
+	 my $webhost = shift;
+	 my $isup = shift;
+
+	 $$queries{"Web Server isup $webhost"} = {
+			 perl => sub { return $isup; },
+			 inf_field   => "isup",
+			 inf_default => 0,
+			 inf_tags    => qq(product="$productname",cluster="$cluster",webhost="$webhost"),
+			 group_by    => "$productname,$cluster,$webhost"
+	 };
+	 $$queries{"Web Server isup $webhost string"} = {
+			 perl => sub { return $isup == 0 ? "up" : "down"; },
+			 inf_field   => "isup_str",
+			 inf_default => 0,
+			 inf_tags    => qq(product="$productname",cluster="$cluster",webhost="$webhost"),
+			 group_by    => "$productname,$cluster,$webhost"
+	 };
+}
+
+main();

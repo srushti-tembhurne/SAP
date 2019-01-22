@@ -1,0 +1,136 @@
+#!/usr/local/bin/perl 
+
+# This script displays all the routers interfaces and their throughput
+#
+#
+# $Id: //ariba/services/monitor/bin/network/network-errors#8 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::rc::InstalledProduct;
+use ariba::Ops::Machine;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::Ops::NetworkUtils;
+use ariba::monitor::CircularDB;
+use ariba::monitor::QueryManager;
+use ariba::monitor::StatusPage;
+use ariba::monitor::Query;
+
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my $debug = 0;
+
+    while(my $arg=shift(@ARGV)){
+        if($arg =~ /^-d/o){ $debug = 1; };
+        if($arg =~ /^-e/o){ $sendEmail = 1; };
+        if($arg =~ /^-p/o){ $sendPage = 1; };
+    }
+
+    my $me = ariba::rc::InstalledProduct->new();
+    my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
+    my @deviceServices = ('router', 'switch', 'loadbalancer', 'firewall');
+
+    for my $datacenter (@dataCenters) {
+        my %queries = ();
+
+        my %matchDatacenter = (
+            status               => 'inservice',
+            datacenter           => $datacenter,
+            monitoringDatacenter => '',
+        );
+
+        my %matchMonitoringDatacenter = (
+            status                => 'inservice',
+            monitoringDatacenter  => $datacenter,
+        );
+
+        my @devices = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+        @devices = (@devices, ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+
+        for my $device (@devices) {
+            my $deviceName = $device->hostname();
+        
+            my $uiHint = 'server';
+            my $service;
+            foreach $service (@deviceServices) {
+                if ($device->provides($service)) {
+                    $uiHint = $service;
+                }
+            }
+
+            print "Working on $uiHint [$deviceName] in $datacenter\n" if ($debug);
+
+
+            # We cannot retrieve everything in one call or
+            # it would run out of files handles
+            my @toDisplay = qw(ifInErrors ifOutErrors ifInDiscards ifOutDiscards);
+
+            for my $item (@toDisplay) {
+                my $cdbs     = ariba::monitor::CircularDB->listDBs("snmp/$deviceName", "${item}_Packets");
+
+                for my $cdb (@$cdbs) {
+
+                    my $cdbTrueName = $cdb->name(1);
+                    $cdbTrueName =~ s/ /_/g;
+
+                    my $query = ariba::monitor::Query->new("snmp/" . $cdbTrueName);
+
+                    my $queryName = $cdb->name();
+                    $queryName =~ s/ Packets//;
+
+                    my $interfaceStat = $queryName;
+                    $interfaceStat =~ s/$deviceName\///;
+                    print "Interface Stat: [$interfaceStat]\n\n" if ($debug);
+
+                    my @interfaceStatParts =  split(' ', $interfaceStat);
+                    my $interface = $interfaceStatParts[0];
+
+                    my $file = $cdb->fileName();
+
+                    my $samples = 1;
+                    my $cdbName = "average($file, $samples)";
+
+                    my $format = "%d packet(s)\n";
+
+                    my $warn = ($queryName =~ /Errors$/) ? 'answer && previousAnswer && answer - previousAnswer > 1' : '';
+
+                    $queries{$queryName} = {
+                        uiHint  => $uiHint,
+                        format  => $format,
+                        info    => 1,
+                        warn    => $warn,
+                        hasErraticSchedule => 1,
+                        ticketOnWarnOpenAfterMinutes => 1,
+                        ticketSubmitter => 'dept_an_ops_prod@ariba.com',
+                        ticketOwner => "unassigned-network",
+                        extractRecorded => $cdbName,
+                        inf_field => "packets",
+                        inf_tags => qq|datacenter=$datacenter,device_service=$uiHint,device_name=$deviceName,interface=$interface,ifioitem=$item|,
+                        inf_default => 0,
+                        group_by => "$datacenter,$service,$uiHint,$deviceName,$interface,$item",
+                    };
+
+                }
+            }
+        }
+
+        next unless scalar(keys(%queries));
+
+        my $email = $me->default('notify.email');
+
+        $queries{influx_details} = {measurement => "network_errors"};
+        my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+
+        my $q = ariba::monitor::QueryManager->newWithDetails("network-errors", $pn, $me->service(), $me->customer(), \%queries);
+
+        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+
+    }
+}
+
+main();
+
+__END__

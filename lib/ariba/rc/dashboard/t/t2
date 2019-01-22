@@ -1,0 +1,22 @@
+#!/usr/local/bin/perl
+#
+# Test tool: Publishes dummy data to RC Dashboard via HTTP API
+#
+
+$|++;
+use strict;
+use warnings;
+use Carp;
+use Data::Dumper;
+use FindBin;
+use lib '/home/rc/lib/perl';
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../lib/perl";
+use lib "$FindBin::Bin/../bin/admin/bin";
+use ariba::rc::dashboard::ClientRP;
+
+my $client = new ariba::rc::dashboard::ClientRP();
+$client->{'verbose'} = 1;
+# $client->running( $buildname, "rsync", undef, $prodname, $branchName, $releaseName, $service );
+my $res = $client->running ();
+

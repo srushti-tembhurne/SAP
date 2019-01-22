@@ -1,0 +1,154 @@
+#!/usr/local/bin/perl -w
+
+# $Id: //ariba/services/monitor/bin/redis/redis-nodes-status#1
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+use JSON;
+use Net::Telnet;
+use Data::Dumper;
+use ariba::rc::Utils;
+use ariba::Ops::PageUtils;
+use ariba::rc::Utils;
+use Net::SSH::Perl;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
+use ariba::rc::InstalledProduct;
+
+my $debug = 0;
+my $urlTimeout = 20;
+my $me = ariba::rc::InstalledProduct->new( 'mon' );
+my $user = $me->default("DBAInfo.REDIS.ADMIN.userName");
+my $pass = $me->default("dbainfo.redis.ADMIN.password");
+my $muser = $me->default("DBAInfo.REDIS.RLEC.userName");
+my $mpass = $me->default("dbainfo.redis.RLEC.password");
+if(!$user or !$pass or !$muser or !$mpass){
+	die "\n Redis configs not present in mon.. exiting... ";
+}
+
+main();
+sub main {
+    my $sendEmail = 0;
+    my $sendPage = 0;
+    my %queries;
+    my $redport = 9443;
+    while(my $arg=shift(@ARGV)){
+        if($arg =~ /^-d/o){ $debug = 1; }
+        if($arg =~ /^-e/o){ $sendEmail = 1; };
+        if($arg =~ /^-p/o){ $sendPage = 1; };
+    }
+    my $service = $me->service();
+    my $monserver = ariba::Ops::PageUtils::monitorServer();
+    my @split = split /\./, $monserver;
+    my $dc = $split[1];
+
+    my $host = 'redis'.$service.'.'.$dc.'.ariba.com';
+
+    my $ssh     = ariba::rc::Utils::sshCmd();
+    $ssh .= " -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no ";
+
+    my $command = sprintf('%s %s@%s %s/%s', $ssh, $user, $host, '/opt/redislabs/bin', 'rladmin status');
+    my @output ;
+    print "Executing command: $command\n\n" if $debug;
+    ariba::rc::Utils::sshCover($command, $pass, undef, undef, \@output);
+
+	
+    my $result = join "\n", @output;
+    $result =~ s/EXTERNAL_ADDRESS//;
+    $result =  &format($result);
+    my $end = '</td></tr><tr><td>';
+    my $mid = '</td><td style="width:120px !important;">';
+    $result =~ s/\n/$end/g;
+    $result =~ s/\s+/$mid/g;
+    $result = '<html><blockquote><table><tr><td>' . $result;
+    $result = $result . '</td></tr></table></blockquote></html>';
+######  Too Much Information #####
+#    $queries{"Redis Summary"} = {
+#                    perl    => sub { return $result; },
+#                    description => "Redis Cluster Details",
+#                    uiHint => "Summary",
+#    };
+    my $url = 'https://'.$host.':'.$redport;
+    my $surl = $url.'/v1/nodes';
+    my $cmd = "curl -s -u $muser:$mpass ". '--insecure '.$surl;
+    my $results = `$cmd`;
+    if($results !~ /\S+/){
+		die "\n Could not complete Curl - no results.. exiting";
+    }
+    my $ref =  decode_json( $results);
+    my %nodehash;
+    foreach my $node(@$ref){
+        my $name= $node->{uid};
+        my $ip= $node->{addr};
+	    $nodehash{$name} = $ip;	
+    }
+
+   foreach my $nid(keys %nodehash){
+	    my $rhost = $nodehash{$nid};
+    	my $ssh     = ariba::rc::Utils::sshCmd();
+
+        my $command = sprintf('%s %s@%s %s/%s', $ssh, $user, $rhost, '/opt/redislabs/bin/', 'cnm_ctl status');
+        my @output ;
+        print "Executing command: $command\n\n" if $debug;
+        ariba::rc::Utils::sshCover($command, $pass, undef, undef, \@output);
+	    print "\n Output = ", join "\n", @output if($debug);
+	    foreach my $line(@output){
+		    chomp($line);
+		    my $status = 'error';
+		    my $param;
+            #if($line =~ /(\S+)\s+\(pid  (\d+)\) is running\.\.\./){
+            if($line =~ /(\S+)\s+RUNNING\s+ pid\s+(\d+).*/){
+                $status = 'Running';
+                $param = $1;
+
+            }
+            elsif($line =~ /(\S+)\s+(\S+).*/i){
+                $param = $1;
+                $status = $2;
+            }
+
+		    $queries{"Redis_Node_".$nid."_".$param."_Process"} = {
+        	            perl    => sub { return $status; },
+	                    description => "Redis Process Details",
+			            crit => "answer ne 'Running'",
+			            info => "answer eq 'Running'",
+                	    uiHint => "Node ".$nid,
+                            inf_field => "node_status",
+                            inf_tags => qq|node_id=$nid,param=$param|,
+         	};
+	    }
+
+    }
+ 
+    $queries{influx_details} = {measurement => "redis_nodes_details"};
+
+    my $qm = ariba::monitor::QueryManager->newWithDetails('Redis Nodes Details', 'mon', $service, "", '', \%queries);
+    my $email = $me->default('notify.email') || $me->default('notify');
+    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+
+}
+
+sub format {
+	my $result = shift;
+	my @res = split/\n/, $result;
+	foreach (my $i=0; $i < scalar @res; $i++){
+		my @temp = split /\s+/, $res[$i];
+		if ($temp[0] eq uc($temp[0])) {
+			if(!$i){
+				$res[$i] = '<h3>NODES:</h3>';
+				next;
+			}
+			if($temp[0] =~ /\:$/){
+				$res[$i] = '<br><br><H3>'.$res[$i].'</H3>';	
+				next;
+			}
+			for(my $j=0;$j < scalar @temp; $j++){
+				$temp[$j] = '<strong><u>'.$temp[$j].'</u></strong>';
+			}	
+			$res[$i] = join "    ", @temp;
+		}
+	}
+	return join "\n", @res;
+}
+

@@ -1,0 +1,127 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::Constants;
+use ariba::rc::CipherStore;
+use ariba::rc::Utils;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Globals;
+use Data::Dumper;
+
+sub main
+{
+    my $sendEmail = 0;
+    my $sendPage  = 0;
+    my $debug     = 0;
+    my $force     = 0;
+
+    while (my $arg = shift)
+    {
+        if ($arg =~ /^-d/o) {$debug++}
+        if ($arg =~ /^-f/o) {$force++}
+    }
+
+    $main::quiet = 1 unless ($debug);
+
+    my $me = ariba::rc::InstalledProduct->new();
+
+    my $email        = $me->default('notify.email');
+    my $cluster      = $me->currentCluster();
+    my $otherCluster = $me->otherCluster();
+    my $service      = $me->service();
+
+    my $cipherStore = ariba::rc::CipherStore->new($me->service());
+    my $monUser     = ariba::rc::Globals::deploymentUser($me->name(), $me->service());
+    my $password    = $cipherStore->valueForName($monUser);
+
+    unless ($password)
+    {
+        print "Failed to get password for $monUser\n" if ($debug);
+        exit ();
+    }
+
+    my $product_info;
+    foreach my $prod (ariba::rc::InstalledProduct->installedProductsList())
+    {
+        my $product_name = $prod->name();
+
+        my @hosts    = $prod->hostsForRoleInCluster('copyhost', $cluster)      if ($cluster);
+        my @dr_hosts = $prod->hostsForRoleInCluster('copyhost', $otherCluster) if ($otherCluster);
+
+        push (@hosts, [shift (@hosts),    "$cluster"])      if (scalar (@hosts));
+        push (@hosts, [shift (@dr_hosts), "$otherCluster"]) if (scalar (@dr_hosts));
+
+        # this is only needed if the product runs on multiple clusters
+        next unless (scalar (@hosts));
+
+        my $installDir = $prod->installDir();
+        foreach my $hostinfo (@hosts)
+        {
+            my $hostName = $hostinfo->[0];
+            my $cluster  = $hostinfo->[1];
+            my @output;
+            my $result = "unknown";
+            my $retry  = 2;
+
+            while ($retry-- > 0)
+            {
+                unless (ariba::rc::Utils::executeRemoteCommand("ssh $monUser\@$hostName \"ls -l $installDir/../bin\"", $password, 0, undef, undef, \@output,))
+                {
+                    $result = "failed to execute command remotely.";
+                }
+                else
+                {
+                    $result = "result was not parsed correctly";
+                    foreach my $line (@output)
+                    {
+                        if ($line =~ / -> /)
+                        {
+                            my ($jnk, $dir) = split (' -> ', $line);
+                            $dir =~ s|/bin$||;
+                            if ($installDir eq $dir)
+                            {
+                                $dir =~ m|([^/]+$)|;
+                                my $subdir = $1;
+                                $result = "ok - $subdir installed";
+                            }
+                            else
+                            {
+                                $result = "$cluster install $dir does not match $installDir";
+                            }
+                            $retry = 0;
+                            last;
+                        }
+                    }
+                }
+            }
+            $product_info->{$product_name}->{$cluster} = $result;
+        }
+    }
+
+    foreach my $pname (keys %{$product_info})
+    {
+        my $row = $product_info->{$pname};
+        foreach my $cluster (keys %{$row})
+        {
+            my %queries;
+            $queries{"$pname $cluster"} = {
+                                           perl      => sub {return $row->{$cluster};},
+                                           inf_field => "state",
+                                           inf_tags  => qq(cluster="$cluster"),
+                                          };
+            $queries{influx_details} = {measurement => "product_deployment_status"};
+            my $qm = ariba::monitor::QueryManager->newWithDetails("product_deployment_status", $pname, $service, undef, undef, \%queries);
+            $qm->processQueries();
+        }
+    }
+}
+
+main(@ARGV);
+
+__END__
+
+

@@ -1,0 +1,13 @@
+#!/usr/local/bin/perl -w
+use strict;
+
+use ariba::Ops::OW::Component;
+
+sub main {
+	my $template = ariba::Ops::OW::Component->newFromHtmlFile($ARGV[0]);
+
+	$template->displayToStream();
+}
+
+main();
+

@@ -1,0 +1,173 @@
+#!/usr/local/bin/perl -w
+
+# Check the ssl session cache size
+# 
+# $Id: //ariba/services/monitor/bin/ws/cache-and-log-size#5 $
+
+use strict;
+use FindBin;
+use lib "$FindBin::RealBin/../../lib";
+
+use ariba::monitor::QueryManager;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::rc::CipherStore;
+use ariba::rc::InstalledProduct;
+use ariba::rc::Passwords;
+use ariba::rc::Utils;
+
+my $debug	= 0;
+
+sub usage {
+	my $error = shift; 
+
+	print "$0 -product <productName> [-d|-e|-p]\n\n"; 
+	print "	-product  Specifies the product to check\n";
+	print "	-d        Turns on debug mode\n"; 
+	print "	-e        Sends email\n";
+	print "	-p        Sends page\n";
+
+	print "\nError: $error\n" if ($error);
+
+	exit;
+}
+
+sub main {
+	my $sendEmail = 0;
+	my $sendPage  = 0;
+	my $productName;
+
+	while (my $arg = shift) {
+		if ($arg =~ /^-d$/o) { $debug++; next }
+		if ($arg =~ /^-e$/o) { $sendEmail = 1; next }
+		if ($arg =~ /^-p$/o) { $sendPage  = 1; next }
+		if ($arg =~ /^-product$/o) { $productName = shift; next; }
+	}
+
+	usage('Product is required') unless ($productName);
+
+	$main::quiet = 1 unless ($debug);
+
+	my $me         = ariba::rc::InstalledProduct->new();
+	my $service    = $me->service();
+	my $cluster     = $me->currentCluster();
+
+	unless (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
+		print uc($productName), " product not installed for $service\n" if ($debug);
+		exit;
+	}
+
+	my $ws          = ariba::rc::InstalledProduct->new($productName, $service);
+	my $role        = $ws->webserverRole();
+	
+
+	my $serviceHost = $ws->default('servicehost');
+	
+	unless ($serviceHost) {
+		print "Could not get service host for ", uc($productName), "\n" if ($debug); 
+		exit; 
+	};
+
+	my $logDir = "/var/log/apache/$serviceHost";
+
+	my @webMachines = $ws->hostsForRoleInCluster($role, $ws->currentCluster());
+	my $user  = $ws->deploymentUser();
+
+	my $cipherStore = ariba::rc::CipherStore->new($service, $user);
+	my $password    = $cipherStore->valueForName($user);
+	
+	unless ($password) {
+		print "Could not determine password for $user in $service!\n" if ($debug);
+		exit;
+	};
+
+	my %queries;
+	my $MB = 1024 * 1024;
+
+	foreach my $webserver (@webMachines) {
+		my $ymd = DateTime->now('time_zone' => 'local')->ymd('.');
+		my $sslCacheFile = "$logDir/safe/ssl_scache.pag";
+		my $accessLogFile = "$logDir/access.$ymd";
+		my $errorLogFile = "$logDir/error.$ymd";
+
+		my @filesToCheck = ($sslCacheFile, $accessLogFile, $errorLogFile);
+		my ($error, $sslCacheSize, $accessLogSize, $errorLogSize) = 
+			sizeOfFilesOnServer(\@filesToCheck, $webserver, $user, $password);
+
+		$queries{"$webserver - ssl session cache size"} = {
+			recordMaxResults	=> 110000,
+			recordDataType		=> 'gauge',
+			recordItem			=> 'answer',
+			noRowCount 			=> 1,
+			uiHint	=> $webserver,
+			format	=> $error ? undef : '%.2f MB(s)',
+			info	=> 'defined(answer)',
+			warn	=> 'answer =~ /fail/ || answer > 100',
+			crit	=> 'answer > 500',
+			perl	=> sub { return $error || $sslCacheSize / $MB; },
+            inf_field   => "ssl_session_cache_size",
+            inf_tags    => "web_server=\"$webserver\"",
+            inf_default => 0,
+            group_by    => "$webserver",
+        } unless ($productName eq 'ws');
+
+		$queries{"$webserver - error log size"} = {
+			recordMaxResults	=> 110000,
+			recordDataType		=> 'gauge',
+			recordItem			=> 'answer',
+			noRowCount 			=> 1,
+			uiHint	=> $webserver,
+			format	=> '%.2f MB(s)',
+			info	=> 'defined(answer)',,
+			warn	=> 'answer > ' . ($accessLogSize / $MB),
+			error	=> $error,
+			perl	=> sub { return $error || $errorLogSize / $MB; },
+            inf_field   => "error_log_size",
+            inf_tags    => "web_server=\"$webserver\"",
+            inf_default => 0,
+            group_by    => "$webserver",
+        };
+	}
+
+    $queries{'influx_details'} = { measurement => 'ws_cache_log_size' };
+	my $notify = $me->default("notify.email");
+	my $qm = ariba::monitor::QueryManager->newWithDetails(
+			"cache-and-log-size", $productName, $service, $me->customer(), \%queries
+	);
+	$qm->processQueries($debug, $notify, $sendEmail, $sendPage);
+}
+
+sub sizeOfFilesOnServer {
+	my $filesRef = shift; 
+	my $server = shift; 
+	my $user = shift;
+	my $password = shift;
+	my @sizeOfFiles;
+
+	return 'No files to check size for' unless (@$filesRef);
+
+	my $files = join(' ', @$filesRef);
+	my $ssh = ariba::rc::Utils::sshCmd();
+	my $cmd = "$ssh $user\@$server ls -l $files"; 
+
+	my @output;
+	my $success = executeRemoteCommand($cmd, $password, 0, undef, undef, \@output);
+	my $output = join("\n", @output);
+	unless ($success) {
+		# It is ok if the files are not found.
+		return "failed to execute $cmd\nError: $!\nOutput: $output" unless ($! && $! =~ /Bad file descriptor/);
+	}
+	
+	print "$output\n\n" if ($debug);
+	foreach my $file (@$filesRef) {
+		$file = quotemeta($file); 
+		if ($output =~ /\s+(\d+)\s+\S+\s+\S+\s+\S+\s+$file$/m) {
+			push(@sizeOfFiles, $1);
+		} else {
+			push(@sizeOfFiles, undef);
+		}
+	}
+
+	return (undef, @sizeOfFiles);
+}
+
+main(@ARGV);
