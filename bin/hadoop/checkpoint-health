@@ -97,18 +97,9 @@ sub main {
                     'the product and it is up. Check the Secondary Name node\'s kr log' . 
                     'to see what happened. Escalate to Tools if needed.', 
                 Tools => 'Debug based on the Secondary Name node\'s kr log',
-            ],
-            inf_field => "checkpoint_fsimage_last_mod",
-            inf_default => "none",
-            inf_tags => "host=\"$host\"",
+            ]
         };
     }
-
-    $queries{"checkpoint fsimage on $host - last modified crit threshold"} = {
-        perl      => sub { $checkpointInterval },
-        inf_field => "cflm_crit_threshold",
-        inf_tags  => "host=\"$host\"",
-    };
 
     $queries{'checkpoint fsimage - validation'} = {
         warn                => 'answer ne "OK"',
@@ -126,17 +117,13 @@ sub main {
                 'node\'s kr log to see what happened. If the oiv tool failed, ' . 
                 'correct based on what the error. Otherwise, Escalate to Tools if needed.', 
             Tools => 'Debug based on the error',
-        ],
-        inf_field => "checkpoint_fsimage_validation",
-        inf_default => "none",
-        inf_tags => "host=\"$host\"",
+        ]
     };
 
     my $email = $me->default('notify.email');
 
-    $queries{"influx_details"} = {measurement => "hadoop_checkpoint"};
     my $qm = ariba::monitor::QueryManager->newWithDetails('checkpoint', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queries);
-    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 } 
 
 sub checkpointImageLastModifiedAgeForProduct {

@@ -1,8 +1,9 @@
 #!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/network/power#12 $
+# $Id: //ariba/services/monitor/bin/network/power#15 $
 
 use strict;
+use File::Basename;
 use FindBin;
 use lib "$FindBin::Bin/../../lib";
 
@@ -13,25 +14,28 @@ use ariba::Ops::Machine;
 use ariba::Ops::ProductAPIExtensions;
 use ariba::rc::CipherStore;
 use ariba::rc::InstalledProduct;
+use dmail::LockLib;
 
 my $docURL = 'http://ops.ariba.com/documentation/network-admin/docs/network-power.txt';
+my $lockFile = "/tmp/" . basename($0);
 
 sub main {
-
 	my $sendEmail = 0;
 	my $sendPage  = 0;
-	my $debug	 = 0;
+	my $debug     = 0;
 
 	while (my $arg = shift(@ARGV)) {
 		if ($arg =~ /^-e/o) { $sendEmail = 1; };
 		if ($arg =~ /^-p/o) { $sendPage  = 1; };
-		if ($arg =~ /^-d/o) { $debug	 = 1; };
+		if ($arg =~ /^-d/o) { $debug     = 1; };
 	}
 
-	my $me	= ariba::rc::InstalledProduct->new();
+	die "can't grab lock\n" unless dmail::LockLib::requestlock($lockFile, 5);
+
+	my $me    = ariba::rc::InstalledProduct->new();
 	my $email = $me->default('notify.email');
 
-	my $cipherStore	= ariba::rc::CipherStore->new($me->service());
+	my $cipherStore    = ariba::rc::CipherStore->new($me->service());
 	my $accessPassword = $cipherStore->valueForName('networkAccess');
 
 	for my $datacenter ( ariba::Ops::ProductAPIExtensions::datacentersForProducts($me) ) {
@@ -41,20 +45,20 @@ sub main {
 		my %matchDatacenter = (
 			'datacenter' => $datacenter,
 			'providesServices' => 'switch',
-			'os'               => 'catos, ios, ios-xe, IOS-XE',
+			'os'               => 'catos, ios, ios-xe, IOS-XE, eos',
 			'status'           => 'inservice',
 			'monitoringDatacenter' => '',
 		);
 
 		my %matchMonitoringDatacenter = (
-			'status'		   => 'inservice',
+			'status'           => 'inservice',
 			'providesServices' => 'switch',
-			'os'               => 'catos, ios, ios-xe, IOS-XE',
+			'os'               => 'catos, ios, ios-xe, IOS-XE, eos',
 			'monitoringDatacenter' => $datacenter,
 		);
 
-				my @machines = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
-				@machines = (@machines , ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+                my @machines = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
+                @machines = (@machines , ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
 
 		# There is a bug in PersistantObject.pm matching code. 
 		# As a work arounf we get switches first then routers.
@@ -63,20 +67,20 @@ sub main {
 		%matchDatacenter = (
 			'datacenter' => $datacenter,
 			'providesServices' => 'router',
-			'os'			   => 'catos, ios',
-			'status'		   => 'inservice',
+			'os'               => 'catos, ios',
+			'status'           => 'inservice',
 			'monitoringDatacenter' => '',
 		);
 
 		%matchMonitoringDatacenter = (
-			'status'		   => 'inservice',
+			'status'           => 'inservice',
 			'providesServices' => 'router',
-			'os'			   => 'catos, ios',
+			'os'               => 'catos, ios',
 			'monitoringDatacenter' => $datacenter,
 		);
 
-				@machines = (@machines , ariba::Ops::Machine->machinesWithProperties(%matchDatacenter));
-				@machines = (@machines , ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
+                @machines = (@machines , ariba::Ops::Machine->machinesWithProperties(%matchDatacenter));
+                @machines = (@machines , ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
 
 		foreach my $machine (@machines) {
 
@@ -90,6 +94,11 @@ sub main {
 
 			# Create a networkDevice, and get the power supply status.
 			my $networkDevice = ariba::Ops::NetworkDeviceManager->newFromMachine($machine);
+			unless($networkDevice) {
+				print "[DEBUG] driver init failed for $hostname: '$@', skipping...\n" if $debug;
+				$@ = undef; # clear the error
+				next;
+			}
 
 			$networkDevice->setAccessPassword($accessPassword);
 
@@ -99,15 +108,13 @@ sub main {
 
 				$queries{"$hostname power supply status for PS${ps}"} = {
 					noRowCount => 1,
-					info => "answer eq 'ok' || answer eq 'on' || answer eq 'normal'",
+					info => "answer eq 'ok' || answer eq 'on' || answer eq 'normal' || answer eq 'enabled'",
 					warn => "answer eq 'unknown' || answer eq 'minorFault' || answer eq 'other'
-						|| answer eq 'notPresent'",
-					crit => "answer eq 'majorFault' || answer eq 'off' || answer eq 'failed'",
+						|| answer eq 'notPresent' || answer eq 'testing'",
+					crit => "answer eq 'majorFault' || answer eq 'off' || answer eq 'failed' || answer eq 'disabled'",
 					perl => "return '$psStatus{$ps}'",
 					inf_field => "PS${ps}Status",
 					inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
-					inf_default => 0,
-					group_by => "$datacenter,$hostname",
 				};
 			}
 		}
@@ -115,13 +122,12 @@ sub main {
 		# For dev
 		next unless keys %queries;
 
-		#$queries{"For more info about power supplies see"} = {
-		#	perl => "'below'",
-		#	note => "<html><a href=\"$docURL\">$docURL</a></html>",
-		#	info => 1,
-		#};
+		$queries{"For more info about power supplies see"} = {
+			perl => "'below'",
+			note => "<html><a href=\"$docURL\">$docURL</a></html>",
+			info => 1,
+		};
 
-		$queries{influx_details} = {measurement => "network-power-supply"};
 		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
 		my $qm = ariba::monitor::QueryManager->newWithDetails(
 			'network-power-supply', $pn, $me->service(), $me->customer(), \%queries
@@ -129,6 +135,7 @@ sub main {
 
 		$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 	}
+	dmail::LockLib::releaselock($lockFile);
 }
 
 main();

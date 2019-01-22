@@ -1,7 +1,7 @@
 #!/usr/local/bin/perl -w
 
 # machine-watcher 97-04-02 Dan Grillo <grio@280.com>
-# $Id: //ariba/services/monitor/bin/common/dns-watcher#23 $
+# $Id: //ariba/services/monitor/bin/common/dns-watcher#24 $
 #
 # Based on an idea in a program orginally by Bryce Jasmer
 
@@ -42,7 +42,7 @@ sub main {
 	my $me          = ariba::rc::InstalledProduct->new();
 	my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
 	my $pager       = $me->default('notify.email');
-	my $qmName	= 'dns-watcher-stratus';
+	my $qmName	= 'dns-watcher';
 	my $progName	= $0;
 
 	my $lockFile = "/tmp/$qmName";
@@ -51,7 +51,7 @@ sub main {
 		die "can't grab lock\n";
 	}
 
-	#
+	# 
 	ariba::monitor::MachineHelper::setDebug($debug);
 
 	# The config file can modify our resolver behavior.
@@ -59,9 +59,9 @@ sub main {
 	my $dnsServer = readConfigFile($dnsRecordFile, \@otherDnsRecords) if $dnsRecordFile;
 
 	my @allServerList = $res->nameservers();
-
+								
 	my ($goodListRef, $badListRef) = getGoodList(@allServerList);
-
+	
 	my @goodList = @$goodListRef;
 	my @badList = @$badListRef;
 
@@ -85,13 +85,11 @@ sub main {
 
 		my %queries = ();
 		my $badListString;
-		my $badCount = 0;
 
 		unless(@badList) {
 			$badListString = "ok";
 		} else {
 			$badListString = join(', ', @badList);
-			$badCount = scalar(@badList);
 		}
 
 		$queries{"Invalid DNS servers"} = {
@@ -101,21 +99,7 @@ sub main {
 			crit       => "answer ne 'ok'",
 			perl       => sub { return $badListString },
             inf_field => "invalidDNSServers",
-            inf_default => "ok",
-            inf_tag => qq(datacenter="$datacenter"),
-            group_by => "$datacenter",
-		};
 
-		$queries{"Invalid DNS servers count"} = {
-			noRowCount => 1,
-			format     => "</td><td colspan=2>%s",
-			info       => 1,
-			crit       => "answer > 0",
-			perl       => sub { return $badCount },
-			inf_field => "invalidDNSServersCount",
-			inf_default => 0,
-			inf_tag => qq(datacenter="$datacenter"),
-			group_by => "$datacenter",
 		};
 
 		if (@goodList) {
@@ -123,27 +107,37 @@ sub main {
 				$queries{sprintf("%s dns entry", $machine->hostname())} = {
 					noRowCount => 1,
 					format     => "</td><td>%s</td><td>scaledStatusChangeTime\n",
-					info       => "answer eq '0'", # up
-					warn       => "answer eq '1'", # sick
-					crit       => "answer eq '2'", # down
+					info       => "answer eq 'up'",
+					warn       => "answer eq 'sick'",
+					crit       => "answer eq 'down'",
 					perl       => sub { main::checkDNS($machine) },
                     inf_field  => "DNSStaus",
                     inf_tags   => qq|hostname="|.$machine->hostname().qq|"|,
-                    inf_default => 0,
-                    group_by => "$datacenter".$machine->hostname(),
+					processAnswer => sub { 
+						ariba::monitor::MachineHelper::computeStatusChange($machine, $hysteresis)
+					},
 				};
 			}
 		}
 
-        $queries{influx_details} = {measurement => "dns_watcher"};
 		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
 
 		my $qm = ariba::monitor::QueryManager->newWithDetails(
 			$qmName, $pn, $me->service(), $me->customer(), \%queries
 		);
 
-    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+		$qm->run();
+		#$qm->runInParallel(10);
 
+		if ($debug) {
+                        $qm->displayToStdout();
+                } else {
+                        $qm->checkStatus();
+                        $qm->archiveResults();
+			$qm->displayToLog();
+		}
+
+		ariba::monitor::MachineHelper::notifyPeople($me, $progName, $pager, $sendPage, \@machines);
 	}
 
 	dmail::LockLib::releaselock($lockFile);
@@ -199,10 +193,10 @@ sub checkDNS {
 	$machine->setNewTime(time());
 
 	unless ($query) {
-		$machine->setNewStatus(2);
+		$machine->setNewStatus("down");
 		$machine->setNewError($res->errorstring());
 	} else {
-		$machine->setNewStatus(0);
+		$machine->setNewStatus("up");
 	}
 
 	return $machine->newStatus();
@@ -212,10 +206,10 @@ sub getGoodList {
 	my @thisServerList = @_;
 	my @thisGoodList;
 	my @thisBadList;
-
+	
 	for my $ns (@thisServerList) {
 		$res->nameservers($ns) if $ns;
-
+	
 		unless ($res->search($ns)) {
 			push(@thisBadList, $ns);
 		} else {

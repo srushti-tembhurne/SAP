@@ -104,9 +104,7 @@ sub main {
             correctiveActions   => [
                 Ops => 'Correct the problem based on the reported error from fsck. Escalate to Tools if needed.', 
                 Tools => 'Debug based on error',
-            ],
-            inf_field => "file_system_check",
-            inf_default => "none",
+            ]
         };
     } elsif ($runSanity) {
         my $host = ariba::Ops::NetworkUtils::hostname();
@@ -121,10 +119,7 @@ sub main {
             correctiveActions   => [
                 Ops => 'Correct the problem based on the reported error from fsck. Escalate to Tools if needed.', 
                 Tools => 'Debug based on error',
-            ],
-            inf_field => "file_system_check",
-            inf_default => "none",
-            inf_tags => qq|host="$host"|,
+            ]
         };
     } elsif ($runReplica) {
         my $results = runFsck($hadoop, $runReplica);
@@ -136,7 +131,6 @@ sub main {
             description         => qq`Runs 'hdfs fsck' and report on the number of blocks with no replicas in the cluster.
                 CRIT if the number of missing replicas is > 5`,
             inf_field => "missing_replicas",
-            inf_default => "none",
         };
     } else {
         my $stats = hdfsHealth($hadoop);
@@ -144,11 +138,9 @@ sub main {
     }
 
     my $email = $me->default('notify.email');
-    $queries{"influx_details"} = {measurement => "hdfs_health"};
-
 
     my $qm = ariba::monitor::QueryManager->newWithDetails('HDFS', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queries);
-    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 } 
 
 sub runFsck {
@@ -463,7 +455,6 @@ sub populateQueriesForStatsWithNamePrefix {
 
         (my $inf_field = "$queryNamePrefix $queryName") =~ s/^\s*(.*?)$/$1/;
         $inf_field =~ s/\s+/_/g;
-
         $queries->{"$queryNamePrefix $queryName"} = {
             format  => $format,
             uiHint  => $uiHint,
@@ -473,8 +464,6 @@ sub populateQueriesForStatsWithNamePrefix {
             recordMaxResults => $recordMaxResults,
             critOnWarnAfterMinutes => $critOnWarnAfterMinutes,
             inf_field => $inf_field,
-            inf_default => "none",
-            group_by => "1", 
         };
     }
 }

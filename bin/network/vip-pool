@@ -3,6 +3,7 @@
 # $Id: //ariba/services/monitor/bin/network/redundancy-check#12 $
 
 use strict;
+use File::Basename;
 use FindBin;
 use lib "$FindBin::Bin/../../lib";
 
@@ -13,8 +14,10 @@ use ariba::rc::InstalledProduct;
 use ariba::Ops::Machine;
 use ariba::Ops::ProductAPIExtensions;
 use ariba::SNMP::Session;
+use dmail::LockLib;
 
 my $debug = 0;
+my $lockFile = "/tmp/" . basename($0);
 
 sub main {
     my $sendEmail = 0;
@@ -31,6 +34,8 @@ sub main {
         if ($arg =~ /^-p/o) { $sendPage  = 1; };
         if ($arg =~ /^-d/o) { $debug     = 1; };
     }
+
+    die "can't grab lock\n" unless dmail::LockLib::requestlock($lockFile, 5);
 
     my $me = ariba::rc::InstalledProduct->new();
     my $email = $me->default('notify.email');
@@ -49,11 +54,17 @@ sub main {
 
         foreach my $host (@machines) {
             my $nm = ariba::Ops::NetworkDeviceManager->newFromMachine($host);
+            unless($nm) {
+                print "[DEBUG] driver init failed for " . $host->hostname() . ": '$@', skipping...\n" if $debug;
+                $@ = undef; # clear the error
+                next;
+            }
             push(@f5Devices, $nm);
         }
 
         foreach my $f5 (@f5Devices) {
             my $snmp = $f5->snmp();
+            $snmp->setTimeout(30);
             my $hostname = $snmp->hostname();
 
             my $walked = $snmp->bulkWalkOidsF5(@oids);
@@ -61,6 +72,10 @@ sub main {
             foreach my $ip ( keys %$walked ) {
                 my $name = $walked->{ $ip }->{ name };
                 my $value = $walked->{ $ip }->{ value };
+
+                ### As per HOA-141795, removing Forwarding IP VIPs, because they'll always be in unknown state 
+                ### and snmp walk can't happen on them
+                next if ( $value == 4);
                 my $status = $poolStates{ $value } || 'unknown';
 
                 $queries{ "$hostname:$name is" } = {
@@ -69,21 +84,19 @@ sub main {
                     perl => "return qq($status)",
                     inf_field => "status",
                     inf_tags => qq|datacenter="$dataCenter",hostname="$hostname",IPName="$name"|,
-                    inf_default => 0,
-                    group_by => "$dataCenter,$hostname",
                 };
             }
         }
 
         if (%queries) {
-            $queries{influx_details} = {measurement => "Network-F5-VIP-Pool"};
             my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($dataCenter);
             my $qm = ariba::monitor::QueryManager->newWithDetails(
                 'Network F5 VIP Pool', $pn, $me->service(), $me->customer(), \%queries
             );
-            $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+            $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
         }
     }
+    dmail::LockLib::releaselock($lockFile);
 }
 
 main();

@@ -651,7 +651,8 @@ sub main {
     my $email = $me->default('notify.email');
 
     my $qm = ariba::monitor::QueryManager->newWithDetails('smp-data-consistency', 'an', $service, undef, \%queries);
-    $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+    my $dbc = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndSchemaId ( $an, ariba::Ops::DBConnection->typeMain() );
+    $qm->setSQLConnectInfoFromDBConnection($dbc);
     ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
     $qm->processQueries($debug, $email, $sendEmail, $sendPage);
 }

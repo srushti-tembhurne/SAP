@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl
+#!/usr/local/bin/perl -w
 
 use strict;
 use Data::Dumper;
@@ -113,7 +113,7 @@ sub main {
 
     for my $webMachine (@webMachines) {
 
-        my $connections = 0;
+        my $connections;
         for my $port (@portsToMonitor) {
 
             for my $lb (@lbs) {
@@ -135,40 +135,27 @@ sub main {
 
         }
 
-        print "$webMachine has $connections connections\n" if $debug;
+    print "$webMachine has $connections connections\n" if $debug;
 
-        my $qname = "Current connections to $webMachine";
-        $queries{$qname} = {
-            recordMaxResults => 106000,
-            recordDataType   => 'gauge',
-            info             => "answer ne '' and answer > -1",
-            warn             => "answer ne '' and answer > $maxConnectionsWarn",
-            crit             => "answer > $maxConnectionsCrit",
-            perl             => "return qq($connections)",
-            inf_field        => "connections",
-            inf_tags         => "webserver=\"$webMachine\"",
-            group_by         => $webMachine,
-            inf_default      => "none",
-        };
-        $queries{"$qname warn threshold"} = {
-            perl      => sub { $maxConnectionsWarn },
-            inf_field => "connections_warn_threshold",
-            inf_tags  => "webserver=\"$webMachine\"",
-            group_by  => $webMachine,
-        };
-        $queries{"$qname crit threshold"} = {
-            perl      => sub { $maxConnectionsCrit },
-            inf_field => "connections_crit_threshold",
-            inf_tags  => "webserver=\"$webMachine\"",
-            group_by  => $webMachine,
-        };
+    $queries{"Current connections to $webMachine"} = {
+
+	'recordMaxResults' => 106000,
+	'recordDataType'   => 'gauge',
+	'info'             => "answer ne '' and answer > -1",
+	'warn' => "answer ne '' and answer > $maxConnectionsWarn",
+	'crit' => "answer > $maxConnectionsCrit",
+	'perl' => "return qq($connections)",
+
+    };
+
 
     }
 
     my $email = $me->default('notify.email');
-    $queries{'influx_details'} = { measurement => 'ssws_httpd_connection_status' };
-    my $q = ariba::monitor::QueryManager->newWithDetails( "Per webserver http connections", $product, $me->service(), $me->customer(), \%queries );
-    $q->processQueries( $debug, $email, $sendEmail, $sendPage );
+
+    my $q = ariba::monitor::QueryManager->newWithDetails( "Per webserver http connections",
+        $product, $me->service(), $me->customer(), \%queries );
+    $q->processQueriesUsingServer( $debug, $email, $sendEmail, $sendPage );
 }
 
 main(@ARGV);

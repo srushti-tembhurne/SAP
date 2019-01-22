@@ -1,7 +1,8 @@
-#!/usr/local/tools/perl-5.22.1/bin/perl 
-# $Id: //ariba/services/monitor/bin/an/messaging-queue-status#1 $
+#!/usr/local/tools/perl-5.22.1/bin/perl
+# $Id: //ariba/services/monitor/bin/an/messaging-queue-status#2 $
 
 use strict;
+use warnings;
 use FindBin;
 use lib "$FindBin::Bin/../../lib";
 use lib "$FindBin::Bin/../../bin";
@@ -78,7 +79,6 @@ die "No queries for processing\n"  unless ( keys %$queries );
 #-----------------------------------------------------------------
 # create QueryManager object and process queries
 my $qmName = "Messaging Queue Status";
-$queries->{'influx_details'} = { 'measurement' => "an_messaging_queue_status" };
 my $qm = ariba::monitor::QueryManager->newWithDetails (
         $qmName, $productName, $service, undef, $queries
 );
@@ -103,7 +103,7 @@ sub getQueueData {
 
     foreach my $instance ( @$instances ) {
         # the appinstance for activemq has springboot type and Messaging Queue
-    #print "\nappname --> ".$instance->appName if($debug);
+	#print "\nappname --> ".$instance->appName if($debug);
         next unless ( $instance->appName =~ $amq_appname );
     
         my $host = $instance->host;
@@ -187,8 +187,8 @@ sub buildQueries {
             my $warn = $q1->{warn};
             my $crit = $q1->{crit};
 
-            my $queryname = ( $queue ) ? qq($queue m $display) : qq(m $display);
-            $queryname =~ s/\s+/_/g;
+
+            my $queryname = "$queue m$display";
 
             my $qvalue = $qdata->{$prop};
             my $query = {
@@ -196,12 +196,10 @@ sub buildQueries {
                 perl => "$qvalue",
                 warn => "$warn",
                 crit => "$crit",
-        correctiveActions => [
+		correctiveActions => [
                  Ops => "Queue is not being consumed correctly either because CollabQueueListeners are down or the appcount is insufficent. Escalate to Engineering immediately. Check/watch KR Logs / status of all CollabQueueListeners nodes",
-        Engr => 'Evaluate the KR Logs of CollabPlatform and CollabQueueListeners nodes and take appropriate action.',
-            ],      
-                inf_field => lc($queryname),
-                inf_default => 0
+		Engr => 'Evaluate the KR Logs of CollabPlatform and CollabQueueListeners nodes and take appropriate action.',
+        	],		
             };
             $qs->{"$queryname"} = $query; # a query prepared for QueryManager
         } # end for all queries for a given queue

@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl
+#!/usr/local/bin/perl -w
 
 ##########################################################################
 #   This executable works in a similar fashion to modjk-worker-status,   #
@@ -118,37 +118,31 @@ sub main {
                 
                 $queries{"Missing Workers for $productName on $webserverHost"} = {
                     warn                            => "numrows > ($totalAppinstanceCount/4)",
-                    perl                            => sub { return scalar(@{$missingWorkersRef}); },
+                    perl                            => sub { return join ("\n" , @{$missingWorkersRef}); },
                     uiHint                          => "$productName/$webserverType/$webserverHost",
                     description                     => "This category lists all those appinstances for which there was no definition found in the modjk file.",
                     inf_field                       => "missing_workers_cnt",
-                    inf_default                     => 0,
                     inf_tags                        => qq(product="$productName",ws_type="$webserverType",host="$webserverHost"),
-                    group_by                        => qq($productName,$webserverType,$webserverHost),
                 };
                 
                 $queries{"Workers in error state for $productName on $webserverHost "} = {
                     warn                            => "numrows > ($totalAppinstanceCount/4)",
                     crit                            => "numrows > ($totalAppinstanceCount/2)",
-                    perl                            => sub { return scalar(@{$erroredWorkersRef}); },
+                    perl                            => sub { return join ("\n" , @{$erroredWorkersRef}); },
                     uiHint                          => "$productName/$webserverType/$webserverHost",
                     description                     => "This category lists all the workers that are down (i.e. in error state with respect to modjk).",
                     inf_field                       => "workers_in_error_state_cnt",
-                    inf_default                     => 0,
                     inf_tags                        => qq(product="$productName",ws_type="$webserverType",host="$webserverHost"),
-                    group_by                        => qq($productName,$webserverType,$webserverHost),
                 };
                 
                 $queries{"Extra Workers for $productName on $webserverHost "} = {
                     warn                            => "numrows > 0",
                     crit                            => "numrows > ($totalAppinstanceCount/2)",
-                    perl                            => sub { return scalar(@{$extraWorkersRef}); },
+                    perl                            => sub { return join ("\n" , @{$extraWorkersRef}); },
                     uiHint                          => "$productName/$webserverType/$webserverHost",
                     description                     => "This category lists all those workers found in the modjk conf file for which a corresponding appinstance was not found.",
                     inf_field                       => "extra_workers_cnt",
-                    inf_default                     => 0,
                     inf_tags                        => qq(product="$productName",ws_type="$webserverType",host="$webserverHost"),
-                    group_by                        => qq($productName,$webserverType,$webserverHost),
                 };
                 
                 $queries{"Percentage down (workers in error state & missing workers) for $productName on $webserverHost "} = {
@@ -158,16 +152,14 @@ sub main {
                     uiHint                          => "$productName/$webserverType/$webserverHost",
                     description                     => "This category prints the percentage of workers that are down/missing with respect to all appinstances",
                     inf_field                       => "percent_down",
-                    inf_default                     => 0,
                     inf_tags                        => qq(product="$productName",ws_type="$webserverType",host="$webserverHost"),
-                    group_by                        => qq($productName,$webserverType,$webserverHost),
                 };
             }
         }
     }
 
     my $email = $mon->default('notify.email');
-    $queries{influx_details} = { measurement => 'ssws_modjk_workers' }; 
+    
     my $qm = ariba::monitor::QueryManager->newWithDetails('modjk-workers', $ssws->name(), $ssws->service(), $ssws->customer(), \%queries);
     $qm->processQueries($debug, $email, $sendEmail, $sendPage);
 }

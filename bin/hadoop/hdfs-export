@@ -55,8 +55,8 @@ sub main {
     }
 
     my $me = ariba::rc::InstalledProduct->new();
-    exit unless (ariba::rc::InstalledProduct->isInstalled('hadoop', 'dev'));
-    my $hadoop = ariba::rc::InstalledProduct->new('hadoop', 'dev');
+    exit unless (ariba::rc::InstalledProduct->isInstalled('hadoop', $me->service()));
+    my $hadoop = ariba::rc::InstalledProduct->new('hadoop', $me->service());
     my $cluster = $hadoop->currentCluster();
 
     my ($virtualHost) = $hadoop->rolesManager()->virtualHostsForRoleInCluster('hbase-master', $cluster);
@@ -144,17 +144,13 @@ sub main {
             correctiveActions => [
                 Ops => "Follow up with DBAs. If in warn state, no snapshot was taken in the last 6 hours",
             ],
-            inf_field => "snapshot",
-            inf_tags => qq|table="$table"|,
-            inf_default => "none",
         };
     }
 
     my $email = $me->default('notify.email');
-    $queries{influx_details} = {measurement => "hdfs_export"};
 
     my $qm = ariba::monitor::QueryManager->newWithDetails('hbase', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queries);
-    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 }
 
 sub snapshotInfo {

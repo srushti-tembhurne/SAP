@@ -93,19 +93,14 @@ sub main {
                 Ops => 'Troubleshoot based on the status. If it is FAULTED, look at the app logs to see what happened, ' . 
                     'or try to start the node with hadoop-daemon command manually. Otherwise, escalate to Tools',
                 Tools => qq`Debug based on the error`,
-            ],
-            inf_field => "status",
-            inf_default => "none",
-            inf_tags => qq|node="$nodeName"|,
-            group_by => $nodeName,
+            ]
         };
     }
 
     my $email = $me->default('notify.email');
-    $queries{influx_details} = {measurement => "verritas_cluster_status" };
 
     my $qm = ariba::monitor::QueryManager->newWithDetails('veritas-cluster-status', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queries);
-    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 } 
 
 sub veritasClusterStatusForNode {

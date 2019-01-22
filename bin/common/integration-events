@@ -16,7 +16,6 @@ use ariba::Ops::OracleClient;
 use ariba::Ops::DBConnection;
 use ariba::Ops::ProductAPIExtensions;
 use ariba::rc::InstalledProduct;
-use Data::Dumper;
 
 my $sqlError;
 
@@ -49,113 +48,69 @@ sub main {
     
     my %queries  = ();
     
-    $queries{"Failed pending queue exports"} = {
-        'info' => "numrows > -1",
-        'skip' => $skip,
-        'crit' => "numrows > 0",
-        'perl' => sub { main::failedPendingQueue($product) },
-        inf_field => "failed_pending_queue",
-        inf_default => 0,
-        group_by => "one",
-    };
-    $queries{"Failed toolkit import events and other exports (prod realm)"} = {
-        'info' => "numrows > -1",
-        'crit' => "numrows >= 1",
-        'recordMaxResults' => 40000,
+	$queries{"Failed pending queue exports"} = {
+		'info' => "numrows > -1",
+		'skip' => $skip,
+		'crit' => "numrows > 0",
+		'perl' => sub { main::failedPendingQueue($product) },
+	};
+	$queries{"Failed toolkit import events and other exports (prod realm)"} = {
+		'info' => "numrows > -1",
+		'crit' => "numrows >= 1",
+		'recordMaxResults' => 40000,
                 'recordItem' => 'numrows',
-        'skip' => $skip,
-        'perl' => sub { main::failedEvents($product) },
-        inf_field => "failed_import_export",
-        inf_default => 0,
-        group_by => "one",
-    };
-    $queries{"Failed events (test realms)"} = {
-        'info' => "numrows > -1",
-        'crit' => 0, # Set in code later
-        'skip' => $skip,
-        'perl' => sub { main::failedOther($product) },
-        inf_field => "failed_events",
-        inf_default => 0,
-        group_by => "one",
-    };
-    $queries{"Failed to send events (current) count"} = {
-        'sql' => q/
-            SELECT count(*) as failed_event_current_cnt
-            FROM IntegrationEventLogTab Int1, GlobalIntegrationErrorTab Rec2, 
-                IntegrationErrorItemTab Int3 
-            WHERE Int1.arl_ErrorDetails = Rec2.rootId AND Rec2.gie_Items = Int3.lvId AND 
-                Rec2.rootId = Int3.rootId AND Int1.arl_Status = 'Error' AND 
-                Int3.iei_ErrorMessage LIKE 'Fault received when processing the WS exchange%Couldn''t send message.' AND 
-                (Int1.arl_Active = 1) AND (Int1.arl_PurgeState = 0) AND (Rec2.gie_Active = 1) AND 
-                (Rec2.gie_PurgeState = 0)
-            /,
-        inf_default => 0,
-        group_by => "one",
-    };
-    $queries{"Failed to send events in last 24 hours count"} = {
-        'sql' => q/
-            SELECT count(*) as failed_event_24hrs_cnt
-            FROM IntegrationEventLogHistoryTab Int1, GlobalIntegrationErrorTab Rec2, 
-                IntegrationErrorItemTab Int3 
-            WHERE Int1.alh_ErrorDetails = Rec2.rootId AND Rec2.gie_Items = Int3.lvId AND
-                Rec2.rootId = Int3.rootId AND (Int1.alh_Status = 'Error' AND
-                Int1.alh_TimeCreated > sysdate-1 AND
-                Int3.iei_ErrorMessage LIKE 'Fault received when processing the WS exchange%Couldn''t send message.') AND 
-                (Int1.alh_Active = 1) AND (Int1.alh_PurgeState = 0) AND (Rec2.gie_Active = 1) AND
-                (Rec2.gie_PurgeState = 0)
-            /,
-        inf_default => 0,
-        group_by => "one",
-    };
-
-
-    ### Leaving the sql in the source code, jic we need for future
-=pod
-    $queries{"Failed to send events (current)"} = {
-        'info' => 'numrows > -1', 
-        'recordMaxResults'  => 40000,
-        'recordItem'        => 'numrows',
-        'format'            => "RootId %s, Created %s, Partition %s, Error %s\n",
-        'sql' => q/
-            SELECT Int1.rootId as rootid, to_char(Int1.arl_TimeCreated, 'YYYY-MM-DD HH24:MI:SS') as time_created, Int1.arl_PartitionNumber as partition_num,
-                Int3.iei_ErrorMessage as iei_errormsg, 'current' as type
-            FROM IntegrationEventLogTab Int1, GlobalIntegrationErrorTab Rec2, 
-                IntegrationErrorItemTab Int3 
-            WHERE Int1.arl_ErrorDetails = Rec2.rootId AND Rec2.gie_Items = Int3.lvId AND 
-                Rec2.rootId = Int3.rootId AND Int1.arl_Status = 'Error' AND 
-                Int3.iei_ErrorMessage LIKE 'Fault received when processing the WS exchange%Couldn''t send message.' AND 
-                (Int1.arl_Active = 1) AND (Int1.arl_PurgeState = 0) AND (Rec2.gie_Active = 1) AND 
-                (Rec2.gie_PurgeState = 0)
-            /,
-    };
-    $queries{"Failed to send events in last 24 hours"} = {
-        'info' => 'numrows > -1', 
-        'recordMaxResults'  => 40000,
-        'recordItem'        => 'numrows',
-        'format'            => "RootId %s, Created %s, Partition %s, Error %s\n",
-        'sql' => q/
-            SELECT Int1.rootId as rootid, to_char(Int1.alh_TimeCreated, 'YYYY-MM-DD HH24:MI:SS') as time_created, Int1.alh_PartitionNumber as partition_num,
-                Int3.iei_ErrorMessage as iei_errormsg, 'last_24_hours' as type
-            FROM IntegrationEventLogHistoryTab Int1, GlobalIntegrationErrorTab Rec2, 
-                IntegrationErrorItemTab Int3 
-            WHERE Int1.alh_ErrorDetails = Rec2.rootId AND Rec2.gie_Items = Int3.lvId AND
-                Rec2.rootId = Int3.rootId AND (Int1.alh_Status = 'Error' AND
-                Int1.alh_TimeCreated > sysdate-1 AND
-                Int3.iei_ErrorMessage LIKE 'Fault received when processing the WS exchange%Couldn''t send message.') AND 
-                (Int1.alh_Active = 1) AND (Int1.alh_PurgeState = 0) AND (Rec2.gie_Active = 1) AND
-                (Rec2.gie_PurgeState = 0)
-            /,
-    };
-=cut
+		'skip' => $skip,
+		'perl' => sub { main::failedEvents($product) },
+	};
+	$queries{"Failed events (test realms)"} = {
+		'info' => "numrows > -1",
+		'crit' => 0, # Set in code later
+		'skip' => $skip,
+		'perl' => sub { main::failedOther($product) },
+	};
+	$queries{"Failed to send events (current)"} = {
+		'info' => 'numrows > -1', 
+		'recordMaxResults' 	=> 40000,
+		'recordItem' 		=> 'numrows',
+		'format'			=> "RootId %s, Created %s, Partition %s, Error %s\n",
+		'sql' => q/
+			SELECT Int1.rootId, to_char(Int1.arl_TimeCreated, 'YYYY-MM-DD HH24:MI:SS'), Int1.arl_PartitionNumber, 
+				Int3.iei_ErrorMessage 
+			FROM IntegrationEventLogTab Int1, GlobalIntegrationErrorTab Rec2, 
+				IntegrationErrorItemTab Int3 
+			WHERE Int1.arl_ErrorDetails = Rec2.rootId AND Rec2.gie_Items = Int3.lvId AND 
+				Rec2.rootId = Int3.rootId AND Int1.arl_Status = 'Error' AND 
+				Int3.iei_ErrorMessage LIKE 'Fault received when processing the WS exchange%Couldn''t send message.' AND 
+				(Int1.arl_Active = 1) AND (Int1.arl_PurgeState = 0) AND (Rec2.gie_Active = 1) AND 
+				(Rec2.gie_PurgeState = 0)
+			/,
+	};
+	$queries{"Failed to send events in last 24 hours"} = {
+		'info' => 'numrows > -1', 
+		'recordMaxResults' 	=> 40000,
+		'recordItem' 		=> 'numrows',
+		'format'			=> "RootId %s, Created %s, Partition %s, Error %s\n",
+		'sql' => q/
+			SELECT Int1.rootId, to_char(Int1.alh_TimeCreated, 'YYYY-MM-DD HH24:MI:SS'), Int1.alh_PartitionNumber,
+				Int3.iei_ErrorMessage 
+			FROM IntegrationEventLogHistoryTab Int1, GlobalIntegrationErrorTab Rec2, 
+				IntegrationErrorItemTab Int3 
+			WHERE Int1.alh_ErrorDetails = Rec2.rootId AND Rec2.gie_Items = Int3.lvId AND
+				Rec2.rootId = Int3.rootId AND (Int1.alh_Status = 'Error' AND
+				Int1.alh_TimeCreated > sysdate-1 AND
+				Int3.iei_ErrorMessage LIKE 'Fault received when processing the WS exchange%Couldn''t send message.') AND 
+				(Int1.alh_Active = 1) AND (Int1.alh_PurgeState = 0) AND (Rec2.gie_Active = 1) AND
+				(Rec2.gie_PurgeState = 0)
+			/,
+	};
     
     my $email = $me->default('notify.email');
-   
-    $queries{influx_details} = { measurement => "integration_events" };
+    
     my $q = ariba::monitor::QueryManager->newWithDetails(
         "integration-events", $product->name(), $service, $product->customer(), \%queries
         );
     
-    $q->setSQLConnectInfo($product->connectInfoForOracleClient());
+	$q->setSQLConnectInfo($product->connectInfoForOracleClient());
     $q->processQueries($debug, $email, $sendEmail, $sendPage);
 }
 
@@ -175,13 +130,13 @@ sub getStatus {
     my $rcmap = "SELECT id, name, communityid, rp_realmtype from realmtab, communitytab, realmprofiletab where realmid = id AND rp_id = id";
 
     my $badEventsSql =  
-    "SELECT Int1.alh_AdapterName as adaptername,Int1.alh_Status as status,Int2.arl_clienttype as client_type,
-       CASE WHEN Int2.arl_lastqueuedtime IS NOT NULL OR Int2.arl_objectspending > 0 THEN 'PENDING' ELSE 'EXPORT' END as last_queuedtime
+    "SELECT Int1.alh_AdapterName,Int1.alh_Status,Int2.arl_clienttype,
+       CASE WHEN Int2.arl_lastqueuedtime IS NOT NULL OR Int2.arl_objectspending > 0 THEN 'PENDING' ELSE 'EXPORT' END 
        FROM IntegrationEventLogHistoryTab Int1, IntegrationEventLogTab Int2 
 WHERE 
 Int2.arl_AdapterName = Int1.alh_AdapterName AND 
 Int2.arl_UniqueName IN 
-   (SELECT Int101.arl_UniqueName FROM IntegrationEventLogTab Int101 
+   (SELECT Int101.arl_UniqueName FROM IntegrationEventLogTab Int101
      WHERE Int101.arl_Status = 'Error' AND 
            (
            (
@@ -218,7 +173,8 @@ Int2.arl_UniqueName IN
         push @results, @schemaResults;
 
         for my $r (@schemaRealms) {
-            $realms{$r->{ID}} = qq($r->{NAME}\t$r->{COMMUNITYID}\t$r->{RP_REALMTYPE});
+            $r =~ /^(\d+)\t(.*)/;
+            $realms{$1} = $2;
         }
 }
 
@@ -254,8 +210,8 @@ sub getFailed
 
     if(defined($sqlError)) {
         $query->setError($sqlError);
-    $query->setCrit(1);
-    return ($sqlError);
+	$query->setCrit(1);
+	return ($sqlError);
     }
 
     my @bad = ();
@@ -267,12 +223,8 @@ sub getFailed
 # each event (adapter source) for which the latest two statuses is error is bad
 # for pending queue events (not web services though at this point), we need to send a page, we'll add a string we check for crit
 #
-
     for my $result (@results) {
-        my $adapter = $result->{ADAPTERNAME};
-        my $status  = $result->{STATUS};
-        my $cl      = $result->{CLIENT_TYPE};
-        my $kind    = $result->{LAST_QUEUEDTIME};
+        my ($adapter, $status, $cl, $kind) = split("\t",$result);
 
         if ($adapter ne $prev) {
             $count = 0;
@@ -308,8 +260,7 @@ sub getFailed
         $query->setSeverity(0) if (scalar(@bad) > 1);
     }
     
-    return join(";",@bad);
+    return join("\n",@bad);
 }
 
 main();
-

@@ -2,7 +2,7 @@
 #
 # Monitor total down nodes per type and community
 #
-# $Id: //ariba/services/monitor/bin/common/node-health#15 $
+# $Id: //ariba/services/monitor/bin/common/node-health#17 $
 #
 
 use strict;
@@ -66,7 +66,6 @@ sub main {
 
         my $productName = $product->name();
         my $customer = $product->customer();
-        my $cluster = $product->currentCluster();
 
         my $qmName = ariba::monitor::QueryManager->generateInstanceName("http-urls-status-normal", $productName, $customer, $cluster); 
         next unless ariba::monitor::QueryManager->objectWithNameExists($qmName);
@@ -86,9 +85,6 @@ sub main {
             } else {
                 $community = "default community";
             }
-
-            ### Just store "community 1" as "1" in influxdb
-            $community =~ s/community\s*//g unless ($community eq 'default community');
 
             $total{$community} = {} unless $total{$community};
             $total{$community}->{$appName} = 0 unless $total{$community}->{$appName}; 
@@ -114,8 +110,7 @@ sub main {
                 my $warn = int(0.5 + $total{$community}->{$appName}/2);
                 $warn = 2 if $total{$community}->{$appName} == 2;
                 my $crit = "numrows > 0 && numrows >= $warn";
-                my $instances_down_cnt = scalar(@{$down{$community}->{$appName}});
-                my $status = join(";", @{$down{$community}->{$appName}});
+                my $status = join("\n", @{$down{$community}->{$appName}});
                 if((scalar(@{$sick{$community}->{$appName}}) == $total{$community}->{$appName}) and
                    ($appName eq "UI")) {
                     $crit = '1 || "All nodes are unresponsive"';
@@ -133,34 +128,16 @@ sub main {
                                         'uiHint' => "$community",
                                         'perl' => sub { return $status; },
                                         inf_field   => "instances_down",
-                                        inf_default => "none",
                                         inf_tags    => qq(type="$appName",community="$community"),
-                                        group_by    => qq($appName,$community),
-                                };
-                $queries{"$appName app instances down count on $community"} = {
-                                        'perl' => sub { return $instances_down_cnt; },
-                                        inf_field   => "instances_down_count",
-                                        inf_default => 0,
-                                        inf_tags    => qq(type="$appName",community="$community"),
-                                        group_by    => qq($appName,$community),
-                                };
-                $queries{"$appName app instances down crit threshold on $community"} = {
-                                        'perl' => sub { return $warn; },
-                                        inf_field   => "instances_down_count_crit_threshold",
-                                        inf_default => 0,
-                                        inf_tags    => qq(type="$appName",community="$community"),
-                                        group_by    => qq($appName,$community),
-                };
+                                }
             }
         }
         next unless(keys(%queries));
-        $queries{influx_details} = { measurement => "node_health" };
 
         $qm = ariba::monitor::QueryManager->newWithDetails("node-health", $productName, $service, $customer, $cluster, \%queries);
 
-        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+        $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
     }
 }
 
 main();
-

@@ -1,11 +1,12 @@
-#!/usr/local/bin/perl 
+#!/usr/local/bin/perl -w
 
 # This script displays all the routers interfaces and their throughput
 #
 #
-# $Id: //ariba/services/monitor/bin/network/network-errors#8 $
+# $Id: //ariba/services/monitor/bin/network/network-errors#9 $
 
 use strict;
+use File::Basename;
 use FindBin;
 use lib "$FindBin::Bin/../../lib";
 
@@ -17,6 +18,9 @@ use ariba::monitor::CircularDB;
 use ariba::monitor::QueryManager;
 use ariba::monitor::StatusPage;
 use ariba::monitor::Query;
+use dmail::LockLib;
+
+my $lockFile = "/tmp/" . basename($0);
 
 sub main {
     my $sendEmail = 0;
@@ -28,6 +32,8 @@ sub main {
         if($arg =~ /^-e/o){ $sendEmail = 1; };
         if($arg =~ /^-p/o){ $sendPage = 1; };
     }
+
+    die "can't grab lock\n" unless dmail::LockLib::requestlock($lockFile, 5);
 
     my $me = ariba::rc::InstalledProduct->new();
     my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
@@ -54,8 +60,7 @@ sub main {
             my $deviceName = $device->hostname();
         
             my $uiHint = 'server';
-            my $service;
-            foreach $service (@deviceServices) {
+            foreach my $service (@deviceServices) {
                 if ($device->provides($service)) {
                     $uiHint = $service;
                 }
@@ -85,9 +90,6 @@ sub main {
                     $interfaceStat =~ s/$deviceName\///;
                     print "Interface Stat: [$interfaceStat]\n\n" if ($debug);
 
-                    my @interfaceStatParts =  split(' ', $interfaceStat);
-                    my $interface = $interfaceStatParts[0];
-
                     my $file = $cdb->fileName();
 
                     my $samples = 1;
@@ -107,10 +109,6 @@ sub main {
                         ticketSubmitter => 'dept_an_ops_prod@ariba.com',
                         ticketOwner => "unassigned-network",
                         extractRecorded => $cdbName,
-                        inf_field => "packets",
-                        inf_tags => qq|datacenter=$datacenter,device_service=$uiHint,device_name=$deviceName,interface=$interface,ifioitem=$item|,
-                        inf_default => 0,
-                        group_by => "$datacenter,$service,$uiHint,$deviceName,$interface,$item",
                     };
 
                 }
@@ -121,14 +119,14 @@ sub main {
 
         my $email = $me->default('notify.email');
 
-        $queries{influx_details} = {measurement => "network_errors"};
         my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
 
         my $q = ariba::monitor::QueryManager->newWithDetails("network-errors", $pn, $me->service(), $me->customer(), \%queries);
 
-        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+        $q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 
     }
+    dmail::LockLib::releaselock($lockFile);
 }
 
 main();

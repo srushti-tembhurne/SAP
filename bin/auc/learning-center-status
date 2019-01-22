@@ -2,43 +2,232 @@
 
 # $Id: //ariba/services/monitor/bin/auc/learning-center-status#1 $
 
+# General comments regarding this script template:
+#   1.  The first monitoring script using this is/was for AUC Learning Center, which has some specific processing
+#       rules that I wasn't able to figure out a way to make them configuration items.  The main example of this
+#       is the time setup.  The DA URL needs to have a start time set one hour before the script runs, with a
+#       duration of one hour.  This requires code and logic to get the current time, calculate the start time,
+#       and build the URL to request data from the DA host.
+#
+#       This could be isolated in a module (perhaps the right way to go), but if it is only used once, it might
+#       as well stay here.  But that does mean this template would need more modification to use it for another
+#       monitoring request, rather than less.
+#
+#   2.  Given the above, and that there may be many of these sorts of things, I've marked the ones present in
+#       this template with the word NOTE, hoping it will stand out (it does in vim, because vim also highlights
+#       this all caps string whan found in a comment).
+
 use warnings;
 use strict;
 
 use Data::Dumper;
+use File::Basename;
+use Getopt::Long qw(:config no_ignore_case_always no_getopt_compat require_order no_bundling);
+use LWP;
+use IO::Socket::SSL qw();
 use JSON;
+use File::Slurp;
 use FindBin;
-
+# This INC dir works for release and testing, to find the released lib in the user's home.
 use lib "$FindBin::Bin/../../lib";
+# While this one will find the test lib hierarchy, only useful when run from the <.user/bin> directory.
+use lib "$FindBin::Bin/../lib";
 
-use ariba::Ops::Utils;
+use ariba::monitor::Query;
+use ariba::monitor::QueryManager;
 use ariba::rc::InstalledProduct;
+use ariba::Ops::ProductAPIExtensions;
+use ariba::monitor::Utils;
 use ariba::Ops::ServiceController;
 
-sub main {
-    my $monProd    = ariba::rc::InstalledProduct->new('mon');
-    my $installDir = $monProd->installDir();
-    my $product    = qw(community);
+# Debug can have incrementing values, such that '-d -d' sets it to '2'.  For development work, a value of
+# '2' implies not wanting to actually run the queries, but just to dump the query hash and exit.  This
+# can of course be changed as needed.
+my $debug = 0;
 
-    my $service = $monProd->service();
-    my $communityProd = ariba::rc::InstalledProduct->new($product, $service);
-    chomp (my $secureSiteURL = $communityProd->default('SiteURLSecure'));
-    return unless $secureSiteURL;
+# NOTE:  This will be different for each version of the script, and should be defined in the config file.
+#        However, this would mean no possible message until after the config is read and converted, so
+#        no usage for everything that comes before that.  The simple solution is to create a very generic
+#        usage message here.  This will be *replaced* by the values read in from the config, if any.
+my $program = basename $0; # remove leading path elements, provided by some host systems.
+my $usage = "usage:  $program [-d] [-e] [-p] [-h] -product|-prod product-name\n\n" .
+            "Option names may also be spelled out:\n" .
+            "\t-d or -debug\n\t-e or -sendemail (note spelling!)\n\t-p or -sendpage\n\t-h or -help\n\t" .
+            "-product or -prod product-name (required)\n\n" .
+            "If the 'help' option is present, all other options are ignored.";
 
-    my $duration = qw(3600);
-    my $startTime = time () - $duration;
-    my $dev_url  = qq(/internal/learning_center_build_monitoring.php?start_ts=$startTime&duration_sec=$duration);
-    my $prod_url = qq(/internal/community_creation_monitoring.php?start_ts=$startTime&duration_sec=$duration);
+# This will 'die' if any of the needed pieces are not found, with the basic message:
+my $message = "ERROR:  Failed to obtain information required to process: ";
+sub main
+{
+    # handle command line args.  NOTE:  these are the basics, more may be needed to meet functional
+    # and design requirements.
+    my ($sendEmail, $sendPage, $product, $help); # Debug is defined as a file global, above.
+    GetOptions (
+                   'debug|d+'       => \$debug,      # allow multiple debug options to increase debug level.
+                   'sendemail|e'    => \$sendEmail,
+                   'sendpage|p'     => \$sendPage,
+                   'product|prod=s' => \$product,
+                   'help|h'         => \$help,
+               );
 
-    my $full_url= (ariba::Ops::ServiceController::isProductionServices($service)) ? "$secureSiteURL$prod_url" : "$secureSiteURL$dev_url";
+    # Check for help option, print usage and exit:
+    if ($help)
+    {
+        print "$usage\n";
+        exit 0;
+    }
 
-    eval {
-        my $data_hash = ariba::Ops::Utils::generateJsonOutput($full_url);
-        print encode_json($data_hash) if ( scalar(keys %{$data_hash}) );
-    };
+    # The only required option, for a minimal setup, is the product name.
+    die "$message missing required product name.\n\n$usage\n" unless $product;
+    my $monProd = ariba::rc::InstalledProduct->new ('mon');
+    die "$message cannot create a 'mon' product object.\n" unless $monProd;
+    my $installDir = $monProd->installDir ();
+    die "$message cannot retrieve install directory from monitor product object.\n" unless $installDir;
+
+    # Prepend the 'home' directory, aka the install directory.  NOTE:  the config file names will be different.  Edit this.
+    my $confFile = "$installDir/etc/query/learning-center.conf";
+    # Read the conf file and convert the JSON to Perl data structures.
+    chomp (my $configString = read_file ($confFile));
+    die "$message cannot read configuration file '$confFile'.\n" unless $configString;
+    my $config = eval {decode_json ($configString)}; # trap and throw away any JSON error messages.
+    # If the decode failed, $config should be undef or empty, and fail the test below.
+    die "$message cannot decode JSON string:\n\n'$configString'.\n" unless $config;
+
+    # The config structure has one key named 'globals', for all config information not specific to a
+    # particular monitored item.  This needs to be removed from the config and saved separately.
+    my $configGlobals = delete $config->{globals};
+    # There are two "comment" keys present to explain usage/purpose of the 'globals' key, useful only in
+    # the JSON source file, so remove those keys here.
+    delete @$configGlobals{'comment','comment2'};
+    # And finally, there is a 'usage' key, which may or may not have content.  If the generic usage above is sufficient, this
+    # would be empty, otherwise it is an array of strings.
+    my $newUsage = join '', @{delete $config->{'usage'}};
+    $usage = $newUsage if $newUsage;  # Preserves the original unless we have a new one.
+
+    my $service = $monProd->service ();
+    # NOTE:  this section is very product dependent and should be replaced for new monitoring.
+    # ======================
+    # Check that the product named from the command line exists in this service.
+    die "$message product '$product' is not installed for service '$service'.\n"
+        unless ariba::rc::InstalledProduct->isInstalled ($product, $service);
+    # Retrieve the secure site URL and append our PHP path and arguments.
+    my $communityProd = ariba::rc::InstalledProduct->new ($product, $service);
+    die "$message cannot create a 'community' product object.\n" unless $communityProd;
+    chomp (my $secureSiteURL = $communityProd->default ('SiteURLSecure'));
+    die "$message could not retrieve secure site URL.\n" unless $secureSiteURL;
+    # ======================
+    # We need to determine if the script is running in a production or devlab service, so it can select an appropriate URL path
+    # and options from the config.
+    # Greg says this info should be in the product configs, so a single call will retrieve the right thing regardless of service.
+    my $URLPathOpts;
+    if (ariba::Ops::ServiceController::isProductionServices ($service))
+    {
+        $URLPathOpts = "$secureSiteURL$configGlobals->{url_path_opts_prod}";
+    }
+    else
+    {
+        $URLPathOpts = "$secureSiteURL$configGlobals->{url_path_opts_dev}";
+    }
+
+    # NOTE:  The exact timing method used for a monitoring script will likely be different so this needs to change or go away.
+    # But the full URL still needs to be created in some way, as a method to call here, from ariba::monitor::Utils, to keep
+    # changes isolated from this script as much as possible.
+    my $fullURL = ariba::monitor::Utils::makeDirectActionURL ($configGlobals->{duration}, $URLPathOpts);
+    print "$fullURL\n" if $debug;
+
+    # Now, get the data from the remote host.  Because we are using self-signed certificates, and have no local set to verify
+    # against, the request needs to ignore varification:
+    my $userAgent = LWP::UserAgent->new (ssl_opts => {SSL_verify_mode => 0,
+                                                      verify_hostname => 0,});
+    my $request = HTTP::Request->new (GET => $fullURL);
+    my $response = $userAgent->request ($request);
+    $response->is_success or die "ERROR:  Request failed for '$fullURL':  ", $response->message (), "\n";
+    # The response will be JSON from the remote host, which needs to be converted...
+    my $responseHashRef = eval {decode_json ($response->content ())};
+    # And again, if this is undef/empty, we've failed for some reason and an error exit seems best for now.
+    die "$message invalid or missing response from remote '$fullURL'.\n" unless $responseHashRef;
+    print Dumper ($responseHashRef), "\n" if $debug;
+
+    my %queries;
+    # Now loop over each key in the %$config hash, get the data element for it from the %$responseHashRef, and build
+    # a query object.  NOTE:  for Learning Center, there are 3 basic types of information:
+    #   1.  first, where there are values for each of info, warn and crit (0, 1, 2); a "warn" key exists for only this type;
+    #   2.  the second where there are values for info and crit (0, >0), the crit name is "crit";
+    #   3.  the third, which are informational only.  The severity key has the value 'informational'.
+    # For each value, check first for the 'warn' key, the 'crit' key, and take the last as a default (no check).
+    for my $queryName (keys %$config)
+    {
+        # Build a query object for the basic, common elements, which exists for all queries (though value may vary, the
+        # key is constant).
+        $queries {$config->{$queryName}->{'metric_name'}} = {
+                                                             note => $config->{$queryName}->{'metric_note'},
+                                                             description => $config->{$queryName}->{'metric_description'},
+                                                          };
+
+        # Check for "global" values that may need to be applied to every query.  For AUC Learning Center, the values are
+        # to be saved in the circular DB, as well as providing for graphing of the results.  This applies to every query.
+        # NOTE:  another piece that is likely product specific.  At least this is skipped if the key is not present.
+        if ($configGlobals->{cdb_rows_retention})
+        {
+            # Implement all requested/required circulardb related query fields here.
+            $queries {$config->{$queryName}->{'metric_name'}}->{'recordMaxResults'} = eval $configGlobals->{cdb_rows_retention};
+            $queries {$config->{$queryName}->{'metric_name'}}->{'recordDataType'} = 'counter';
+            # $queries {'recordDataUnits'} units of the quantity - seems to be any arbitrary string that defines the units in use.
+            $queries {$config->{$queryName}->{'metric_name'}}->{'recordItem'} = 'answer';
+            # $queries {'recordTime'} cdb record id to insert/update, in seconds since epoch
+            # $queries {$config->{$queryName}->{'metric_name'}}->{'recordOnError'} = 1; # cdb updated with results even if error is set on query
+            # It turns out that the value actually used for 'graphRecorded' in other scripts is always a numeric '1'.  I presume there is an
+            # enumeration somewhere that should be interpreting the string values talked about here and in the Query.pm file.
+            $queries {$config->{$queryName}->{'metric_name'}}->{'graphRecorded'} = 1; # graphs to generate all|daily|weekly|monthly|quarterly|yearly
+        }
+
+        # Then, add the query specific parts.
+        my ($info, $warn, $crit);
+        if (exists $config->{$queryName}->{'warn'}) # NOTE: Test for 'warn' MUST be before test for 'crit', to separate the two types of queries.
+        {
+            $queries {$config->{$queryName}->{'metric_name'}}->{'info'} = "answer == $config->{$queryName}->{'info'}";
+            $queries {$config->{$queryName}->{'metric_name'}}->{'warn'} = "answer == $config->{$queryName}->{'warn'}";
+            $queries {$config->{$queryName}->{'metric_name'}}->{'crit'} = "answer == $config->{$queryName}->{'crit'}";
+            $queries {$config->{$queryName}->{'metric_name'}}->{'perl'} = sub {return $responseHashRef->{$queryName}};
+            $queries {$config->{$queryName}->{'metric_name'}}->{'severity'}    = $config->{$queryName}->{'severity'};
+        }
+        elsif (exists $config->{$queryName}->{'crit'})
+        {
+            $queries {$config->{$queryName}->{'metric_name'}}->{'info'} = "answer == $config->{$queryName}->{'info'}";
+            $queries {$config->{$queryName}->{'metric_name'}}->{'crit'} = "answer >= $config->{$queryName}->{'crit'}";
+            $queries {$config->{$queryName}->{'metric_name'}}->{'perl'} = sub {return $responseHashRef->{$queryName}};
+            $queries {$config->{$queryName}->{'metric_name'}}->{'severity'} = $config->{$queryName}->{severity};
+        }
+        else # an 'informational' query.  Only have the note and description and an info value.
+        {
+            $queries {$config->{$queryName}->{'metric_name'}}->{'perl'} = sub {return $responseHashRef->{$queryName}};
+            $queries {$config->{$queryName}->{'metric_name'}}->{'info'} = "answer";
+        }
+    }
+
+    if ($debug > 2)
+    {
+        print Dumper (\%queries);
+        exit 0;
+    }
+
+    if ($debug > 1)
+    {
+        # Print what script would do normally, and exit without any other action.
+        print "Expando name:  '$configGlobals->{expando_name}'\nName of communityProd:\n",
+              $communityProd->name (), "\n============\nName of service:\n", $service, "\nArg is:  undef\n",
+              "=========\nDump of queries:\n", Dumper (\%queries),;
+    }
+    else
+    {
+        my $queryManager = ariba::monitor::QueryManager->newWithDetails ($configGlobals->{expando_name}, $communityProd->name (),
+                                                                         $service, undef, \%queries);
+        $queryManager->processQueries ($debug, $configGlobals->{email}, $sendEmail, $sendPage);
+    }
 }
 
-main(@ARGV);
+main (@ARGV);
 
 __END__
 
@@ -109,4 +298,3 @@ my $ua = LWP::UserAgent->new(
             SSL_verify_mode => 0,
             verify_hostname => 0,
             ...});
-

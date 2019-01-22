@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl -w
 #
-# $Id: //ariba/services/monitor/bin/dba/listener-status#24 $
+# $Id: //ariba/services/monitor/bin/dba/listener-status#26 $
 #
 # This script checks to see if the listener process is running 
 # on the system. If not found, the scripts attempts to start it
@@ -40,6 +40,9 @@ my ($user, $pass);
 
 $main::quiet = 1;
 
+my %influx_data;
+$influx_data{measurement} = 'cookies_dba_listener_status';
+
 sub main {
 	my $sendEmail = 0;
 	my $sendPage  = 0;
@@ -73,6 +76,7 @@ sub main {
 	my @sidsForMainListener;
 	my @sidsForDataGuardListeners;
 
+	my $sid_product = {};
 	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections)) {
 
 		my $type        = $dbc->type();
@@ -85,6 +89,7 @@ sub main {
 		push(@hosts, $virtualHost) unless @hosts;
 
 		push(@instances, $instance) if (grep { /^$hostname$/ } @hosts);
+		$sid_product->{$instance} = $product->name(); 
 	}
 
 	return unless(@instances);
@@ -93,6 +98,7 @@ sub main {
 
 	for my $sid (@instances) {
 
+		$influx_data{tags} = { cluster => $cluster, service => $me->service(), hostname => $hostname, product => $sid_product->{$sid}, sid => $sid };
 		my $oraHome = ariba::util::OraInfo::latestOracleHome() || next;
 
 		$queries{"Listener process on $hostname"} = {
@@ -104,8 +110,6 @@ sub main {
 			'uiHint' => 'listener-status',
             'inf_field' => "listernerStatus",
             'inf_tags' => "datacenter=\"$datacenter\",hostname=\"$hostname\",uihint=\"listener-status\"",
-            'inf_default' => 0,
-            'group_by' => "listener-status",
 		};
         if ( ariba::Ops::DatacenterController::isProductionAllMSDatacenters($datacenter) ) {
             $queries{"Listener_dr process on $hostname"} = {
@@ -117,8 +121,6 @@ sub main {
                 'uiHint' => 'listener-status',
                 'inf_field' => "listernerStatus",
                 'inf_tags' => "datacenter=\"$datacenter\",hostname=\"$hostname\",uihint=\"listener-status\"",
-                'inf_default' => 0,
-                'group_by' => "DR-listener-status",
             };
         }
 
@@ -126,12 +128,11 @@ sub main {
 		last; #XXX do we need to run this for each sid?
 	}
 
-    queries{'influx_details'} = {measurement => "dba"};
 	my $qm = ariba::monitor::QueryManager->newWithDetails(
 		'dba', $tab, $me->service(), $me->customer(), \%queries
 	);
 
-	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 }
 
 sub checkListener {
@@ -197,6 +198,12 @@ sub checkRestartListener {
 		}
 	}
 
+	$influx_data{data}{listener_status} = getNumericStatus($status);
+	eval {
+		my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+		ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line );
+	};
+
 	return $status;
 }
 
@@ -235,7 +242,25 @@ sub checkRestartListenerDR {
         }
     }
 
+	$influx_data{data}{listener_status} = getNumericStatus($status);
+	eval {
+		my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+		ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line );
+	};
+
     return $status;
+}
+
+sub getNumericStatus {
+	my $verboseStatus = shift;
+
+	my $numMap = { $RUNNING => 0, $STARTED => 1, $NOTRUNNING => 2 };
+
+	if ( exists($numMap->{$verboseStatus}) ) {
+		return $numMap->{$verboseStatus};
+	} 
+
+	return -1;
 }
 
 main();

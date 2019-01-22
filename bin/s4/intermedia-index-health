@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl
 #
-# $Id: //ariba/services/monitor/bin/s4/intermedia-index-health#12 $
+# $Id: //ariba/services/monitor/bin/s4/intermedia-index-health#13 $
 #
 
 use strict;
@@ -12,7 +12,6 @@ use ariba::monitor::Url;
 use ariba::Ops::OracleClient;
 use ariba::Ops::ProductAPIExtensions;
 use ariba::rc::InstalledProduct;
-use Data::Dumper;
 
 sub main {
 	my $debug = 0;
@@ -160,8 +159,6 @@ sub main {
 				uiHint => "Primary",
                 inf_field   => "out_of_date",
                 inf_tags    => "index_name=\"$indexName\", schema_name=\"$schemaName\"",
-                inf_default => 0,
-                group_by    => $indexName,
 			};
 			$queries{"Free Text Index $indexName on $schemaName pending items"} = {
 				recordMaxResults => 30000,
@@ -173,8 +170,6 @@ sub main {
 				uiHint => "Primary",
                 inf_field   => "pending_items",
                 inf_tags    => "index_name=\"$indexName\", schema_name=\"$schemaName\"",
-                inf_default => 0,
-                group_by    => $indexName,
 			};
 
 			print "$indexName, $schemaName, $outOfDate, $pendingCount\n" if ($debug);
@@ -191,15 +186,13 @@ sub main {
 		next unless (keys(%queries));
 
 		my $email = $me->default('notify.email');
-        	$queries{influx_details} = { measurement => 'intermedia_index_health' };
-
 
 		my $q = ariba::monitor::QueryManager->newWithDetails(
 				"intermedia-index-health", $product->name(), $service, $product->customer(), \%queries
 				);
 
 		$q->setSQLConnectInfo($product->connectInfoForOracleClient());
-		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+		$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 	}
 }
 

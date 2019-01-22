@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl 
+#!/usr/local/bin/perl -w
 #
 # $Id: //ariba/services/monitor/bin/common/aql-metrics#11 $
 
@@ -7,7 +7,6 @@ use strict;
 
 use FindBin;
 use lib "$FindBin::Bin/../../lib";
-use lib "$FindBin::Bin/../../bin";
 
 use ariba::rc::InstalledProduct;
 use ariba::Ops::DateTime;
@@ -193,7 +192,7 @@ sub main {
 
 	my $me = ariba::rc::InstalledProduct->new();
 	my $email = $me->default("notify.email");
-	my $service = $me->service();
+
 	my @products = ariba::rc::InstalledProduct->installedProductsList($me->service(), $productName, $customerName);
 	unless (@products) {
 		print "Error: can't find installed $productName" . ($customerName?"/$customerName":"")."\n";
@@ -270,10 +269,6 @@ sub main {
 				"noRowCount" => 1,
 				"hasErraticSchedule" => 1, # So Ops can re-run to fix mon page
 				"perl" => sub { main::checkForAqlError($error, $result) },
-				'inf_field' => "result",
-				'inf_default' => 0,
-				'inf_tags' =>  "aqlfile=\"$aqlBaseFile\"",
-				'group_by' =>  "$aqlBaseFile"
 			}; 
 
 			# We exctract the filename and replace its .aql extension by .csv
@@ -304,12 +299,12 @@ sub main {
 
 		# We update "current" ("current" is a symlink to the latest results) to the latest results
 		updateCurrentDestinationDirForTime($destinationDirRoot, $prettyTime) unless ($runDate);
-		$queries{"influx_details"} = { 'measurement' => 'aql_metrics'};
+		
 		my $qm = ariba::monitor::QueryManager->newWithDetails(
 			"aql-metric", $product->name(), $product->service(), $product->customer(), \%queries); 
 		$qm->processQueries($debug, $email, $sendEmail, $sendPage); 
 	}
+
 }
 
 main();
-

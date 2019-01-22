@@ -1,6 +1,6 @@
-#!/usr/local/bin/perl
+#!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/common/redis-status-embedded#4 $
+# $Id: //ariba/services/monitor/bin/common/redis-status-embedded#5 $
 
 $quiet = 1;
 
@@ -73,17 +73,16 @@ sub main {
                 perl => sub { redisPing( $instance, $stopProgram );},
                 uiHint => "default community/$appName",
                 inf_field => "status",
-                inf_default => "none",
                 inf_tags => qq(instance_name="$instanceName",app_name="$appName"),
-                group_by => qq($appName,$instanceName)
             };
         }
 
-        $queries{"influx_details"} = { 'measurement' => "redi_status" };
-        my $q = ariba::monitor::QueryManager->newWithDetails( "redis-status", $product->name(), $service, $product->customer(), \%queries);
+        my $q = ariba::monitor::QueryManager->newWithDetails(
+            "redis-status", $product->name(), $service, $product->customer(), \%queries
+        );
         $q->setUiManager('http-urls-status');
 
-        my $ret = $q->processQueries($debug, $product->default('notify.email'), $sendEmail, $sendPage);
+        my $ret = $q->processQueriesUsingServer($debug, $product->default('notify.email'), $sendEmail, $sendPage);
     }
 }
 

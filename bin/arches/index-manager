@@ -1,5 +1,5 @@
-#!/usr/local/bin/perl
-# $Id: //ariba/services/monitor/bin/arches/index-manager#21 $
+#!/usr/local/bin/perl -w
+# $Id: //ariba/services/monitor/bin/arches/index-manager#22 $
 
 use strict;
 use FindBin;
@@ -25,7 +25,7 @@ Usage: $0 [-daily] [-e|-p|-d|-h] [-prod prodname]
     -p        Enables sending of pages for monitor query.
     -d        Turns on debug mode. 
     -h        Shows this help.
-    -prod     product name
+    -prod     arches product name.
 
 USAGE
 
@@ -38,13 +38,11 @@ sub debug {
     print "(debug) @_\n" if ($debug);
 }
 
-$| = 1;
-
 sub main {
     my $sendEmail = 0;
     my $sendPage = 0;
     my $runDailyQueries = 0;
-    my $prodname = 'arches'
+    my $prodname = "arches";
 
     while (my $arg = shift) {
         if ($arg =~ /^-h$/o) { usage();         next; }
@@ -56,6 +54,8 @@ sub main {
 
         usage("Invalid argument: $arg");
     }
+
+    usage("arches product name not specified") unless $prodname;
 
     my $me = ariba::rc::InstalledProduct->new();
     exit unless (ariba::rc::InstalledProduct->isInstalled($prodname, $me->service()));
@@ -78,8 +78,7 @@ sub main {
                                      maxresults => '',
                                      datatype => '' },
            AvgProcessingTime    => { crit => 7200,
-                                     warn => 900, 
-                                     name => 'Average Publishing Job Processing Time(sec)',
+                                     warn => 900, name => 'Average Publishing Job Processing Time(sec)',
                                      desc =>  'Checks IndexMgr average publishing time',
                                      maxresults => 36000,
                                      datatype => 'gauge' },
@@ -115,7 +114,6 @@ sub main {
                             Ops => 'For warn, please file CR for engineering.  For crit, please escalate to engineering.',
                         ],
                         inf_field   => $metric,
-                        inf_default => "none",
                     };
                     $jobFlag = 1;
                 }
@@ -140,7 +138,6 @@ sub main {
                         Ops => 'File a CR for Engineering based on the current severity - default is s2, but use s1 if more than 100 jobs. If there is an error, fix based on the error message.',
                     ],
                     inf_field => "long_running_jobs",
-                    inf_default => "none",
                 };
 
                 $dailyQueries{'Jobs that had error when processing'} = {
@@ -155,19 +152,17 @@ sub main {
                         Ops => 'Open a CR to assign to Engineering/Platform to investigate the cause. If error, fix based on the error message.',
                     ],
                     inf_field => "processing_error_jobs",
-                    inf_default => "none",
                 };
             }
         }
 
 
         my $email = $me->default('notify.email');
-        $dailyQueries{'influx_details'} = {measurement => 'arches_index_mgr', tags => qq(cluster="$cluster")};
-        $queries{'influx_details'} = {measurement => 'arches_index_mgr', tags => qq(cluster="$cluster")};
+
         %queries = %dailyQueries if ( $runDailyQueries );
 
         my $qm = ariba::monitor::QueryManager->newWithDetails('index-manager', $arches->name(), $arches->service(), undef, $cluster, \%queries);
-        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+        $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 
     }
 }
@@ -203,12 +198,9 @@ sub jobsForAppAndType {
     
     $query->setSeverity(1) if (scalar(@jobs) >= 100);
     
-    #return join(";", @jobs);
-    return scalar(@jobs);
+    return join("\n", @jobs);
 }
 
 main(@ARGV);
 
 __END__
-
-

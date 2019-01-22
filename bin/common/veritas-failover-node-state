@@ -1,8 +1,10 @@
 #!/usr/local/bin/perl -w
 #
-# $Id: //ariba/services/monitor/bin/common/veritas-failover-node-state#10 $
+# $Id: //ariba/services/monitor/bin/common/veritas-failover-node-state#12 $
 #
-# This runs on each dbserver
+# This looks for veritas volumes mounte on the wrong db hosts.
+# It is designed for Oracle clusters only with 2 hosts per cluster
+# oracle-vip { host.1 host.2 }
 #
 
 use strict;
@@ -18,200 +20,214 @@ use ariba::Ops::FileSystemUtilsRPC;
 use ariba::DBA::SampleSQLQueries;
 
 use File::Basename;
+use Data::Dumper;
 
 sub main {
 
-	my $debug=0;
-	my $sendEmail=0;
-	my $sendPage=0;
-	my %VVsForFailoverNodes;
+    my $debug=0;
+    my $sendEmail=0;
+    my $sendPage=0;
+    my %VVsForFailoverNodes;
 
-	# Grab the args
-	while(my $arg=shift(@ARGV)){
-		if ( $arg =~ /^-d/o ) { $debug++; }
-		if ( $arg =~ /^-e/o ) { $sendEmail=1; };
-		if ( $arg =~ /^-p/o ) { $sendPage=1; };
-	}
+    # Grab the args
+    while(my $arg=shift(@ARGV)){
+        if ( $arg =~ /^-d/o ) { $debug++; }
+        if ( $arg =~ /^-e/o ) { $sendEmail=1; };
+        if ( $arg =~ /^-p/o ) { $sendPage=1; };
+    }
 
-	# Set debug stuff
-	$main::quiet = 1 unless $debug >= 2;
+    # Set debug stuff
+    $main::quiet = 1 unless $debug >= 2;
 
-	my $me = ariba::rc::InstalledProduct->new();
-	my $email = $me->default('notify.email');
-	my @products = ariba::rc::InstalledProduct->installedProductsList($me->service());
-	my $cipherStore = ariba::rc::CipherStore->new( $me->service() );
-	my $username = "svc" . $me->service();
-	my $password = $cipherStore->valueForName($username);
+    my $me = ariba::rc::InstalledProduct->new();
+    my $email = $me->default('notify.email');
+    my @products = ariba::rc::InstalledProduct->installedProductsList($me->service());
+    my $cipherStore = ariba::rc::CipherStore->new( $me->service() );
+    my $username = "svc" . $me->service();
+    my $password = $cipherStore->valueForName($username);
+    my $monserver = ($me->hostsForRoleInCluster('monserver', $me->currentCluster()))[0];
 
-	my %queries;
-	my $tab = ariba::monitor::StatusPage::commonProduct();
-	$| = 1;
+    my %queries;
+    my $tab = ariba::monitor::StatusPage::commonProduct();
+    $| = 1;
 
-	my %sidsChecked = ();
+    # Loop over the installed products on this host (mon)
+    for my $product (@products) {
 
-	# Loop over the installed products on this host (mon)
-	for my $product (@products) {
+        %queries = ();
 
-		# process the queries from the last time through the loop
-		if ( %queries ) {
-                        $queries{influx_details} = {measurement => "veritas_failover_node_state"};
-			my $qm = ariba::monitor::QueryManager->newWithDetails("veritas_failover_node_state", $tab, $me->service(), undef, \%queries);
-			$qm->processQueries($debug, $email, $sendEmail, $sendPage);
-		}
-		%queries = ();
+        my $productName = $product->{prodname};
+        my @connections = ariba::Ops::DBConnection->connectionsFromProducts($product);
 
-		my $productName = $product->{prodname};
-                my @connections = ariba::Ops::DBConnection->connectionsFromProducts($product);
+        # Loop over all the database connections
+        for my $dbc ( ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections)) {
+            next if $dbc->isHana();
 
-		# Loop over all the hosts 
-		for my $dbc ( ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections)) {
+            # not applicable to rman dbs
+            my $dbSid = $dbc->sid();
+            next if $dbSid =~ /rman/;
 
-			# Only proceed with this db connection if the product config is setup for a 
-			# database cluster
-			my @realHostsForDBConnection = $dbc->realHosts();
-			my %uniqueHosts = map { $_ => 1 } @realHostsForDBConnection;
-			next unless (keys(%uniqueHosts) == 2);
+            # Only proceed with this db connection if the product config is setup for a
+            # database cluster
+            my @hosts = $dbc->realHosts();
+            my %uniqueHosts = map { $_ => 1 } @hosts;
+            next unless (keys(%uniqueHosts) == 2);
 
-			my $primaryDBCClusterHost = $realHostsForDBConnection[0];
-			my $failoverDBCClusterHost = $realHostsForDBConnection[1];
-			my $dbSid = $dbc->sid();
-			my $queryName = "Active 3par VVs on $primaryDBCClusterHost for $dbSid not imported on $failoverDBCClusterHost";
+            my $ucSid = uc( $dbSid );
+            my $vipName = $dbc->host();
 
-			# Only run once/db sid
-			next if $sidsChecked{$dbSid};
-			$sidsChecked{$dbSid} = 1;
+            # Loop over the hosts in the cluster and find the active one
+            my $primaryHost;
+            my @output;
+            foreach my $host ( @hosts ) {
+                my $cmd = "ssh -l $username $host sudo '/opt/VRTS/bin/hagrp -state | grep -iv offline'";
+                ariba::rc::Utils::executeRemoteCommand($cmd, $password, 0, undef, undef, \@output);
 
-			$queries{$queryName} = {
-				'uiHint' => $productName,
-				'info' => 1,
-				'warn' => 0,
-				'crit' => 0,
-				'perl' => sub {return 'none'},
-				'inf_field' => "active_3par_VVs_not_imported",
-				'inf_tags' => "SID=\"$dbSid\",primary=\"$primaryDBCClusterHost\",failover=\"$failoverDBCClusterHost\",product_name=$productName",
-				'group_by' => "SID=\"$dbSid\",primary=\"$primaryDBCClusterHost\",failover=\"$failoverDBCClusterHost\",product_name=$productName",
-				'inf_default' => "none",
-			};
-			$queries{"$queryName threshold"} = {
-                                perl => sub {return 0}, 
-                                inf_field => "threshold_level",
-                                inf_tags => "SID=\"$dbSid\",primary=\"$primaryDBCClusterHost\",failover=\"$failoverDBCClusterHost\",product_name=$productName",
-                                group_by => "SID=\"$dbSid\",primary=\"$primaryDBCClusterHost\",failover=\"$failoverDBCClusterHost\",product_name=$productName",
-			
-			};
+                # Loop @output to find the active host based on the sid
+                # sample output
+                # 1  '#Group         Attribute             System     Value'
+                # 2  'AUCPRO1        State                 db101      |ONLINE|'
+                foreach my $line ( @output ) {
+                    next unless ( $line =~ /${ucSid}\s+State\s+([A-Za-z0-9]+)/ );
+                    $primaryHost = $1;
+                    $host =~ /^[A-Za-z0-9]+(.+)/;
+                    $primaryHost .= $1;
+                    last;
+                }
+                last if $primaryHost;
+            }
 
-			# Get all the imported disks on the failover cluster node.  
-			# Only do it once for each failover node.
-			unless ( $VVsForFailoverNodes{$failoverDBCClusterHost} ) {
-				my @vvList;
-				eval {
-					@vvList = ariba::Ops::FileSystemUtilsRPC::vvsForFailover ($failoverDBCClusterHost, $me->service());
-				};
+                        my $standbyHost = ( $primaryHost eq $hosts[0] ) ? $hosts[1] : $hosts[0];
+            my $queryName = "$vipName {$hosts[0] $hosts[1]}, Active 3par VVs on primary for sid $dbSid not imported on standby";
+            $queries{$queryName} = {
+                'uiHint' => $productName,
+                'info' => 1,
+                'warn' => 0,
+                'crit' => 0,
+                'perl' => "return 'none'",
+                'inf_field' => "active_3par_VVs_not_imported",
+            };
 
-				if ($@) {
-					my $err = $@;
-					$queries{$queryName}->{'warn'} = 1;
-					$queries{$queryName}->{'perl'} = sub {return "$err"};
-					$queries{"$queryName threshold"}->{perl} = sub {return 1};
-					next;
-				}
+            if ( $primaryHost ) {
+                $queries{$queryName}->{'inf_tags'} =
+                    "SID=\"$dbSid\",primary=\"$primaryHost\",failover=\"$standbyHost\"",
+            }
+            else {
+                $queries{$queryName}->{'crit'} = 1;
+                $queries{$queryName}->{'perl'} = "return 'Could not determine active host.  Is the cluster on line?'";
+                next;
+            }
 
-				@{ $VVsForFailoverNodes{$failoverDBCClusterHost} } = @vvList;
+            # Get all the imported disks on the failover cluster node.
+            # Only do it once for each failover node.
+            unless ( $VVsForFailoverNodes{$standbyHost} ) {
+                my @vvList;
+                eval {
+                    @vvList = ariba::Ops::FileSystemUtilsRPC::vvsForFailover ($standbyHost, $me->service());
+                };
 
-				print "failover node imported disks: ", join("\n", @{$VVsForFailoverNodes{$failoverDBCClusterHost}}), "\n" if $debug >= 2;
-			}
+                if ($@) {
+                    $queries{$queryName}->{'warn'} = 1;
+                    $queries{$queryName}->{'perl'} = "return \"$@\"";
+                    next;
+                }
 
-			# Get the list of all the filesystems the db is using on the primary node
-			# First, get the list of the active db files and log files.  Then we get the list 
-			# unique filesystem mountpoint for the files.
-			my @dbFiles = filesForDB($me, $dbc, \$queries{$queryName});
-			next unless @dbFiles;
-			my @mountPoints;
+                @{ $VVsForFailoverNodes{$standbyHost} } = @vvList;
 
-			eval {
-				@mountPoints = ariba::Ops::FileSystemUtilsRPC::mountPointsForFileList
-					(\@dbFiles, $primaryDBCClusterHost, $me->service());
-			};
+                print "failover node imported disks: ", join("\n", @{$VVsForFailoverNodes{$standbyHost}}), "\n" if $debug >= 2;
+            }
 
-			if ($@) {
-				$queries{$queryName}->{'warn'} = 1;
-				$queries{$queryName}->{'perl'} = sub {return "$@"};
-				$queries{"$queryName threshold"}->{perl} = sub {return 1};
-				next;
-			}
+            # Get the list of all the filesystems the db is using on the primary node
+            # First, get the list of the active db files and log files.  Then we get the list
+            # unique filesystem mountpoint for the files.
+            my @dbFiles = filesForDB($me, $dbc, \$queries{$queryName});
+            next unless @dbFiles;
+            my @mountPoints;
 
-			my @fsList;
-			eval {
-				@fsList = ariba::Ops::FileSystemUtilsRPC::vvsForMountPoints(\@mountPoints, $primaryDBCClusterHost, $me->service());
-			};
+            eval {
+                @mountPoints = ariba::Ops::FileSystemUtilsRPC::mountPointsForFileList
+                    (\@dbFiles, $primaryHost, $me->service());
+            };
 
-			if ($@) {
-				$queries{$queryName}->{'warn'} = 1;
-				$queries{$queryName}->{'perl'} = sub {return "$@"};
-				$queries{"$queryName threshold"}->{perl} = sub {return 1};
-				next;
-			}
+            if ($@) {
+                $queries{$queryName}->{'warn'} = 1;
+                $queries{$queryName}->{'perl'} = "return \"$@\"";
+                next;
+            }
 
-			my @problemVvs;
-			for my $fsDetails (@fsList) {
-				my ($fs, $vvlist) = split(/:/, $fsDetails);
-				for my $vvAndWWN (split(/ /, $vvlist)) {
-					my ($vv, $WWn) = split(/,/, $vvAndWWN);
-					unless ( grep(/$vvAndWWN/, @{ $VVsForFailoverNodes{$failoverDBCClusterHost} }) ) {
-						push @problemVvs, "$vv($fs)";
-					}
-				}
-			}
+            my @fsList;
+            eval {
+                @fsList = ariba::Ops::FileSystemUtilsRPC::vvsForMountPoints(\@mountPoints, $primaryHost, $me->service());
+            };
 
-			if ( scalar(@problemVvs) ) {
-				$queries{$queryName}{'crit'} = 1;
-				$queries{$queryName}{'perl'} = sub { return join(' ', @problemVvs) };
-				$queries{"$queryName threshold"}->{perl} = sub {return 2};
-			}
-		} # dbcs
+            if ($@) {
+                $queries{$queryName}->{'warn'} = 1;
+                $queries{$queryName}->{'perl'} = "return \"$@\"";
+                next;
+            }
 
-	} # products
-        $queries{influx_details} = {measurement => "veritas_failover_node_state"};
-	my $qm = ariba::monitor::QueryManager->newWithDetails("veritas_failover_node_state", $tab, $me->service(), undef, \%queries);
-	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+            my @problemVvs;
+            for my $fsDetails (@fsList) {
+                my ($fs, $vvlist) = split(/:/, $fsDetails);
+                for my $vvAndWWN (split(/ /, $vvlist)) {
+                    my ($vv, $WWn) = split(/,/, $vvAndWWN);
+                    unless ( grep(/$vvAndWWN/, @{ $VVsForFailoverNodes{$standbyHost} }) ) {
+                        push @problemVvs, "$vv($fs)";
+                    }
+                }
+            }
+
+            if ( scalar(@problemVvs) ) {
+                    $queries{$queryName}{'crit'} = 1;
+                    $queries{$queryName}{'perl'} = sub { return join(' ', @problemVvs) };
+            }
+
+        } # dbcs
+
+        my $qm = ariba::monitor::QueryManager->newWithDetails("veritas-cluster-status", $tab, $me->service(), undef, \%queries);
+        $qm->setUiManager( "veritas-cluster-status" );
+        $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monserver);
+
+    } # products
+
 }
 
 sub filesForDB {
-	my $me = shift;
-	my $dbc = shift;
-	my $queryRef = shift;
-	my @dbFilesReturnedFromQuery;
-	my @allDBFiles;
+    my $me = shift;
+    my $dbc = shift;
+    my $queryRef = shift;
+    my @dbFilesReturnedFromQuery;
+    my @allDBFiles;
 
-	eval {
-		@dbFilesReturnedFromQuery = ariba::DBA::SampleSQLQueries::executeSQLQuery($me, "getVolume", $dbc);
-	};
-	if ( $@ ) {
-		my $msg = "Connection to " . $dbc->host() . " failed: $@";
-		$$queryRef->{'warn'} = 1;
-		$$queryRef->{'perl'} = sub {return '$msg'};
-		return ();
-	} 
+    eval {
+        @dbFilesReturnedFromQuery = ariba::DBA::SampleSQLQueries::executeSQLQuery($me, "getVolume", $dbc);
+    };
+    if ( $@ ) {
+        my $msg = "Connection to " . $dbc->host() . " failed: $@";
+        $$queryRef->{'warn'} = 1;
+        $$queryRef->{'perl'} = "return '$msg'";
+        return ();
+    }
 
-	unless ( scalar @dbFilesReturnedFromQuery ) {
-		my $msg = "Query of Oracle data files from " . $dbc->host() . " returned no rows";
-		$$queryRef->{'warn'} = 1;
-		$$queryRef->{'perl'} = sub {return '$msg'};
-		return ();
-	} 
+    unless ( scalar @dbFilesReturnedFromQuery ) {
+        my $msg = "Query of Oracle data files from " . $dbc->host() . " returned no rows";
+        $$queryRef->{'warn'} = 1;
+        $$queryRef->{'perl'} = "return '$msg'";
+        return ();
+    }
 
-	push(@allDBFiles, @dbFilesReturnedFromQuery);
+    push(@allDBFiles, @dbFilesReturnedFromQuery);
 
-	@dbFilesReturnedFromQuery = ariba::DBA::SampleSQLQueries::executeSQLQuery($me, "logLocations", $dbc);
-	unless ( scalar @dbFilesReturnedFromQuery ) {
-		my $msg = "Query of Oracle log files from " . $dbc->host() . " returned no rows";
-		$$queryRef->{'warn'} = 1;
-		$$queryRef->{'perl'} = sub {return '$msg'};
-		return ()
-	}
-	push(@allDBFiles, @dbFilesReturnedFromQuery);
+    @dbFilesReturnedFromQuery = ariba::DBA::SampleSQLQueries::executeSQLQuery($me, "logLocations", $dbc);
+    unless ( scalar @dbFilesReturnedFromQuery ) {
+        my $msg = "Query of Oracle log files from " . $dbc->host() . " returned no rows";
+        $$queryRef->{'warn'} = 1;
+        $$queryRef->{'perl'} = "return '$msg'";
+        return ()
+    }
+    push(@allDBFiles, @dbFilesReturnedFromQuery);
 
-	return @allDBFiles;
+    return @allDBFiles;
 }
 
 main(@ARGV);

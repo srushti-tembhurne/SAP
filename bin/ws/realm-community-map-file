@@ -17,7 +17,7 @@ use ariba::Ops::Startup::Apache;
 use ariba::Ops::NetworkUtils;
 use ariba::monitor::QueryManager;
 
-my $vers = '$Id: //ariba/services/monitor/bin/ws/realm-community-map-file#7 $';
+my $vers = '$Id: //ariba/services/monitor/bin/ws/realm-community-map-file#8 $';
 $main::quiet	= 1;	# silence transferFromSrcToDest output
 
 # need this for rsync to work from crontab
@@ -68,15 +68,13 @@ sub main {
 				},
                 inf_field => "last_checked",
                 inf_tags  => "webserver=\"$webserver\",product_name=\"$prodname\"",
-                group_by  => "$webserver,$prodname",
-                inf_default => 0
 			};
 		}
 	}
 
-    $queries{'influx_details'} = { measurement => 'ssws_realm_community_map' };
 	my $email = $me->default('notify.email');
-	my $qm = ariba::monitor::QueryManager->newWithDetails( "realm-community-map-file", $ssws->name(), $service, undef, \%queries);
+	my $qm = ariba::monitor::QueryManager->newWithDetails(
+		"realm-community-map-file", $ssws->name(), $service, undef, \%queries);
 	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
 }
 
@@ -145,4 +143,3 @@ sub mtimeForFileFromHost {
 main();
 
 __END__
-

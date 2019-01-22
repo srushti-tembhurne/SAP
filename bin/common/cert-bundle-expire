@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/common/cert-bundle-expire#13 $
+# $Id: //ariba/services/monitor/bin/common/cert-bundle-expire#14 $
 
 use strict;
 use FindBin;
@@ -38,26 +38,25 @@ sub main {
     my $hostname      = ariba::Ops::NetworkUtils::hostname();
     my $machine   = ariba::Ops::Machine->new($hostname);
     my $datacenter    = $machine->datacenter();
-    my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
 
     my $certDir       = ariba::Ops::Constants->caCertDir();
 
     my %queries       = ();
 
     # recurse through directories.
-    processCertDir($cert, $certDir, \%queries, $datacenter);
+    processCertDir($cert, $certDir, \%queries);
     #adding an cert dir,if there are more cert dir need to be parsed,then we can iterate it
     my $service = $me->service();
     my $anCertDir       = "/home/an$service/lib/certs";
     if ( -e $anCertDir ) {
         print "Parsing AN certs $anCertDir \n" if($debug);
-        processCertDir($cert, $anCertDir, \%queries, $datacenter);
+        processCertDir($cert, $anCertDir, \%queries);
     }
     else {
         print "No AN certs present in $anCertDir for this $service service \n" if($debug);
     }
 
-    $queries{influx_details} = {measurement => "certificate_time_until_expire"};
+    my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
     my $q  = ariba::monitor::QueryManager->newWithDetails(
         "cert-bundle-expire", $pn, $me->service(), $me->customer(), \%queries
     );
@@ -69,7 +68,6 @@ sub processCertDir {
     my $cert    = shift;
     my $dir     = shift;
     my $queries = shift;
-    my $datacenter = shift;
     my $uiHint  = shift;
 
     my $certDir = Symbol::gensym();
@@ -109,8 +107,6 @@ sub processCertDir {
             description => "For initial debugging refer to $path",
             inf_field => "certDaysToExpiration",
             inf_tags => "CADisplayName=\"$displayName\"",
-            group_by => "$datacenter,$displayName",
-            inf_default => 0,
         };
     }
 

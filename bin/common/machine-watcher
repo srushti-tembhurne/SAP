@@ -1,7 +1,7 @@
 #!/usr/local/bin/perl
 
 # machine-watcher 97-04-02 Dan Grillo <grio@280.com>
-# $Id: //ariba/services/monitor/bin/common/machine-watcher#49 $
+# $Id: //ariba/services/monitor/bin/common/machine-watcher#51 $
 #
 # Based on an idea in a program orginally by Bryce Jasmer
 
@@ -64,7 +64,7 @@ sub main {
     my $me          = ariba::rc::InstalledProduct->new();
     my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
     my $pager       = $me->default('notify.email');
-    my $qmName      = 'machine-watcher-stratus';
+    my $qmName      = 'machine-watcher';
     my $progName    = $0;
 
     # Set unbuffered output if running in debug, try to keep writes working nicer in multi-process environment.
@@ -122,7 +122,7 @@ sub main {
             # here, so we *do not* remove the primary mon host name when monitoring it from the secondary mon host.
             @machines = grep {$_->hostname !~ /$monserver/} @machines;
         }
-
+        
         next unless(@machines);
 
         print "Checking ", scalar(@machines), " machines in $datacenter\n" if $debug;
@@ -173,11 +173,10 @@ sub main {
                                                                         inf_tags   => qq|datacenter=$datacenter|,
                                                                         inf_field  => "mw_max_queue_size_status"
                                                                      };
-        $queries{influx_details} = {measurement => "machine_watcher"};
+
         my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
         my $uiManagerName = $qmName . '2';
         my $qm = ariba::monitor::QueryManager->newWithDetails("$uiManagerName-$datacenter", $pn, $me->service(), $me->customer(), \%queries);
-        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
         $qm->setUiManager ($uiManagerName);
         $qm->run();
         if ($debug)
@@ -240,7 +239,7 @@ sub main {
                 for my $machine (@$subMachines) { # CHILD
 
                     my $severity;
-
+                    next if($machine->provides('micro'));
                     print "  Checking ", $machine->hostname(), "\n" if $debug;
 
                     my $status = $machine->status();
@@ -297,8 +296,6 @@ sub main {
                         },
                         inf_field     => "status",
                         inf_tags      => qq|datacenter=$datacenter,hostname=$hostname,mdbstatus=$status|,
-                        inf_default   => "NA",
-                        group_by      => "$datacenter,$status"
                       # It turns out this is the source of the double query display on the mon web page, as well as the many UP alerts.
                       # I do not understand this well enough yet to know why.  And I do not know the basic intent of this construct or
                       # what it was expected to look like.  Commenting this may be breaking something somewhere, but no idea what.  It
@@ -321,9 +318,7 @@ sub main {
                 # script name, which will still be 'machine-watcher'.  This removes the need to change any of the startup-hooks.
                 $qmName .= '2_' . $childNumber;
 
-                $queries{influx_details} = {measurement => "machine_watcher"};
-                my $qm = ariba::monitor::QueryManager->newWithDetails($qmName, $pn, $me->service(), $me->customer(), \%queries);
-                $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+                $qm = ariba::monitor::QueryManager->newWithDetails($qmName, $pn, $me->service(), $me->customer(), \%queries);
 
                 $qm->setUiManager ($uiManagerName);
 
@@ -417,15 +412,12 @@ sub checkMachine {
             # Though documentation says the raw SNMP is in milliseconds, it looks like the value is actually off by a factor of
             # 10, meaning the following division actually returns a value that compares correctly with the 'uptime' command.
             $upTime /= 100 if $upTime; # convert to secs.
-        }
-
-    }
-
+        
     # If snmp worked and we got an uptime, the first part is done.  The branch will be used if uptime was not found OR if
     # the ping failed.
-    if ($upTime) {
-        $machine->setNewStatus("up");
-        $machine->setNewTime($upTime);
+            $machine->setNewStatus("up");
+            $machine->setNewTime($upTime);
+        }
     } else {
         # I think the logic for setting the time is incorrect, by using the value of 'time()'.  What that does is set the
         # 'uptime' to a value equal to the amount of time since the epoch (Jan. 1, 1970).  It would make more sense, I

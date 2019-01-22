@@ -115,9 +115,7 @@ sub main {
                                                   2)Send email to AUC Community alias DL ARB AUC_Eng (External) <DL_5419DA6CFD84A00838000005@exchange.sap.corp>'
                                     ],
                                     recordMaxResults => 8640,
-				                    perl => sub {  return scan_status('timeout_calls'); }, 
-                                    inf_field   => "timed_out_calls",
-                                    inf_default => 0,
+				    perl => sub {  return scan_status('timeout_calls'); }, 
                                   };
 
      $queries{'Request failed calls'} = {
@@ -131,7 +129,6 @@ sub main {
                                           recordMaxResults => 8640,
                                           perl =>  sub { return scan_status('failed_calls'); },
                                           inf_field   => "request_failed_calls",
-                                          inf_default => 0,
                                          };
       $queries{'Clean calls'} =  {
                                    warn => "answer =~ /(invalid|error)/i",
@@ -140,7 +137,6 @@ sub main {
                                    recordMaxResults => 8640,
                                    perl =>  sub { return scan_status('clean_calls'); },
                                    inf_field   => "clean_calls",
-                                   inf_default => 0,
                                  };
 
       $queries{'Virus found calls'} = {
@@ -152,7 +148,6 @@ sub main {
                                          recordMaxResults => 8640,
                                          perl =>  sub { return scan_status('virus_found_calls'); },
                                          inf_field   => "virus_found_calls",
-                                         inf_default => 0,
                                          };
 
       $queries{'Total Virus scan requests'} = {
@@ -162,12 +157,10 @@ sub main {
                                                  recordMaxResults => 8640,
                                                  perl => sub { return scan_status('total'); },
                                                  inf_field   => "total_virus_scan_requests",
-                                                 inf_default => 0,
        
        };
 
       my $email = $me->default('notify.email');
-      $queries{'influx_details'} = { measurement => 'community_clamav_status'};
       my $qm = ariba::monitor::QueryManager->newWithDetails('ClamAV Status', $me->name(), $me->service(), $me->customer(), \%queries);
       $qm->processQueries($debug, $email, $sendEmail, $sendPage);
                                     

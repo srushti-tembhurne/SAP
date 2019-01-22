@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl
+#!/usr/local/bin/perl -w
 
 use strict;
 use FindBin;
@@ -61,12 +61,9 @@ sub main {
                 Ops                         => 'Please look into the node on the webserver.',
             ],
             description                     => "modjk worker status for given webserver, app, tasknode",
-	        timeout                         => 600,
-            inf_field                       => "status",
-            inf_default                     => "none",
+	    timeout                         => 600,
         };
- 
-        $queries{'influx_details'} = { measurement => 'ssws_modjk_worker_status' };
+
         my $email = $mon->default('notify.email');
         my $qm = ariba::monitor::QueryManager->newWithDetails('modjk-worker-status', $ws->name(), $ws->service(), $ws->customer(), \%queries);
         $qm->processQueries($debug, $email, $sendEmail, $sendPage);

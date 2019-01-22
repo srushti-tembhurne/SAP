@@ -1,12 +1,11 @@
 #!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/an/intermedia-status#15 $
+# $Id: //ariba/services/monitor/bin/an/intermedia-status#16 $
 
 use strict;
-use Data::Dumper;
 
 use FindBin;
-use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../../lib";
 
 use ariba::Ops::OracleClient;
 use ariba::Ops::DBConnection;
@@ -22,7 +21,6 @@ sub main {
 	my $sendEmail = 0;
 	my $sendPage = 0;
 	my $queries = {};
-	my $queries_summary = {};
 
 	while (my $arg = shift(@ARGV)) {
 		if ($arg =~ m/^-d/o) { $debug = 1; }
@@ -69,7 +67,7 @@ sub main {
 			$oc = createOracleClient($dbc);
 		} else {
 
-			my ($id, $word) = ($results[0]->{'ID'}, $results[0]->{'WORD'});
+			my ($id, $word) = split($oc->colsep(), $results[0]);
 
 			# This should never be NULL, but we saw it, and want to catch
 			# it in case it is - from Todd.
@@ -81,23 +79,19 @@ sub main {
 				# remove the quotes that we get, because we're going to escape it again.
 				$word =~ s/^'(.+?)'$/$1/;
 
-				$validitySQL = "select count(1) as sv_$column from org where id = $id and contains($column, '{$word}') > 0";
+				$validitySQL = "select count(1) from org where id = $id and contains($column, '{$word}') > 0";
 
 			} else {
 
-				$validitySQL = "select 0 as sv_$column from dual";
-				$id = 'NULL' unless defined $id;
-				$word = 'NULL';
+				$validitySQL = "select 0 from dual";
 			}
 
 			#- to verify a search of that word using results from the first query (1 means success, 0 means failure):
-			$queries_summary->{"Search validity for org.$column"} = {
+			$queries->{"Search validity for org.$column"} = {
 				note	=> "1 means success, 0 means failure (searched for id: [$id] word: [$word]",
 				info	=> "answer == 1",
 				crit	=> "answer == 0 and previousAnswer == 0",
-				sql	=> $validitySQL,
-				inf_tags	=> "id=$id,word=$word",
-				group_by	=> "$id,$word",
+				sql	=> "select count(1) from org where id = $id and contains($column, '{$word}') > 0",
 			};
 		}
 	}
@@ -119,7 +113,7 @@ sub main {
 		$oc->disconnect();
 		$oc = createOracleClient($dbc);
 	} else {
- 		my ($id, $word) = ($results[0]->{'ID'}, $results[0]->{'WORD'});
+		my ($id, $word)  = split($oc->colsep(), $results[0]);
 
 		# From Todd - this can be a null value and it's ok. Work around that fact.
 		if ($word && $word ne 'NULL') {
@@ -130,25 +124,19 @@ sub main {
 			# remove the quotes that we get, because we're going to escape it again.
 			$word =~ s/^'(.+?)'$/$1/;
 
-			$rfxCountSQL = "select count(1) as rfx_event from rfx_event where id = $id and contains(keywords, '{$word}') > 0";
+			$rfxCountSQL = "select count(1) from rfx_event where id = $id and contains(keywords, '{$word}') > 0";
 
 		} else {
 
 			$rfxCountSQL = "select count(1) from dual";
-			$id = 'NULL' unless defined $id;
-			$word = 'NULL';
 		}
 
 		# - to verify a search of that word using results from the first query (1 means success, 0 means failure):
-		$queries_summary->{"Search validity for rfx_event"} = {
+		$queries->{"Search validity for rfx_event"} = {
 			note	=> "1 means success, 0 means failure (NULL/empty is ok) (searched for id: [$id] word: [$word]",
 			info	=> "answer == 1",
 			crit	=> "answer == 0 and previousAnswer == 0",
-			sql	    => $rfxCountSQL,
-			inf_field => "rfx_event",
-			inf_tags	=> "id=$id,word=$word",
-			group_by	=> "$id,$word",
-			inf_default => 0,
+			sql	=> $rfxCountSQL,
 		};
 	}
 
@@ -166,11 +154,7 @@ sub main {
 
 		for my $row (@indexRows) {
 
-            my $indexName           = $row->{'INDEX_NAME'};
-            my $synchronizeInterval = $row->{'SYNCHRONIZE_INTERVAL'};
-            my $lastSynchronized    = $row->{'LAST_SYNCHRONIZED'};
-            my $optimizeInterval    = $row->{'OPTIMIZE_INTERVAL'};
-            my $lastOptimized       = $row->{'LAST_OPTIMIZED'};
+			my ($indexName, $synchronizeInterval, $lastSynchronized, $optimizeInterval, $lastOptimized) = split($oc->colsep(), $row);
 
 			$lastSynchronized = str2time($lastSynchronized);
 			$lastOptimized    = str2time($lastOptimized);
@@ -195,22 +179,8 @@ sub main {
 				warn	=> "($now - answer) >  ($synchronizeInterval + ($synchronizeInterval * 1.5))",
 				crit	=> "($now - answer) >  ($synchronizeInterval + ($synchronizeInterval * 2.0))",
 				perl	=> "return $lastSynchronized",
-				inf_field => "last_sync",
-				inf_tags => qq(index_name="$indexName"),
-				inf_default => 0,
-				group_by => $indexName,
-			};
-			$queries->{"$indexName last synchronize warn/crit flag"} = {
-				perl =>
-					sub {
-						my $delta = $now - $lastSynchronized;
-						return ( $delta > $synchronizeInterval * 3   ) ? 2
-						     : ( $delta > $synchronizeInterval * 2.5 ) ? 1
-						     : 0;
-					},
-				inf_field => "last_sync_warn_crit_flag",
-				inf_tags  => qq(index_name="$indexName"),
-				group_by  => $indexName,
+                inf_field => "last_sync",
+                inf_tags => qq(index_name="$indexName"),
 			};
 
 			# optimize monitoring
@@ -220,22 +190,8 @@ sub main {
 				warn	=> "($now - answer) >  ($optimizeInterval + ($optimizeInterval * 1.5))",
 				crit	=> "($now - answer) >  ($optimizeInterval + ($optimizeInterval * 2.0))",
 				perl	=> "return $lastOptimized",
-				inf_field =>  "last_optimize",
-				inf_tags => qq(index_name="$indexName"),
-				inf_default => 0,
-				group_by => $indexName,
-			};
-			$queries->{"$indexName last optimize warn/crit flag"} = {
-				perl =>
-					sub {
-						my $delta = $now - $lastOptimized;
-						return ( $delta > $optimizeInterval * 3   ) ? 2
-						     : ( $delta > $optimizeInterval * 2.5 ) ? 1
-						     : 0;
-					},
-				inf_field => "last_optimize_warn_crit_flag",
-				inf_tags  => qq(index_name="$indexName"),
-				group_by  => $indexName,
+                inf_field =>  "last_optimize",
+                inf_tags => qq(index_name="$indexName"),
 			};
 		}
 	}
@@ -244,27 +200,21 @@ sub main {
 	for my $type (qw(SYNCHRONIZE OPTIMIZE)) {
 
 		# these have different thresholds
-		$queries_summary->{"Max duration of $type in minutes"} = {
+		$queries->{"Max duration of $type in minutes"} = {
 			info    => $type eq 'OPTIMIZE' ? "answer <= 30" : "answer <= 15",
 			warn    => $type eq 'OPTIMIZE' ? "answer >  30" : "answer >  15",
 			crit    => $type eq 'OPTIMIZE' ? "answer >= 60" : "answer >= 30",
-			sql	=> "select max(round((maintenance_end - maintenance_start)*24*60,2)) as duration_$type
-				from ndr_text_index_log where maintenance_type = '$type'",
+			sql	=> "select max(round((maintenance_end - maintenance_start)*24*60,2))
+				from ndr_text_index_log where maintenance_type = '$type'"
 		};
 	}
 
 	##############################################3
-    $queries->{influx_details} = { measurement => "intermedia_status" };
-    $queries_summary->{influx_details} = { measurement => "intermedia_status_summary" };
+	my $q = ariba::monitor::QueryManager->newWithDetails('intermedia-status', 'an', $me->service(), $me->customer(), $queries);
 
-    my $q  = ariba::monitor::QueryManager->newWithDetails('intermedia-status', 'an', $me->service(), $me->customer(), $queries);
-    $q->setSQLConnectInfoFromOracleClient($oc);
-    $q->processQueries($debug, $me->default('notify.email'), $sendEmail, $sendPage);
+	$q->setSQLConnectInfoFromOracleClient($oc);
 
-
-    my $qs = ariba::monitor::QueryManager->newWithDetails('intermedia-status', 'an', $me->service(), $me->customer(), $queries_summary);
-    $qs->setSQLConnectInfoFromOracleClient($oc);
-    $qs->processQueries($debug, $me->default('notify.email'), $sendEmail, $sendPage);
+	$q->processQueriesUsingServer($debug, $me->default('notify.email'), $sendEmail, $sendPage);
 }
 
 sub createOracleClient {

@@ -73,17 +73,12 @@ sub main {
         recordItem => 'numrows',
         recordMaxResults => 35000, 
         perl => sub { main::failedJobsInLastHours($hadoop, 1); },
-        inf_field => "failed_jobs_in_last_hour",
-        inf_default => 0, 
     };
 
-
-
     my $email = $me->default('notify.email');
-    $queries{"influx_details"} = {measurement => "MapReduce_Status"};
 
     my $qm = ariba::monitor::QueryManager->newWithDetails('MapReduce', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queries);
-    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 } 
 
 sub failedJobsInLastHours {

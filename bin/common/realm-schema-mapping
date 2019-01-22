@@ -5,7 +5,7 @@
 # Script to monitor realm-to-schema mappings and wrongly-assigned realms
 #
 # Checks the results of a scheduled task which in turn checks whether rootIds
-# for a particular table are mapped correctly to the right schema.
+# for a particular table are mapped correctly to the right schema. 
 #
 # https://devwiki.ariba.com/bin/view/Main/DBSchemaRealmMappingVerificationTask
 #
@@ -22,7 +22,6 @@ use ariba::rc::InstalledProduct;
 use ariba::Ops::OracleClient;
 use ariba::Ops::HanaClient;
 use ariba::Ops::DBConnection;
-use Data::Dumper;
 
 my $debug = 0;
 
@@ -73,7 +72,6 @@ sub main {
 		note => "results from $url",
 		requestString => $requestString,
         inf_field => "status",
-        inf_default => "none",
 	};
 
 	$queries{"Realm to schema to SID  mapping (ID, Name, Schema, SID)"} = {
@@ -95,7 +93,6 @@ sub main {
 		};
 	}
 
-	$queries{"influx_details"} = { 'measurement' => "realm_schema_mapping"};
 	my $email = $me->default('notify.email');
 
 	my $qm = ariba::monitor::QueryManager->newWithDetails(
@@ -115,7 +112,7 @@ sub fetchAndParse {
 
 	my $da = ariba::monitor::Url->new($url);
 
-	$da->setTimeout(60*10);
+	$da->setTimeout(60*10); 
 	$da->useOutOfBandErrors();
 	$da->setSaveRequest(1);
 
@@ -175,7 +172,7 @@ sub realmSchemaSid {
 
 	my @dbcs = ariba::Ops::DBConnection->connectionsForProductOfDBType($product, ariba::Ops::DBConnection->typeMain());
 	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSidAndSchema(@dbcs))  {
-                my $dbsid = ($dbc->isHana()) ? uc($dbc->host()). ":". $dbc->port() : uc($dbc->sid());
+		my $dbsid = uc($dbc->sid());
 		my $dbschema = $dbc->schemaId();
 		$schemaSid{$dbschema} = $dbsid;
 	}
@@ -184,6 +181,7 @@ sub realmSchemaSid {
 	my @oracle_dbcs   = ariba::Ops::DBConnection->connectionsForProductOfDBServerType(undef, $oracle_dbtype, \@dbcs);
 	my @hana_tx_schema_ids   = map { $_->schemaId } @hana_dbcs;
 	my @oracle_tx_schema_ids = map { $_->schemaId } @oracle_dbcs;
+
 	my $dbc;
 	my ($dbType, $user, $password, $sid, $host, $port) = $product->connectInfoWithDBType();
 	if ($dbType eq ariba::Ops::DBConnection->hanaDBServerType()) {
@@ -209,8 +207,8 @@ sub realmSchemaSid {
 	# then it most likely has the new "dbtype" column.
 
 	my $has_hana_tx_schemas = @hana_tx_schema_ids;
-    my $extra_query = $has_hana_tx_schemas ? ',nvl(b.dbtype, \'hana\') as dbtype' : '';
-	my $realmQuery = "select a.realmid realmid, b.name realmname, a.schematype, a.databaseschema, a.isprimary $extra_query"
+	my $extra_query = $has_hana_tx_schemas ? ', b.dbtype' : '';
+	my $realmQuery = "select a.realmid, b.name realmname, a.schematype, a.databaseschema, a.isprimary $extra_query"
 		       . " from schematypemaptab a, realmtab b"
 		       . " where a.realmid = b.id"
 		       . " order by a.realmid, a.schematype, a.isprimary";
@@ -229,22 +227,33 @@ sub realmSchemaSid {
 	$dbc->disconnect();
 	if($dbc->error()) {
 		print "sql error: " . $dbc->error() . "\n";
+		$query->setError($dbc->error());
 		return $dbc->error();
 	}
+
 	my $colsep = $dbc->colsep();
 	foreach my $result (@results) {
-		# only transactional schems will have sid
-		my $schema = $result->{DATABASESCHEMA};
-		my ($type, $schema_id) = split(/\.Schema/, $schema);
-		my $sid =  $schemaSid{$schema_id};
-		$result->{SID} = $sid;
-	}
-	### If hana datatype, return the results, else set to Oralce
-	return (\@results) if ($has_hana_tx_schemas);
+		my ($a_realmid, $b_realmname, $a_schematype, $a_databaseschema, $a_isprimary, $dbtype) = split(/$colsep/,$result);
+		my ($type, $schema_id) = split(/\.Schema/, $a_databaseschema);
 
-	foreach my $result (@results) {
-		$result->{DBTYPE} = $oracle_dbtype;
+		$dbtype ||= $oracle_dbtype;
+		$schema_id = int($schema_id);
+		my $sid = $schemaSid{$schema_id};
+		my $realm_details = "$a_realmid\t$b_realmname\t$a_databaseschema\t$sid\n";
+		$realmResults .= "$a_realmid\t$b_realmname\t$a_databaseschema\t$sid\n";
+
+		if($has_hana_tx_schemas) { # do we have any hana tx schemas assigned to oracle realms or vice versa?
+			if($a_schematype =~ /transactional/i) {
+				if(lc($dbtype) eq $oracle_dbtype && grep { /^$schema_id$/ } @hana_tx_schema_ids) {
+					$misallocated_realms{$oracle_dbtype} .= $realm_details;
+				}
+				elsif(lc($dbtype) eq $hana_dbtype && grep { /^$schema_id$/ } @oracle_tx_schema_ids) {
+					$misallocated_realms{$hana_dbtype} .= $realm_details;
+				}
+			}
+		}
 	}
-	return (\@results);
+
+	return $realmResults;
 }
 main();

@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/everywhere/check-omniback-result#22 $
+# $Id: //ariba/services/monitor/bin/everywhere/check-omniback-result#23 $
 #
 # Monitoring the OMNI backup result.
 
@@ -259,13 +259,10 @@ sub main {
             crit => "$criticalStatus",
             noRowCount => 1,
             note => "$rmanStr",
-            #perl => sub { main::queryMessages($status, $lastThree, $archStr, $ctlBackup, $written, $driveStr, $slotStr, $sessionId, $DBID, $startTime, $queue, $duration, $nextSchedule, $jobNameType, $mirrored) },   
-            perl => sub { return $backupResult},   
+            perl => sub { main::queryMessages($status, $lastThree, $archStr, $ctlBackup, $written, $driveStr, $slotStr, $sessionId, $DBID, $startTime, $queue, $duration, $nextSchedule, $jobNameType, $mirrored) },   
             uiHint => "rman-backup-session-status/$sid",
             inf_field => "backupResult",
             inf_tags => "datacenter=\"$datacenter\",sid=\"$sid\",uiHint=\"rman-backup-session-status/$sid\",jobName=\"$jobName\"",
-            inf_default => 0,
-            group_by => "rman-backup-session-status/$sid",
         },
         "$jobName-Summary" => {
             hasErraticSchedule => 1,
@@ -278,9 +275,6 @@ sub main {
             uiHint => "product-level-backup-status",
             inf_field => "productLevelBackupResult",
             inf_tags => "datacenter=\"$datacenter\",sid=\"$sid\",uiHint=\"product-level-backup-status\",jobName=\"$jobName-Summary\"",
-            inf_default => 0,
-            group_by => "product-level-backup-status",
-
         },
     );
 
@@ -293,24 +287,23 @@ sub main {
         'dba', $product, $service, $customer, \%queries
     );
 
-    $queries{influx_details} = {measurement => "dba"};
-    my $result = $qm->processQueries($debug, $to, $sendEmail, $sendPage, $server);
+    my $result = $qm->processQueriesUsingServer($debug, $to, $sendEmail, $sendPage, $server);
     # $result will be '0' on success
 
-#    if (!$debug && $backupResult eq 'Failed') {
-#        # Send out a separate notificationRequest with more data from omnirpt
-#        my $subject = "Backup failed for: $jobName";
-#
-#        my $notificationRequest = ariba::Ops::NotificationRequest->newWarn(
-#            $progName, $product, $service, $customer, undef, $subject, $fullReport, $to
-#        );
-#
-#        $notificationRequest->setDebug($debug);
-#        $result |= !$notificationRequest->send();
-#        # send() will return non-zero value for success, but we are using
-#        # $result as an exit() value so take the inverse of what send returns
-#    }
-#
+    if (!$debug && $backupResult eq 'Failed') {
+        # Send out a separate notificationRequest with more data from omnirpt
+        my $subject = "Backup failed for: $jobName";
+
+        my $notificationRequest = ariba::Ops::NotificationRequest->newWarn(
+            $progName, $product, $service, $customer, undef, $subject, $fullReport, $to
+        );
+
+        $notificationRequest->setDebug($debug);
+        $result |= !$notificationRequest->send();
+        # send() will return non-zero value for success, but we are using
+        # $result as an exit() value so take the inverse of what send returns
+    }
+
     exit($result);
 }
 

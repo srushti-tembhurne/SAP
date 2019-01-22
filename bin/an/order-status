@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl -w
 #
-# $Id: //ariba/services/monitor/bin/an/order-status#82 $
+# $Id: //ariba/services/monitor/bin/an/order-status#83 $
 
 use strict;
 
@@ -293,7 +293,6 @@ sub main {
 	);
 
 
-    $queries{influx_details} = { measurement => 'an_order_status'};
 	my $email = $me->default('notify.email');
 
 	my $qm = ariba::monitor::QueryManager->newWithDetails(
@@ -304,10 +303,11 @@ sub main {
                 die "can't grab lock\n";
         }
 
-	$qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+	my $dbc = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndSchemaId ( $an, ariba::Ops::DBConnection->typeMain() );
+	$qm->setSQLConnectInfoFromDBConnection($dbc);
 	ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
 
-	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 
 	dmail::LockLib::releaselock($LOCKFILE);
 }

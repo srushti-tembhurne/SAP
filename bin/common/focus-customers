@@ -81,13 +81,12 @@ sub main {
 			description => "Monitoring for realms (@focusCustomers)",
 			perl   => sub { main::processQuery($focusQuery, $focusCustomersHashRef) },
 			inf_field => "query_result",
-                        inf_tags => "query_name=\"$focusQuery\"",
+            inf_tags => "query_name=\"$focusQuery\"",
 		};
 	}
 
     my $email = $mon->default('notify.email');
 
-    $queries{influx_details} = {measurement => "focus_customers"};
     my $qm = ariba::monitor::QueryManager->newWithDetails('Focus Customers', $mon->name(), $mon->service(), undef, \%queries);
     $qm->processQueries($debug, $email, $sendEmail, $sendPage);
 }

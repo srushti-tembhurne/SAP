@@ -14,7 +14,7 @@ use ariba::Ops::ServiceController;
 
 use dmail::LockLib;
 
-my $LOCKFILE = '/tmp/an-stratus-daily-order-status';
+my $LOCKFILE = '/tmp/an-daily-order-status';
 
 my $adminAppURL;
 my $debug = 0;
@@ -65,7 +65,7 @@ sub main {
 				nvl(cd.document_type, 'Unknown') DocType,
 				nvl(cd.operation_type,  'Unavailable') OpType,
 				sj.service_id ServiceId,
-				schema_community as community,
+				schema_community, 
 				to_char(cd.created,'YYYY-MM-DD HH24:MI:SS') Created,
 				nvl(f.name,  'Name unavailable') fromOrg,
 				nvl(t.name, 'Name unavailable') Provider
@@ -84,7 +84,7 @@ sub main {
        	     nvl(cd.document_type, 'Unknown') DocType,
        	     nvl(cd.operation_type,  'Unavailable') OpType,
        	     sj.service_id ServiceId,
-       	     schema_community as community,
+       	     schema_community,
        	     to_char(cd.created,'YYYY-MM-DD HH24:MI:SS') Created,
        	     nvl(f.name,  'Name unavailable') fromOrg,
        	     nvl(t.name, 'Name unavailable') Provider
@@ -106,7 +106,6 @@ sub main {
 
 
 	my $email = $me->default('notify.email');
-    $queries{influx_details} = { measurement => "an_daily_order_status" };
 
 	my $qm = ariba::monitor::QueryManager->newWithDetails(
 		"order-status", "an", $me->service(), $me->customer(), \%queries
@@ -119,7 +118,7 @@ sub main {
 	$qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
 	ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
 
-	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 
 	dmail::LockLib::releaselock($LOCKFILE);
 }

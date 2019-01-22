@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl
+#!/usr/local/bin/perl -w
 
 # $Id: //ariba/services/monitor/bin/common/memcached-status#1 $
 
@@ -87,7 +87,6 @@ sub main {
 				perl => sub { return "down" },
                 inf_field   => "is_up",
                 inf_tags    => "mem_cache_host=\"$memCacheHost\"",
-                group_by    => $memCacheHost,
 			};
 		} else {
 			$remote->autoflush(1);
@@ -106,7 +105,6 @@ sub main {
 				perl => sub { return "ok" },
                 inf_field   => "is_up",
                 inf_tags    => "mem_cache_host=\"$memCacheHost\"",
-                group_by    => $memCacheHost,
 			};
 		}
 
@@ -118,9 +116,7 @@ sub main {
 				warn => $memCachedDown,
 				perl => sub { return $stats->{'curr_items'} },
                 inf_field   => "num_cached_items",
-                inf_default => 0,
                 inf_tags    => "mem_cache_host=\"$memCacheHost\"",
-                group_by    => $memCacheHost,
 		};
 
 		$queries{"$memCacheHost total number of connections"} = {
@@ -131,9 +127,7 @@ sub main {
 				warn => $memCachedDown,
 				perl => sub { return $stats->{'total_connections'} },
                 inf_field   => "total_connections",
-                inf_default => 0,
                 inf_tags    => "mem_cache_host=\"$memCacheHost\"",
-                group_by    => $memCacheHost,
 		};
 
 		$queries{"$memCacheHost memcached bytes read"} = {
@@ -144,9 +138,7 @@ sub main {
 				warn => $memCachedDown,
 				perl => sub { return $stats->{'bytes_read'} },
                 inf_field   => "bytes_read",
-                inf_default => 0,
                 inf_tags    => "mem_cache_host=\"$memCacheHost\"",
-                group_by    => $memCacheHost,
 		};
 
 		$queries{"$memCacheHost memcached bytes written"} = {
@@ -157,9 +149,7 @@ sub main {
 				warn => $memCachedDown,
 				perl => sub { return $stats->{'bytes_written'} },
                 inf_field   => "bytes_written",
-                inf_default => 0,
                 inf_tags    => "mem_cache_host=\"$memCacheHost\"",
-                group_by    => $memCacheHost,
 		};
 
 		$queries{"$memCacheHost memcached store size in bytes"} = {
@@ -170,9 +160,7 @@ sub main {
 				warn => $memCachedDown,
 				perl => sub { return $stats->{'bytes'} },
                 inf_field   => "store_size",
-                inf_default => 0,
                 inf_tags    => "mem_cache_host=\"$memCacheHost\"",
-                group_by    => $memCacheHost,
 		};
 
 		my $percentAvail;
@@ -188,9 +176,7 @@ sub main {
 				warn => "!defined(answer) || answer eq '' || answer < 10",
 				perl => sub { return $percentAvail },
                 inf_field   => "percent_available",
-                inf_default => 0,
                 inf_tags    => "mem_cache_host=\"$memCacheHost\"",
-                group_by    => $memCacheHost,
 		};
 
 		$queries{"$memCacheHost memcached get misses"} = {
@@ -201,9 +187,7 @@ sub main {
 				warn => $memCachedDown,
 				perl => sub { return $stats->{'get_misses'} },
                 inf_field   => "misses_cnt",
-                inf_default => 0,
                 inf_tags    => "mem_cache_host=\"$memCacheHost\"",
-                group_by    => $memCacheHost,
 		};
 
 		$queries{"$memCacheHost memcached get hits"} = {
@@ -214,9 +198,7 @@ sub main {
 				warn => $memCachedDown,
 				perl => sub { return $stats->{'get_hits'} },
                 inf_field   => "hits_cnt",
-                inf_default => 0,
                 inf_tags    => "mem_cache_host=\"$memCacheHost\"",
-                group_by    => $memCacheHost,
 		};
 
 		$queries{"$memCacheHost memcached evictions"} = {
@@ -227,15 +209,15 @@ sub main {
 				warn => "!defined(answer) || answer eq '' || answer > 1",
 				perl => sub { return $stats->{'evictions'} },
                 inf_field   => "evitions_cnt",
-                inf_default => 0,
                 inf_tags    => "mem_cache_host=\"$memCacheHost\"",
-                group_by    => $memCacheHost,
 		};
 	}
 
-    $queries{'influx_details'} = { measurement => 'memcached_status'};
-	my $q = ariba::monitor::QueryManager->newWithDetails( "Memcached Status", $me->name(), $me->service(), $me->customer(), \%queries);
-	my $ret = $q->processQueries($debug, $me->default('notify.email'), $sendEmail, $sendPage);
+	my $q = ariba::monitor::QueryManager->newWithDetails(
+		"Memcached Status", $me->name(), $me->service(), $me->customer(), \%queries
+	);
+
+	my $ret = $q->processQueriesUsingServer($debug, $me->default('notify.email'), $sendEmail, $sendPage);
 
 }
 

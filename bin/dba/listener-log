@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl -w
 #
-# $Id: //ariba/services/monitor/bin/dba/listener-log#6 $
+# $Id: //ariba/services/monitor/bin/dba/listener-log#8 $
 #
 # This script parses the oracle listener log file to record the number 
 # of connection attempts for each sid on this host.
@@ -74,6 +74,8 @@ sub main {
 
 	my $listenerLog = parseListenerLogForConnectionAttempts();
 
+	my %influx_data;
+	$influx_data{measurement} = 'cookies_dba_listener_log';
 	for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@connections)) {
 
 		my $virtualHost	= $dbc->host();
@@ -89,15 +91,15 @@ sub main {
 		# if the sid does not exist on this db, skip
 		ariba::util::OraInfo::sidToOracleHome($sid) || next;
 
+		$influx_data{tags} = { cluster => $cluster, service => $service, hostname => $hostname, product => $product->name(), sid => $sid };
+		$influx_data{data}{connection_attempts} = $listenerLog->connectionAttemptsForSid($sid);
+		$influx_data{data}{highest_cps_in_last_five_minutes} = $listenerLog->connectionAttemptsForSid($sid);
 		my %queries = ();
 		$queries{"$hostname $sid connection attempts for service $service"} = {
 			info    => 1,
 			perl    => sub { return $listenerLog->connectionAttemptsForSid($sid); },
 			uiHint	=> 'listener-log',
 			recordMaxResults	=> 110000,
-                        inf_field => "connection_attempt",
-                        inf_tags => qq|sid="$sid",hostname="$hostname"|,
-                        group_by => "$sid-$hostname",
 		};
 
 		$queries{"$hostname $sid connection attempts - highest per second in last 5 min(s) for service $service"} = {
@@ -105,18 +107,20 @@ sub main {
 			perl    => sub { return $listenerLog->highestConnectionAttemptsForSid($sid); },
 			uiHint	=> 'listener-log',
 			recordMaxResults	=> 110000,
-                        inf_field => "max_connection_attempt_per_second",
-                        inf_tags => qq|sid="$sid",hostname="$hostname"|,
-                        group_by => "$sid-$hostname",
 		};
 
 		my $email = $me->default('notify.email');
-                $queries{influx_details} = {measurement => "dba"};
+
 		my $qm = ariba::monitor::QueryManager->newWithDetails(
 			"dba", $product->name(), $service, undef, \%queries
 		);
 
-		$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+		$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+		eval {
+			my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+			ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line );
+		};
 	}
 
 }

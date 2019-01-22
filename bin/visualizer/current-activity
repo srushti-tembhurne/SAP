@@ -1,6 +1,6 @@
-#!/usr/local/bin/perl 
+#!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/visualizer/current-activity#2 $
+# $Id: //ariba/services/monitor/bin/visualizer/current-activity#3 $
 
 use strict;
 use FindBin;
@@ -60,11 +60,10 @@ sub main {
                    'If crit, Visualizer is polling AN too often and may cause AN performance issues, run control-deployment stop on arecibo and escalate to Platform.', 
         ],
         inf_field   => "supplier_address_fetch_cnt",
-        inf_default => 0,
     };
 
     my $email = $mon->default('notify.email');
-    $queries{'influx_details'} = {measurement => 'arecibo_current_activity'};
+
     my $qm = ariba::monitor::QueryManager->newWithDetails('current-activity', $me->name(), $me->service(), $me->customer(), \%queries);
     $qm->processQueries($debug, $email, $sendEmail, $sendPage);
 }

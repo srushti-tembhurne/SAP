@@ -17,11 +17,10 @@ use ariba::Ops::OracleClient;
 
 my $debug = 0;
 
-sub usage
-{
-    my $error = shift;
+sub usage {
+        my $error = shift;
 
-    print <<USAGE;
+        print <<USAGE;
 Usage: $0 [-e|-p|-d|-h|-daily] -product <product>
 
         -e                   Enables sending of email for monitor query.
@@ -33,81 +32,78 @@ Usage: $0 [-e|-p|-d|-h|-daily] -product <product>
 
 USAGE
 
-    print "(error) $error\n" if $error;
+        print "(error) $error\n" if $error;
 
-    exit ();
+        exit();
 }
 
-sub main
-{
+sub main {
     my $sendEmail = 0;
     my $sendPage  = 0;
     my $productName;
 
-    while (my $arg = shift (@ARGV))
-    {
+    while (my $arg = shift(@ARGV)) {
         print STDERR "parsing arg $arg\n" if $debug;
-        if ($arg =~ m/^-h$/o) {usage(); next;}
-        if ($arg =~ m/^-d$/o)    {$debug       = 1;             next;}
-        if ($arg =~ m/^-e$/o)    {$sendEmail   = 1;             next;}
-        if ($arg =~ m/^-p$/o)    {$sendPage    = 1;             next;}
-        if ($arg =~ m/^-prod$/o) {$productName = shift (@ARGV); next;}
+        if ($arg =~ m/^-h$/o) { usage(); next; }
+        if ($arg =~ m/^-d$/o) { $debug=1; next; }
+        if ($arg =~ m/^-e$/o) { $sendEmail=1; next; };
+        if ($arg =~ m/^-p$/o) { $sendPage=1; next; };
+        if ($arg =~ m/^-prod$/o) { $productName = shift(@ARGV); next; };
         usage("Unknown arg: $arg");
     }
-    my $me       = ariba::rc::InstalledProduct->new();
-    my $hostname = ariba::Ops::NetworkUtils::hostname();
-    my $cluster  = $me->currentCluster();
-    my $email    = $me->default('notify.email');
-    my $service  = $me->service();
+    my $me	          = ariba::rc::InstalledProduct->new();
+    my $hostname      = ariba::Ops::NetworkUtils::hostname();
+    my $cluster       = $me->currentCluster();
+    my $email         = $me->default('notify.email');
+    my $service = $me->service();
     my @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
 
-    foreach my $product (@products)
-    {
+    foreach my $product (@products) {
         my @dbconnections = ariba::Ops::DBConnection->connectionsFromProducts($product);
-        for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbconnections))
-        {
-            next if $dbc->isDR();    # skip DRs
-
-            my $type        = $dbc->type();
-            my $user        = "sys";
-            my $pass        = $me->default("dbainfo.$user.password");
-            my $product     = $dbc->product();
-            my $prodName    = $product->name();
-            my $service     = $product->service();
+        for my $dbc (ariba::Ops::DBConnection->uniqueConnectionsByHostAndSid(@dbconnections)) {
+            next if $dbc->isDR();	# skip DRs
+           
+            my $type     = $dbc->type();
+	    my $user = "sys";
+	    my $pass = $me->default("dbainfo.$user.password");
+            my $product  = $dbc->product();
+            my $prodName = $product->name();
+            my $service  = $product->service();
             my $virtualHost = $dbc->host();
             my $activeHost  = $product->activeHostForVirtualHostInCluster($virtualHost, $cluster);
             next unless $activeHost;
 
-            my $instance = uc ($dbc->sid());
-            next if $instance =~ /HANA/;        # skip hana SIDs
-            next if $virtualHost =~ /hana/i;    # skip hana Hosts
+            my $instance = uc($dbc->sid());
+            next if $instance =~ /HANA/;		# skip hana SIDs
+            next if $virtualHost =~ /hana/i;		# skip hana Hosts
 
             my %queries = ();
+		
+	    my $oc = ariba::Ops::OracleClient->new($user, $pass, $instance, $virtualHost);
+	    $oc->connect();
+	    my $versionSql = 'select version from v$instance';
+	
+	    my $version = $oc->executeSql($versionSql);
+	    my $requiredVersion = "11.2.0.2";
 
-            my $oc = ariba::Ops::OracleClient->new($user, $pass, $instance, $virtualHost);
-            $oc->connect();
-            my $versionSql = 'select version from v$instance';
+	    $queries{"$instance on $activeHost with sequence constraint number"} = {
+	        warn => "answer = 2000000000 && $version eq $requiredVersion" ,
+	        sql => 'select con# from con$ where name=\'_NEXT_CONSTRAINT\' and owner#=0', 
+	        recordMaxResults => 110000,
+	        ticketOnWarnOpenAfterMinutes => 1,
+	        ticketOwner => "unassigned-dba",
+	        uiHint => 'Incremental Constraint Sequence',
+	        };
 
-            my $version         = $oc->executeSql($versionSql);
-            my $requiredVersion = "11.2.0.2";
-
-            $queries{"$instance on $activeHost with sequence constraint number"} = {
-                                                                                    warn                         => "answer = 2000000000 && $version eq $requiredVersion",
-                                                                                    sql                          => 'select con# as cons_num from con$ where name=\'_NEXT_CONSTRAINT\' and owner#=0',
-                                                                                    recordMaxResults             => 110000,
-                                                                                    ticketOnWarnOpenAfterMinutes => 1,
-                                                                                    ticketOwner                  => "unassigned-dba",
-                                                                                    uiHint                       => 'Incremental Constraint Sequence',
-                                                                                    inf_tags                     => qq(sid=$instance,host=$activeHost),
-                                                                                   };
-
-            $queries{influx_details} = {measurement => 'dba_db_sequence_check'};
-            my $qm = ariba::monitor::QueryManager->newWithDetails("dba", $product->name(), $product->service(), undef, \%queries);
+            my $qm = ariba::monitor::QueryManager->newWithDetails(
+                "dba", $product->name(), $product->service(), undef, \%queries
+            );
+		
 
             $qm->setSQLConnectInfo($user, $pass, $instance, $activeHost);
-            $qm->processQueries($debug, $email, $sendEmail, $sendPage);
-        }
-    }
+            $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+            }
+    }       
 }
 
 main();

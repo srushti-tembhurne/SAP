@@ -55,7 +55,7 @@ sub main {
 	my @p = ariba::rc::InstalledProduct->installedProductsList($service,$prodname);
 	my @dbcs = ariba::Ops::DBConnection->connectionsFromProducts(@p);
 
-	recordOracleVersions($me, $tab, $hostname, $debug, $datacenter);
+	recordOracleVersions($me, $tab, $hostname, $debug);
 
 }
 
@@ -64,7 +64,6 @@ sub recordOracleVersions {
 	my $tab = shift;
 	my $hostname = shift; 
 	my $dryrun = shift;
-    my $datacenter = shift;
 	my $q;
 
 	open(F,"< /etc/oratab") || return;
@@ -84,17 +83,12 @@ sub recordOracleVersions {
 			info => 1,
 			perl => sub { return $version; },
 			uiHint => "version/$hostname",
-            inf_field => "OracleVersion",
-            inf_tags => qq|datacenter="$datacenter",uiHint="version/$hostname",hostname="$hostname",sid="$sid"|,
-            inf_default => 0,
-            group_by => "$datacenter,$hostname",
 		};
 	}
 	close(F);
 
 	return unless(scalar(keys(%$q)));
 
-    $q->{"influx_details"} = {measurement => "dba"};
 	my $qm = ariba::monitor::QueryManager->newWithDetails("dba", $tab, $me->service(), undef, $q);
 	$qm->processQueriesUsingServer($dryrun, undef, 0, 0);
 }

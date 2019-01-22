@@ -68,8 +68,6 @@ sub main {
 			recordMaxResults => 9000,
 			recordDataType   => "gauge",
 			perl => "return $statusValue",
-                        inf_field => "tab_status",
-                        inf_tags => "tab_product_name=\"$productName\"",
 		};
 
 		$numberOfProducts++;
@@ -84,19 +82,20 @@ sub main {
 			recordMaxResults => 9000,
 			recordDataType   => "gauge",
 			perl => "return $average",
-                        inf_field => "tab_status_average",
-                        inf_tags => "tab_product_name=tab_average",
 		};
 	}
-
-        $queries{influx_details} = {measurement => "vm_tab_status"};
 	
 	my $q = ariba::monitor::QueryManager->newWithDetails("vm-tab-status", "mon", $me->service(), $me->customer(), \%queries);
 
-	my $email = $me->default('notify.email');
-
 	$q->setUiHint("ignore");
-	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	$q->run();
+
+	if ( $debug ) {
+		$q->displayToStdout();
+	} else {
+		$q->archiveResults();
+		$q->displayToLog();     
+	}
 
 	# Reset queries here for different queries.
 	%queries = ();
@@ -110,8 +109,6 @@ sub main {
 			info   => "answer >= 0",
 			format => "%0.2f\n",
 			extractRecorded => "average(mon/Tab_status_for_$productName, $samples)",
-                        inf_field => "${days}_moving_average_tab_status",
-                        inf_tags => "tab_product_name=\"${productName}_moving_average\"",
                 };
         }
 
@@ -119,12 +116,9 @@ sub main {
 		info   => "answer >= 0",
 		format => "%0.2f\n",
 		extractRecorded => "average(mon/Tab_status_average, $samples)",
-                inf_field => "${days}_moving_avg_for_all_tabs",
-                inf_tags => "tab_product_name=all_tabs_average",
         };
 
-
-        $queries{influx_details} = {measurement => "vm-tab-status-moving-averages"};
+	my $email = $me->default('notify.email');
 
         $q = ariba::monitor::QueryManager->newWithDetails(
 		"vm-tab-status-moving-averages", "mon", $me->service(), $me->customer(), \%queries

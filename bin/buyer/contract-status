@@ -31,17 +31,17 @@ sub main {
     $q{"Broken contracts needing attention from support"} = {
         info => 1,
         timeout => 3600,
-        sql => "SELECT count(*) as contract_count 
-            FROM
+        sql => "SELECT Con1.rootId, App2.ap_PartitionNumber, App2.ap_LastModified,
+            App2.ap_UniqueName, App2.ap_Name, App2.ap_NextVersion,
+            Con1.mar_ExternalSourcingId, App2.ap_StatusString FROM
             ContractRequestTab Con1, ApprovableTab App2 WHERE App2.rootId =
             Con1.rootId AND (App2.ap_StatusString IN ('SourcingConfirming',
             'SourcingFailed', 'SourcingCompleted', 'Processing') AND App2.ap_Type =
             'ariba.contract.core.ContractRequest') AND (App2.ap_Active = 1) AND
             (App2.ap_PurgeState = 0) ORDER BY App2.ap_PartitionNumber,
             App2.ap_LastModified, App2.ap_StatusString ASC, App2.ap_UniqueName ASC",
+        processAnswer => sub { notifyForCRStatus(); },
     };
-
-    $q{influx_details} = {measurement => 'buyer_contract_status'};
 
     my $qm = ariba::monitor::QueryManager->newWithDetails(
         "contract-status", "buyer", $me->service(), undef, $me->currentCluster(), \%q
@@ -50,6 +50,43 @@ sub main {
     $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($buyer));
 
     $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+}
+
+sub notifyForCRStatus {
+    my ($program, $productName, $service, $customer, $cluster, $status);
+    my $self = $ariba::monitor::Query::_ourGlobalQuerySelf;
+    my $notify = "linterthal\@ariba.com,tehunter\@ariba.com,TJCarr\@ariba.com,amanigan\@ariba.com,jdvorchak\@ariba.com";
+    $service = $self->service();
+    $program = $0;
+    $customer = undef;
+    $status = "warn";
+    $productName = $self->productName();
+    $cluster = $self->cluster(),
+
+    my $ret = join("\n", ( $self->results() ) );
+
+    $notify = "jmcminn\@ariba.com" if($service eq 'dev');
+
+    if($self->results()) {
+        my $subject = ":: Contracts needing attention from support";
+        my $body = "The following contracts are in suspicious states:\n\n";
+        $body .= $ret;
+
+        my $notificationRequest = ariba::Ops::NotificationRequest->newMessage(
+            $status,
+            $program,
+            $productName,
+            $service,
+            $customer,
+            $cluster,
+            $subject,
+            $body,
+            $notify
+        );
+        $notificationRequest->sendAsEmail();
+    }
+
+    return($ret);
 }
 
 main(@ARGV);

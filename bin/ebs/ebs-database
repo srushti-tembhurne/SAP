@@ -16,7 +16,7 @@ sub main {
 	my $debug = 0;
 	my $sendEmail = 0;
 	my $sendPage = 0;
-    my $answer = 0;
+	my $answer = "true";
 
 	while(my $arg=shift(@ARGV) ){
 		if($arg =~ /^-d/o){ $debug = 1; }
@@ -30,21 +30,18 @@ sub main {
 	my $email = $me->default('notify.email');
 
 	my $db = $ebs->default('DBConnections.DRAN.hostname');
-	$answer = 1 if($db =~ m/snv/);
+	$answer = "false" if($db =~ m/snv/);
 
 	$queries{"EBS pointing to BOU DB"} =
 	{
 	  info => 1,
-      crit        => 'answer == 1',
-      perl        => "return qq($answer)",
-      inf_field   => "ebs_points_to_bou_db",
-      inf_default => 0,
-    };
+	  crit => 'answer eq "false"',
+	  perl => "return qq($answer)",
+	};
 
-    $queries{'influx_details'} = {measurement => 'ebs_database'};
 	my $q = ariba::monitor::QueryManager->newWithDetails("ebs-database", "ebs", $me->service(), $me->customer(), \%queries);
 
-	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 }
 
 main();

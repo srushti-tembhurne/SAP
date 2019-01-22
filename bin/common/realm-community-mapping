@@ -13,6 +13,7 @@ use ariba::Ops::ProductAPIExtensions;
 use ariba::Ops::OracleClient;
 use ariba::Ops::DBConnection;
 use ariba::rc::InstalledProduct;
+use ariba::Ops::HanaClient;
 
 my $product;
 
@@ -67,7 +68,7 @@ sub main {
 
     #This table check is introduced as part of HOA-64075
     my ($dbType, $user, $password, $sid, $host, $port) = $product->connectInfoWithDBType();
-	print "$dbType, $user, $sid, $host, $port" if($debug);
+	print "$dbType, $user, $sid, $host, $port\n" if($debug);
 	my $oracleClient;
 	if(	$dbType =~ /oracle/si ) {
 	  
@@ -104,20 +105,30 @@ sub main {
 
     my $sql = getCommunitySql(@communities);
 
-    #$queries{"Realms affected by communities down (Community ID, Realm ID, Name, Label, State)"} = {
-    #    'rowCountLimit' => 8000,
-    #    'info'          => "numrows > -1",
-    #    'warn'          => "numrows > 1",
-    #    'sql'           => $sql,
-    #};
+    my $commtDownKey = 'Realms affected by communities down (Community ID, Realm ID, Name, Label, Customer ID, State)';
+    my $commtMapKey = 'Realm community mapping (Community ID, Realm ID, Name, Label, Customer ID, State)';
 
-    $queries{"Realm community mapping (Community ID, Realm ID, Name, Label, State)"} = {
+    $queries{"$commtDownKey"} = {
         'rowCountLimit' => 8000,
-        'info'          => 1,
-        'sql'           => getSql(),
+        'info'          => "numrows > -1",
+        'warn'          => "numrows > 1",
     };
 
-    $queries{"influx_details"} = { 'measurement' => "realm_community_mapping" };
+    $queries{"$commtMapKey"} = {
+        'rowCountLimit' => 8000,
+        'info'          => 1,
+    };
+
+    if ($dbType eq ariba::Ops::DBConnection->hanaDBServerType()) {
+        my $hc = ariba::Ops::HanaClient->new($user, $password, $host, $port);
+        my @resultDown = querySQL($hc,$sql);
+        my @resultMapping = querySQL($hc,getSql());
+        $queries{"$commtDownKey"}{'perl'} = sub {return "@resultDown"};
+        $queries{"$commtMapKey"}{'perl'}  = sub {return "@resultMapping"};
+    } else {
+        $queries{"$commtDownKey"}{'sql'} = $sql;
+        $queries{"$commtMapKey"}{'sql'}  = getSql();
+    }
 
     my $email = $me->default('notify.email');
 
@@ -125,13 +136,21 @@ sub main {
         "realm-community-mapping", $product->name(), $service, $product->customer(), \%queries
     );
     
-    if ($dbType eq ariba::Ops::DBConnection->hanaDBServerType()) {
-        $qm->setSQLConnectInfoForHana($user, $password, $host, $port);     
-    }
-    else {  
+    if ($dbType eq ariba::Ops::DBConnection->oracleDBServerType()) {
         $qm->setSQLConnectInfo($user, $password, $sid, $host);
     }
-    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+}
+
+sub querySQL{
+    my ($hc,$sql) = @_;
+    my @data = $hc->executeSqlByFile($sql);
+
+    my @result;
+    for my $line (@data){
+        ref $line eq "ARRAY" ? push @result, join("\t",(map{s/^"//; $_} @$line)) : push @result, $line;
+    }
+    return map {"$_\n" } @result;
 }
 
 sub getSql {
@@ -139,15 +158,15 @@ sub getSql {
     my $versionClause = "";
     
     $versionClause = " and (c.Version is null or c.Version = (select b.RealmToCommunityVersion from BucketStateTab b where b.Bucket = 0)) " if $bucketStateTableExists;
-    print "select c.CommunityId, r.Id, r.Name, r.Label,r.State from CommunityTab c, RealmTab r where r.Id = c.RealmId$versionClause$extraClause order by c.CommunityId, r.Label" if($debug);
-    return "select c.CommunityId community , r.Id realm_id, r.Name realm_name, r.Label label,r.State state from CommunityTab c, RealmTab r where r.Id = c.RealmId$versionClause$extraClause order by c.CommunityId, r.Label";
+    print "select c.CommunityId, r.Id, r.Name, r.Label, rp.rp_CRMCustomerId, r.State from CommunityTab c, RealmTab r, RealmProfileTab rp where r.Id = c.RealmId and r.Id = rp.rp_Id$versionClause$extraClause order by c.CommunityId, r.Label" if($debug);
+    return "select c.CommunityId, r.Id, r.Name, r.Label, rp.rp_CRMCustomerId, r.State from CommunityTab c, RealmTab r, RealmProfileTab rp where r.Id = c.RealmId and r.Id = rp.rp_Id$versionClause$extraClause order by c.CommunityId, r.Label";
 }
 
 sub getCommunitySql {
     my @communitiesList = @_;
     my $sql;
 
-    if(@communitiesList) {
+    if (@communitiesList) {
         my $where = " and c.CommunityId in(" . join(",", @communitiesList) . ")"; 
         $sql = getSql($where);
     }

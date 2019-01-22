@@ -50,6 +50,7 @@ die "No product $productName in service" unless defined($product);
 
 #-----------------------------------------------------------------
 #get the configuration for the lli metrics
+print "$FindBin::Bin\n";
 $cfgfile = "$installdir/etc/activity-stats-lli.json" unless $cfgfile;
 
 my $fh;
@@ -76,13 +77,12 @@ print Dumper($queries) if $debug;
 
 #-----------------------------------------------------------------
 #create QueryManager object and process queries
-$queries->{influx_details} = { measurement => 's4_current_activity_lli' };
 my $qmName = "Current-Activity-LLI";
 my $qm = ariba::monitor::QueryManager->newWithDetails (
         $qmName, $productName, $service, undef, $queries
 );
 
-$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 
 exit 0;
 #-----------------------------------------------------------------
@@ -125,7 +125,6 @@ sub retrieveStatsData {
 
 sub buildQueries {
     my ($data, $qcfg, $qs) = @_;
-
     my %influx_db_col = ( 'LLI Exception Count For Submit Excel Bid' => 'submit_excel_bid_cnt',
                           'LLI Exception Count For Delete All Content' => 'delete_all_content_cnt',
                           'LLI RFX Count' => 'rfx_cnt',
@@ -139,7 +138,7 @@ sub buildQueries {
                           'LLI Time For Delete All Content' => 'delete_all_content_time',
                           'LLI Exception Count For Generate Excel Bid File' => 'excel_bid_file_cnt',
                           'Contract Request Count' => 'contract_req_cnt',
-                          'Contract Request Failed Count' => 'contract_req_failed_cnt' );
+                          'Contract Request Failed Count' => 'contract_req_failed_cnt' ); 
 
     for my $qn ( keys %$data ) { #the first key of data is the query name
         #spec for the given query
@@ -175,19 +174,17 @@ sub buildQueries {
                 $q->{perl} = "return $val;"; 
                 $q->{warn} = "answer > " . $qspec->{"warn"};
                 $q->{crit} = "answer > " . $qspec->{"crit"};
-        
                 $q->{inf_field} = $inf_field;
-                $q->{inf_default} = 0;
                 $q->{inf_tags} = qq(community="$community",instance_type="$appname",instance_name="$instancename");
-                $q->{group_by} = qq($community,$appname,$instancename);
+                
                 $qs->{$queryname} = $q; # a query prepared for QueryManager
             }    
         }
 
         if ( $aggrnode ) {
             for my $h ( keys %{$data->{$qn}{host}} ) {
-                my $inf_field = $influx_db_col{$qdisplayname};
                 my $queryname = "$h $qdisplayname";
+                my $inf_field = $influx_db_col{$qdisplayname};
                 my $val = $data->{$qn}{host}{$h}{value};
                 my $cnt = $data->{$qn}{host}{$h}{count};
                 $val = $val / $cnt if ( "$aggrtype" eq "average" && $cnt );
@@ -197,11 +194,8 @@ sub buildQueries {
                 $q->{perl} = "return $val";
                 $q->{warn} = "answer > " . $qspec->{"aggr-node-warn"};
                 $q->{crit} = "answer > " . $qspec->{"aggr-node-crit"};
-
-                $q->{inf_field} = $inf_field;           
-                $q->{inf_default} = 0;
+                $q->{inf_field} = $inf_field;
                 $q->{inf_tags} = qq(instance_name="$h");
-                $q->{group_by} = qq($h);
 
                 $qs->{$queryname} = $q; # a node level query for QueryManager
             }
@@ -219,11 +213,9 @@ sub buildQueries {
             $q->{perl} = "return $val";
             $q->{warn} = "answer > " . $qspec->{"aggr-all-warn"};
             $q->{crit} = "answer > " . $qspec->{"aggr-all-crit"};
-
             $q->{inf_field} = $inf_field;
-            $q->{inf_default} = 0;
             $q->{inf_tags} = qq(instance_type="summary");
-            $q->{group_by} = qq(summary);
+
             $qs->{$queryname} = $q; # a summary query for QueryManager;
         }
     }

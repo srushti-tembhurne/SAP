@@ -119,15 +119,12 @@ sub main {
         uiHint  => "snapshots",
         perl => sub { return $oldestSnapshot; },
         description => "Date of oldest hbase snapshot",
-        inf_field => "oldest_snapshot_date",
-        inf_default => "none",
     };
 
     my $email = $me->default('notify.email');
-    $queries{influx_details} = {measurement => "cleanup_habse_snapshot",};
 
     my $qm = ariba::monitor::QueryManager->newWithDetails('hbase', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queries);
-    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 }
 
 sub snapshotInfo {

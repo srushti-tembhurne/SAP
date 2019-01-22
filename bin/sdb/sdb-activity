@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl
 #
-# $Id: //ariba/services/monitor/bin/sdb/sdb-activity#18 $
+# $Id: //ariba/services/monitor/bin/sdb/sdb-activity#19 $
 #
 
 use strict;
@@ -33,7 +33,7 @@ sub critIfRunningForLongerThanDays {
 		$query->deleteRunningStartTime();
 	}
 
-	return qq($status);
+	return $status;
 }
 
 sub main {
@@ -65,7 +65,6 @@ sub main {
 		'perl' => sub { return $monitorStats->dnBLoadStatus(); },
 		'processAnswer' => sub { main::critIfRunningForLongerThanDays(5) },
         'inf_field'   => "d&b_load_status",
-        'inf_default' => "none",
 	};
 
 	my $loadWarn = 0;
@@ -84,7 +83,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "d&b_load_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"D&B Load Preperation Status"} = {
@@ -92,7 +90,6 @@ sub main {
 		'crit' => 'answer eq "Error"',
 		'perl' => sub { return $monitorStats->dnBLoadPreperationStatusMetric(); },
         'inf_field'   => "d&b_load_prep_status",
-        'inf_default' => "none",
 	};
 
 	my $loadPrepWarn = 0;
@@ -109,7 +106,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "d&b_load_prep_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"D&B FTP Download Status"} = {
@@ -118,7 +114,6 @@ sub main {
 		'ticketOnWarnOpenAfterMinutes' => 1,
 		'perl' => sub { return $monitorStats->dnBFtpDownload(); },
         'inf_field'   => "d&b_ftp_download_status",
-        'inf_default' => "none",
 	};
 
 	my $downloadWarn = 0;
@@ -135,7 +130,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "d&b_ftp_download_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"AN Load Status"} = {
@@ -143,7 +137,6 @@ sub main {
 		'crit' => 'answer eq "Error"',
 		'perl' => sub { return $monitorStats->aNLoadStatus(); },
         'inf_field'   => "an_load_status",
-        'inf_default' => "none",
 	};
 	
 	$queries{"AN Load Time" } = {
@@ -154,7 +147,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "an_load_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"Enrichment Pending Request Count"} = {
@@ -163,7 +155,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "enrichment_pending_count",
-        'inf_default' => "0",
 	};
 
 	$queries{"Enrichment Average Request Time"} = {
@@ -172,7 +163,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "enrichment_avg_request_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"Enrichment Max Request Time"} = {
@@ -181,7 +171,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "enrichment_max_request_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"Loader Step 01 - Copy Supplier Table Time"} = {
@@ -191,7 +180,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "step_1_copy_supplier_table_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"Loader Step 02 - Supplier Pre Req Index Time"} = {
@@ -201,7 +189,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "step_2_supplier_pre_req_idx_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"Loader Step 03 - Supplier Insert Time"} = {
@@ -211,7 +198,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "step_3_supplier_insert_time",
-        'inf_default' => "0",
 	};
 	
 	$queries{"Loader Step 04 - Supplier Insert Count"} = {
@@ -220,7 +206,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "step_4_supplier_insert_cnt",
-        'inf_default' => "0",
 	};
 
 	$queries{"Loader Step 05 - Supplier Update Time"} = {
@@ -230,7 +215,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "step_5_supplier_upd_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"Loader Step 06 - Supplier Update Count"} = {
@@ -239,7 +223,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "step_6_supplier_upd_cnt",
-        'inf_default' => "0",
 	};
 	
 	$queries{"Loader Step 07 - Engine Index Time"} = {
@@ -249,7 +232,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "step_7_engine_idx_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"Loader Step 08 - Order Engine Index Time"} = {
@@ -259,7 +241,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "step_8_order_engine_idx_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"Loader Step 09 - Post Load Supplier Index Time"} = {
@@ -269,7 +250,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "step_9_order_engine_idx_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"Loader Step 10 - Post Load Vendor Table Index Time"} = {
@@ -279,7 +259,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "step_10_vendor_tbl_idx_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"Loader Step 11 - GSO Tracked Supplier Merge Time"} = {
@@ -289,7 +268,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "step_11_gso_supplier_merge_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"Loader Step 12 - GSO Supplier Parent Names Sync Up Time"} = {
@@ -299,7 +277,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "step_12_gso_supplier_parent_names_sync_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"Loader Step 13 - Swap Master Table Name Time"} = {
@@ -309,7 +286,6 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "step_13_swap_master_tbl_time",
-        'inf_default' => "0",
 	};
 
 	$queries{"Loader Step 14 - Swap Master Table Index Time"} = {
@@ -319,11 +295,10 @@ sub main {
 		'recordDataType' => 'gauge',
 		'recordMaxResults' => 60000,
         'inf_field'   => "step_14_swap_master_tbl_idx_time",
-        'inf_default' => "0",
 	};
 
 	my $email = $me->default('notify.email');
-    $queries{'influx_details'} = { measurement => 'sdb_sdb_activity'};
+
 	my $q = ariba::monitor::QueryManager->newWithDetails("sdb-activity", $product->name(), $service, $product->customer(), \%queries);
 
 	$q->processQueries($debug, $email, $sendEmail, $sendPage);

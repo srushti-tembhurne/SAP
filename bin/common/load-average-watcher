@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/common/load-average-watcher#9 $
+# $Id: //ariba/services/monitor/bin/common/load-average-watcher#11 $
 
 use strict;
 use FindBin;
@@ -42,13 +42,13 @@ sub main {
             status               => 'inservice',
             datacenter           => $datacenter,
             monitoringDatacenter => '',
-            providesServices => 'db, hana, hadoop', 
+            providesServices => 'db, hana, hadoop, web, app', 
         );
 
         my %matchMonitoringDatacenter = (
             status               => 'inservice',
             monitoringDatacenter => $datacenter,
-            providesServices => 'db, hana, hadoop', 
+            providesServices => 'db, hana, hadoop, web, app', 
         );
 
         my @machines = ariba::Ops::Machine->machinesWithProperties( %matchDatacenter );
@@ -77,24 +77,15 @@ sub main {
                 correctiveActions => [
                     Ops => 'Please run top or ps and investigate where the load is coming from, then work with DBA to investigate further.',
                 ],
-                inf_tags => qq|datacenter=$datacenter,hostname=$hostname,listener_host=$hostname|,
+                inf_tags => qq|datacenter=$datacenter,hostname=$hostname|,
                 inf_field => "loadavg",
-                inf_default => 0,
-                group_by => "$datacenter,$hostname"
-            };
-            $queries{ qq!$hostname load average crit threshold! } = {
-                perl      => sub { $crit },
-                inf_field => "loadavg_crit_threshold",
-                inf_tags  => qq|datacenter=$datacenter,hostname=$hostname,listener_host=$hostname|,
-                group_by  => "$datacenter,$hostname"
             };
         }
 
-	$queries{influx_details} = {measurement => "load_average_watcher"};
         my $email = $me->default( 'notify.email' );
         my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter( $datacenter );
         my $q = ariba::monitor::QueryManager->newWithDetails( "load-average", $pn, $me->service(), $me->customer(), \%queries );
-        $q->processQueries( $debug, $email, $sendEmail, $sendPage );
+        $q->processQueriesUsingServer( $debug, $email, $sendEmail, $sendPage );
     }
 }
 

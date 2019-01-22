@@ -1,6 +1,6 @@
-#!/usr/local/bin/perl
+#!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/arches/health-check#14 $
+# $Id: //ariba/services/monitor/bin/arches/health-check#19 $
 #
 # Health check monitoring for Arches
 #
@@ -13,6 +13,8 @@ use ariba::monitor::Url;
 use ariba::monitor::Query;
 use ariba::monitor::QueryManager;
 use ariba::rc::InstalledProduct;
+use ariba::Ops::Utils;
+use DateTime;
 
 my $debug = 0;
 
@@ -20,12 +22,13 @@ sub usage {
     my $error = shift;
 
     print <<USAGE;
-Usage: $0 [-e|-p|-d|-h]
+Usage: $0 [-e|-p|-d|-h] [-prod prodname]
 
     -e        Enables sending of email for monitor query.
     -p        Enables sending of pages for monitor query.
     -d        Turns on debug mode.
     -h        Shows this help.
+    -prod     arches product name.
 
 USAGE
 
@@ -37,37 +40,44 @@ USAGE
 sub main {
     my $sendEmail = 0;
     my $sendPage = 0;
+    my $prodname = "arches";
 
     while (my $arg = shift) {
         if ($arg =~ /^-h$/o) { usage();         next; }
         if ($arg =~ /^-d$/o) { $debug++;        next; }
         if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
         if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
+        if ($arg =~ /^-prod$/o) { $prodname = shift;   next; }
 
         usage("Invalid argument: $arg");
     }
 
+    usage("arches product name not specified") unless $prodname;
+
     my $me = ariba::rc::InstalledProduct->new();
-    exit unless (ariba::rc::InstalledProduct->isInstalled('arches', $me->service()));
-    my $arches = ariba::rc::InstalledProduct->new('arches', $me->service());
+    exit unless (ariba::rc::InstalledProduct->isInstalled($prodname, $me->service()));
+    my $arches = ariba::rc::InstalledProduct->new($prodname, $me->service());
     my %queries;
+    my %influx_data;
     # As per Jira-Id : HOA-9975,Doing health-check only for primary.
     my $cluster = "primary";
 
     my %nameInfo = (
-        lastPublishDurationInMillis => { name => 'last_publish_dur' , desc => 'Check Last Publish Duration In Millis'},
-        lastSearchDurationInMillis => { name => 'last_search_dur', desc => 'Check Last Search Duration In Millis'},
-        lastPublishedTime => { name => 'last_publish_time', desc => 'Checks last publish time' },
-        publishStatus => { name => 'publish_status', desc => 'Checks publish status' },
-        searchStatus => { name => 'search_status', desc => 'Checks search status' },
-        shardStatus => { name => 'shard_status', desc => 'Check Shard Status'},
-        archesMode => { name => 'arches_mode', desc => 'Checks Arches mode' },
-        jobId => { name => 'job_id', desc => 'Check Job ID'},
+        lastPublishDurationInMillis => { name => 'Last Publish Duration In Millis' , desc => 'Check Last Publish Duration In Millis'},
+        lastSearchDurationInMillis => { name => 'Last Search Duration In Millis', desc => 'Check Last Search Duration In Millis'},
+        lastPublishedTime => { name => 'Last Published Time', desc => 'Checks last publish time' },
+        publishStatus => { name => 'Publish Status', desc => 'Checks publish status' },
+        searchStatus => { name => 'Search Status', desc => 'Checks search status' },
+        shardStatus => { name => 'Shard Status', desc => 'Check Shard Status'},
+        jobId => { name => 'Job ID', desc => 'Check Job ID'},
     );
 
     # This is for the "primary" cluster.
     my $url = $arches->default('VendedUrls.FrontDoorTopLevel') . "/Arches/api/health/get";
-    setQueries ($url, \%queries, $cluster, \%nameInfo);
+    setQueries ($url, \%queries, $cluster, \%nameInfo, \%influx_data);
+    $influx_data{tags} = {product => $prodname, service => $me->service(), cluster => $cluster};
+    $influx_data{measurement} = "arches_health_check"; 
+    
 
     my $nrt_publish_get_url_str = $arches->default('VendedUrls.FrontDoorTopLevel') . "/Arches/api/health/nrt_publish_get";
     my $nrt_publish_get_url = ariba::monitor::Url->new($nrt_publish_get_url_str);
@@ -75,7 +85,7 @@ sub main {
     my $nrt_publish_get_response = $nrt_publish_get_url->request($nrt_publish_get_timeout);
     my $nrt_publish_get_reason = $nrt_publish_get_response;
     my $healthCheckValue = "";
-    my $healthCheckName = "active_nrt_publish_status";
+    my $healthCheckName = "Active NRT Publish Status";
     my $healthCheckDesc = "Active NRT Publish Status";
     if ($nrt_publish_get_url->error()) {
         $nrt_publish_get_response = $nrt_publish_get_url->error();
@@ -83,10 +93,11 @@ sub main {
     } else {
         $healthCheckValue = $nrt_publish_get_response;
         ( $healthCheckValue ) = $nrt_publish_get_response =~ m|<response>(.*)</response>|;
-        if ($healthCheckValue && $healthCheckValue ne 'OK') {
+        if ($healthCheckValue ne 'OK') {
             my $healthCheckReason = $nrt_publish_get_reason;
             ( $healthCheckReason ) = $nrt_publish_get_reason =~ m|<message>(.*)</message>|;
-            $healthCheckValue = ( $healthCheckReason ) ? $healthCheckValue . qq( - ) . $healthCheckReason : undef;
+            $healthCheckValue .= " - ";
+            $healthCheckValue .= $healthCheckReason;
         }
     }
     #Changing the thresholds with reference to HOA-50710
@@ -101,26 +112,37 @@ sub main {
             Ops => 'Follow up with engineering',
         ],
         inf_field => $healthCheckName,
-        inf_default => "none",
     };
-
+    $influx_data{data}->{activeNRTPublishStatus} = ($healthCheckValue eq 'OK') ? 0 : 1;
+    eval {
+        my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+        ariba::Ops::Utils::sendToStatsD($statsd_line, undef, undef, $debug) if ( $statsd_line);
+    };
     my $email = $me->default('notify.email');
-    $queries{'influx_details'} = { measurement => 'arches_health_check'};
 
     my $qm = ariba::monitor::QueryManager->newWithDetails('health-check', $arches->name(), $arches->service(), undef, $cluster, \%queries);
-    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
     
     if($arches->hasSecondaryCluster()) {
     # This will process the secondary stuff separately.
-        undef %queries;
-        my $app = ($arches->appInstancesLaunchedByRoleInClusterMatchingFilter('indexmgr', 'secondary', 'IndexMgr'))[0];
-        $url = 'http://' . $app->host . ':' . $app->httpPort . '/Arches/api/health/get';
-        $cluster = 'secondary';
-        $queries{'influx_details'} = { measurement => 'arches_health_check'};
-        setQueries ($url, \%queries, $cluster, \%nameInfo);
+    undef %queries;
+    my $app = ($arches->appInstancesLaunchedByRoleInClusterMatchingFilter('indexmgr', 'secondary', 'IndexMgr'))[0];
+    $url = 'http://' . $app->host . ':' . $app->httpPort . '/Arches/api/health/get';
+    $cluster = 'secondary';
 
-        $qm = ariba::monitor::QueryManager->newWithDetails('health-check', $arches->name(), $arches->service(), undef, $cluster, \%queries);
-        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    delete $influx_data{data};
+
+    setQueries ($url, \%queries, $cluster, \%nameInfo, \%influx_data);
+    $influx_data{tags}->{cluster} = $cluster;
+    $influx_data{tags} = {product => $prodname, service => $me->service(), cluster => $cluster};
+
+    eval {
+        my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+        ariba::Ops::Utils::sendToStatsD($statsd_line, undef, undef, $debug) if ( $statsd_line);
+    }; 
+
+    $qm = ariba::monitor::QueryManager->newWithDetails('health-check', $arches->name(), $arches->service(), undef, $cluster, \%queries);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
     }
 }
 
@@ -129,6 +151,7 @@ sub setQueries {
     my $queryHashRef = shift;
     my $cluster = shift;
     my $nameInfoHashRef = shift;
+    my $influx_data = shift;
     # All four are required.
     die "ERROR:  missing required arguments for function setQueries\n"
         unless $url && $queryHashRef && $cluster && $nameInfoHashRef;
@@ -138,7 +161,7 @@ sub setQueries {
     my ($response, $urlError) = archesHealthStatus($url);
 
     my $archesHealthInfo = healthInfo($response);
-
+    delete $archesHealthInfo->{archesMode};
     for my $metric (keys %{$archesHealthInfo}) {
         if ($response) {
             my $value = $response;
@@ -153,16 +176,41 @@ sub setQueries {
                 crit => $crit || $urlError,
                 perl => sub { return $archesHealthInfo->{ $metric }->{'value'}; },
                 description => $$nameInfoHashRef{$metric}->{'desc'},
-                correctiveActions   => [
+                correctiveActions   => [ 
                     Ops => 'Follow up with engineering',
                 ],
                 inf_field => $nameInfoHashRef->{$metric}->{'name'},
-                inf_default => "none",
                 inf_tags    => "cluster=\"$cluster\"",
-                group_by    => $cluster,
             };
+            my ($influx_value,$color_code) = convert_to_influx_data($metric,$archesHealthInfo->{ $metric }->{'value'},lc($archesHealthInfo->{ $metric }->{'color'}));
+            $influx_data->{data}->{$metric} = $influx_value;
+            $influx_data->{data}->{$metric . "_color_code"} = $color_code;
         }
     }
+}
+
+sub convert_to_influx_data
+{
+    my $metric = shift;
+    my $value = shift;
+    my $color = shift;
+    my %color_codes = (red => 2, yellow => 1, green => 0);
+
+    if ($metric eq 'lastPublishedTime')
+    {
+        my ($year,$month,$day,$hour,$min,$second) = split (/\W/, $value);
+        my $dt = DateTime->new(year => $year, month => $month, day => $day, hour => $hour, minute => $min, second => $second);
+        return ($dt->epoch(), $color_codes{$color});
+    }
+    elsif ($metric =~ /Status$/)
+    {
+        return ($color_codes{$color},$color_codes{$color})
+    }
+    else
+    {
+        return ($value,$color_codes{$color});
+    }
+
 }
 
 sub archesHealthStatus {

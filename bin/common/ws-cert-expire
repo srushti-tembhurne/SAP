@@ -1,6 +1,6 @@
-#!/usr/local/bin/perl
+#!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/common/ws-cert-expire#8 $
+# $Id: //ariba/services/monitor/bin/common/ws-cert-expire#9 $
 
 use strict;
 use FindBin;
@@ -68,8 +68,6 @@ sub main {
 			}	
 				
 			if (%queries) {
-
-                $queries{"influx_details"} = { 'measurement' => "ws_cert_expire"};
 				my $q  = ariba::monitor::QueryManager->newWithDetails(
 					"ws-cert-expire", $name, $me->service(), $me->customer(), \%queries
 					);
@@ -108,8 +106,6 @@ sub processCert {
 		description => "For initial debugging refer to $path",
         inf_field => "days_to_expire",
         inf_tags => "cert=\"$file\"",
-        group_by => "$file",
-        inf_default => 0
 	};
 }
 

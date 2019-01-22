@@ -91,8 +91,6 @@ sub main {
 		  	info => "numrows > -1",
 		  	timeout => 120,
 		  	perl => "$pageRequests",
-                        inf_field => "page_request_during_last_shift",
-                        group_by => "1",
 		},
 
 		"number of page requests sent as pages during last shift" => {
@@ -102,8 +100,6 @@ sub main {
 		  	info => "numrows > -1",
 		  	timeout => 120,
 		  	perl => "$pageRequestsSentAsPages",
-                        inf_field => "page_requests_sent_during_last_shift",
-                        group_by => "1",
 		},
 
 		"number of page requests sent as pages and escalated during last shift" => {
@@ -113,8 +109,6 @@ sub main {
 		  	info => "numrows > -1",
 		  	timeout => 120,
 		  	perl => "$pageRequestsSentAsPagesAndEscalated",
-                        inf_field => "escalated_pages_during_last_shift",
-                        group_by => "1",
 		},
 
                 "moving avg ($week days) for page requests sent as pages" => {
@@ -123,8 +117,6 @@ sub main {
 			info   => "answer >= 0",
 			format => "%d\n",
 			extractRecorded => "average(mon/number_of_page_requests_sent_as_pages_during_last_shift, $week)",
-                        inf_field => "${week}_days_moving_avg_pages_sent",
-                        group_by => "1",
                 },
 
                 "moving avg ($month days) for page requests sent as pages" => {
@@ -133,8 +125,6 @@ sub main {
 			info   => "answer >= 0",
 			format => "%d\n",
 			extractRecorded => "average(mon/number_of_page_requests_sent_as_pages_during_last_shift, $month)",
-                        inf_field => "${month}_days_moving_avg_pages_sent",
-                        group_by => "1",
                 },
 	);
 
@@ -154,8 +144,6 @@ sub main {
 			recordMaxResults => "1000",
 			info => "1",
 			perl => sub {analyzePagesForProductNameAndServiceNameAndCustomerName($product->name(), $product->service(), $product->customer());},
-                        inf_field => "recent_page_requests",
-                        inf_tags => 'page_group="' . $product->name() . " " . $customer . '"',
 		};
 
 		# We want to go through an asp customer only once
@@ -165,8 +153,6 @@ sub main {
 				recordMaxResults => "1000",
 				info => "1",
 				perl => sub {analyzePagesForProductNameAndServiceNameAndCustomerName($product->name(), $product->service(), undef);},
-                                inf_field => "recent_page_requests",
-                                inf_tags => "page_group=" . $product->name(),
 			};
 		
 			$ASPProducts{$product->name()} = 1;
@@ -176,7 +162,6 @@ sub main {
 	}
 
 
-        $queries{influx_details} = {measurement => "page_metrics"};
 
   	my $qm = ariba::monitor::QueryManager->newWithDetails(
   		"page-metrics", 

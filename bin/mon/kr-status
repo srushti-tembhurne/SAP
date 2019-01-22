@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl 
+#!/usr/local/bin/perl -w
 
 use strict;
 
@@ -19,6 +19,7 @@ use ariba::Ops::Machine;
 use ariba::Ops::NetworkUtils;
 use ariba::Ops::DateTime;
 use ariba::Ops::Constants;
+use ariba::Ops::Utils;
 use ariba::monitor::StatusPage;
 
 my $logfile = ariba::Ops::Constants->keepRunningEventLogFile();
@@ -77,10 +78,13 @@ sub main {
 		}
 	}
 
+    my $zcat = ariba::Ops::Utils::findSysCmd('zcat');
+    die "Could not find zcat on host $hostname\n" unless $zcat;
+
 	foreach my $file (@logs) {
 		my $status;
 		if($file =~ m/.gz$/) {
-			$status = open(LOG, '-|', '/usr/local/bin/gzcat', $file);
+			$status = open(LOG, '-|', $zcat, $file);
 		} else {
 			$status = open(LOG, "<", $file);
 		}
@@ -265,10 +269,7 @@ sub main {
 			"crit" => "$restartcrit || numrows >= 5",
 			"perl" => sub { return $restart; },
 			"uiHint" => "$tab",
-			"inf_field" => "restarted_in_last_hour",
-			"inf_default" => "none",
-			"inf_tags" => qq(tab="$tab"),
-			"group_by" => $tab,
+            "inf_field" => "restarted_in_last_hour",
 		};
 
 		if($openError) {
@@ -287,10 +288,7 @@ sub main {
 			"warn" => "$oomcrit || numrows >= 5",
 			"perl" => sub { return $oom; },
 			"uiHint" => "$tab",
-			"inf_field" => "oom_in_last_hour",
-			"inf_default" => "none",
-			"inf_tags" => qq(tab="$tab"),
-			"group_by" => $tab,
+            "inf_field" => "oom_in_last_hour",
 		};
 		$q->{"$product instances in $tab dead in last hour"} = {
 			"severity" => 1,
@@ -301,10 +299,7 @@ sub main {
 			"crit" => "numrows > 0",
 			"perl" => sub { return $dead; },
 			"uiHint" => "$tab",
-			"inf_field" => "dead_in_last_hour",
-			"inf_default" => "none",
-			"inf_tags" => qq(tab="$tab"),
-			"group_by" => $tab,
+            "inf_field" => "dead_in_last_hour",
 		};
 		$q->{"$product instances in $tab with UnixFileSystem stack traces in last hour"} = {
 			severity => 1,
@@ -323,11 +318,7 @@ sub main {
 			correctiveActions => [
 				Ops => 'On warn/ToW, check the corresponding kr logs to verify that it is a long running thread issue ' . 
 					'caused by accessing netapp. If so / crit, follow normal escalation process as it is impacting performance.',
-			],
-			"inf_field" => "unix_fs_stack_traces_in_last_hour",
-			"inf_default" => "none",
-			"inf_tags" => qq(tab="$tab"),
-			"group_by" => $tab,
+			]
 		};
 		if ($product eq "s4") {
 			$q->{"$product GlobalTask instances in $tab with Socket Closed stack traces in last hour"} = {
@@ -337,10 +328,7 @@ sub main {
 				ticketOwner => "unassigned-network",
 				perl => sub { return join("\n", sort @socketClosedError); },
 				uiHint => $tab,
-				"inf_field" => "socket_closed_stack_traces_in_last_hour",
-				"inf_default" => "none",
-				"inf_tags" => qq(tab="$tab"),
-				"group_by" => $tab,
+                "inf_field" => "socket_closed_stack_traces_in_last_hour",
 			};
 		}
 
@@ -361,16 +349,11 @@ sub main {
 				Ops => 'For warn, take thread dump on the node and open an S2 CR for Platform Engineering. ' . 
 					'For crit, do the same thing but with S1 severity and escalate to Engineering for ' . 
 					'immediate investigation.',
-			],
-			"inf_field" => "too_long_to_start_in_last_hour",
-			"inf_default" => "none",
-			"inf_tags" => qq(tab="$tab"),
-			"group_by" => $tab,
+			]
 		};
 
-		$q->{influx_details} = { measurement => 'kr_status' };
 		my $qm = ariba::monitor::QueryManager->newWithDetails("keeprunning-status", $product, $me->service(), undef, $prod->currentCluster(), $q);
-		$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+		$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 	}
 }
 

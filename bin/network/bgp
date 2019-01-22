@@ -1,8 +1,9 @@
 #!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/network/bgp#2 $
+# $Id: //ariba/services/monitor/bin/network/bgp#4 $
 
 use strict;
+use File::Basename;
 use FindBin;
 use lib "$FindBin::Bin/../../lib";
 
@@ -14,8 +15,10 @@ use ariba::monitor::QueryManager;
 use ariba::monitor::StatusPage;
 use ariba::rc::InstalledProduct;
 use ariba::SNMP::Session;
+use dmail::LockLib;
 
 my $debug = 0;
+my $lockFile = "/tmp/" . basename($0);
 
 # 9 minutes should cover any 2 pollings allowing some time for delay.
 my $bgpUptimeThreshold = 60 * 9;
@@ -32,14 +35,16 @@ sub main {
 		if ($arg =~ /^-d/o) { $debug = 1; };
 	}
 
+	die "can't grab lock\n" unless dmail::LockLib::requestlock($lockFile, 5);
+
 	my $me = ariba::rc::InstalledProduct->new();
 
 	for my $datacenter (ariba::Ops::ProductAPIExtensions::datacentersForProducts($me)) {
 
 		my %match = (
-			'datacenter'	   => $datacenter,
+			'datacenter'       => $datacenter,
 			'providesServices' => 'router',
-			'status'		   => 'inservice',
+			'status'           => 'inservice',
 		);
 		
 		my @routers = ();
@@ -55,7 +60,7 @@ sub main {
 		for my $router (@routers) {
 
 			my $hostname = $router->hostname();
-			my $peers	= $router->bulkWalkOids('bgpPeerRemoteAddr');
+			my $peers    = $router->bulkWalkOids('bgpPeerRemoteAddr');
 
 			for my $peer (keys %$peers) {
 
@@ -67,8 +72,6 @@ sub main {
 					perl => sub { main::checkBGPTime($peer, $router) },
 					inf_field => "current_state_time",
 					inf_tags => qq|datacenter="$datacenter",hostname="$hostname",peer="$peer"|,
-					inf_default => "NA",
-					group_by => "$datacenter,$hostname,$peer",
 				};
 
 				# this is a hack to make a graph for TMID 5325
@@ -82,34 +85,32 @@ sub main {
 					snmp => "$hostname, bgpPeerState.$peer",
 					inf_field => "current_state",
 					inf_tags => qq|datacenter="$datacenter",hostname="$hostname",peer="$peer"|,
-					inf_default => "NA",
-					group_by => "$datacenter,$hostname,$peer",
 				};
 			}
 		}
 
-		#$queries{'For more info about bgp see'} = {
-		#	perl => " 'below' ",
-		#	note => "<html><a href=\"$bgpDocUrl\">$bgpDocUrl</a></html>",
-		#	info => 1,
-		#};
+		$queries{'For more info about bgp see'} = {
+			perl => " 'below' ",
+			note => "<html><a href=\"$bgpDocUrl\">$bgpDocUrl</a></html>",
+			info => 1,
+		};
 
 		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
 
-		$queries{influx_details} = {measurement => "network_bgp"};
 		my $qm = ariba::monitor::QueryManager->newWithDetails(
 			'network-bgp', $pn, $me->service(), $me->customer(), \%queries
 		);
 
-		$qm->processQueries($debug, $me->default('notify.email'), $sendEmail, $sendPage);
+		$qm->processQueriesUsingServer($debug, $me->default('notify.email'), $sendEmail, $sendPage);
 	}
+	dmail::LockLib::releaselock($lockFile);
 }
 
 sub checkBGPTime {
 	my $peer   = shift;
 	my $router = shift;
 
-	my $now	= time();
+	my $now    = time();
 	my $historyFile = "/tmp/network-bgp-last-flap-$peer";
 
 	for (my $i = 0; $i < 3; $i++) {

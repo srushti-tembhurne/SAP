@@ -45,13 +45,14 @@ sub main {
 
     my $sendEmail = 1;
     my $sendPage = 1;
-    
+
     while (my $arg = shift(@ARGV)) {
         if ($arg =~ /^-d/o) { $debug++; next;}
     }
 
     my $hostname = ariba::Ops::NetworkUtils::hostname();
     my $machine  = ariba::Ops::Machine->new($hostname);
+    my $datacenter = $machine->datacenter();
     my @services = $machine->providesServices();
     my %queries  = ();
 
@@ -81,12 +82,11 @@ sub main {
     @lines = reverse @lines;
     my $lastUpdateOk = 'Ok';
     my $warn_condition;
-    my $dataCenter = $machine->monitoringDatacenter() || $machine->datacenter();
 
     LOG:
     foreach my $line ( @lines ){
         $warn_condition = "Update failed. Your network may be down or none of the mirrors listed in";
-        
+
         next LOG unless $line =~ /$warn_condition/;
 
         my $now = time;
@@ -118,10 +118,13 @@ sub main {
         print "Now: '$currentTime'    Last Match at: '$dateStr'    Diff: '$actual_diff'    Result: '$lastUpdateOk'\n" if $debug;
         ## Since we've reversed the array and they are in reverse chronological order
         ## the first 'Clamd successfully notified about the update.' line is the most
-        ## recent and the one we want so we can exit the loop.        
+        ## recent and the one we want so we can exit the loop.
 
         last LOG;
     }
+    my %influx_data = ();
+    $influx_data{'measurement'} = 'clamav_definitions';
+    $influx_data{'tags'} = { host => $hostname, service => $service, product => $datacenter };
 
     $queries{"ClamAV Definitions Update-$hostname"} = {
         warn => "answer =~ /$warn_condition/",
@@ -133,30 +136,39 @@ sub main {
         ticketOwner => "unassigned-sysadmin",
         perl => sub {return "$lastUpdateOk"},
         uiHint => "$hostname/ClamAV Virus Definitions",
-        inf_field => "ClamAVVirusDef",
-        inf_tags => "uihint=\"$hostname/ClamAV Virus Definitions\",datacenter=\"$dataCenter\"",
-        inf_default => 0,
-        group_by => "$hostname,$dataCenter",
+    };
+    # save as number, not as string (influx/grafana thresholds)
+    my $int_result;
+    if ($lastUpdateOk =~ /$warn_condition/) {
+        $int_result = 0;
+    } else {
+        $int_result = 1;   # OK
+    }
+    $influx_data{'data'}->{'is_ok'} = $int_result;
+
+    eval {
+        my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+        ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line);
     };
 
     my $server   = ariba::Ops::CFEngine::MonitoringGlueUtils::monitorServer($hostname);
     print "SERVER: $server\n", if $debug;
-    
+
     ## calling die here rather than exit.  We should note this and not just blindly exit.
     die "Unrecoverable error: Cannot find Monitoring server!!\n" unless defined $server;
 
+    my $dataCenter = $machine->monitoringDatacenter() || $machine->datacenter();
     my $product  = ariba::monitor::StatusPage::fakeProductNameForDatacenter($dataCenter);
     my $customer = undef;
 
     print "PRODUCT: $product \n", if $debug;
     print "SERVICE: $service \n", if $debug;
 
-    queries{influx_details} = {measurement => "ClamAVStatus"};
     my $q = ariba::monitor::QueryManager->newWithDetails(
         'ClamAV Status', $product, $service, $customer, \%queries
     );
 
-    $q->processQueries($debug, ariba::Ops::Constants->operationsEmailNotificationAddress(), $sendEmail, $sendPage, $server);
+    $q->processQueriesUsingServer($debug, ariba::Ops::Constants->operationsEmailNotificationAddress(), $sendEmail, $sendPage, $server);
 }
 
 main();
@@ -232,3 +244,4 @@ Fri Jan 30 08:00:47 2015 -> daily.cld is up to date (version: 20000, sigs: 13163
 Fri Jan 30 08:00:47 2015 -> bytecode.cvd version from DNS: 245
 Fri Jan 30 08:00:47 2015 -> Connecting via proxy.ariba.com
 Fri Jan 30 08:00:47 2015 -> bytecode.cld is up to date (version: 245, sigs: 43, f-level: 63, builder: dgoddard)
+

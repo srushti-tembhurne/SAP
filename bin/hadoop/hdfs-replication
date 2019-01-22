@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/hadoop/hdfs-replication#19 $
+# $Id: //ariba/services/monitor/bin/hadoop/hdfs-replication#20 $
 
 #
 # Monitoring for Hadoop:
@@ -117,14 +117,12 @@ sub main {
                         Ops => "Follow up with DBAs", 
                     ],
                     inf_field => "${rhost}_$metric",
-                    inf_default => "none",
                     inf_tags => "host=$rhost",
                 };
             }
         }
-        $queriesHealth{"influx_details"} = {measurement => "hdfs_replication"};
         my $qmHealth = ariba::monitor::QueryManager->newWithDetails('hbase', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queriesHealth);
-        $qmHealth->processQueries($debug, $email, $sendEmail, $sendPage);
+        $qmHealth->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
         
     }
 }

@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl
 
-# $Id: //ariba/services/monitor/bin/common/query-frequency#3 $
+# $Id: //ariba/services/monitor/bin/common/query-frequency#4 $
 
 use strict;
 use warnings;
@@ -86,16 +86,16 @@ sub main {
                           'Unable to Read PowerGraph Files' => $errorPowerGraph, 
                           'Updating Queries Per Second (Frequency)' => $queryFreq,
                           'Unable to Read Query Files' => $errorQuery );
-    my %NamesOfQueries =  ('Updating Power Graphs Per Second (Frequency)' => powerGraph, 
-                          'Number of Processed Power Graphs File' => processedPowerGraphs,
-                          'Number of Processed Queries File' => processedQueries,
-                          'Unable to Read PowerGraph Files' => errorPowerGraph, 
-                          'Updating Queries Per Second (Frequency)' => queryFreq,
-                          'Unable to Read Query Files' => errorQuery );
+    my %NamesOfQueries =  ('Updating Power Graphs Per Second (Frequency)' => "powerGraph",
+                          'Number of Processed Power Graphs File' => "processedPowerGraphs",
+                          'Number of Processed Queries File' => "processedQueries",
+                          'Unable to Read PowerGraph Files' => "errorPowerGraph",
+                          'Updating Queries Per Second (Frequency)' => "queryFreq",
+                          'Unable to Read Query Files' => "errorQuery" );
 
     foreach my $query ( keys %listOfQueries ){
         next if ( ( ($query =~ /Quer/) && ($queryFrequency == 0 ) ) || ( ($query =~ /Power/) && ($graphFrequency == 0) ) ); 
-        my $query_name = $NamesOfQueries{$query};
+        my $query_name = $NamesOfQueries{$query}; 
         $queries{$query} = {
             recordMaxResults => 8760,
             warn    => 'answer eq "b" or numrows > 10',
@@ -118,8 +118,6 @@ sub main {
 
 
     my $email = $mon->default('notify.email');
-
-    $queries{influx_details} = {measurement => "query_frequency"};
 
     my $qm = ariba::monitor::QueryManager->newWithDetails('Frequency of Query', $mon->name(), $mon->service(), $mon->customer(), \%queries);
     $qm->processQueries($debug, $email, $sendEmail, $sendPage);

@@ -6,8 +6,8 @@ use warnings;
 
 use FindBin;
 use lib "$FindBin::Bin/../../lib";
-
 use lib "$FindBin::Bin/../../bin";
+
 use JSON;
 use File::Slurp;
 use XML::Simple;
@@ -49,17 +49,13 @@ sub main
     # Read in configuration from JSON format file:
     my $config_file;
     my %statusMap = eval {
-         $config_file = $ENV{MOBILE_STATUS_CONFIG_FILE} || "$etc/query/an-mobile-status.conf";
-         my $contents = read_file($config_file) or die "failed to read_file $config_file: $!";
-         my $config = decode_json $contents or die "failed to decode_json the contents of $config_file";
-         return %$config;
-    };
-    # we currently fail silently (not a good idea!), at least print the error in debug/test mode
-    print "$@" if ( $@ and ($debug or $test) );
+                             $config_file = $ENV{MOBILE_STATUS_CONFIG_FILE} || "$etc/query/an-mobile-status.conf";
+                             my $contents = read_file($config_file) or die "failed to read_file $config_file: $!";
+                             my $config = decode_json $contents or die "failed to decode_json the contents of $config_file";
+                             return %$config;
+                         };
 
     my %queries;
-
-    $queries{'influx_details'} = { measurement => 'mobile_api_response' };
 
     foreach my $inst (@instances)
     {
@@ -85,29 +81,33 @@ sub main
         };
 
         # We only want to see the element with the label 'ResponseCounts', so reasign that to $xml.
-        $xml = $xml->{MonitorStatus}{ResponseCounts}{entry};
+        $xml = $xml->{MonitorStatus}->{ResponseCounts}->{entry};
         # $xml is now a ref to a hash keyed with HTTP return codes, each of which is a ref to a hash of 3 elementes, the
         # crit level, warn level and content (data).  Note that if a system is down or communication failes, there's no
         # XML, no keys and no update to any query, which should cause stale data for all queries.
-        foreach my $httpCode ( keys %statusMap )
+        foreach my $httpCode (keys (%statusMap))
         {
             # The config file has a "special" value, which must be skipped in this loop.  It is used only for error conditions
             # when there is no data string available.
             next if $httpCode eq 'ERROR';
 
-            my ($crit, $warn, $info, $data);
+            my ($crit, $warn, $info, $data,);
             # These are from the configuration file and will always exist.
-            $crit = $statusMap{$httpCode}{crit} // 0;
-            $warn = $statusMap{$httpCode}{warn} // 0;
-
-            # separately save the warn/crit thresholds as they are
-            my ($crit_threshold, $warn_threshold) = ($crit, $warn);
+            $crit = $statusMap{$httpCode}->{crit} if defined $statusMap{$httpCode}->{crit};
+            $warn = $statusMap{$httpCode}->{warn} if defined $statusMap{$httpCode}->{warn};
 
             # The xml string may or may not exist, depending on whether the system can be contacted and is responding.  If not,
             # set the data string to some sort of error message.
-            $data = int( $xml->{$httpCode}{content} // -1 );
+            if (defined $$xml{$httpCode}->{content})
+            {
+                $data = $$xml{$httpCode}->{content};
+            }
+            else
+            {
+                $data = $statusMap{ERROR};
+            }
 
-            if ( $crit < 0 ) # -1 usually, but covers other possible negative values.
+            if ($crit < 0) # -1 usually, but covers other possible negative values.
             {
                 $info = $crit;
                 undef $crit;
@@ -117,58 +117,37 @@ sub main
             printf "Crit:  %-7s Warn:  %-7s Data:  %-7s\n",
                       $crit ? $crit : "NoCrit",
                       $warn ? $warn : "NoWarn",
-                      $data
+                      (defined $data) ? $data : 'NoData'
                 if $debug or $test;
 
-            my $qname = "Mobile API Status ($host $httpCode)";
-            $queries{$qname} = {
-                uiHint      => "$instance",
-                perl        => sub { $data },
-                description => "ANMobile API Status for HTTP code $httpCode",
-                inf_tags    => qq(node="$host",uihint="$instance"),
-                inf_field   => $httpCode,
-                inf_default => 0,
-                group_by    => $instance,
-            };
-            $queries{"$qname warn threshold"} = {
-                perl        => sub { $warn_threshold },
-                inf_tags    => qq(node="$host",uihint="$instance"),
-                inf_field   => $httpCode . '_warn_threshold',
-                group_by    => $instance,
-            };
-            $queries{"$qname crit threshold"} = {
-                perl        => sub { $crit_threshold },
-                inf_tags    => qq(node="$host",uihint="$instance"),
-                inf_field   => $httpCode . '_crit_threshold',
-                group_by    => $instance,
-            };
-
-            ### warn/crit logic here:
-            # crit_threshold >= 0
-            #    info: false
-            #    warn: answer > warn_threshold
-            #    crit: answer == -1 || answer > crit_threshold
-            # crit_threshold < 0
-            #    info: answer > crit_threshold
-            #    warn: false
-            #    crit: answer == -1
-
-            ### will  translate into JSON alert configs (for all configs) logic:
-            # info: crit_threshold < 0 AND answer > crit_threshold
-            # warn: crit_threshold >= 0 AND answer > warn_threshold
-            # crit: answer == -1 OR ( crit_threshold >= 0 AND answer > crit_threshold )
-
-            if ( !defined $crit ) {
-                $queries{$qname}{crit} = "answer == -1";
-                $queries{$qname}{info} = "answer > $info";
+            if (! defined $crit)
+            {
+                $queries {"Mobile API Status ($host $httpCode)"} =  {
+                                                        crit        => "answer =~ /^ERROR:/",
+                                                        info        => "answer > $info",
+                                                        uiHint      => "$instance",
+                                                        perl        => sub {return $data;},
+                                                        description => "ANMobile API Status for HTTP code $httpCode",
+                                                        inf_tags    => qq(node="$host",uihint="$instance"),
+                                                        inf_field   => $httpCode,
+                                                    };
             }
             else # Assumes that crit and warn are not -1, checked above.
             {
-                $queries{$qname}{crit}        = "answer > $crit || answer == -1";
-                $queries{$qname}{warn}        = "answer > $warn";
-                $queries{$qname}{ticketOwner} = 'unassigned-sre';
-                $queries{$qname}{severity}    = 1;
-                $queries{$qname}{correctiveActions} = [ Ops => 'Open a ticket with the team responsible for the ANMobile API' ];
+                $queries {"Mobile API Status ($host $httpCode)"} =  {
+                                                        crit              => "answer > $crit || answer =~ /^ERROR:/,",
+                                                        warn              => "answer > $warn",
+                                                        uiHint            => "$instance",
+                                                        perl              => sub {return $data;},
+                                                        description       => "ANMobile API Status for HTTP code $httpCode",
+                                                        ticketOwner       => 'unassigned-sre',
+                                                        severity          => 1,
+                                                        correctiveActions => [
+                                                                                Ops => 'Open a ticket with the team responsible for the ANMobile API',
+                                                                             ],
+                                                        inf_tags    => qq(node="$host",uihint="$instance"),
+                                                        inf_field   => $httpCode,
+                                                    };
             }
         }
     }
@@ -181,7 +160,7 @@ sub main
         $q = ariba::monitor::QueryManager->newWithDetails (
                     "mobile-api-response-counts", $name, $service, $customer, $cluster, \%queries);
 
-        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+        $q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
     }
 }
 

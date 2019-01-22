@@ -72,11 +72,8 @@ sub main {
         ## I tried to abstract this into a loop, the SQL is all very similar except for the index names
         ## and these are very specific ... It's easier to just hard code them than to try further
         ## to find a cleaner way to do this ... Hard-coding 18 queries ... Yaayyy!!!
-
         
-        foreach my $rec ( @results ){
-
-            my $owner = $rec->{'OWNER'};
+        foreach my $owner ( @results ){
             $queries{'Legal Artifact Queue'} = {
                 warn    => 'numrows > 0',
                 #crit    => 'numrows > 20',
@@ -87,14 +84,12 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                   select /* + INDEX($owner.legal_artifact_q IND_1F10AE86_17279066) */ count(id) as queue_cnt from $owner.legal_artifact_q where status=4; 
+                   select /* + INDEX($owner.legal_artifact_q IND_1F10AE86_17279066) */ count(id) from $owner.legal_artifact_q where status=4; 
                 ",
                 description => 'Legal Artifact Queue Monitoring',
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="legal artifact queue"),
-                group_by => qq($owner,$hostname,$instance,"legal artifact queue"),
             };
             
             $queries{'Legal Artifact Queue > 1 hour'} = {
@@ -107,14 +102,12 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                   select /*+ INDEX($owner.legal_artifact_q IND_1F10AE86_17279066) */ id as id, item as item, decode(status, 1, 'Queued', 2, 'Processing', 'Unknown' || status)as status, round((1420559474 - (status_changed/1000))/3600) stuck_time from $owner.legal_artifact_q where status in (1, 2) and 1420559474 - (status_changed/1000) > 3600
+                   select /*+ INDEX($owner.legal_artifact_q IND_1F10AE86_17279066) */ id, item, decode(status, 1, 'Queued', 2, 'Processing', 'Unknown' || status), round((1420559474 - (status_changed/1000))/3600) stuck_time from $owner.legal_artifact_q where status in (1, 2) and 1420559474 - (status_changed/1000) > 3600
                 ",
                 description => 'Legal Artifact Queue > 1 hour Monitoring',
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="legal artifact queue",subtype="more than 1 hour"),
-                group_by => qq($owner,$hostname,$instance,"legal artifact queue","more than 1 hour"),
             };
             
             $queries{'Legal Disp Queue - Length'} = {
@@ -127,7 +120,7 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                    SELECT /*+ INDEX($owner.legal_disp_queue IND_1F7A44AF_CD3323B5)*/ count(id) as length
+                    SELECT /*+ INDEX($owner.legal_disp_queue IND_1F7A44AF_CD3323B5)*/ count(id) 
                     FROM $owner.legal_disp_queue
                     WHERE status in (1, 2);
                 ",
@@ -135,8 +128,6 @@ sub main {
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="legal disp queue"),
-                group_by => qq($owner,$hostname,$instance,"legal disp queue"),
             };
             
             $queries{'Legal Disp Queue - # of Failed Items'} = {
@@ -149,7 +140,7 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                    SELECT /*+ INDEX($owner.legal_disp_queue IND_1F7A44AF_B1A4A7A0)*/ count(id) as failed_items_cnt
+                    SELECT /*+ INDEX($owner.legal_disp_queue IND_1F7A44AF_B1A4A7A0)*/ count(id)
                     FROM $owner.legal_disp_queue
                     WHERE status=4;
                 ",
@@ -157,8 +148,6 @@ sub main {
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="legal disp queue"),
-                group_by => qq($owner,$hostname,$instance,"legal disp queue"),
             };
             
             $queries{'Legal Disp Queue - # of items in queue > 1 hour'} = {
@@ -171,8 +160,8 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                   SELECT /*+ INDEX($owner.legal_disp_queue IND_1F7A44AF_B1A4A7A0)*/ id as id, item as item, decode(status, 1, 'New', 
-                              2, 'Processing', 'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time 
+                   SELECT /*+ INDEX($owner.legal_disp_queue IND_1F7A44AF_B1A4A7A0)*/ id, item, decode(status, 1, 'New', 
+                              2, 'Processing', 'Unknown' || status), round((1420559474 - (status_changed/1000))/3600) stuck_time 
                    FROM $owner.legal_disp_queue
                    WHERE status IN (1, 2) 
                    AND status_changed < 1420558874000;
@@ -181,8 +170,6 @@ sub main {
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="legal disp queue",subtype="more than 1 hour"),
-                group_by => qq($owner,$hostname,$instance,"legal disp queue","more than 1 hour"),
             };
             
             $queries{'Legal Disp Queue - # of items in queue > 2 hours'} = {
@@ -196,8 +183,8 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                    SELECT /*+ INDEX($owner.legal_disp_queue IND_1F7A44AF_B1A4A7A0)*/ id as id, item as item, decode(status, 1, 'New',
-                              2, 'Processing', 'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time
+                    SELECT /*+ INDEX($owner.legal_disp_queue IND_1F7A44AF_B1A4A7A0)*/ id, item, decode(status, 1, 'New',
+                              2, 'Processing', 'Unknown' || status), round((1420559474 - (status_changed/1000))/3600) stuck_time
                     FROM $owner.legal_disp_queue 
                     WHERE status IN (1, 2)
                     AND status_changed < 1420552274000;
@@ -206,8 +193,6 @@ sub main {
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="legal disp queue",subtype="more than 2 hour"),
-                group_by => qq($owner,$hostname,$instance,"legal disp queue","more than 2 hour"),
             };
             
             $queries{'Document Disp Queue - Length'} = {
@@ -220,14 +205,12 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                    SELECT /*+ INDEX($owner.document_disp_q IND_AEA66A_CD3323B5)*/ count(id) as length  FROM $owner.document_disp_q WHERE status in (1, 2);
+                    SELECT /*+ INDEX($owner.document_disp_q IND_AEA66A_CD3323B5)*/ count(id)  FROM $owner.document_disp_q WHERE status in (1, 2);
                 ",
                 description => 'Document Disp Queue - Length Monitoring',
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc disp queue"),
-                group_by => qq($owner,$hostname,$instance,"doc disp queue"),
             };
             
             $queries{'Document Disp Queue - # of Failed Items'} = {
@@ -240,14 +223,12 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                    SELECT /*+ INDEX($owner.document_disp_q IND_AEA66A_CD3323B5)*/ count(id) as failed_items_cnt FROM $owner.document_disp_q WHERE status=4;
+                    SELECT /*+ INDEX($owner.document_disp_q IND_AEA66A_CD3323B5)*/ count(id) FROM $owner.document_disp_q WHERE status=4;
                 ",
                 description => 'Document Disp Queue - # of Failed Items Monitoring',
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc disp queue"),
-                group_by => qq($owner,$hostname,$instance,"doc disp queue")
             };
             
             $queries{'Document Disp Queue - # of items in queue > 10 Minutes'} = {
@@ -260,8 +241,8 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                    SELECT /*+ INDEX($owner.document_disp_q IND_AEA66A_B1A4A7A0)*/ id as id, item as items, decode(status, 1,
-                        'New',  2, 'Processing', 'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time  
+                    SELECT /*+ INDEX($owner.document_disp_q IND_AEA66A_B1A4A7A0)*/ id, item, decode(status, 1,
+                        'New',  2, 'Processing', 'Unknown' || status), round((1420559474 - (status_changed/1000))/3600) stuck_time  
                     FROM $owner.document_disp_q WHERE status IN (1, 2) 
                     AND status_changed < 1420558874000;
                 ",
@@ -269,8 +250,6 @@ sub main {
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc disp queue",subtype="more than 10 mins"),
-                group_by => qq($owner,$hostname,$instance,"doc disp queue","more than 10 mins")
             };
             
             $queries{'Document Disp Queue - # of items in queue > 2 Hours'} = {
@@ -283,8 +262,8 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                    SELECT /*+ INDEX($owner.document_disp_q IND_AEA66A_B1A4A7A0)*/ id as id, item as item, decode(status, 1,
-                        'New', 2, 'Processing',    'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time 
+                    SELECT /*+ INDEX($owner.document_disp_q IND_AEA66A_B1A4A7A0)*/ id, item, decode(status, 1,
+                        'New', 2, 'Processing',    'Unknown' || status), round((1420559474 - (status_changed/1000))/3600) stuck_time 
                     FROM $owner.document_disp_q 
                     WHERE status IN (1, 2) 
                     AND status_changed < 1420552274000;
@@ -293,8 +272,6 @@ sub main {
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc disp queue",subtype="more than 2 hours"),
-                group_by => qq($owner,$hostname,$instance,"doc disp queue","more than 2 hours")
             };
             
             $queries{'Document Out Disp Queue - Length'} = {
@@ -307,15 +284,13 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                    SELECT /*+ INDEX($owner.doc_out_disp_q IND_357A851C_CD3323B5)*/ count(id) as length
+                    SELECT /*+ INDEX($owner.doc_out_disp_q IND_357A851C_CD3323B5)*/ count(id)
                     FROM $owner.doc_out_disp_q WHERE status in (1, 2);
                 ",
                 description => 'Document Out Disp Queue - Length Monitoring',
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc out disp queue"),
-                group_by => qq($owner,$hostname,$instance,"doc out disp queue")
             };
             
             $queries{'Document Disp Queue - # of Failed Items'} = {
@@ -328,15 +303,13 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                    SELECT /*+ INDEX($owner.doc_out_disp_q IND_357A851C_CD3323B5)*/ count(id) as failed_items_cnt
+                    SELECT /*+ INDEX($owner.doc_out_disp_q IND_357A851C_CD3323B5)*/ count(id)
                     FROM $owner.doc_out_disp_q WHERE status=4;
                 ",
                 description => 'Document Disp Queue - # of Failed Items Monitoring',
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc out disp queue"),
-                group_by => qq($owner,$hostname,$instance,"doc out disp queue")
             };
             
             $queries{'Document Out Disp Queue - # of items in queue > 10 Minutes'} = {
@@ -349,8 +322,8 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                    SELECT /*+ INDEX($owner.doc_out_disp_q IND_357A851C_B1A4A7A0)*/ id as id, item as item, decode(status, 1,
-                        'New',  2, 'Processing',  'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time 
+                    SELECT /*+ INDEX($owner.doc_out_disp_q IND_357A851C_B1A4A7A0)*/ id, item, decode(status, 1,
+                        'New',  2, 'Processing',  'Unknown' || status), round((1420559474 - (status_changed/1000))/3600) stuck_time 
                     FROM $owner.doc_out_disp_q
                     WHERE status IN (1, 2)
                     AND status_changed < 1420558874000;
@@ -359,8 +332,6 @@ sub main {
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc out disp queue",subtype="more than 10 mins"),
-                group_by => qq($owner,$hostname,$instance,"doc out disp queue","more than 10 mins")
             };
             
             $queries{'Document Out Disp Queue - # of items in queue > 2 Hours'} = {
@@ -373,8 +344,8 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                    SELECT /*+ INDEX($owner.doc_out_disp_q IND_357A851C_B1A4A7A0)*/ id as id, item as item, decode(status, 1,
-                        'New', 2, 'Processing', 'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time
+                    SELECT /*+ INDEX($owner.doc_out_disp_q IND_357A851C_B1A4A7A0)*/ id, item, decode(status, 1,
+                        'New', 2, 'Processing', 'Unknown' || status), round((1420559474 - (status_changed/1000))/3600) stuck_time
                     FROM $owner.doc_out_disp_q
                     WHERE status IN (1, 2)
                     AND status_changed < 1420552274000;
@@ -383,8 +354,6 @@ sub main {
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc out disp queue",subtype="more than 2 hours"),
-                group_by => qq($owner,$hostname,$instance,"doc out disp queue","more than 2 hours")
             };
             
             $queries{'Document Sched Queue - Length'} = {
@@ -397,15 +366,13 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                    SELECT /*+ INDEX($owner.document_sched_q IND_427F3D96_CD3323B5) */ count(id) as length
+                    SELECT /*+ INDEX($owner.document_sched_q IND_427F3D96_CD3323B5) */ count(id)
                     FROM $owner.document_sched_q WHERE status in (1, 2);
                 ",
                 description => 'Document Sched Queue - Length Monitoring',
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc sched queue"),
-                group_by => qq($owner,$hostname,$instance,"doc sched queue"),
             };
             
             $queries{'Document Sched Queue - # of Failed Items'} = {
@@ -418,15 +385,13 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                    SELECT /*+ INDEX($owner.document_sched_q IND_427F3D96_CD3323B5)*/ count(id) as failed_items_cnt
+                    SELECT /*+ INDEX($owner.document_sched_q IND_427F3D96_CD3323B5)*/ count(id)
                     FROM $owner.document_sched_q WHERE status=4;
                 ",
                 description => 'Document Sched Queue - # of Failed Items Monitoring',
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc sched queue"),
-                group_by => qq($owner,$hostname,$instance,"doc sched queue"),
             };
             
             $queries{'Document Sched Queue - # of items in queue > 10 Minutes'} = {
@@ -439,8 +404,8 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                    SELECT /*+ INDEX($owner.document_sched_q IND_427F3D96_B1A4A7A0)*/ id as id, item as item, decode(status, 1,
-                        'New',  2, 'Processing',  'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time
+                    SELECT /*+ INDEX($owner.document_sched_q IND_427F3D96_B1A4A7A0)*/ id, item, decode(status, 1,
+                        'New',  2, 'Processing',  'Unknown' || status), round((1420559474 - (status_changed/1000))/3600) stuck_time
                     FROM $owner.document_sched_q
                     WHERE status IN (1, 2)
                     AND status_changed < 1420558874000;
@@ -449,8 +414,6 @@ sub main {
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc sched queue",subtype="more than 10 mins"),
-                group_by => qq($owner,$hostname,$instance,"doc sched queue","more than 10 mins"),
             };
             
             $queries{'Document Sched Queue - # of items in queue > 2 Hours'} = {
@@ -463,8 +426,8 @@ sub main {
                 recordDataType => "counter",
                 recordMaxResults => $maxResults,
                 sql         => "
-                    SELECT /*+ INDEX($owner.document_sched_q IND_427F3D96_B1A4A7A0)*/ id as id, item as item, decode(status, 1,
-                        'New', 2, 'Processing', 'Unknown' || status) as status, round((1420559474 - (status_changed/1000))/3600) stuck_time
+                    SELECT /*+ INDEX($owner.document_sched_q IND_427F3D96_B1A4A7A0)*/ id, item, decode(status, 1,
+                        'New', 2, 'Processing', 'Unknown' || status), round((1420559474 - (status_changed/1000))/3600) stuck_time
                     FROM $owner.document_sched_q
                     WHERE status IN (1, 2)
                     AND status_changed < 1420552274000; 
@@ -473,8 +436,6 @@ sub main {
                 correctiveActions => [
                     Ops => 'Report to AN team', 
                 ],
-                inf_tags => qq(sid="$owner",host="$hostname",instance="$instance",type="doc sched queue",subtype="more than 2 hours"),
-                group_by => qq($owner,$hostname,$instance,"doc sched queue","more than 2 hours"),
             };
 
             my $email = $mon->default('notify.email');
@@ -484,7 +445,6 @@ sub main {
             my $user = "system";
             my $pass = $mon->default("dbainfo.$user.password");
 
-            $queries{influx_details} = {measurement => 'an_legal_queues'};
             $qm->setSQLConnectInfo($user, $pass, $instance, $hostname);
             $qm->processQueries($debug, $email, $sendEmail, $sendPage);
         }

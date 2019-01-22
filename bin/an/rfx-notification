@@ -1,12 +1,12 @@
 #!/usr/local/bin/perl -w
 #
-# $Id: //ariba/services/monitor/bin/an/rfx-notification#8 $
+# $Id: //ariba/services/monitor/bin/an/rfx-notification#9 $
 #
 
 use strict;
 
 use FindBin;
-use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../../lib";
 
 use ariba::monitor::QueryManager;
 use ariba::rc::InstalledProduct;
@@ -34,7 +34,7 @@ sub main {
 	my @communityIds = ariba::Ops::ProductAPIExtensions::communityIdsForProductOfType($an,"supplier");
 	my $communitiesList = join(", ", @communityIds);
 
-	my $dbc = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndSchemaId ( $an, ariba::Ops::DBConnection->typeMainSupplier() );
+	my $dbc = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndSchemaId ( $an, ariba::Ops::DBConnection->typeMain() );
 
 	exit unless $dbc;
 	my $oc = ariba::Ops::OracleClient->newFromDBConnection($dbc);
@@ -44,12 +44,11 @@ sub main {
 	my $email = $me->default('notify.email');
 
 	my $q;
-    	$q->{influx_details} = { measurement => 'rfx_notification'};
 
 	$q->{'RfxPendingNotification in the queue'} = {
 		info => 1,
 		uiHint => 'notification',
-		sql => 'select count(1) as pending_notification from rfx_pending_notification',
+		sql => 'select count(1) from rfx_pending_notification',
 		recordMaxResults => 20000,
 		recordDataType => "gauge",
 	};
@@ -59,7 +58,7 @@ sub main {
 		warn => "answer > 5",
 		crit => "answer > 10",
 		uiHint => 'notification',
-		sql => 'SELECT COUNT(*) as stale_event_notification FROM rfx_pending_notification n JOIN rfx_event event ON event.id = n.event JOIN org o ON o.id = event.sourcing_org WHERE (o.type <> 110) AND n.ACTION_DATE < SYSDATE - 2 AND n.ACTION is not null AND event.is_test = 0',
+		sql => 'SELECT COUNT(*) FROM rfx_pending_notification n JOIN rfx_event event ON event.id = n.event JOIN org o ON o.id = event.sourcing_org WHERE (o.type <> 110) AND n.ACTION_DATE < SYSDATE - 2 AND n.ACTION is not null AND event.is_test = 0',
 		severity => 1,
 		ticketOnWarnOpenAfterMinutes => 20,
 		recordMaxResults => 20000,
@@ -67,8 +66,8 @@ sub main {
 	};
 
 	my $qm = ariba::monitor::QueryManager->newWithDetails('rfx', 'an', $service, undef, $q);
-	$qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
-	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+	$qm->setSQLConnectInfoFromDBConnection($dbc);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 
 }
 

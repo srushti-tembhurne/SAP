@@ -79,7 +79,6 @@ die "No queries for processing\n"  unless ( keys %$queries );
 #-----------------------------------------------------------------
 # create QueryManager object and process queries
 my $qmName = "micro-queue-status";
-$queries->{influx_details} = { measurement => 'an_micro_queue_status' };
 my $qm = ariba::monitor::QueryManager->newWithDetails (
         $qmName, $productName, $service, undef, $queries
 );
@@ -167,7 +166,6 @@ sub buildQueries {
     # create monitor query for each queue
     # data structure: $data->{queuename}->{prop}
     for my $queue ( keys %$data ) { 
-
         my $qdata = $data->{$queue};
     
         my $mbean = $qdata->{mbean};
@@ -191,20 +189,14 @@ sub buildQueries {
 
             my $queryname = "$queue $display";
             my $qvalue = $qdata->{$prop};
-            # at the moment we only have "QueueSize" as being monitored, so 'queuesize' is the fieldname
-            my $f_name = lc($prop);
-
-            ### Replace '-' (also to be safe  ',' and ' ') with '_'
-            $queue =~ tr/-, /___/;
-            $queue = lc($queue);
+            $queue =~ s/-/_/g;
             my $query = {
                 description => $description, #same per queue
-                perl        => sub { $qvalue },
-                warn        => $warn,
-                crit        => $crit,
-                inf_field   => $f_name,
-                inf_tags    => qq|queue="$queue"|,
-                group_by    => $queue,
+                perl => "$qvalue",
+                warn => "$warn",
+                crit => "$crit",
+                inf_field => lc($queue),
+
             };
             $qs->{$queryname} = $query; # a query prepared for QueryManager
         } # end for all queries for a given queue
@@ -269,4 +261,3 @@ __DATA__
         }
     }
 }
-

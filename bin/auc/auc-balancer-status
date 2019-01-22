@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl
+#!/usr/local/bin/perl -w
 
 #
 # $Id: //ariba/services/monitor/bin/piwik/piwik-status#4 $
@@ -99,11 +99,9 @@ sub main {
             ],
             perl => sub { return main::checkStatus( $results{ $role } ); },
             inf_field => "$role"."_status",
-            inf_default => "none",
         };
     }
 
-    $q{'influx_details'} = { measurement => 'cws_balancer_status'};
     my $qm = ariba::monitor::QueryManager->newWithDetails('balancer-status', 'cws', $service, undef, \%q);
     $qm->processQueries($debug, $email, $sendEmail, $sendPage);
         
@@ -136,4 +134,3 @@ sub checkStatus {
 main(@ARGV);
 
 __END__
-

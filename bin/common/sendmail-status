@@ -67,32 +67,18 @@ sub main {
 		info    => "numrows > -1",
 		crit    => $sendmailLogParser->errorCount() > 0,
 		warn    => $sendmailLogParser->warningCount() > 0,
-		perl    => "return $sendmailLogParser->errorCount()",
-        inf_field => "errorCount",
-        inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
-        inf_default => 0,
-        group_by => "$datacenter,$hostname",
+		perl    => "$perlcode",
 	};
-    $queries{"$hostname maillog warnings"} = {
-        uiHint  => 'Maillog Errors',
-        info    => "numrows > -1",
-        crit    => $sendmailLogParser->errorCount() > 0,
-        warn    => $sendmailLogParser->warningCount() > 0,
-        perl    => "return $sendmailLogParser->warningCount()",
         inf_field => "warningCount",
         inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
-        inf_default => 0,
-        group_by => "$datacenter,$hostname",
-    };
 
 	my $email = $me->default('notify') || $me->default('notify.email');
 
-    $queries{influx_details} = {measurement => "Sendmail-Status"};
 	my $qm = ariba::monitor::QueryManager->newWithDetails(
 		'Sendmail Status', $tab, $service, undef, \%queries
 	);
 
-	$qm->processQueries($debug, $email, $sendEmail, $sendPage, $monserver);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monserver);
 
 	dmail::LockLib::releaselock($lockFile);
 }

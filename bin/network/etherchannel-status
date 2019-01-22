@@ -3,6 +3,7 @@
 # $Id: $
  
 use strict;
+use File::Basename;
 use FindBin;
 use lib "$FindBin::Bin/../../lib";
 
@@ -12,8 +13,10 @@ use ariba::monitor::StatusPage;
 use ariba::Ops::Machine;
 use ariba::Ops::ProductAPIExtensions;
 use ariba::rc::InstalledProduct;
+use dmail::LockLib;
 
 my $debug = 0;
+my $lockFile = "/tmp/" . basename($0);
 
 sub main {
     my $sendEmail = 0;
@@ -24,6 +27,8 @@ sub main {
         if ($arg =~ /^-p/o) { $sendPage  = 1; };
         if ($arg =~ /^-d/o) { $debug     = 1; };
     }
+
+    die "can't grab lock\n" unless dmail::LockLib::requestlock($lockFile, 5);
 
     my $me    = ariba::rc::InstalledProduct->new();
     my $email = $me->default('notify.email');
@@ -119,8 +124,6 @@ sub main {
                         perl => "return qq(@portsInMDBNotConfiguredOnSwitch)",
                         inf_tags => qq|datacenter=$datacenter,hostname=$hostname,hostname=$hostname,etherchannel_group=$pagpAdminGroupCapability|,
                         inf_field => "ports_not_configured",
-                        inf_default => "none",
-                        group_by => "$datacenter,$hostname,$pagpAdminGroupCapability",
                     };
                 }
 
@@ -137,30 +140,26 @@ sub main {
                     # check to see if port is up.
                     if ( grep (/$ifName/, @MDBEtherChannelPorts)) {
                         if ($ifOperStatus eq 'up') {
-                            #$result = "Everything is fine.";
-                            $result = "1";
+                            $result = "Everything is fine.";
                         } else {
-                            #$result = "Port is correctly part of a EtherChannel, but is $ifOperStatus.";
-                            $result = "2";
+                            $result = "Port is correctly part of a EtherChannel, but is $ifOperStatus.";
                             $crit = 1;
                             $info = 0;
                         }
                     } else {
                         if ($ifOperStatus eq 'up') {
-                            #$result = "MDB Doesn't know about this EtherChannel setup and the interface is up.";
-                            $result = "3";
+                            $result = "MDB Doesn't know about this EtherChannel setup and the interface is up.";
                             $crit = 1;
                             $info = 0;
                         } else {
-                            #$result = "MDB Doesn't know about this EtherChannel setup and the interface is down.";
-                            $result = "4";
+                            $result = "MDB Doesn't know about this EtherChannel setup and the interface is down.";
                             $warn = 1;
                             $info = 0;
                         }
                     } 
 
                     # append more details of the port to the end of the result.
-                    # $result .= " $ifName is $pagpEthcOperationMode in group $pagpAdminGroupCapability and port is $ifOperStatus";
+                    $result .= " $ifName is $pagpEthcOperationMode in group $pagpAdminGroupCapability and port is $ifOperStatus";
 
                     $queries{"$hostname $ifName"} = {
                         uiHint => "$hostname/EtherChannel$pagpAdminGroupCapability",
@@ -170,8 +169,6 @@ sub main {
                         perl => "return qq($result)",
                         inf_field => "status",
                         inf_tags => qq|datacenter=$datacenter,hostname=$hostname,etherchannel_group=$pagpAdminGroupCapability,if_name=$ifName,operation_mode=$pagpEthcOperationMode|,
-                        inf_default => 0,
-                        group_by => "$datacenter,$hostname,$pagpAdminGroupCapability",
                     };
 
                 }
@@ -179,14 +176,14 @@ sub main {
         }
 
         if (%queries) {
-            $queries{influx_details} = {measurement => "network_etherchannel_status"};
             my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
             my $qm = ariba::monitor::QueryManager->newWithDetails(
                 'Network EtherChannel Status', $pn, $me->service(), $me->customer(), \%queries
             );
-            $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+            $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
         }
     }
+    dmail::LockLib::releaselock($lockFile);
 }
 
 sub createQueriesForNexusDevices {
@@ -212,8 +209,6 @@ sub createQueriesForNexusDevices {
         
         foreach my $pcidx ( keys %$pcstatus_href ) {
             my $result;
-            my $result_txt;
-            my $crit = 0;
             
             my $pcname = $pcstatus_href->{$pcidx}->{name};
             $pcname .= "(" . $pcstatus_href->{$pcidx}->{alias} . ")" if $pcstatus_href->{$pcidx}->{alias};
@@ -228,24 +223,14 @@ sub createQueriesForNexusDevices {
                 $result .= "\n$memname: $memstatus";  
             }
 
-            if ( $result =~ /down/i ) {
-                $result = 2;
-                $result_txt = "down";
-                $crit = 1;
-            } else {
-                $result_txt = "up";
-                $result = 1;
-                $crit = 0;
-            }
+        
             $query_href->{"$hostname $pcname"} = {
                 uiHint => "$uihint/$hostname/$pcname:$pcstatus",
                 noRowCount => 1,
-                crit => $crit,
+                crit => " answer =~ /down/i ",
                 perl => "return qq($result)",
                 inf_field => "port_channel_status",
-                inf_tags => qq|datacenter=$datacenter,hostname=$hostname,device_os="nxos",port_channel="$pcname",pc_status_txt="$result_txt"|,
-                inf_default => 0,
-                group_by => "$datacenter,$hostname,$pcname",
+                inf_tags => qq|datacenter=$datacenter,hostname=$hostname,port_channel=$pcname|,
             };
         }
 
@@ -266,26 +251,19 @@ sub createQueriesForNexusDevices {
             my $peerlinkstatus = $thisvpc_href->{peerlink}->{status};
 
             my $result = "Peer Keep Alive Status: $peerkeepalivestatus";
-            my $result_txt = "up";
             $result .= "\nPeer Link Status with $peerlinkname: $peerlinkstatus";
 
             my $crit = 0;
-            $result = 1;
-            if ( $peerlinkstatus !~ /up/i || $peerkeepalivestatus !~ /alive/i ) {
-                $crit = 1;
-                $result = 2;
-                $result_txt = "down";
-            }
-            
+            $crit = 1 if $peerlinkstatus !~ /up/i;
+            $crit = 1 if $peerkeepalivestatus !~ /alive/i;
+
             $query_href->{"$hostname domain $domainid ($role)"} = {
                 uiHint => "$uihint/$hostname",
                 noRowCount => 1,
                 crit => " $crit ",
                 perl => "return qq($result)",
-                inf_field => "vpc_status",
-                inf_tags => qq|datacenter=$datacenter,hostname=$hostname,device_os="nxos",vpc_domain=$domainid,role="$role",peer_link_name="$peerlinkname",peer_link_status="$peerlinkstatus",peer_keep_alive_status="$peerkeepalivestatus",vpc_status_txt="$result_txt"|,
-                inf_default => 0,
-                group_by => "$datacenter,$hostname,$domainid",
+                inf_field => "vpc_health_check",
+                inf_tags => qq|datacenter=$datacenter,hostname=$hostname,vpc_domain=$domainid|,
             }
         }
     }

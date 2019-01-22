@@ -1,13 +1,12 @@
 #!/usr/local/bin/perl -w
 #
-# $Id: //ariba/services/monitor/bin/an/rfx-digest-status#11 $
+# $Id: //ariba/services/monitor/bin/an/rfx-digest-status#12 $
 #
 
 use strict;
 
 use FindBin;
-#use lib "$FindBin::Bin/../../../lib";
-use lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../../lib";
 
 use ariba::monitor::QueryManager;
 use ariba::rc::InstalledProduct;
@@ -50,44 +49,19 @@ sub main {
 
 	my $email = $me->default('notify.email');
 
-    my $q_digest_status;
-    my $q_failed;
-    my $q_event;
+	my $q;
 
-    $q_digest_status->{influx_details} = { measurement => "rfx_digest_status"};
-    $q_event->{influx_details}         = { measurement => "rfx_event"};
-    $q_failed->{influx_details}        = { measurement => "rfx_failed"};
-
-	$q_digest_status->{'rfx digest items not processed for 24 hours'} = {
+	$q->{'rfx digest items not processed for 24 hours'} = {
 		info => 1,
 		uiHint => 'digest status',
 		crit => 'answer > 0',
-		sql => 'select count(1) as not_processed_for_24_hours from rfx_digest_item rdi where rdi.disabled = 0 and not exists (select 1 from rfx_digest_event rd where rd.event = rdi.event) and rdi.digest_time < (sysdate - 1) and not exists (select 1 from rfx_event_an where id = rdi.event and event_state != 19)',
+		sql => 'select count(1) from rfx_digest_item rdi where rdi.disabled = 0 and not exists (select 1 from rfx_digest_event rd where rd.event = rdi.event) and rdi.digest_time < (sysdate - 1) and not exists (select 1 from rfx_event_an where id = rdi.event and event_state != 19)',
 		runForCommunities => $communitiesList,
 		recordMaxResults => 20000,
 		recordDataType => "gauge",
 	};
 
-	$q_digest_status->{'rfx digest items not processed for 8 hours'} = {
-		info => 1,
-		uiHint => 'digest status',
-		warn => 'answer > 0',
-		sql => 'select count(1) as not_processed_for_8_hours from  rfx_digest_item rdi where rdi.digest_time < (sysdate - 8/24) and rdi.disabled = 0 and not exists (select 1 from rfx_digest_event rd where rd.event = rdi.event)',
-		runForCommunities => $communitiesList,
-		recordMaxResults => 20000,
-		recordDataType => "gauge",
-	};
-
-	$q_digest_status->{'rfx digest items waiting to be sent'} = {
-		info => 1,
-		uiHint => 'digest status',
-		sql => 'select count(1) as waiting_to_send from  rfx_digest_item rdi where  rdi.disabled = 0 and not exists (select 1 from rfx_digest_event rd where rd.event = rdi.event)',
-		runForCommunities => $communitiesList,
-		recordMaxResults => 20000,
-		recordDataType => "gauge",
-	};
-
-    $q_failed->{'discovery digest failed tasks'} = {
+    $q->{'discovery digest failed tasks'} = {
         info => 1,
         uiHint => 'failed tasks',
         crit => 'numrows > 0',
@@ -99,36 +73,47 @@ sub main {
         recordDataType => "gauge",
     };
 
-	$q_event->{'E-Intro in quarantine'} = {
+	$q->{'rfx digest items not processed for 8 hours'} = {
 		info => 1,
-		uiHint => 'event',
-		sql => 'select count(1) as qurantine from rfx_event where event_state = 1005',
+		uiHint => 'digest status',
+		warn => 'answer > 0',
+		sql => 'select count(1) from  rfx_digest_item rdi where rdi.digest_time < (sysdate - 8/24) and rdi.disabled = 0 and not exists (select 1 from rfx_digest_event rd where rd.event = rdi.event)',
+		runForCommunities => $communitiesList,
 		recordMaxResults => 20000,
 		recordDataType => "gauge",
 	};
 
-	$q_event->{'E-Intro in pre-quarantine'} = {
+	$q->{'rfx digest items waiting to be sent'} = {
 		info => 1,
-		uiHint => 'event',
-		sql => 'select count(1) as pre_qurantine from rfx_event where event_state = 1004',
+		uiHint => 'digest status',
+		sql => 'select count(1) from  rfx_digest_item rdi where  rdi.disabled = 0 and not exists (select 1 from rfx_digest_event rd where rd.event = rdi.event)',
+		runForCommunities => $communitiesList,
 		recordMaxResults => 20000,
 		recordDataType => "gauge",
 	};
 
-	my $qm = ariba::monitor::QueryManager->newWithDetails('rfx', 'an', $service, undef, $q_digest_status);
-	$qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+	$q->{'E-Intro in quarantine'} = {
+		info => 1,
+		uiHint => 'event',
+		sql => 'select count(1) from rfx_event where event_state = 1005',
+		recordMaxResults => 20000,
+		recordDataType => "gauge",
+	};
+
+	$q->{'E-Intro in pre-quarantine'} = {
+		info => 1,
+		uiHint => 'event',
+		sql => 'select count(1) from rfx_event where event_state = 1004',
+		recordMaxResults => 20000,
+		recordDataType => "gauge",
+	};
+
+	my $qm = ariba::monitor::QueryManager->newWithDetails('rfx', 'an', $service, undef, $q);
+	my $dirDbc = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndSchemaId ( $an, ariba::Ops::DBConnection->typeMain() );
+	$qm->setSQLConnectInfoFromDBConnection($dirDbc);
 	ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
-	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 
-	my $qm2 = ariba::monitor::QueryManager->newWithDetails('rfx', 'an', $service, undef, $q_event);
-	$qm2->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
-	ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm2);
-	$qm2->processQueries($debug, $email, $sendEmail, $sendPage);
-
-	my $qm3 = ariba::monitor::QueryManager->newWithDetails('rfx', 'an', $service, undef, $q_failed);
-	$qm3->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
-	ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm3);
-	$qm3->processQueries($debug, $email, $sendEmail, $sendPage);
 }
 
 main();

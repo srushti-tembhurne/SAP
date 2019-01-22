@@ -85,14 +85,9 @@ sub main {
 				'info'          => 1,
 				'uiHint'        => "version",
 				'perl'          => sub { checkVersion(\%versionDB); },
-                "inf_field"     => "DBVersion",
-                "inf_tags"      => "datacenter=\"$datacenter\",productName=\"$productName\",uiHint=\"version\"",
-                "inf_default"   => 0,
-                "group_by"      => "$datacenter,$productName",
 			};
 		}
 	}
-    $queries{"influx_details"} = {measurement => "dba"};
 	my $qm = ariba::monitor::QueryManager->newWithDetails("dba", $tab, $me->service(), $me->customer(), \%queries);
 	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 }

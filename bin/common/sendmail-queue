@@ -83,8 +83,6 @@ sub main {
 	$messagesInQueue{$mailServer}   = 0;
 	$ebMessagesInQueue{$mailServer} = 0;
 
-    my $queueSize = main::messagesInQueue('$mailServer') - main::ebMessagesInQueue('$mailServer');
-
 	$queries{"sorted sendmail queue on $mailServer"} = {
 		recordMaxResults => 110000,
 		recordDataType => "gauge",
@@ -95,14 +93,8 @@ sub main {
 		warn => "(main::messagesInQueue('$mailServer') - main::ebMessagesInQueue('$mailServer') > 7000) || answer =~ /^Warning/",
 		crit => "main::messagesInQueue('$mailServer') - main::ebMessagesInQueue('$mailServer') > 10000",
 		timeout => -1,
-		perl => "return $queueSize",
-        inf_field => "queueSize",
-        inf_tags => qq|datacenter="$datacenter",mailServer="$mailServer"|,
-        inf_default => 0,
-        group_by => "$datacenter,$mailServer",
+		perl => "main::getSortedQWithTimeout('$mailServer', $maxDisplayedItems, $timeout)",
 	};
-
-    $queries{influx_details} = {measurement => "sorted-sendmail-queue"};
 
 	my $q = ariba::monitor::QueryManager->newWithDetails(
 		"sorted-sendmail-queue", 
@@ -114,7 +106,7 @@ sub main {
 	);
 
 	my $email = $me->default('notify.email');
-	$q->processQueries($debug, $email, $sendEmail, $sendPage, $monserver);
+	$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monserver);
 
 	dmail::LockLib::releaselock($lockFile);
 }

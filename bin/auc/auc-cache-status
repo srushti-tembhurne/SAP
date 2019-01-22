@@ -52,12 +52,12 @@ sub main {
     my $fortyeightHours = 2 * $twentyfourHours;
 
     $queries{'AUC Cache Learning Status'} = {
-    # tmid 182437, temporarily disable alerts
+	# tmid 182437, temporarily disable alerts
 #        warn    => "answer >= $twentyfourHours && answer < $fortyeightHours",
 #        crit    => "answer >= $fortyeightHours",
         info    => "answer < $twentyfourHours",
         ## select (to_number(to_date(to_char(systimestamp AT TIME ZONE 'UTC','DD-MM-YYYY HH24:MI:SS'),'DD-MM-YYYY HH24:MI:SS') - TO_DATE('01-01-1970 00:00:00', 'DD-MM-YYYY HH24:MI:SS')) * (86400)) - max(judie) from junk
-        sql     => "select (to_number(to_date(to_char(systimestamp AT TIME ZONE 'UTC','DD-MM-YYYY HH24:MI:SS'),'DD-MM-YYYY HH24:MI:SS') - TO_DATE('01-01-1970 00:00:00', 'DD-MM-YYYY HH24:MI:SS')) * (86400)) - max(created) as learning_status from cache_ariba_learning",
+        sql     => "select (to_number(to_date(to_char(systimestamp AT TIME ZONE 'UTC','DD-MM-YYYY HH24:MI:SS'),'DD-MM-YYYY HH24:MI:SS') - TO_DATE('01-01-1970 00:00:00', 'DD-MM-YYYY HH24:MI:SS')) * (86400)) - max(created) from cache_ariba_learning",
 #        sql     => "select max(created) from cache_ariba_learning",
         ticketOwner => 'unassigned-sre',
         severity    => 1,
@@ -68,7 +68,7 @@ sub main {
     };
 
     $queries{'AUC Misc Status'} = {
-        sql   => "select count(*) as misc_status from users where \"UID\" = 0",
+        sql   => "select count(*) from users where \"UID\" = 0",
         crit    => "answer != 1",
         info    => "answer == 1",
         description => 'Check AUC user 0',
@@ -78,7 +78,7 @@ sub main {
     };
 
     $queries{'AUC Import Status - Last Created'} = {
-        sql   => "select max(created) as import_status_last_created from node",
+        sql   => "select max(created) from node",
         description => 'Check AUC Content Import Status',
         correctiveActions => [
             Ops => 'Open a CR and assign to AUC dev team.',
@@ -86,7 +86,7 @@ sub main {
     };
 
     $queries{'AUC Import Status - Last Updated'} = {
-        sql   => "select max(changed) as import_status_last_updated from node",
+        sql   => "select max(changed) from node",
         description => 'Check AUC Content Update Status',
         correctiveActions => [
             Ops => 'Open a CR and assign to AUC dev team.',
@@ -94,7 +94,7 @@ sub main {
     };
 
     my $email = $me->default('notify.email');
-    $queries{'influx_details'} = { measurement => 'community_cache_status'};
+
     my $qm = ariba::monitor::QueryManager->newWithDetails('cache-status', $me->name(), $me->service(), $me->customer(), \%queries);
     $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($me));
     $qm->processQueries($debug, $email, $sendEmail, $sendPage);

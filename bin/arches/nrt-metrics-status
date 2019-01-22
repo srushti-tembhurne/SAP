@@ -1,5 +1,5 @@
-#!/usr/local/bin/perl
-# $Id: //ariba/services/monitor/bin/arches/nrt-metrics-status#2 $
+#!/usr/local/bin/perl -w
+# $Id: //ariba/services/monitor/bin/arches/nrt-metrics-status#6 $
 
 
 ## Creating NRT Metrics Moniotring for Arches 
@@ -16,24 +16,18 @@ use ariba::monitor::Url;
 use ariba::monitor::Query;
 use ariba::monitor::QueryManager;
 use ariba::rc::InstalledProduct;
+use ariba::Ops::SplunkLogger;
 
 my $debug = 0;
 
 my %preetyName = (
-    "unconfirmedJobMetric" => "unconfirmed_job_metric", 
-    "requestProcessingMetric" => "request_processing_metric",         
-    "luceneDocCount" => "lucene_doc_count",
-    "percent90Time"  => "90th_percentile_time",
-    "unconfirmedJobCount" => "unconfirmed_job_count",
-    "averageTime" => "average_time",
-    "count" => "count",
-    "failureCount" => "failure_count",
-    "percent90TimeSearchCore" => "percent_90_timesearch_core",
-    "averageTimeSearchCore" => "average_timesearch_core",
-    "longRunningJobsCount" => "longrunning_jobs_count",
-    "longRunningJobsLogMarker" => "longrunning_job_marker",
-    "requestProcessedMetricLastWindow" => "request_processed_metric_last_window",
-    "requestProcessedMetric" => "request_processed_metric",
+    "unconfirmedJobMetric" => "Unconfirmed Job Metric", 
+    "requestProcessingMetric" => "Request Processing Metric",         
+    "luceneDocCount" => "Lucene Doc Count",
+    "percent90Time"  => "90th Percentile Time",
+    "unconfirmedJobCount" => "Unconfirmed Job Count",
+    "averageTime" => "Average Time",
+    "count" => "Count",
 );
 
 
@@ -63,13 +57,14 @@ sub usage {
     my $error = shift; 
 
     print <<USAGE;
-Usage: $0 [-daily] [-e|-p|-d|-h]
+Usage: $0 [-daily] [-e|-p|-d|-h] [-prod prodname]
 
     -daily    Run daily type of queries
     -e        Enables sending of email for monitor query.
     -p        Enables sending of pages for monitor query.
     -d        Turns on debug mode. 
     -h        Shows this help.
+    -prod     arches product name.
 
 USAGE
 
@@ -86,6 +81,7 @@ sub main {
     my $sendEmail = 0;
     my $sendPage = 0;
     my $runDailyQueries = 0;
+    my $prodname = "arches";
 
     while (my $arg = shift) {
         if ($arg =~ /^-h$/o) { usage();         next; }
@@ -93,19 +89,23 @@ sub main {
         if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
         if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
         if ($arg =~ /^-daily$/o) { $runDailyQueries = 1;   next; }
+        if ($arg =~ /^-prod$/o) { $prodname = shift;   next; }
 
         usage("Invalid argument: $arg");
     }
 
+    usage("arches product name not specified") unless $prodname;
+
     my $me = ariba::rc::InstalledProduct->new();
-    exit unless (ariba::rc::InstalledProduct->isInstalled('arches', $me->service()));
-    my $arches = ariba::rc::InstalledProduct->new('arches', $me->service());
+    exit unless (ariba::rc::InstalledProduct->isInstalled($prodname, $me->service()));
+    my $arches = ariba::rc::InstalledProduct->new($prodname, $me->service());
     my $jobsStatusCollected = 0;
 
     CLUSTER: 
     foreach my $cluster ( $arches->allClusters() ) {
 
         my %queries;
+        my %influx_data = (measurement => "arches_ntr_metrics", tags => {product => $prodname, service =>  $me->service(), cluster => $cluster});
         my $xml;
         my @indexMgrApps = grep { $_->appName() eq 'IndexMgr' } $arches->appInstancesInCluster($cluster); 
         exit unless (@indexMgrApps);
@@ -128,7 +128,6 @@ sub main {
             next INSTANCE if $error;
             last; 
         }
-
             my $rollUpData = { } ; 
             while (my ($xml, $zoneSummary) = each %{ $xml } ) {
                 my $cntAvgTime;
@@ -152,18 +151,19 @@ sub main {
                     $rollUpData->{$zone}->{'totalluceneDocCount'} += $zoneSummary->{$shard}->{'unconfirmedJobMetric'}->{'luceneDocCount'};
                     $rollUpData->{$zone}->{'totalunconfirmedJobCount'} += $zoneSummary->{$shard}->{'unconfirmedJobMetric'}->{'unconfirmedJobCount'};
                     
+
                     foreach my $info ( keys %{$shardInfo} ) {
                         next if ($info =~ /zone/i);
-                        my $pinfo = $preetyName{$info};
+                        my $pinfo = $preetyName{$info} || $info;
                         my $value = $shardInfo->{$info};
                         my $warn = 0;
                         my $crit = 0;
 
                         foreach my $in ( keys %{$value} ) {
-                            my $pin = $preetyName{$in};
+                            my $pin = $preetyName{$in} || $in;
                             my $format;
                             $format = "%d ms\n", if($in =~ /time/i); 
-                            
+                             
                             $queries{"$zone - $shard - $pinfo - $pin"} = {
                                 recordMaxResults => 103680, ## Every 5 min;  for 1 Year = 5 * 12 * 24 * 365
                                 warn           =>  $warn,
@@ -173,37 +173,64 @@ sub main {
                                 description    =>  $description{$in},
                                 uiHint         =>  "$zone",
                                 inf_field      => "$pin",
-                                inf_default    => ( $pin eq "longrunning_job_marker" ) ? "none" : 0,
                                 inf_tags       => qq(zone="$zone",shard="$shard",type="$pinfo"),
-                                group_by       => qq($zone,$shard,$pinfo),
                             };
+                            $influx_data{tags}->{zone} = $zone;
+                            $influx_data{tags}->{shard} = $shard;
+                            my $metric_name = $info . "-$in";
+                            set_statsd_data(\%influx_data,$metric_name,$value->{$in});
                         }
                     }
+                    eval {
+                        my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+                        ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line);
+                    };
+                    delete $influx_data{data};
                 }
                 
             }
 
-            my $processRollUpInfo = processRollUpData($rollUpData, \%queries);
+            my $processRollUpInfo = processRollUpData($rollUpData, \%queries, \%influx_data);
             print "Finally Processed Data ", Dumper($processRollUpInfo), "\n", if $debug;
             print "Total Number of Queries for $cluster ", scalar keys %queries, "\n", if $debug; 
             
             next CLUSTER unless (scalar keys %queries > 0 ) ;
             my $email = $me->default('notify.email');
-            $queries{'influx_details'} = { measurement => 'arches_nrt_metrics'};
             my $qm = ariba::monitor::QueryManager->newWithDetails('NRT-metrics', $arches->name(), $arches->service(), undef, $cluster, \%queries);
-            $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+            $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
         }
+}
+
+sub set_statsd_data
+{
+    my $data =shift;
+    my $field_name = shift;
+    my $fvalue = shift;
+    if ($fvalue =~ /\D/)
+    {
+        my $log_name = $field_name . "_splunk_log_id";
+        my $splunk_logger = ariba::Ops::SplunkLogger->new("data->{measurement}");
+        my $log_id = $splunk_logger->log_msg({ message => "$fvalue" });
+        $data->{data}->{$log_name} = $log_id;
+    }
+    else
+    {
+        $data->{data}->{$field_name} = $fvalue;
+    }
 }
 
 sub processRollUpData {
     my $rollUpData = shift;
     my $queries = shift;
+    my $influx_data = shift;
     my $warn = 0; 
     my $crit = 0;          
 
+    $influx_data->{tags}->{shard} = 'RolledUp';
     print "IN ROLLUPDATA ", Dumper($rollUpData), "\n", if $debug;           
     my $processrRollUpData = {}; 
     while (my ($zone, $rollUpInfo) = each %{$rollUpData}){
+        $influx_data->{tags}->{zone} = $zone;
         foreach my $item (keys %$rollUpInfo) {
             my $totalcnt = $rollUpInfo->{'totalCount'};
             my $cntTimesAvg = $rollUpInfo->{$item};
@@ -224,7 +251,13 @@ sub processRollUpData {
                 description    =>  $description{$item},
                 uiHint         =>  $zone,
             };         
+            $influx_data->{data}->{$item} = $processrRollUpData->{$zone}->{$rollUpType{$item}} ;
         }
+        eval {
+            my $statsd_line = ariba::Ops::Utils::generateStatsDLine($influx_data);
+            ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line);
+        };
+        delete $influx_data->{data};
     }
 
       

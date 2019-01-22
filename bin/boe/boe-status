@@ -1,6 +1,7 @@
 #!/usr/local/bin/perl
 
 use strict;
+use warnings;
 
 use FindBin;
 use lib "$FindBin::Bin/../../lib";
@@ -117,27 +118,26 @@ foreach my $url (@boeURLs)
     }
 
     # Create a simple query for each url test.
-    $queries{"$url"} = {
-                        crit              => "answer >= $crit and previousAnswer >= $crit",
-                        warn              => "answer >= $warn",
-                        info              => "answer >= $info",
-                        perl              => sub {return $status},
-                        description       => $description,
-                        note              => $result,
-                        correctiveActions => [
-                                              Ops => $action,
-                                             ],
-                        inf_field         => "code",
-                        inf_tags          => qq(url="$url"),
-                        group_by          => $url,
-                       };
+    $queries {"$url"} = {
+                            crit              => "answer >= $crit and previousAnswer >= $crit",
+                            warn              => "answer >= $warn",
+                            info              => "answer >= $info",
+                            perl              => sub {return $status},
+                            description       => $description,
+                            note              => $result,
+                            correctiveActions => [
+                                                    Ops => $action,
+                                                 ],
+                        };
 }
 
 print Dumper (\%queries) if $test;
 unless ($test)
 {
-    $queries{'influx_details'} = { 'measurement' => 'boe_boestatus' };
-    my $q = ariba::monitor::QueryManager->newWithDetails("business-objects-status", $name, $service, $customer, $cluster, \%queries);
+    my $q;
+    $q = ariba::monitor::QueryManager->newWithDetails (
+                "business-objects-status", $name, $service, $customer, $cluster, \%queries);
+
     $q->processQueries($debug, $email, $sendEmail, $sendPage);
 }
 

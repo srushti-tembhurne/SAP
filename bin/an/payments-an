@@ -58,7 +58,7 @@ Copyright 2013 Ariba
 
 use strict;
 use FindBin;
-use  lib "$FindBin::Bin/../../lib";
+use lib "$FindBin::Bin/../../lib";
 
 use Pod::Usage;
 use Getopt::Long;
@@ -99,7 +99,7 @@ sub main {
        severity => 1,
        runForCommunities => $CommunitiesList,
        recordMaxResults => 8928,
-       sql => q`Select p.payment_proposal_id, o.anid as buyer_anid, o1.anid as supplier_anid, p.status as payment_status
+       sql => q`Select p.payment_proposal_id, o.anid as BUYER_ANID, o1.anid as SUPPLIER_ANID, p.status as PAYMENT_STATUS
                 from payment_remittance_item p inner join org_join o on p.from_org=o.id inner join org_join o1 on p.to_org=o1.id 
                 inner join cxml_document cd on p.payment_doc = cd.id inner join payment_method_join pm on pm.id=p.payment_method
                 where pm.name='scf' and p.pay_me_now_status=15 and o.deployment='Production' and o.visibility='Public' and cd.created < (sysdate - 0.5) and cd.created > (sysdate - 7) and p.rvstatus=1`,
@@ -111,7 +111,7 @@ sub main {
        severity => 1,
        runForCommunities => $supplierCommunitiesList,
        recordMaxResults => 8928,
-       sql => q`Select p.payment_proposal_id, o.anid as buyer_anid, o1.anid as supplier_anid, p.status as payment_status
+       sql => q`Select p.payment_proposal_id, o.anid as BUYER_ANID, o1.anid as SUPPLIER_ANID, p.status as PAYMENT_STATUS
                 from payment_remittance_item p inner join org_join o on p.from_org=o.id inner join org_join o1 on p.to_org=o1.id inner join cxml_document cd on p.payment_doc = cd.id 
                 inner join payment_method_join pm on pm.id=p.payment_method where pm.name='scf' and o.deployment='Production' and o.visibility='Public' and cd.created < (sysdate -1) 
                 and cd.created > (sysdate -7) and p.status='Scheduled' and p.rvstatus=1`,
@@ -123,19 +123,17 @@ sub main {
        severity => 1,
        runForCommunities => $buyerCommunitiesList,
        recordMaxResults => 8928,
-       sql => q`Select p.payment_proposal_id, o.anid as buyer_anid, o1.anid as supplier_anid, p.status as payment_status
+       sql => q`Select p.payment_proposal_id, o.anid as BUYER_ANID, o1.anid as SUPPLIER_ANID, p.status as PAYMENT_STATUS
                 from payment_remittance_item p inner join org_join o on p.from_org=o.id inner join org_join o1 on p.to_org=o1.id inner join cxml_document cd on 
                 p.payment_doc = cd.id inner join payment_method_join pm on pm.id=p.payment_method left join payment_remittance pr on p.remittance=pr.id
                 where pm.name='scf' and o.deployment='Production' and o.visibility='Public' and p.scheduled_payment_date<sysdate and p.scheduled_payment_date>(sysdate-7) and p.status!='Rejected' 
                 and (p.remittance is null or pr.scf_type!='TradedBuyerRemittance') and p.rvstatus=1`,
     };
 
-    $queries{"influx_details"} = { 'measurement' => "payments_an" };
-
     my $qm = ariba::monitor::QueryManager->newWithDetails('SCF', $an->name(), $mon->service(), undef, \%queries);
     $qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
     ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
-    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 }
 
 main(@ARGV);

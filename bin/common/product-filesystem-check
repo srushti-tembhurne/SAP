@@ -47,32 +47,22 @@ sub main {
 			my ($realmIdsRef, $oracleError) = realmIdsForProduct($product); 
 			print "Oracle error when getting realms for $productName: $oracleError\n" if ($debug && $oracleError);
 
-			for my $realmId_hash (@$realmIdsRef) { 
-				my $realmId = $realmId_hash->{'ID'};
+			for my $realmId (@$realmIdsRef) { 
 				my $realmRoot = "$filesystemRoot/realm_$realmId";
 				$queries{"$realmRoot exists with content"} = {
-					'info'		    => "answer eq '$YES'",
-					'crit'		    => "answer ne '$YES'",
-					'perl'		    => sub { return main::checkDirForContents($realmRoot); },
-                    'inf_field' 	=> "content_exists",
-                    'inf_tags'  	=> "realm_root=\"$realmRoot\"",
-                    'inf_default' 	=> 'none',
-					'group_by'   	=> $realmRoot,
+					'info'		=> "answer eq '$YES'",
+					'crit'		=> "answer ne '$YES'",
+					'perl'		=> sub { return main::checkDirForContents($realmRoot); },
 				}
 			}
 		} else { 
 			$queries{"$filesystemRoot exists with content"} = {
-				'info'		    => "answer eq '$YES'",
-				'crit'		    => "answer ne '$YES'",
-				'perl'		    => sub { return main::checkDirForContents($filesystemRoot); },
-                'inf_field' 	=> "content_exists",
-                'inf_tags'  	=> "filesystem_root=\"$filesystemRoot\"",
-                'inf_default' 	=> 'none',
-			    'group_by'   	=> $filesystemRoot,
+				'info'		=> "answer eq '$YES'",
+				'crit'		=> "answer ne '$YES'",
+				'perl'		=> sub { return main::checkDirForContents($filesystemRoot); },
 			}
 		}
 
-        	$queries{influx_details} = { measurement => 'file_system' };
 		my $email = $me->default('notify.email');
 
 		my $qm = ariba::monitor::QueryManager->newWithDetails(

@@ -75,15 +75,12 @@ sub main {
     $queries{'number of running jobs'} = { 
         recordMaxResults => 35000, 
         perl => sub { main::numOfRunningJobs($hadoop); },
-        inf_field => "\"Number of Running Jobs\"",
-        inf_default => "none",
     };
 
     my $email = $me->default('notify.email');
-    $queries{influx_details} = {measurement => "mr_health"};
 
     my $qm = ariba::monitor::QueryManager->newWithDetails('MapReduce', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queries);
-    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 } 
 
 sub numOfRunningJobs {
@@ -226,9 +223,6 @@ sub populateQueriesForStatsWithNamePrefix {
                     warn    => $warn,
                     perl    => sub { return $value },
                     recordMaxResults => $recordMaxResults,
-                    inf_field => qq|"$queryNamePrefix $queryName"|,
-                    inf_default => "none",
-                    group_by => $uiHint,
                 };
             }
         }

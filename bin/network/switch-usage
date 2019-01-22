@@ -3,9 +3,10 @@
 # This script displays all the routers interfaces and their throughput
 #
 #
-# $Id: //ariba/services/monitor/bin/network/switch-usage#7 $
+# $Id: //ariba/services/monitor/bin/network/switch-usage#9 $
 
 use strict;
+use File::Basename;
 use FindBin;
 use lib "$FindBin::Bin/../../lib";
 
@@ -17,6 +18,9 @@ use ariba::monitor::CircularDB;
 use ariba::monitor::QueryManager;
 use ariba::monitor::StatusPage;
 use ariba::monitor::Query;
+use dmail::LockLib;
+
+my $lockFile = "/tmp/" . basename($0);
 
 sub main {
 	my $sendEmail = 0;
@@ -29,6 +33,8 @@ sub main {
 		if($arg =~ /^-p/o){ $sendPage = 1; };
 	}
 
+	die "can't grab lock\n" unless dmail::LockLib::requestlock($lockFile, 5);
+
 	my $me = ariba::rc::InstalledProduct->new();
 	my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
 
@@ -36,6 +42,8 @@ sub main {
 
 	my $warn;
 	my $crit;
+	my $maxFastEth = 100;
+	my $maxGigaEth = 1000;
 
 	my %queries = ();
 
@@ -43,14 +51,14 @@ sub main {
 		for my $deviceType ('router', 'switch', 'loadbalancer', 'firewall') {
 
 			my %matchDatacenter = (
-					status	 => 'inservice',
+					status     => 'inservice',
 					datacenter => $datacenter,
 					monitoringDatacenter => '',
 					providesServices => $deviceType,
 					);
 
 			my %matchMonitoringDatacenter = (
-					status	 => 'inservice',
+					status     => 'inservice',
 					monitoringDatacenter => $datacenter,
 					providesServices => $deviceType,
 					);
@@ -66,6 +74,9 @@ sub main {
 				# average over 5 samples by default
 				my $samples = 5;
 
+				$warn = 0.8 * $maxFastEth;
+				$crit = 0.9 * $maxFastEth;
+
 				# We cannot retrieve everything in one call or
 				# it would run out of files handles
 				my @toDisplay = qw(OutOctets InOctets);
@@ -76,7 +87,7 @@ sub main {
 
 
 				for my $item (@toDisplay) {
-					my $cdbs	 = ariba::monitor::CircularDB->listDBs("snmp/$deviceName", $item);
+					my $cdbs     = ariba::monitor::CircularDB->listDBs("snmp/$deviceName", $item);
 
 					for my $cdb (@$cdbs) {
 
@@ -111,11 +122,9 @@ sub main {
 						# c3750-n3-2.opslab.ariba.com/GigabitEthernet1:0:1 ifOutOctets MBits
 						#
 						my $intf = $cdb->name();
-						my $use_crit = 1;
 						if( $intf =~ m|backup10|)
 						{
 							$critString = undef;
-							$use_crit = 0;
 						}
 						
 						$intf =~ s/$deviceName\/(\S+).*/$1/;
@@ -127,44 +136,24 @@ sub main {
 
 
 						my $format = "%.1f of " . $maxSpeed . " Mbit/s\n";
+                        my $metricDescription = $cdb->name();
 
-						my $metricDescription = $cdb->name();
-						# QueryManager doesn't like ',' and '=' in tags (lots of uninitialized warnings)
-						$metricDescription =~ tr/=,/__/;
-						$queries{$metricDescription} = {
+						$queries{$cdb->name()} = {
 							uiHint => $uiHint,
 							format => $format,
 							info => "answer eq '' or answer > -1",
 							warn => "answer eq '' or answer > $warn",
 							crit => $critString,
-							hasErraticSchedule => 1,
+                                                        hasErraticSchedule => 1,
 							extractRecorded => $cdbName,
-							inf_field => "usage",
-							inf_tags => qq|deviceType="$deviceType",deviceName="$deviceName",metricDescription="$metricDescription"|,
-							inf_default => 0,
-							group_by => "$datacenter,$deviceType,$deviceName,$metricDescription",
+                            inf_field => "usage",
+                            inf_tags => qq|deviceType="$deviceType",deviceName="$deviceName",metricDescription="$metricDescription"|,
 						};
-						$queries{"$metricDescription warn threshold"} = {
-							perl      => sub { $warn },
-							inf_field => "usage_warn_threshold",
-							inf_tags  => qq|deviceType="$deviceType",deviceName="$deviceName",metricDescription="$metricDescription"|,
-							group_by  => "$datacenter,$deviceType,$deviceName,$metricDescription",
-						};
-						$queries{"$metricDescription crit threshold"} = {
-							perl      => sub { $crit },
-							inf_field => "usage_crit_threshold",
-							inf_tags  => qq|deviceType="$deviceType",deviceName="$deviceName",metricDescription="$metricDescription"|,
-							group_by  => "$datacenter,$deviceType,$deviceName,$metricDescription",
-						};
-						$queries{"$metricDescription use crit threshold"} = {
-							perl      => sub { $use_crit },
-							inf_field => "usage_use_crit_threshold",
-							inf_tags  => qq|deviceType="$deviceType",deviceName="$deviceName",metricDescription="$metricDescription"|,
-							group_by  => "$datacenter,$deviceType,$deviceName,$metricDescription",
-						};
+
 					}
 				}
 			}
+
 		}
 		next unless scalar(keys(%queries));
 
@@ -172,14 +161,14 @@ sub main {
 
 		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
 
-		$queries{influx_details} = {measurement => "network-usage"};
 		my $q = ariba::monitor::QueryManager->newWithDetails("network-usage", $pn, $me->service(), $me->customer(), \%queries);
 
-		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+		$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 
 		# After each datacenter reinit queries hash.
 		%queries  = ();
 	}
+	dmail::LockLib::releaselock($lockFile);
 }
 
 main();

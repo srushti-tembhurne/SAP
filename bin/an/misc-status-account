@@ -53,7 +53,7 @@ sub main{
 		severity => "1",
 		crit => "answer != 1",
 		sql  => q`
-				select count(1) as count
+				select count(1) 
 				from person
 				where user_id = 'ariba-network-catalog-tester@ariba.com'
 				and status = 'Enabled'
@@ -66,15 +66,16 @@ sub main{
 	};
 
 	my $email = $me->default('notify.email');
-    $queries->{influx_details} = {measurement => 'an_misc_status_account'};
+
 	my $qm = ariba::monitor::QueryManager->newWithDetails(
 		"misc-status", "an", $me->service, $me->customer(), $queries
 	);
 
-	$qm->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+	my $dbc = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndSchemaId ( $an, ariba::Ops::DBConnection->typeMain() );
+	$qm->setSQLConnectInfoFromDBConnection($dbc);
         ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $qm);
 
-	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 
 }
 

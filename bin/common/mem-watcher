@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl
+#!/usr/local/bin/perl -w
 
 # $Id$
 
@@ -32,12 +32,12 @@ sub main {
 	my $ws = ($me->hostsForRoleInCluster("monserver", $cluster))[0];
 	my $port = $me->default("WebServerHTTPPort");
 
-	my $warn;
+	my $warn;	
 	my $crit;
 
-	# tmid:161074
-	my $machineStatsDoc = "https://wiki.ariba.com:8443/display/ENGDPTS/Machinestats";
-	my $note = "\n<html>For memory issues, see <a href=\"$machineStatsDoc\">$machineStatsDoc</a></html>";
+    # tmid:161074
+    my $machineStatsDoc = "https://wiki.ariba.com:8443/display/ENGDPTS/Machinestats";
+    my $note = "\n<html>For memory issues, see <a href=\"$machineStatsDoc\">$machineStatsDoc</a></html>";
 
 	for my $datacenter ( @dataCenters ) {
 
@@ -72,17 +72,15 @@ sub main {
 			my $severity;
 
 			my $url = ariba::monitor::misc::snmpGraphsUrl($hostname, "$ws:$port");
-			my $qMemKey = qq!<html><a href="$url">$hostname</a></html> mem!;
-			my $qSwapKey = qq!<html><a href="$url">$hostname</a></html> swap!;
-			my $memWarnCritFlag = 0;
-			my $swapWarnCritFlag = 0;
 
 
 			# Value Variable
 			my ($swapValue,$realValue,$procMem,$ioMem,$procFrag,$ioFrag);
+            my ($ramValue, $virtMemValue);
 
 			# QueryNames
 			my ($swapQueryName, $memQueryName, $procMemQueryName, $ioMemQueryName, $procFragQueryName, $ioFragQueryName);
+            my ($ramQueryName, $virtMemQueryName); # these are for panos
 
 			# Devices running ios have different memory monitoring needs.
 			if ( $machine->os() =~ /ios/i ) {
@@ -140,7 +138,6 @@ sub main {
 					$swapValue = int($swapCdb->aggregateUsingFunctionForRecords('average', '+2'));
 				}
 			}
-
 			if ($machine->provides('db')) {
 				$severity = 1;
 			}
@@ -163,11 +160,11 @@ sub main {
 				my $ioFragCritValue = 80;
 
 				if (defined ($procMem)) {
-					my $graphLink = $procMemQueryName;
-					if (defined ($procFrag)) {
-						$graphLink .= ",$procFragQueryName";
-					}
-					$networkQueries{qq!<html><a href="$url">$hostname</a></html> Processor Memory!} = {
+						my $graphLink = $procMemQueryName;
+						if (defined ($procFrag)) {
+							$graphLink .= ",$procFragQueryName";
+						}
+						$networkQueries{qq!<html><a href="$url">$hostname</a></html> Processor Memory!} = {
 						format => "%d%%\n",
 						showGraphLink => $graphLink,
 						info => "answer eq '' or  answer > -1",
@@ -177,8 +174,6 @@ sub main {
 						perl => "$procMem",
 						inf_field => "processorMemory",
 						inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
-						inf_default => 0,
-						group_by => "$datacenter,$hostname",
 					};
 				}
 
@@ -193,17 +188,15 @@ sub main {
 						perl => "$procFrag",
 						inf_field => "processorMemoryFragmentation",
 						inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
-						inf_default => 0,
-						group_by => "$datacenter,$hostname",
 					};
 				}
 
 				if (defined ($ioMem)) {
-					my $graphLink = $ioMemQueryName;
-					if (defined ($ioFrag)) {
-						$graphLink .= ",$ioFragQueryName";
-					}
-					$networkQueries{qq!<html><a href="$url">$hostname</a></html> IO Memory!} = {
+						my $graphLink = $ioMemQueryName;
+						if (defined ($ioFrag)) {
+							$graphLink .= ",$ioFragQueryName";
+						}
+						$networkQueries{qq!<html><a href="$url">$hostname</a></html> IO Memory!} = {
 						format => "%d%%\n",
 						showGraphLink => $graphLink,
 						info => "answer eq '' or  answer > -1",
@@ -213,8 +206,6 @@ sub main {
 						perl => "$ioMem",
 						inf_field => "IOMemory",
 						inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
-						inf_default => 0,
-						group_by => "$datacenter,$hostname",
 					};
 				}
 
@@ -229,33 +220,102 @@ sub main {
 						perl => "$ioFrag",
 						inf_field => "IOMemoryFragmentation",
 						inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
-						inf_default => 0,
-						group_by => "$datacenter,$hostname",
 					};
 				}
 
 			# Move all network memory monitoring to network queries.
+            } elsif ( $machine->os() eq "panos" ) {
+                my $virtMemWarnValue = 60;
+                my $virtMemCritValue = 80;
+                my $ramWarnValue = 60;
+                my $ramCritValue = 80;
+
+                $ramQueryName = "snmp/$hostname/Percent_Ram_Usage";
+                if (ariba::monitor::Query->objectWithNameExists($ramQueryName)) {
+                    my $query = ariba::monitor::Query->new($ramQueryName);
+                    my $memCdb = $query->cdb();
+                    $ramValue = int($memCdb->aggregateUsingFunctionForRecords('average', '+2'));
+                }
+
+                $virtMemQueryName = "snmp/$hostname/Percent_Virtual_Memory_Usage";
+                if (ariba::monitor::Query->objectWithNameExists($virtMemQueryName)) {
+                    my $query = ariba::monitor::Query->new($virtMemQueryName);
+                    my $memCdb = $query->cdb();
+                    $virtMemValue = int($memCdb->aggregateUsingFunctionForRecords('average', '+2'));
+                }
+
+                if (defined ($ramValue)) {
+                    my $graphLink = $ramQueryName;
+                    $networkQueries{qq!<html><a href="$url">$hostname</a></html> Ram!} = {
+                        format => "%d%%\n",
+                        showGraphLink => $graphLink,
+                        info => "answer eq '' or  answer > -1",
+                        warn => "answer eq '' or  answer > $ramWarnValue",
+                        crit => "answer ne '' and answer > $ramCritValue",
+                        note => $note,
+                        perl => "$ramValue",
+                        inf_field => "Ram",
+                        inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
+                    };
+                }
+
+                if (defined ($virtMemValue)) {
+                    my $graphLink = $virtMemQueryName;
+                    $networkQueries{qq!<html><a href="$url">$hostname</a></html> Virtual Memory!} = {
+                        format => "%d%%\n",
+                        showGraphLink => $graphLink,
+                        info => "answer eq '' or  answer > -1",
+                        warn => "answer eq '' or  answer > $virtMemWarnValue",
+                        crit => "answer ne '' and answer > $virtMemCritValue",
+                        note => $note,
+                        perl => "$virtMemValue",
+                        inf_field => "VirtualMemory",
+                        inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
+                    };
+				}
+			} elsif ( $machine->os() eq "nxos" ) {
+                my $warnValue = 60;
+                my $critValue = 80;
+                my $memValue;
+
+                $memQueryName = "snmp/$hostname/Nexus_Platform_Memory_Usage";
+                if (ariba::monitor::Query->objectWithNameExists($memQueryName)) {
+                    my $query = ariba::monitor::Query->new($memQueryName);
+                    my $memCdb = $query->cdb();
+                    $memValue = int($memCdb->aggregateUsingFunctionForRecords('average', '+2'));
+                }
+
+                if (defined ($memValue)) {
+                    my $graphLink = $memQueryName;
+                    my $qname = "Nexus Platform Memory Usage";
+                    $networkQueries{qq!<html><a href="$url">$hostname</a></html> $qname!} = {
+                        format => "%d%%\n",
+                        showGraphLink => $graphLink,
+                        info => "answer eq '' or  answer > -1",
+                        warn => "answer eq '' or  answer > $warnValue",
+                        crit => "answer ne '' and answer > $critValue",
+                        note => $note,
+                        perl => "$memValue",
+                        inf_field => "Nexus_Platform_Memory_Usage",
+                        inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
+                    };
+                }
 			} elsif ( $machine->os() eq "bigip" ) {
 
-				my $warnValue = 75;
-				my $graphLink = $memQueryName;
+                                my $warnValue = 75;
 
-				if (defined ($realValue)) {
-					$networkQueries{$qMemKey} = {
-						format => "%d%%\n",
-						showGraphLink => $graphLink,
-						info => "answer eq '' or  answer > -1",
-						warn => "answer eq '' or  answer > $warnValue",
-						note => $note,
-						perl => "$realValue",
-						inf_field => "Memory",
-						inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
-						inf_default => 0,
-						group_by => "$datacenter,$hostname",
-					};
-					$memWarnCritFlag = 0;
-					$memWarnCritFlag = 1  if ( $realValue eq '' or $realValue > $warnValue );
-				}
+                                my $graphLink = $memQueryName;
+
+                                if (defined ($realValue)) {
+                                        $networkQueries{qq!<html><a href="$url">$hostname</a></html> mem!} = {
+                                                format => "%d%%\n",
+                                                showGraphLink => $graphLink,
+                                                info => "answer eq '' or  answer > -1",
+                                                warn => "answer eq '' or  answer > $warnValue",
+                                                note => $note,
+                                                perl => "$realValue",
+                                        };
+                                }
 
 			} elsif ( $machine->os() eq "pix" || $machine->os() eq "css" ) {
 
@@ -265,7 +325,7 @@ sub main {
 				my $graphLink = $memQueryName;
 
 				if (defined ($realValue)) {
-					$networkQueries{$qMemKey} = {
+					$networkQueries{qq!<html><a href="$url">$hostname</a></html> mem!} = {
 						format => "%d%%\n",
 						showGraphLink => $graphLink,
 						info => "answer eq '' or  answer > -1",
@@ -275,15 +335,8 @@ sub main {
 						perl => "$realValue",
 						inf_field => "Memory",
 						inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
-						inf_default => 0,
-						group_by => "$datacenter,$hostname",
 					};
-					$memWarnCritFlag =
-						  ( $realValue > $critValue ) ? 2
-						: ( $realValue eq '' or $realValue > $warnValue ) ? 1
-						: 0;
 				}
-
 			} elsif ( $machine->os() ne "sunos" ) {
 
 				my $warnValue = 85;
@@ -294,8 +347,8 @@ sub main {
 
 				# For db servers, we want a little more headroom for memory problems
 			 	if ( grep (/^db$/, $machine->providesServices()) ) {
-					$warnValue = 75;
-					$critValue = 80;
+					$warnValue = 85;
+					$critValue = 95;
 
 					$swapWarnValue = 5;
 					$swapCritValue = 10;
@@ -304,7 +357,7 @@ sub main {
 				# We want to set different thresholds for S4 SV sids
 				if ( grep (/^s4sv$/, $machine->providesServices()) ) {
 					$warnValue = 85;
-					$critValue = 90;
+					$critValue = 95;
 
 					$swapWarnValue = 5;
 					$swapCritValue = 10;
@@ -317,12 +370,11 @@ sub main {
 				}
 
 				if (defined ($realValue)) {
-					my $graphLink = $memQueryName;
-					if (defined ($swapValue)) {
-						$graphLink .= ",$swapQueryName";
-					}
-
-					$queries{$qMemKey} = {
+						my $graphLink = $memQueryName;
+						if (defined ($swapValue)) {
+							$graphLink .= ",$swapQueryName";
+						}
+						$queries{qq!<html><a href="$url">$hostname</a></html> mem!} = {
 						format => "%d%%\n",
 						showGraphLink => $graphLink,
 						info => "answer eq '' or  answer > -1",
@@ -332,15 +384,10 @@ sub main {
 						severity => $severity,
 						perl => "$realValue",
 					};
-
-					$memWarnCritFlag =
-						  ( $realValue > $critValue ) ? 2
-						: ( $realValue eq '' or $realValue > $warnValue ) ? 1
-						: 0;
 				}
 
 				if (defined ($swapValue)) {
-					$queries{$qSwapKey} = {
+					$queries{qq!<html><a href="$url">$hostname</a></html> swap!} = {
 						format => "%d%%\n",
 						showGraphLink => "$memQueryName,$swapQueryName",
 						info => "answer eq '' or  answer > -1",
@@ -349,11 +396,6 @@ sub main {
 						note => $note,
 						perl => "$swapValue",
 					};
-
-					$swapWarnCritFlag =
-						  ( $swapValue > $swapCritValue ) ? 2
-						: ( $swapValue eq '' or $swapValue > $swapWarnValue ) ? 1
-						: 0;
 				}
 
 			} else {
@@ -361,83 +403,44 @@ sub main {
 				next unless defined $realValue && defined $swapValue;
 
 				my $totalMemUsage = $realValue + $swapValue;
-				my $totalCritValue = 110;
-				my $memWarnValue = 90;
-				my $swapWarnValue = 50;
-
-				$queries{$qMemKey} = {
+				$queries{qq!<html><a href="$url">$hostname</a></html> mem!} = {
 					format => "%d%%\n",
 					showGraphLink => "$memQueryName,$swapQueryName",
 					info => "answer eq '' or answer > -1",
-					warn => "answer eq '' or ( answer > $memWarnValue && $swapValue > 0 ) ",
-					crit => "answer ne '' and $totalMemUsage > $totalCritValue",
+					warn => "answer eq '' or ( answer > 90 && $swapValue > 0 ) ",
+					crit => "answer ne '' and $totalMemUsage > 110",
 					note => $note,
 					severity => $severity,
 					perl => "$realValue",
 				};
-				$memWarnCritFlag =
-					  ( $realValue ne '' and $totalMemUsage > $totalCritValue ) ? 2
-					: ( $realValue eq '' or ( $realValue > $memWarnValue and $swapValue > 0 ) ) ? 1
-					: 0;
 
-				$queries{$qSwapKey} = {
+				$queries{qq!<html><a href="$url">$hostname</a></html> swap!} = {
 					format => "%d%%\n",
 					showGraphLink => "$memQueryName,$swapQueryName",
 					info => "answer eq '' or answer > -1",
-					warn => "answer eq '' or answer > $swapWarnValue",
-					crit => "answer ne '' and $totalMemUsage > $totalCritValue",
+					warn => "answer eq '' or answer > 50",
+					crit => "answer ne '' and $totalMemUsage > 110",
 					note => $note,
 					perl => "$swapValue",
 				};
 
-				$swapWarnCritFlag =
-					  ( $swapValue ne '' and $totalMemUsage > $totalCritValue ) ? 2
-					: ( $swapValue eq '' or $swapValue > $swapWarnValue ) ? 1
-					: 0;
 			}
-
-			if (defined $queries{$qMemKey}) {
-				$queries{$qMemKey}{inf_field} = "Memory";
-				$queries{$qMemKey}{inf_tags} = qq|datacenter="$datacenter",hostname="$hostname"|;
-				$queries{$qMemKey}{inf_default} = 0;
-				$queries{$qMemKey}{group_by} = "$datacenter,$hostname";
-
-				$queries{qq!$hostname mem warncrit flag!} = {
-					perl      => sub { $memWarnCritFlag },
-					inf_field => "mem_warncrit_flag",
-					inf_tags  => qq|datacenter="$datacenter",hostname="$hostname"|,
-					group_by  => "$datacenter,$hostname"
-				};
-			}
-
-			if (defined $queries{$qSwapKey}) {
-				$queries{$qSwapKey}{inf_field} = "Swap";
-				$queries{$qSwapKey}{inf_tags} = qq|datacenter="$datacenter",hostname="$hostname"|;
-				$queries{$qSwapKey}{inf_default} = 0;
-				$queries{$qSwapKey}{group_by} = "$datacenter,$hostname";
-
-				$queries{qq!$hostname swap warncrit flag!} = {
-					perl      => sub { $swapWarnCritFlag },
-					inf_field => "swap_warncrit_flag",
-					inf_tags  => qq|datacenter="$datacenter",hostname="$hostname"|,
-					group_by  => "$datacenter,$hostname"
-				};
-			}
+				$queries{qq!<html><a href="$url">$hostname</a></html> mem!}{inf_field} = "Memory";
+				$queries{qq!<html><a href="$url">$hostname</a></html> mem!}{inf_tags} = qq|datacenter="$datacenter",hostname="$hostname"|;
+				$queries{qq!<html><a href="$url">$hostname</a></html> swap!}{inf_field} = "Swap";
+				$queries{qq!<html><a href="$url">$hostname</a></html> swap!}{inf_tags} = qq|datacenter="$datacenter",hostname="$hostname"|;
 		}
 
 		my $email = $me->default('notify.email');
 
 		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
 
-
-		$queries{influx_details} = {measurement => "memory"};
 		my $q = ariba::monitor::QueryManager->newWithDetails("memory", $pn, $me->service(),$me->customer(), \%queries);
-		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+		$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 
 		# Create Network Memory QueryManager
-		$networkQueries{influx_details} = {measurement => "network_memory"};
 		$q = ariba::monitor::QueryManager->newWithDetails("Network Memory" , $pn, $me->service(),$me->customer(), \%networkQueries);
-		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+		$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 	}
 }
 

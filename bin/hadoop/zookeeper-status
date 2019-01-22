@@ -1,6 +1,6 @@
-#!/usr/local/bin/perl
+#!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/hadoop/zookeeper-status#6 $
+# $Id: //ariba/services/monitor/bin/hadoop/zookeeper-status#7 $
 
 use strict;
 use FindBin;
@@ -82,18 +82,12 @@ sub main {
                     Tools => 'Troubleshoot based on kr log', 
                 ],
                 'inf_field' => 'ZooKeeperStatus',
-                'inf_default'=>'none',
                 'inf_tags'=> sprintf("instance_name=\"%s\",cluster=\"%s\"", $instance->instanceName(), $cluster),
-                'group_by' => $instance->instanceName(),
             };
         }
-    
-
 
         my $email = $me->default('notify.email');
-        $queries{"influx_details"} = {
-            'measurement' => "zookeeper",
-        };
+
         my $qm = ariba::monitor::QueryManager->newWithDetails('zookeeper', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $cluster, \%queries);
         $qm->processQueries($debug, $email, $sendEmail, $sendPage);
     }

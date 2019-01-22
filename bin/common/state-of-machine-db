@@ -76,36 +76,25 @@ sub main {
 
 		machinesInUseForDatacenter ($datacenter);
 		my @machinesFromMdb = constructHashOfMachinesInDatacenter ($datacenter);
-                my @machinesUnusedAndInService = machinesUnusedAndInService(\@machinesFromMdb);
-                foreach my $m (@machinesUnusedAndInService)
-                {
-		    $queries{"Machines unused and in service: $m"} = {
-			info => "1",
-			perl => sub {return 'UnusedAndInService'},
-                        inf_field => "machine_status",
-                        inf_tags => "machine_name=\"$m\"",
-		    };
-                }
-                
-                my @machinesUsedAndNotInService = machinesUsedAndNotInService(\@machinesFromMdb);
-                foreach my $n (@machinesUsedAndNotInService)
-                {
-		    $queries{"Machines used and not inservice: $n"} = {
-			info => "1",
-			crit => "answer eq 'UsedAndNotInService'",
-			perl => sub {return 'UsedAndNotInService'},
-                        inf_field => "machine_status",
-                        inf_tags => "machine_name=\"$n\"",
-		    };
-                }
-		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
 
-                $queries{influx_details} = {measurement => "state_of_machine_db"};	
+		$queries{"Machines unused and in service"} = {
+			info => "1",
+			perl => sub { main::machinesUnusedAndInService(\@machinesFromMdb);},
+		};
+
+		$queries{"Machines used and not inservice"} = {
+			info => "1",
+			crit => "answer",
+			perl => sub { main::machinesUsedAndNotInService(\@machinesFromMdb);},
+		};
+
+		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
+	
 		my $qm = ariba::monitor::QueryManager->newWithDetails(
 				'State of Machine DB', $pn, $me->service(), $me->customer(), \%queries
 	 	);
 
-		$qm->processQueries($debug, $me->default('notify.email'), $sendEmail, $sendPage);
+		$qm->processQueriesUsingServer($debug, $me->default('notify.email'), $sendEmail, $sendPage);
 	}
 }
 
@@ -137,7 +126,7 @@ sub checkMachines {
 		}
 	}
 
-	return @listOfMachinesReturned;
+	return join("\n", @listOfMachinesReturned);
 }
 
 

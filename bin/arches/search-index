@@ -1,6 +1,6 @@
-#!/usr/local/bin/perl
+#!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/arches/search-index#16 $
+# $Id: //ariba/services/monitor/bin/arches/search-index#20 $
 
 use strict;
 use FindBin;
@@ -17,7 +17,7 @@ sub usage {
     my $error = shift; 
 
     print <<USAGE;
-Usage: $0 [-e|-p|-d|-h]
+Usage: $0 [-e|-p|-d|-h] [-prod prodname]
 
     -e        Enables sending of email for monitor query.
     -p        Enables sending of pages for monitor query.
@@ -39,7 +39,7 @@ sub debug {
 sub main {
     my $sendEmail = 0;
     my $sendPage = 0;
-    my $prodname = 'arches';
+    my $prodname = "arches";
 
     while (my $arg = shift) {
         if ($arg =~ /^-h$/o) { usage();         next; }
@@ -47,8 +47,11 @@ sub main {
         if ($arg =~ /^-e$/o) { $sendEmail = 1;  next; }
         if ($arg =~ /^-p$/o) { $sendPage = 1;   next; }
         if ($arg =~ /^-prod$/o) { $prodname = shift;   next; }
+
         usage("Invalid argument: $arg");
     }
+
+    usage("arches product name not specified") unless $prodname;
 
     my $me = ariba::rc::InstalledProduct->new();
     exit unless (ariba::rc::InstalledProduct->isInstalled($prodname, $me->service()));
@@ -66,15 +69,17 @@ sub main {
             my $appNameIndex = $indexApp->instanceName();
             my $responseUrl = $indexApp->searchIndexResponseURL();
             debug("Checking $responseUrl");
-
+            
             my ($url,$response);
             eval {
                 $url = ariba::monitor::Url->new($responseUrl);
                 $response = $url->request();
             };
+
             if($@) {
                 print "Error [ $@ ]  while fetching $responseUrl,skipping ..\n" if($debug);
             }
+
             ## Sample return XML output on Dev100 service
             ## url: http://hdp147.lab1.ariba.com:20002/Arches/search/searchmetrics
             ##'<metrics node="C0_IndexMgr4(Dispatcher)">
@@ -152,15 +157,13 @@ sub main {
                 next if $type =~ /node/;
                 while (my($adapter, $values) = each %{$content}){
 
-                    my $count = $values->{'Count'}; 
+                    my $critWarnCondition = $values->{'Count'}; 
                     my $crit;
-                    my $use_crit = 1;
 
                     if ( $adapter =~ /avro/ ) {
-                        $crit = undef;
-                        $use_crit = 0;
+                        $crit = undef
                     } else {
-                        $crit = "answer > 1000 && ($count > 100)"
+                        $crit = "answer > 1000 && ($critWarnCondition > 100)"
                     }
 
                     $queriesResponse{"$appNameIndex $type $adapter Average Time (ms)"} = {
@@ -168,8 +171,8 @@ sub main {
                         recordDataType  => 'gauge',
                         format          => "%0.2f\n",
                         url             => $responseUrl,
-                        warn            => "answer > 150 && ($count > 100)",
-                        crit            => "answer > 1000 && ($count > 100)",
+                        warn            => "answer > 150 && ($critWarnCondition > 100)",
+                        crit            => "answer > 1000 && ($critWarnCondition > 100)",
                         uiHint          => "metrics/$adapter/$type/Average Time",
                         perl            => sub { return $values->{'AverageTimeTakenInMillis'} || $url->error(); },
                         description => "$type performance on $appNameIndex",
@@ -177,29 +180,14 @@ sub main {
                             Ops => 'Escalate to Engineering',
                         ],
                         inf_field       => "avg_time",
-                        inf_default     => 0,
-                        inf_tags        => qq(cluster="$cluster",adapter="$adapter",type="$type",instance_name="$appNameIndex"),
-                        group_by        => qq($cluster,$adapter,$type,$appNameIndex),
+                        inf_tags        => qq(adapter="$adapter",type="$type",instance_name="$appNameIndex"),
                     };
-                    $queriesResponse{"$appNameIndex $type $adapter count"} = {
-                        perl            => sub { return $count },
-                        inf_field       => "count",
-                        inf_default     => 0,
-                        inf_tags        => qq(cluster="$cluster",adapter="$adapter",type="$type",instance_name="$appNameIndex"),
-                        group_by        => qq($cluster,$adapter,$type,$appNameIndex),
-                    };
-                    $queriesResponse{"$appNameIndex $type $adapter 90 Percentile Time (ms) use crit"} = {
-                        perl            => sub { return $use_crit },
-                        inf_field       => "ninety_percentile_time_use_crit",
-                        inf_default     => 0,
-                        inf_tags        => qq(cluster="$cluster",adapter="$adapter",type="$type",instance_name="$appNameIndex"),
-                        group_by        => qq($cluster,$adapter,$type,$appNameIndex),
-                    };
+
                     $queriesResponse{"$appNameIndex $type $adapter 90 Percentile Time (ms)"} = {
                         recordMaxResults => 36000,
                         recordDataType  => 'gauge',
                         format          => "%0.2f\n",
-                        warn            => "answer > 150 && ($count > 100)",
+                        warn            => "answer > 150 && ($critWarnCondition > 100)",
                         crit            => $crit,
                         url             => $responseUrl,
                         uiHint          => "metrics/$adapter/$type/90 Percentile",
@@ -209,16 +197,13 @@ sub main {
                             Ops => 'Escalate to Engineering',
                         ],
                         inf_field       => "ninety_percentile_time",
-                        inf_default     => 0,
-                        inf_tags        => qq(cluster="$cluster",adapter="$adapter",type="$type",instance_name="$appNameIndex"),
-                        group_by        => qq($cluster,$adapter,$type,$appNameIndex),
+                        inf_tags        => qq(adapter="$adapter",type="$type",instance_name="$appNameIndex"),
                     };
                 }
             }
         }
-        $queriesResponse{'influx_details'} = { measurement => 'arches_search_metrics'};
         my $qmStatus = ariba::monitor::QueryManager->newWithDetails('search', $arches->name(), $arches->service(), undef, $cluster, \%queriesResponse);
-        $qmStatus->processQueries($debug, $email, $sendEmail, $sendPage);
+        $qmStatus->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 
         my @searchApps = grep { $_->appName() eq 'SearchCore' } $arches->appInstancesInCluster($cluster);
         exit unless (scalar @searchApps > 0);
@@ -240,15 +225,12 @@ sub main {
                     Engr => 'Look at kr logs for details of the corruption.',
                 ],
                 inf_field       => "status",
-                inf_default     => "none",
-                inf_tags        => qq(cluster=$cluster,instance_name="$appNameSearch",type="search_index_status"),
-                group_by        => $appNameSearch . ",$cluster",
+                inf_tags        => qq(instance_name="$appNameSearch",type="search_index_status"),
             };
         }
-        
-        $queries{'influx_details'} = { measurement => 'arches_node_health'};
+
         my $qm = ariba::monitor::QueryManager->newWithDetails('node-health', $arches->name(), $arches->service(), undef, $cluster, \%queries);
-        $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+        $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
     }
 }
 

@@ -49,10 +49,6 @@ sub main {
                         uiHint => "$hostname",
                         info => "numrows > -1",
                         perl => "main::numaPolicy()",
-                        inf_field => "numa_policy",
-                        inf_tags => qq|datacenter="$datacenter",hostname="$hostname"|,
-                        inf_default => 0,
-                        group_by => "$datacenter,$hostname",
 	};
 
 	##########################################
@@ -72,10 +68,6 @@ sub main {
 			info => "numrows > -1",
 			format => "%i MB",
 			perl => "return $nodeFree",
-            inf_field => "absolute_free_memory",
-            inf_tags => qq|datacenter="$datacenter",hostname="$hostname",node="$node"|,
-            inf_default => 0,
-            group_by => "$datacenter,$hostname,$node",
 		};
 
 		$queries{"$hostname $node free memory"} = {
@@ -85,10 +77,6 @@ sub main {
 			info => "numrows > -1",
 			format => "%d%%\n",
 			perl => "return (($nodeFree / $nodeSize) * 100)",
-            inf_field => "free_memory",
-            inf_tags => qq|datacenter="$datacenter",hostname="$hostname",node="$node"|,
-            inf_default => 0,
-            group_by => "$datacenter,$hostname,$node",
 		};
 
 	}
@@ -125,10 +113,6 @@ sub main {
 			recordMaxResults => 110000,
 			info => "numrows > -1",
 			perl => "return $numaHit",
-            inf_field => "numa_hit",
-            inf_tags => qq|datacenter="$datacenter",hostname="$hostname",node="$nodeName"|,
-            inf_default => 0,
-            group_by => "$datacenter,$hostname,$nodeName",
 		};
 
 		$queries{"$hostname $nodeName NUMA miss"} = {
@@ -137,10 +121,6 @@ sub main {
 			recordMaxResults => 110000,
 			info => "numrows > -1",
 			perl => "return $numaMiss",
-            inf_field => "numa_miss",
-            inf_tags => qq|datacenter="$datacenter",hostname="$hostname",node="$nodeName"|,
-            inf_default => 0,
-            group_by => "$datacenter,$hostname,$nodeName",
 		};
 
 		$queries{"$hostname $nodeName interleave hit"} = {
@@ -149,10 +129,6 @@ sub main {
 			recordMaxResults => 110000,
 			info => "numrows > -1",
 			perl => "return $interleaveHit",
-            inf_field => "interleave_hit",
-            inf_tags => qq|datacenter="$datacenter",hostname="$hostname",node="$nodeName"|,
-            inf_default => 0,
-            group_by => "$datacenter,$hostname,$nodeName",
 		};
 
 		$queries{"$hostname $nodeName local node"} = {
@@ -161,10 +137,6 @@ sub main {
 			recordMaxResults => 110000,
 			info => "numrows > -1",
 			perl => "return $localNode",
-            inf_field => "local_node",
-            inf_tags => qq|datacenter="$datacenter",hostname="$hostname",node="$nodeName"|,
-            inf_default => 0,
-            group_by => "$datacenter,$hostname,$nodeName",
 		};
 
 		$queries{"$hostname $nodeName other node"} = {
@@ -173,15 +145,10 @@ sub main {
 			recordMaxResults => 110000,
 			info => "numrows > -1",
 			perl => "return $otherNode",
-            inf_field => "other_node",
-            inf_tags => qq|datacenter="$datacenter",hostname="$hostname",node="$nodeName"|,
-            inf_default => 0,
-            group_by => "$datacenter,$hostname,$nodeName",
 		};
 	}
 
 
-        $queries{influx_details} = {measurement => "redhat_db_status"};
         my $q = ariba::monitor::QueryManager->newWithDetails(
 		"Redhat DB Status", $tab, $me->service(), $me->customer(), \%queries
 	);
@@ -189,7 +156,7 @@ sub main {
         if ($debug) {
                 $q->displayToStdout();
         } else {
-                my $ret = $q->processQueries($debug, 'an_auto_sysadmin@ariba.com', 1, 0);
+                my $ret = $q->processQueriesUsingServer($debug, 'an_auto_sysadmin@ariba.com', 1, 0);
                 exit($ret);
         }
 }

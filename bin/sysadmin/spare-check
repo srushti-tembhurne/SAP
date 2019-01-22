@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/sysadmin/spare-check#16 $
+# $Id: //ariba/services/monitor/bin/sysadmin/spare-check#17 $
 
 use strict;
 use FindBin;
@@ -25,8 +25,8 @@ sub main {
 	#
 	my %evenOddCheck = (
 		'snv' => 1,
-				'poweredgec6105,x4140' => 1,
-				'x4100m2' => 1,
+                'poweredgec6105,x4140' => 1,
+                'x4100m2' => 1,
 	);
 
 	while(my $arg=shift(@ARGV)){
@@ -41,7 +41,7 @@ sub main {
 	my $cluster = $me->currentCluster();
 
 
-		my @typesToMonitor = ( 'poweredgec6105,x4140', 'x4100m2' );
+        my @typesToMonitor = ( 'poweredgec6105,x4140', 'x4100m2' );
 
 	for my $datacenter ( @dataCenters ) {
 		my %queries = ();
@@ -56,7 +56,7 @@ sub main {
 			}
 
 			my %match = (
-				status	 => 'spare',
+				status     => 'spare',
 				datacenter => $datacenter,
 				hardwareType => $types,
 			);
@@ -71,7 +71,6 @@ sub main {
 					$warn = 1;
 					$crit = 0;
 				}
-
 
 				# We need to look at the machines and count even/odd
 				my $even = 0;
@@ -96,8 +95,6 @@ sub main {
 					perl => sub {return $odd;},
 					inf_field => "oddSpareNumber",
 					inf_tags => qq|datacenter="$datacenter",types=>"$types"|,
-					inf_default => 0,
-					group_by => "$datacenter,$types",
 				};
 
 				$queries{"Even spare $types"} = {
@@ -107,24 +104,8 @@ sub main {
 					perl => sub {return $even;},
 					inf_field => "evenSpareNumber",
 					inf_tags => qq|datacenter="$datacenter",types=>"$types"|,
-					inf_default => 0,
-					group_by => "$datacenter,$types",
 				};
-
-				$queries{"Odd-Even spare warn threshold $types"} = {
-					perl      => sub { $warn },
-					inf_field => "oesn_warn_threshold",
-					inf_tags  => qq|datacenter="$datacenter",types=>"$types"|,
-					group_by  => "$datacenter,$types",
-				};
-
-				$queries{"Odd-Even spare crit threshold $types"} = {
-					perl      => sub { $crit },
-					inf_field => "oesn_crit_threshold",
-					inf_tags  => qq|datacenter="$datacenter",types=>"$types"|,
-					group_by  => "$datacenter,$types",
-				};
-
+				
 			} else {
 				my $warn = 1;
 				my $doWarn = grep { $pn eq $_ } qw(snv pridc); 
@@ -135,16 +116,13 @@ sub main {
 					perl => sub {return scalar(@machines);},
 					inf_field => "SpareNumber",
 					inf_tags => qq|datacenter="$datacenter",types=>"$types"|,
-					inf_default => 0,
-					group_by => "$datacenter,$types",
 				};
 			}
 		}
 		my $email = $me->default('notify.email');
-		
-		$queries{influx_details} = {measurement => "Spare-machines"};
+	
 		my $q = ariba::monitor::QueryManager->newWithDetails("Spare machines", $pn, $me->service(), $me->customer(), \%queries);
-		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+		$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 	}
 }
 

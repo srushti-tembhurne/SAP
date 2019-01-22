@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl
+#!/usr/local/bin/perl -w
 
 # $Id: //ariba/services/monitor/bin/common/cpu-watcher#65 $
 
@@ -31,7 +31,6 @@ sub main {
     my @dataCenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
 
     my $cluster = $me->currentCluster();
-    my $service = $me->service();
     my $ws = ($me->hostsForRoleInCluster("monserver", $cluster))[0];
     my $port = $me->default("WebServerHTTPPort");
 
@@ -80,7 +79,6 @@ sub main {
             my $samples = 4;
             my $outage = undef;
 
-            my $has_hysteresis = 0;
             if ($machine->provides('web')) {
                 $warn = 40;
                 $crit = 49;
@@ -129,12 +127,8 @@ sub main {
                 # Adding hysteresis for app servers to detect only pegged CPU
                 # tmid: 166839
                 $crit .= " and previousAnswer > $crit";
-                $has_hysteresis = 1
             }
 
-            my $crit_threshold = $has_hysteresis ? (split(' ', $crit))[0] : $crit;
-            my $hysteresis_tag = $has_hysteresis ? "yes" : "no";
-           
             # tmid:161074
             if ($note) {
                 $note .= "\n<html>For CPU issues, see <a href=\"$machineStatsDoc\">$machineStatsDoc</a></html>";
@@ -180,10 +174,6 @@ sub main {
                     perl           => sub { return $usagePercentage },
                     recordMaxResults  => 13000,
                     recordDataType    => 'gauge',
-                    inf_field => "cpu_usage_percentage",
-                    inf_tags => qq|cluster=$cluster,service=$service,hostname=$hostname,hysteresis=$hysteresis_tag|,
-                    inf_default => 0,
-                    group_by => "$datacenter,$hostname"
                 };
                 
             }
@@ -205,37 +195,15 @@ sub main {
                         }, 
                     }, 
                 }, 
-                inf_field => "cpu_avg_usage_percentage_sample4",
-                inf_tags => qq|cluster=$cluster,service=$service,hostname=$hostname,hysteresis=$hysteresis_tag|,
-                inf_default => 0,
-                group_by => "$datacenter,$hostname"
             };
-
-            $queries{qq!$hostname cpu variable crit threshold!} = {
-                perl        => sub { return $crit_threshold },
-                inf_field   => "cpu_avg_usage_percentage_crit_threshold",
-                inf_tags    => qq|cluster=$cluster,service=$service,hostname=$hostname,hysteresis=$hysteresis_tag|,
-                inf_default => 95,
-                group_by    => "$datacenter,$hostname"
-            };
-
-            $queries{qq!$hostname cpu variable warn threshold!} = {
-                perl        => sub { return $warn },
-                inf_field   => "cpu_avg_usage_percentage_warn_threshold",
-                inf_tags    => qq|cluster=$cluster,service=$service,hostname=$hostname,hysteresis=$hysteresis_tag|,
-                inf_default => 85,
-                group_by    => "$datacenter,$hostname"
-            };
-
         }
 
         my $email = $me->default('notify.email');
 
-        $queries{influx_details} = {measurement => "dc_cpu_watcher"};
         my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
 
         my $q = ariba::monitor::QueryManager->newWithDetails("cpu", $pn, $me->service(), $me->customer(), \%queries);
-        $q->processQueries($debug, $email, $sendEmail, $sendPage);
+        $q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
     }
 }
 

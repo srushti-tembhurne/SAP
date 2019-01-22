@@ -1,6 +1,6 @@
-#!/usr/local/bin/perl
+#!/usr/local/bin/perl -w
 ################################################################################
-# $Id: //ariba/services/monitor/bin/s4/esignature-status#5 $
+# $Id: //ariba/services/monitor/bin/s4/esignature-status#7 $
 #
 # Copyright (c) 2014 Ariba
 #
@@ -66,7 +66,7 @@ use ariba::rc::InstalledProduct;
 use ariba::monitor::QueryManager;
 use ariba::Ops::ServiceController;
 use JSON;
-
+use File::Temp qw(tempfile);
 use Data::Dumper;
 
 sub main
@@ -112,7 +112,8 @@ sub main
 
     exit 0 unless defined($key);
 
-    my $signinHeader = "<DocuSignCredentials><Username>$user</Username><Password>$password</Password><IntegratorKey>$key</IntegratorKey></DocuSignCredentials>";
+    my $signinHeader = "<DocuSignCredentials><Username>$user</Username><Password>$password</Password>" .
+                       "<IntegratorKey>$key</IntegratorKey></DocuSignCredentials>";
 
     my $resp = `$CURL $certArg -s $proxyArg -H "Accept: application/json" -H "Content-Type: application/json" -H "X-DocuSign-Authentication: $signinHeader" $url`;
 
@@ -123,13 +124,13 @@ sub main
     };
 
     if(!$@ && $json->{'loginAccounts'}) {
-        $queryResult = qq(OK);
+        $queryResult = "OK";
     } else {
-        $queryResult = qq(Unexpected response -  $resp);
+        $queryResult = "Unexpected response - " . $resp;
     }
 
     $queries{"Docusign Rest Api"} = {
-        crit => 'answer !~ /^"OK"$/',
+        crit => 'answer !~ /^OK$/',
         severity => 1,
         description => '3rd party service is available',
         correctiveActions => [
@@ -137,24 +138,26 @@ sub main
             Support => 'Escalate to provider for fix',
         ],
         perl => sub { return $queryResult; },
-        inf_field => "docusign_rest_api",
     };
 
-    my $soapBody = '<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><Ping xmlns="http://www.docusign.net/API/3.0" /></soap:Body></soap:Envelope>';
-    my $soapUrl = $product->default('Application.ACM.Signature.DocuSign.SOAPMonitoringURL') || "https://www.docusign.net/api/3.0/DSAPI.asmx";
+    my $soapBody = '<?xml version="1.0" encoding="utf-8"?>' .
+                   '<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" ' .
+                   'xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><Ping xmlns="http://www.docusign.net/API/3.0" /></soap:Body></soap:Envelope>';
+    my $soapUrl = $product->default('Application.ACM.Signature.DocuSign.SOAPMonitoringURL') ||
+                  "https://www.docusign.net/api/3.0/DSAPI.asmx";
     my $soapAction = "http://www.docusign.net/API/3.0/Ping";
 
     $resp = `$CURL $certArg -s $proxyArg -H "Content-Type: text/xml; charset=utf-8" -H "X-DocuSign-Authentication: $signinHeader" -H "SOAPAction: $soapAction" -d '$soapBody' $soapUrl`;
 
     my $soapResult;
     if($resp =~ m|<PingResult>true</PingResult>|i) {
-        $soapResult = qq(OK);
+        $soapResult = "OK";
     } else {
-        $soapResult = qq(Unexpected Response $resp);
+        $soapResult = "Unexpected Response - " . $resp;
     }
 
     $queries{"Docusign Soap Api"} = {
-        crit => 'answer !~ /^"OK"$/',
+        crit => 'answer !~ /^OK$/',
         severity => 1,
         description => '3rd party service is available',
         correctiveActions => [
@@ -162,23 +165,43 @@ sub main
             Support => 'Escalate to provider for fix',
         ],
         perl => sub { return $soapResult; },
-        inf_field => "docusign_soap_api",
     };
 
-    $soapBody = '<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><soap:Body><testPing xmlns="http://api.echosign"><apiKey>' . $echoSignKey . '</apiKey></testPing></soap:Body></soap:Envelope>';
+    $soapBody = '<?xml version="1.0" encoding="utf-8"?>' .
+                '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsd="http://www.w3.org/2001/XMLSchema" ' .
+                'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><soap:Body><testPing xmlns="http://api.echosign"><apiKey>' .
+                $echoSignKey . '</apiKey></testPing></soap:Body></soap:Envelope>';
     $soapUrl = $product->default('Application.ACM.Signature.EchoSign.EndpointURL') || "https://secure.echosign.com/services/EchoSignDocumentService15";
 
-    $resp = `curl --tlsv1.2 -k -s $proxyArg -H "Content-Type: text/xml; charset=utf-8" -H 'SOAPAction: \"\"' -d '$soapBody' $soapUrl`;
+    if(! -e '/usr/local/tools/bin/curl') {
+    $soapBody ='<?xml version="1.0" encoding="utf-8"?>
+               <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><soap:Body>
+               <testPing xmlns="http://api.echosign">
+               <apiKey>'.$echoSignKey.'</apiKey>
+               </testPing></soap:Body></soap:Envelope>';
+
+         my ($fh, $filename) = tempfile();
+         print $fh "$soapBody";
+         $fh->flush;
+         my @output;
+         require 'geturl';
+         geturl("-q","-post","-postfile","$filename","-contenttype","text/xml;charset=utf-8","-header","SOAPAction: ","-results",\@output,$soapUrl);
+         close $fh;
+         unlink($filename);
+         $resp = qq(@output);
+    } else {
+          $resp = `curl -k -s $proxyArg -H "Content-Type: text/xml; charset=utf-8" -H 'SOAPAction: \"\"' -d '$soapBody' $soapUrl`;
+     }
 
     my $echoSoapResult;
     if($resp =~ m|testPingResponse|i) {
-        $echoSoapResult = qq(OK);
+        $echoSoapResult = "OK";
     } else {
-        $echoSoapResult = qq(Unexpected Response $resp);
+        $echoSoapResult = "Unexpected Response - " . $resp;
     }
 
     $queries{"Echosign Soap Api"} = {
-        crit => 'answer !~ /^"OK"$/',
+        crit => 'answer !~ /^OK$/',
         severity => 1,
         description => '3rd party service is available',
         correctiveActions => [
@@ -186,14 +209,11 @@ sub main
             Support => 'Escalate to provider for fix',
         ],
         perl => sub { return $echoSoapResult; },
-        inf_field => "echosign_soap_api",
     };
-
-    $queries{influx_details} = { measurement => 'esignature_status' };
 
     my $email = $mon->default('notify.email');
     my $qm = ariba::monitor::QueryManager->newWithDetails("esignature-status", $product->name(), $product->service(), $product->customer(), \%queries);
-    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 }
 
 main();

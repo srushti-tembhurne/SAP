@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl
+#!/usr/local/bin/perl -w
 
 # $Id: //ariba/services/monitor/etc/monitor-query-template#6 $
 
@@ -74,7 +74,6 @@ sub main {
             Engr => '',
         ],
         inf_field => "ping_status",
-        inf_default => "none",
     };
 
     $queries{'eBay Enabled Status'} = {
@@ -88,11 +87,9 @@ sub main {
             Engr => '',
         ],
         inf_field => "enabled_status",
-        inf_default => "none",
     };
 
     my $email = $mon->default('notify.email');
-    $queries{'influx_details'} = { measurement => 'spotbuy_ebay_status'};
 
     my $qm = ariba::monitor::QueryManager->newWithDetails('ebay-status', $me->name(), $me->service(), $me->customer(), \%queries);
     $qm->processQueries($debug, $email, $sendEmail, $sendPage);
@@ -165,7 +162,7 @@ sub checkCode {
         $ret .= ": ($xml->{ 'ebay' }->{ 'search' }) $xml->{ 'ErrorMessages' }->{ 'Message' }";
     }
 
-    return qq($ret);
+    return $ret;
 }
 
 sub checkEnabled {
@@ -179,7 +176,7 @@ sub checkEnabled {
         $ret .= ": $xml->{ 'ErrorMessages' }->{ 'Message' }";
     }
 
-    return qq($ret);
+    return $ret;
 }
 
 main(@ARGV);

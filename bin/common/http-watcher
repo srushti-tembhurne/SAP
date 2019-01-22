@@ -1,6 +1,6 @@
-#!/usr/local/tools/perl-5.22.1/bin/perl
+#!/usr/local/tools/perl-5.22.1/bin/perl -w
 #
-# $Id: //ariba/services/monitor/bin/common/http-watcher#93 $
+# $Id: //ariba/services/monitor/bin/common/http-watcher#97 $
 #
 # http-watcher 99-05-16 Dan Grillo <grio@ariba.com>
 # based on machine-watcher
@@ -29,7 +29,6 @@ use Sys::Syslog;
 use CGI ();
 use dmail::LockLib;
 use Mail::Send;
-use Data::Dumper;
 
 require "geturl";
 
@@ -39,18 +38,17 @@ my $envName = sharedLibEnvName();
 
 $ENV{$envName} .= ":$ENV{'ORACLE_HOME'}/lib";
 
-my $TRACEFILE_BASE = "/tmp/stratus-current-http-watcher-url";
-my $traceFile      = $TRACEFILE_BASE;
+my $TRACEFILE_BASE = "/tmp/current-http-watcher-url";
+my $traceFile = $TRACEFILE_BASE;
 
 my $debug = 0;
 my $sendEmail;
 my $sendPage;
-my $programStartTime = scalar (localtime (time ()));
+my $programStartTime = scalar(localtime(time()));
 
-sub usage
-{
+sub usage {
     print "Error: $_[0]\n" if $_[0];
-    print "usage: $0 [-d|-h] -t <critical|normal> -prodName <productName> -c <clusterName> [<url files>...]\n";
+    print "usage: $0 [-d|-h] -t <critical|normal> -c <clusterName> [<url files>...]\n";
     print "          -h for this help\n";
     print "          -d to turn on debugging\n";
     print "          -t critical or normal to select the category of urls checked\n";
@@ -61,63 +59,52 @@ sub usage
     print "          <url files> file(s) that contain urls to monitor\n";
     print "                      defaults to \$URLFILE\n";
     print "                      or $FindBin::Bin/../../etc/http-watcher-urls\n";
-    exit (1);
+    exit(1);
 }
 
-sub trace
-{
+sub trace {
     my $message = shift;
 
     print "\n$message\n" if $debug;
 
-    open (TRACE, ">> $traceFile") || die "can't open $traceFile: $!";
+    open (TRACE, "> $traceFile") || die "can't open $traceFile: $!";
     print TRACE "$message\n";
-    print TRACE "since ", scalar (localtime (time)), " (pid = $$)\n";
-    close (TRACE);
+    print TRACE "since ", scalar(localtime(time))," (pid = $$)\n";
+    close(TRACE);
 }
 
-sub removeTrace
-{
-    unlink ($traceFile) || warn "can't remove $traceFile: $!"  if ( -e $traceFile );
-
+sub removeTrace {
+    unlink($traceFile) || warn "can't remove $traceFile: $!";
 }
 
-sub currentTrace
-{
-    open (TRACE, $traceFile) || warn "can't read traceFile $traceFile: $!";
-    my $text = join ("", <TRACE>);
-    close (TRACE);
+sub currentTrace {
+    open(TRACE, $traceFile) || warn "can't read traceFile $traceFile: $!";
+    my $text = join("", <TRACE>);
+    close(TRACE);
 
     return $text;
 }
 
-sub main
-{
+sub main {
     my $defaultUrlFile = $ENV{'URLFILE'} || "$FindBin::Bin/../../etc/http-watcher-urls";
 
-    my @urlFiles                = ();
-    my %queriesForProducts      = ();
+    my @urlFiles = ();
+    my %queriesForProducts = ();
     my %suiteQueriesForProducts = ();
     my $type;
     my $cluster;
-    my $product_name;
     my $path = "http://ops.ariba.com/documentation/prodops/common/http_watcher.shtml";
 
-    while (my $arg = shift (@ARGV))
-    {
-        if ($arg =~ /^-h/o) {usage();}
-        if ($arg =~ /^-d/o) {$debug = 1; next;}
-        if ($arg =~ /^-t/o) {$type = shift (@ARGV); next;}
-        if ($arg =~ /^-c/o) {$cluster = shift (@ARGV); next;}
-        if ($arg !~ /^-/o) {push (@urlFiles, $arg); next;}
-        if ($arg =~ /^-p/o) {$product_name = shift (@ARGV); next;}
+    while (my $arg = shift(@ARGV)) {
+        if ($arg =~ /^-h/o) { usage();}
+        if ($arg =~ /^-d/o) { $debug = 1; next;}
+        if ($arg =~ /^-t/o) { $type = shift(@ARGV); next; }
+        if ($arg =~ /^-c/o) { $cluster = shift(@ARGV); next; }
+        if ($arg !~ /^-/o) { push(@urlFiles, $arg); next;}
     }
 
-    exit (1) unless ($product_name);
-
-    unless (@urlFiles)
-    {
-        push (@urlFiles, $defaultUrlFile);
+    unless(@urlFiles) {
+        push(@urlFiles, $defaultUrlFile);
     }
 
     #
@@ -127,58 +114,60 @@ sub main
 
     $cluster = $me->currentCluster() unless ($cluster);
 
-    for my $URLFILE (@urlFiles)
-    {
+    for my $URLFILE (@urlFiles) {
         next unless -f $URLFILE;
         readConfigFile($URLFILE, \%includes);
     }
 
     # dynamically load urls that live in ariba::HTTPWatcherPlugin::*
-    my $urlsRef = evalURLsAndLoadIncludes($me, \%includes, $type, $cluster, $product_name);
+    my $urlsRef = evalURLsAndLoadIncludes($me, \%includes, $type, $cluster);
 
     removeTrace();
 
-    my $LOCKFILE_BASE = "/tmp/http-watcher-stratus";
+    my $LOCKFILE_BASE  = "/tmp/http-watcher";
 
     my $processCount = 0;
-    for my $productName (sort keys %$urlsRef)
-    {
+    for my $productName (sort keys %$urlsRef) {
+
+        $processCount++;
+        sleep(1) if ($processCount % 5 == 0); # Slow down forking to 5 processes per second
+
+        my $pid = fork();
+        next if ($pid); # If successful fork, parent goes to next product, child checks urls.
+
         # we remove our trace file when we finish
         # if another exists when are running, print it out
-        my $lockFile = $LOCKFILE_BASE . "-$productName";
-        $lockFile .= "-$type" if ($type);
+        my $lockFile  = $LOCKFILE_BASE  . "-$productName";
+        $lockFile .= "-$type" if($type);
 
         $traceFile = $TRACEFILE_BASE . "-$productName";
-        $traceFile .= "-$type" if ($type);
+        $traceFile .= "-$type" if($type);
 
-        if (-f $traceFile)
-        {
-            print STDERR "Another http-watcher running?  It looks like it is doing: " . currentTrace() . "\n";
+        if ( -f $traceFile ) {
+            print STDERR "Another http-watcher running?  It looks like it is doing: " .
+            currentTrace() . "\n";
         }
 
-        if (!dmail::LockLib::requestlock($lockFile, 5))
-        {
+        if (!dmail::LockLib::requestlock($lockFile,5)) {
             print STDERR "can't grab lock\n";
             exit;
         }
 
-        for my $url (@{$urlsRef->{$productName}})
-        {
+        for my $url (@{$urlsRef->{$productName}}) {
 
             next unless defined $url;
 
             # This looks like the proper place to test for any type of URL that should be excluded, and skip them.
-            my $urlName = $url->instance();
-            if (   $urlName =~ /phttpconnect\.quadrem\.net:4443\/invoke\/quadrem\/cxml_srm/
-                || $urlName =~ /externalSite=true/)
-            {
+            my $urlName     = $url->instance();
+            if ($urlName =~ /phttpconnect\.quadrem\.net:4443\/invoke\/quadrem\/cxml_srm/ ||
+                $urlName =~ /externalSite=true/) {
                 next;
             }
 
             my $productName = $url->productName();
             my $customer    = $url->customerName() || '';
-            my $appName     = $url->applicationName() || "none";
-            my $displayName = $url->displayName() || $url->instanceName();
+            my $appName     = $url->applicationName();
+            my $displayName = $url->displayName();
             my $severity    = $url->severity();
 
             my $uiHint;
@@ -202,17 +191,15 @@ sub main
 
             my @fakeANProductName = ('invoice-signing', 'edi-van', 'fax');
 
-            for my $prod (@fakeANProductName)
-            {
-                if ($productName && $productName eq $prod)
-                {
+            for my $prod ( @fakeANProductName ) {
+                if ($productName && $productName eq $prod ) {
                     $productName = 'an';
                 }
             }
 
+
             # this should always have a default value
-            unless (defined $url->recordStatus())
-            {
+            unless (defined $url->recordStatus()) {
                 $url->setRecordStatus('no');
             }
 
@@ -221,201 +208,218 @@ sub main
             my $inspector = $url->inspectorURL() || 'none';
             my $logurl    = $url->logURL() || 'none';
 
-            if ($appName)
-            {
-
-                if ($community)
-                {
+            if ($appName) {
+                if ($community) {
                     $uiHint = "community $community/$appName";
-                }
-                elsif (!$customer)
-                {
+                } elsif (!$customer) {
                     $uiHint = "default community/$appName";
                 }
 
                 # This came from vm
                 $urlName = 'not-displayed-for-security' if $urlName =~ m|/ad/login|o;
 
-                if ($customer)
-                {
-                    $format = "<html></td><td>%s since statusChangeTime queryError</html>\n",;
-                }
-                else
-                {
-                    $format = "%s since statusChangeTime queryError\n";
+                if ($customer) {
+                    $format = "<html></td><td>%s since statusChangeTime queryError</html>\n",
+                } else {
+                    $format  = "%s since statusChangeTime queryError\n";
                 }
 
-            }
-            else
-            {
-                if ($community)
-                {
+            } else {
+                if ($community) {
                     $uiHint = "community $community/$displayName";
-
-                }
-                elsif (!$customer)
-                {
+                } elsif (!$customer) {
                     $uiHint = "General";
                 }
-
-                $format = "<html></td><td>%s since statusChangeTime queryError</html>\n",;
+                $format = "<html></td><td>%s since statusChangeTime queryError</html>\n",
             }
 
             $uiHint = $url->uiHint() if ($url->uiHint());
 
-            $urlName =~ s/(=)/\$1/g;
-
-            unless ($url->checkSSLCertOnly())
-            {
+            unless ($url->checkSSLCertOnly()) {
 
                 my $queryName = $displayName;
-                if (
-                       $community
-                    && $queryName !~ /,/
-                    && ($productName eq "an"
-                        || (grep /^$productName$/, (ariba::rc::Globals::sharedServiceSourcingProducts(), ariba::rc::Globals::sharedServiceBuyerProducts())))
-                   )
-                {
-                    $queryName .= ", community $community";
+                if ($queryName !~ /,/ && ($productName eq "an" ||
+                   (grep /^$productName$/, (ariba::rc::Globals::sharedServiceSourcingProducts(),
+                                 ariba::rc::Globals::sharedServiceBuyerProducts())))) {
+                    if ($community) {
+                        $queryName .= ", community $community";
+                    } else { 
+                        $queryName .= ", community default";
+                    }
                 }
 
                 my $sdbCrit;
-                my $use_crit = 1;
-                if ($productName eq 'sdb')
-                {
-                    #HOA-59527,Connection to Soap Query: should not go to crit when sdb load is running
-                    my $q      = ariba::monitor::Query->new('sdb/D_B_Load_Status');
+                if ($productName eq 'sdb'){
+                    my $q = ariba::monitor::Query->new('sdb/D_B_Load_Status');
                     my $D_B_st = $q->results();
-                    if ($D_B_st ne 'Running')
-                    {
+                    if ($D_B_st ne 'Running') {
                         $sdbCrit = "answer eq 'down' && previousAnswer eq 'down'";
-                        $use_crit = 2;
                     }
-                    else
-                    {
-                        $use_crit = 0;
-                    }
-                }
-                else
-                {
+                } else {
                     $sdbCrit = "answer eq 'down'";
                 }
-                $community = "Default Community" if (!$community);
-                $displayName =~ s/,\s*/-/g;
+
                 $queriesForProducts{$productName}->{$customer}->{$queryName} = {
-                                noRowCount       => 1,
-                                format           => $format,
-                                useFormatOnError => 1,
-                                info             => "answer eq 'up'",
-                                warn             => "answer eq 'sick'",
-                                crit             => $sdbCrit,
-                                severity         => $severity,
-                                staleInterval    => 600,    # don't go stale for 10 minutes
-                                perl             => sub {main::checkURL($url)},
-                                url              => $urlName,
-                                logURL           => $url->logURL() || "",
-                                adminURL         => $url->adminURL() || "",
-                                timeout          => -1,
-                                uiHint           => $uiHint,
-                                inspectorURL     => $url->inspectorURL() || "",
-                                processAnswer    => sub {main::processURLAnswer()},
-                                note             => "For initial debugging refer to $path",
-                                inf_field        => "status",
-                                inf_default      => 0,
-                                inf_tags         => qq(urlname="$urlName",appname="$appName",community="$community",node="$displayName",adminurl="$adminurl",inspector="$inspector",logurl="$logurl"),
-                                group_by         => "$displayName,$appName"
-               };
-               $queriesForProducts{$productName}{$customer}{"$queryName use crit"} = {
-                   perl      => sub { $use_crit },
-                   inf_field => "use_crit",
-                   inf_tags  => qq(urlname="$urlName",appname="$appName",community="$community",node="$displayName",adminurl="$adminurl",inspector="$inspector",logurl="$logurl"),
-                   group_by  => "$displayName,$appName"
-              };
+                    noRowCount => 1,
+                    format     => $format,
+                    useFormatOnError => 1,
+                    info       => "answer eq 'up'",
+                    warn       => "answer eq 'sick'",
+                    crit       => $sdbCrit,
+                    severity   => $severity,
+                    staleInterval => 600,   # don't go stale for 10 minutes
+                    perl       => sub { main::checkURL($url) },
+                    url        => $urlName,
+                    logURL     => $url->logURL()  || "",
+                    adminURL   => $url->adminURL()  || "",
+                    timeout    => -1,
+                    uiHint     => $uiHint,
+                    inspectorURL  => $url->inspectorURL() || "",
+                    processAnswer => sub { main::processURLAnswer() },
+                    note       => "For initial debugging refer to $path",
+                    inf_field        => "status",
+                    inf_tags         => qq(urlname="$urlName",appname="$appName",community="$community",node="$displayName",adminurl="$adminurl",inspector="$inspector",logurl="$logurl"),
+                };
 
                 # If this url is a front-door url for an integrated instance, create
                 # front-door queries that re-use this result for the other products in
                 # this instance suite.
-                if ($url->suiteIntegrated())
-                {
-                    for my $suiteProductName ($url->suiteProductNames())
-                    {
+                if ($url->suiteIntegrated()) {
+                    for my $suiteProductName ($url->suiteProductNames()) {
                         $suiteQueriesForProducts{$productName}->{$customer}->{$suiteProductName}->{"$productName $displayName"} = {
-                                     noRowCount       => 1,
-                                     format           => $format,
-                                     useFormatOnError => 1,
-                                     info             => "answer eq 'up'",
-                                     warn             => "answer eq 'sick'",
-                                     crit             => "answer eq 'down'",
-                                     severity         => $severity,
-                                     staleInterval    => 600,                                                                      # don't go stale for 10 minutes
-                                     perl             => sub {main::checkSuiteComponent($productName, $customer, $displayName)},
-                                     url              => $urlName,
-                                     timeout          => -1,
-                                     uiHint           => $uiHint,
-                                     note             => "For initial debugging refer to $path",
-                                     inf_field        => "status",
-                                     inf_default      => 0,
-                                     inf_tags         => qq(urlname="$urlName",appname="$appName",node="$displayName"),
-                                     group_by         => "$displayName,$appName",
-                         };
-
+                            noRowCount => 1,
+                            format     => $format,
+                            useFormatOnError => 1,
+                            info       => "answer eq 'up'",
+                            warn       => "answer eq 'sick'",
+                            crit       => "answer eq 'down'",
+                            severity   => $severity,
+                            staleInterval => 600,   # don't go stale for 10 minutes
+                            perl       => sub { main::checkSuiteComponent($productName, $customer, $displayName) },
+                            url        => $urlName,
+                            timeout    => -1,
+                            uiHint     => $uiHint,
+                            note       => "For initial debugging refer to $path",
+                            inf_field        => "status",
+                            inf_tags         => qq(urlname="$urlName",appname="$appName",node="$displayName"),
+                        };
+                    }
                 }
             }
 
             # Skip SSL check if URL is not HTTPS or skipSSLCheck is defined and is 1.
-            next if (!$url->isHTTPS() || (defined $url->skipSSLCheck() && $url->skipSSLCheck() == 1));
-        }
+            next if ( !$url->isHTTPS() || ( defined $url->skipSSLCheck() && $url->skipSSLCheck() == 1 ) );
+
+            my $openTicket;
+
+            # The (?:...) regex does NOT capture the subpattern within the parentheses.
+            if ($displayName =~ /^(?:3rdParty|Inovis VAN)/) {
+                $openTicket = 1;
+            }
+
+            if ($displayName !~ /TRE service post_url/si && $displayName !~ / https$/ ) {
+                $queriesForProducts{$productName}->{$customer}->{"$displayName SSL certificate"} = {
+                    noRowCount => 1,
+                    format     => "<html></td><td>expires in %d days queryError</html>\n",
+                    useFormatOnError => 1,
+                    info       => "answer >= 20",
+                    warn       => "answer < 20 || answer == -2",
+                    crit       => "answer < 10 && answer != -2",
+                    ticketOnWarnOpenAfterMinutes => $openTicket,
+                    severity   => $severity,
+                    staleInterval => 600,   # don't go stale for 10 minutes
+                    perl       => sub { main::checkSSLCert($url) },
+                    url        => $urlName,
+                    uiHint     => $uiHint,
+                    timeout    => -1,
+                    processAnswer => sub { main::processSSLCertAnswer($url) },
+                };
+            }
         }
 
-        for my $customer (sort keys %{$queriesForProducts{$productName}})
-        {
+        for my $customer (sort keys %{$queriesForProducts{$productName}}) {
+
             my $queries = $queriesForProducts{$productName}->{$customer};
             runQueries($monserver, "http-urls-status-$type", $productName, $customer, $me->service(), $cluster, $queries, "http-urls-status");
 
             # run queries on behalf of any integrated suite members that need
             # the status of the just-ran queries
-            for my $suiteProductName (keys %{$suiteQueriesForProducts{$productName}->{$customer}})
-            {
+            for my $suiteProductName (keys %{$suiteQueriesForProducts{$productName}->{$customer}}) {
+
                 $queries = $suiteQueriesForProducts{$productName}->{$customer}->{$suiteProductName};
                 runQueries($monserver, "integrated-suite-status-$type", $suiteProductName, $customer, $me->service(), $cluster, $queries, "integrated-suite-status");
-
             }
+        }
+
+        # Create notificationRequests from the ariba::monitor::Url cache
+        notifyPeopleFromURLStatuses($me, $urlsRef->{$productName});
+
+        # write out status to ops db
+        unless (ariba::Ops::Utils::runWithTimeout(60, sub { writeStatusChangesToDB($urlsRef->{$productName}); })) {
+            die "timeout doing writeStatusChangesToDB()\n";
         }
 
         dmail::LockLib::releaselock($lockFile);
 
         removeTrace();
+
+        exit if defined($pid); # Exit out if it is a successfully forked child, otherwise run serially
     }
+
+    1 while (waitpid(-1, 0) > 0); # Wait for children to exit
     exit 0;
 }
 
-sub runQueries
-{
-    my $monserver   = shift;
-    my $qmname      = shift;
+sub runQueries {
+    my $monserver = shift;
+    my $qmname = shift;
     my $productName = shift;
-    my $customer    = shift;
-    my $service     = shift;
-    my $cluster     = shift;
-    my $queries     = shift;
-    my $uiManager   = shift;
+    my $customer = shift;
+    my $service = shift;
+    my $cluster = shift;
+    my $queries = shift;
+    my $uiManager = shift;
 
     # XXXX this is a hack that needs to happen.
     # XXXX '' is not the correct customer name for a product with no
     # XXXX customer.
 
-    my $realCustomer = ($customer eq '') ? undef : $customer;
-    $queries->{"influx_details"} = {'measurement' => 'front_door'};
+    my $realCustomer = ( $customer eq '' ) ? undef : $customer;
 
-    my $qm = ariba::monitor::QueryManager->newWithDetails($qmname, $productName, $service, $realCustomer, $cluster, $queries);
+    my $qm = ariba::monitor::QueryManager->newWithDetails( $qmname, $productName, $service, $realCustomer, $cluster, $queries);
     $qm->setUiManager($uiManager);
 
     #$qm->runInParallel(2);
-    $qm->processQueries();
+    $qm->run();
+
+    if ($debug) {
+        $qm->displayToStdout();
+    } else {
+        $qm->checkStatus();
+
+        if ((my $ret = $qm->appendToServer($monserver)) != 0) {
+
+            if ($ret == EX_UNAVAILABLE()) {
+                trace("writeQueriesForDisplay($productName) encountered EX_UNAVAILABLE from server");
+            } else {
+                trace("writeQueriesForDisplay($productName) encountered [$ret] from server");
+                warn $ret;
+            }
+        }
+
+        $qm->archiveResultsOnServer();
+        $qm->displayToLog() unless ( $monserver eq ariba::Ops::NetworkUtils::hostname() );
+
+        # do a disconnect here so the queryd children don't hang around until
+        # the GC collects this qm
+        if ($qm->server()) {
+            $qm->server()->disconnect();
+            $qm->setServer(undef);
+        }
+    }
 }
 
-sub checkSuiteComponent
-{
+sub checkSuiteComponent {
     my $productName             = shift;
     my $customer                = shift;
     my $suiteComponentQueryName = shift;
@@ -425,21 +429,18 @@ sub checkSuiteComponent
     return $query->results();
 }
 
-sub evalURLsAndLoadIncludes
-{
-    my $me       = shift;
+sub evalURLsAndLoadIncludes {
+    my $me = shift;
     my $includes = shift;
-    my $type     = shift;
-    my $cluster  = shift;
-    my $pname    = shift;
+    my $type = shift;
+    my $cluster = shift;
 
     trace("evalURLs()");
 
     my $service = $me->service();
     my %urls    = ();
 
-    for my $include (keys %{$includes})
-    {
+    for my $include ( keys %{$includes} ) {
 
         next unless $include =~ /include\s+(\S+)\s+(.*)$/o;
 
@@ -447,41 +448,33 @@ sub evalURLsAndLoadIncludes
         my $parms   = $2;
 
         $parms =~ s/\s+$//o;
-        my @initparams = split (/\s+/o, $parms);
+        my @initparams = split(/\s+/o, $parms);
 
-        unshift (@initparams, $cluster);
-        unshift (@initparams, $service);
+        unshift(@initparams, $cluster);
+        unshift(@initparams, $service);
 
         print "   package = $package\n" if $debug;
-        print "   initparms = ", join (" ", @initparams), "\n" if $debug;
+        print "   initparms = ", join(" ", @initparams),"\n" if $debug;
 
-        eval ("require $package");
+        eval("require $package");
         die "require $package failed ($@)" if $@;
 
         my @monitoredProducts = eval "${package}::init(\@initparams)";
-        die "${package}::init(", join (", ", @initparams), ") failed ($@)" if $@;
+        die "${package}::init(", join(", ",@initparams), ") failed ($@)" if $@;
 
         # the urls() method allocs ariba::monitor::Urls() and they
         # live on in the shared cache
-        for my $product (@monitoredProducts)
-        {
-            next unless defined ($product);
+        for my $product (@monitoredProducts) {
+            next unless defined($product);
 
             my $productName = $product->name();
-            next if ($productName ne $pname);
-
-            push (@{$urls{$productName}}, eval "${package}::urls(\$product)");
+            push(@{$urls{$productName}}, eval "${package}::urls(\$product)");
             die "${package}::urls() failed ($@)" if $@;
-            if ($type && $type eq 'critical')
-            {
-                @{$urls{$productName}} = grep {$_->recordStatus() && $_->recordStatus() eq 'yes'} @{$urls{$productName}};
-            }
-            elsif ($type && $type eq 'normal')
-            {
-                @{$urls{$productName}} = grep {!($_->recordStatus()) || $_->recordStatus() ne 'yes'} @{$urls{$productName}};
-            }
-            else
-            {
+            if($type && $type eq 'critical') {
+                @{$urls{$productName}} = grep { $_->recordStatus() && $_->recordStatus() eq 'yes' } @{$urls{$productName}};
+            } elsif($type && $type eq 'normal') {
+                @{$urls{$productName}} = grep { !($_->recordStatus()) || $_->recordStatus() ne 'yes' } @{$urls{$productName}};
+            } else {
                 usage("Please specify a -t option\n");
             }
         }
@@ -490,74 +483,155 @@ sub evalURLsAndLoadIncludes
     return \%urls;
 }
 
-sub readConfigFile
-{
+sub readConfigFile {
     my $file     = shift;
     my $includes = shift;
 
     trace("readConfigFile($file)");
 
-    open (CONFIG, $file) || return;
+    open(CONFIG, $file) || return;
 
-    while (my $line = <CONFIG>)
-    {
+    while (my $line = <CONFIG>) {
 
         next if $line =~ /^#/o;
         next if $line =~ /^;/o;
-        chomp ($line);
+        chomp($line);
         next if $line =~ /^\s*$/o;
 
-        if ($line =~ /^include\s+/o)
-        {
+        if ($line =~ /^include\s+/o) {
 
             $includes->{$line} = $line;
 
-            print "will include ", $includes->{$line}, "\n" if $debug;
+            print "will include ", $includes->{$line},"\n" if $debug;
         }
     }
 
-    close (CONFIG);
+    close(CONFIG);
 }
 
-sub checkSSLCert
-{
+sub writeStatusChangesToDB {
+    my $urlsRef = shift;
+
+    trace("writeStatusChangesToDB()");
+
+    my $me = ariba::rc::InstalledProduct->new();
+
+    my @willSubmit = ();
+
+    for my $url ( @$urlsRef ) {
+        #
+        # this is in case we shifted URL in checkURL due to lastFailedURL
+        #
+        $url = ariba::monitor::Url->new( $url->query()->url() )
+            if ( $url->query() && $url->query()->url() );
+
+        next unless defined($url);
+
+        next unless $url->transitionType();
+
+        next unless $url->recordStatus() && $url->recordStatus() eq "yes";
+
+        print "looking at ",$url->displayName()," transitionType = ",$url->transitionType(),"\n" if $debug;
+
+        my $submit;
+
+        # skip submits for sick->up, up->sick
+        if ( $url->transitionType() eq "down->up" ) {
+            $submit = 1;
+        } elsif ( $url->transitionType() eq "up->down" || $url->transitionType() eq "sick->down") {
+            $submit = 1;
+        }
+
+        push(@willSubmit, $url) if $submit;
+    }
+
+    if (scalar @willSubmit > 0) {
+        ariba::monitor::DowntimeEntry->connectToDatabase($me);
+    }
+
+    for my $url ( @willSubmit ) {
+        my $transitionType = 0;
+
+        if ( $url->transitionType() eq "down->up" ) {
+            $transitionType = 1;
+        } elsif ( $url->transitionType() eq "up->down" || $url->transitionType() eq "sick->down") {
+            $transitionType = 0;
+        } else {
+            warn "Unexpected transistion type ", $url->transitionType(), "for url ", $url->instance(),"\n";
+            next;
+        }
+
+        my $note;
+
+        my $productStatus = ariba::monitor::ProductStatus->newWithDetails(
+            $url->productName(), $me->service(), $url->customerName()
+        );
+
+        if ($productStatus->inPlannedDownTime()) {
+            $note = sprintf('%s; MCL = %s; TMID:%d', $productStatus->comment(), $productStatus->mcl(), $productStatus->tmid());
+        } else {
+            $note = $url->error() || "";
+        }
+
+        $note = substr($note, 0, 750); # col is 1024
+
+        if ( $debug ) {
+            print "Will write DB change for ", $url->instance(), "\n";
+            print "   productname: ", $url->productName(),"\n";
+            print "   appname: ", $url->displayName(),"\n";
+            print "   customer: ", $url->customerName(),"\n" if $url->customerName();
+            print "   planned: ", $productStatus->inPlannedDownTime(),"\n";
+            print "   transitiontime: ", $url->transitionTime(),"\n";
+            print "   transistiontype: ", $transitionType, "\n";
+            print "   note: ", $note, "\n";
+        }
+
+        my $entry = ariba::monitor::DowntimeEntry->newWithDetails({
+            'productname' => $url->productName(),
+            'appname' => $url->displayName(),
+            'transitiontype' => $transitionType,
+            'planned' => $productStatus->inPlannedDownTime() ? 1 : 0,
+            'timestamp' => $url->transitionTime(),
+            'note' => $note,
+        });
+
+        $entry->setCustomer( $url->customerName() ) if $url->customerName();
+        $entry->save();
+    }
+}
+
+sub checkSSLCert {
     my $url = shift;
     my $valid;
 
     trace("checkSSLCert() building SSL connection for " . $url->instance());
 
-    my $cert = $url->sslCertificate();
+    my $cert  = $url->sslCertificate();
     my $error = $cert->errors() || '';
 
-    if ($cert)
-    {
+    if ($cert) {
         $valid = $cert->validForDays() || -1;
-    }
-    else
-    {
+    } else {
         $valid = -1;
     }
 
     # alter our answer if we're in a scheduled outage.
-    if ($valid == -1 && checkForScheduledOutage($url, \$error))
-    {
+    if ($valid == -1 && checkForScheduledOutage($url, \$error)) {
         $valid = -2;
     }
 
-    return join ("\n", ($valid, $error));
+    return join("\n", ($valid, $error));
 }
 
-sub processSSLCertAnswer
-{
-    my $url = shift;
+sub processSSLCertAnswer {
+    my $url   = shift;
 
     my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
 
     my ($valid, $error) = $query->results();
 
     # Catch the timeout case.
-    if ($valid =~ /timed out/)
-    {
+    if ($valid =~ /timed out/) {
         $error = $valid;
         $valid = -1;
     }
@@ -567,8 +641,7 @@ sub processSSLCertAnswer
     # XXX - don't setError() on $url, because it can possibly overwrite
     # the setError() from checkURLs(), which isn't what we want. This
     # happens because we use the same $url object for both queries.
-    if ($error)
-    {
+    if ($error) {
         $url->setSslCertError($error);
         $query->setError($error);
     }
@@ -576,13 +649,13 @@ sub processSSLCertAnswer
     return $valid;
 }
 
-sub checkURL
-{
+
+sub checkURL {
     my $originalUrl = shift;
 
-    my $query = $ariba::monitor::Query::_ourGlobalQuerySelf;
+    my $query  = $ariba::monitor::Query::_ourGlobalQuerySelf;
     $query->deleteDetails();
-    $originalUrl->setQuery($query);
+    $originalUrl->setQuery( $query );
 
     #
     # if this URL is in the PO cache, it means it is also still in the SSRealm
@@ -591,11 +664,9 @@ sub checkURL
     # but if the object is not still a valid realm URL, we will just use the
     # random URL instead.
     #
-    if ($query->lastFailedUrl())
-    {
-        if (ariba::monitor::Url->_objectWithNameExistsInCache($query->lastFailedUrl()))
-        {
-            print "checkURLs() USING ", $query->lastFailedUrl(), "because it IS in PO URL cache." if ($debug);
+    if ( $query->lastFailedUrl() ) {
+        if( ariba::monitor::Url->_objectWithNameExistsInCache( $query->lastFailedUrl() ) ) {
+            print "checkURLs() USING " , $query->lastFailedUrl() , "because it IS in PO URL cache." if($debug);
             my $newUrl = ariba::monitor::Url->new($query->lastFailedUrl());
 
             map {$newUrl->setAttribute($_, $originalUrl->attribute($_))} $originalUrl->attributes();
@@ -604,19 +675,16 @@ sub checkURL
             $newUrl->setRealmName($query->lastFailedUrlRealmName()) if ($query->lastFailedUrlRealmName());
 
             $originalUrl = $newUrl;
-        }
-        else
-        {
-            print "checkURLs() skipping ", $query->lastFailedUrl(), "because it's not in PO URL cache." if ($debug);
+        } else {
+            print "checkURLs() skipping " , $query->lastFailedUrl() , "because it's not in PO URL cache." if($debug);
         }
         $query->deleteAttribute('lastFailedUrl');
         $query->deleteAttribute('lastFailedUrlRealmName');
     }
 
-    my @urls = ($originalUrl);
-    if ($originalUrl->secondaryURLs())
-    {
-        push (@urls, $originalUrl->secondaryURLs());
+    my @urls = ( $originalUrl );
+    if ($originalUrl->secondaryURLs()) {
+        push( @urls, $originalUrl->secondaryURLs() );
     }
 
     my @output;
@@ -633,8 +701,7 @@ sub checkURL
     # encountered.
     #
     #
-    for my $url (@urls)
-    {
+    for my $url (@urls) {
         $lastUrl = $url;
 
         # Set the REFERER header to the query name
@@ -651,27 +718,21 @@ sub checkURL
         ($error, $connectionError) = processUrl($query, $url, @output);
 
         # If there is any error => try next url
-        if ($error || $connectionError)
-        {
+        if ($error || $connectionError ) {
 
-            if ($url->storeOutput())
-            {
+            if ($url->storeOutput()) {
                 # just store the first hundred lines
                 my $sliceEnd = ($#output < 100 ? $#output : 100);
-                my $details = ariba::monitor::Query->newFromHash(
-                                                                 $url->instance() . " output",
-                                                                 $query->productName(),
-                                                                 $query->service(),
-                                                                 $query->customer(),
-                                                                 $query->cluster(),
-                                                                 {
-                                                                  perl => sub {return join ("\n", @output[0 .. $sliceEnd]);},
-                                                                 },
-                                                                );
+                my $details = ariba::monitor::Query->newFromHash($url->instance() . " output", $query->productName(),
+                   $query->service(),
+                   $query->customer(),
+                   $query->cluster(),
+                   {
+                  perl => sub { return join("\n", @output[0 .. $sliceEnd]); },
+                   },);
                 $query->setDetails($details);
             }
-            if ($url->stopOnError())
-            {
+            if ($url->stopOnError()) {
 
                 # Remember which was the last failed url
                 #
@@ -683,9 +744,7 @@ sub checkURL
                 last;
             }
 
-        }
-        else
-        {
+        } else {
             # if the url check returns success there's no need to go
             # through the rest of the urls.
             #
@@ -709,28 +768,25 @@ sub checkURL
 
     # this return value gets ignored because we over-write it with
     # processAnswer() later.
-    return (1);
+    return(1);
 }
 
-sub processUrl
-{
-    my $query  = shift;
-    my $url    = shift;
+sub processUrl {
+    my $query = shift;
+    my $url = shift;
     my @output = @_;
 
-    my $error           = '';
+    my $error  = '';
     my $connectionError = 0;
-    my $errorString     = $url->errorString() || "HTTP-WATCHER UNDEFINED ERROR STRING";
+    my $errorString = $url->errorString() || "HTTP-WATCHER UNDEFINED ERROR STRING";
 
     # put final redirected URL into query if that option is set
-    if ($url->printURL())
-    {
+    if($url->printURL()) {
         $query->setFinalURL($url->finalURL());
     }
 
     # the case where we are looking for any arbitrary errors
-    for my $line (@output)
-    {
+    for my $line (@output) {
 
         # this weird test on error is so the ErrorDispatcher's
         # monitor output which has the word error in it is
@@ -739,9 +795,8 @@ sub processUrl
         # There are a few other wierd places where "error" comes up
         next unless defined $line;
 
-        if (   $line =~ m/(\berror\b|die:|refused|refusing|timed out|exception|not found|did not|can\s?not|invalid|unavailable|maintenance)/io
-            || $line =~ m/(SAFEGUARD|$errorString|No route to host|maintenance)/o)
-        {
+        if ($line =~ m/(\berror\b|die:|refused|refusing|timed out|exception|not found|did not|can\s?not|invalid|unavailable|maintenance)/io ||
+            $line =~ m/(SAFEGUARD|$errorString|No route to host|maintenance)/o) {
             my $matchedError = $1;
 
             #
@@ -772,7 +827,7 @@ sub processUrl
             next if $line =~ m|error_icon\.gif|o;
 
             # css from weblogic console
-            next if $line =~ m/\.message-error\s+{/o || $line =~ m/\.logAndExceptionTable\s+{/o;    # }}
+            next if $line =~ m/\.message-error\s+{/o || $line =~ m/\.logAndExceptionTable\s+{/o; # }}
 
             # css from amne console
             next if $line =~ m/\.(error|invalid).* \{/o;
@@ -806,33 +861,23 @@ sub processUrl
 
             # Errors that we need to "fix up" because they don't mean
             # exactly what they say
-            if ($line =~ /$errorString/o)
-            {
-                $error           = "Found error string [$errorString] in page [$line]";
+            if ($line =~ /$errorString/o) {
+                $error = "Found error string [$errorString] in page [$line]";
                 $connectionError = 0;
-            }
-            elsif ($line =~ /is temporarily unavailable/o)
-            {
+            } elsif ($line =~ /is temporarily unavailable/o) {
 
                 $error = "serving busy page";
 
-            }
-            elsif ($line =~ /status\s+code="560"/io)
-            {
+            } elsif ($line =~ /status\s+code="560"/io) {
 
                 $error = "serving cXML 560 busy page";
 
-            }
-            else
-            {
+            } else {
 
-                if ($line =~ /SAFEGUARD /o)
-                {
-                    $error  = "access blocked by Safeguard";
+                if ($line =~ /SAFEGUARD /o) {
+                    $error = "access blocked by Safeguard";
                     @output = ();
-                }
-                else
-                {
+                } else {
                     $error = "Found error string [$matchedError] in page [$line]";
                 }
             }
@@ -847,10 +892,9 @@ sub processUrl
 
     # If we stopped following redirection because the url matched a given pattern
     # we didn't fetch anything and thus $watchString will not be found.
-    if (!$url->stopFollowingOnPatternFound())
-    {
+    if (!$url->stopFollowingOnPatternFound()) {
 
-        my $output = join ("", @output);
+        my $output = join("", @output);
 
         # check for SAML SSO redirects that are too big and end up as
         # a post embedded in a html page served by our apps.  When a
@@ -860,44 +904,38 @@ sub processUrl
         # redirect page, so use this regex to check for such a
         # redirect page.
         my $samlSSORedirectPageRegex = '<form action=".*externalSite=true.*" id=formRedirectForm method=post name=formRedirectForm>';
-        if ($output =~ /$samlSSORedirectPageRegex/)
-        {
+        if ($output =~ /$samlSSORedirectPageRegex/) {
 
             # no need to check $watchString as this is the last page;
             # this is the equivalent of
             # $url->stopFollowingOnPatternFound() being true
 
-        }
-        elsif ($watchString)
-        {
+        } elsif ($watchString) {
 
-            if ($output =~ /$watchString/)
-            {
+            if ($output =~ /$watchString/) {
                 # if we match the watchString, then we don't worry about errors
-                $error           = "";
+                $error = "";
                 $connectionError = 0;
-            }
-            else
-            {
+            } else {
                 my $fullError = "no '$watchString' in page";
-                $fullError .= " ($error)"             if $error;
+                $fullError .= " ($error)" if $error;
                 $fullError .= " for realm $realmName" if $realmName;
                 $error = $fullError;
             }
         }
-
         # Checking for Discover Canada SSO redirect error, to try and skip it, ie. allow script to assume this is equivalent to 'up'.
         my $discoverCanadaSSORedirectPageRegex = '<META HTTP-EQUIV="Refresh" CONTENT="0; URL=/loginlogoutCP/exec/invalidssologinForm.do">';
-        if ($output =~ /$discoverCanadaSSORedirectPageRegex/)
-        {
+        if ($output =~ /$discoverCanadaSSORedirectPageRegex/) {
             ($error, $connectionError) = ('', 0);
         }
     }
+
 
     # cleanLine must be performed
     # because it may set the error back to a
     # false condition.
     $error = cleanLine($error) if $error;
+
 
     return ($error, $connectionError);
 
@@ -912,18 +950,17 @@ sub processUrl
 # so it has to happen in the Query::runProcessAnswer() that happens after this
 # call and not in Query::run() which happens before it.
 #
-sub processURLAnswer
-{
-    my $query           = $ariba::monitor::Query::_ourGlobalQuerySelf;
-    my $origUrl         = ariba::monitor::Url->new($query->url());
-    my $url             = $origUrl->processAnswerLastUrl();
-    my $error           = $origUrl->processAnswerError();
+sub processURLAnswer {
+    my $query  = $ariba::monitor::Query::_ourGlobalQuerySelf;
+    my $origUrl = ariba::monitor::Url->new( $query->url() );
+    my $url = $origUrl->processAnswerLastUrl();
+    my $error = $origUrl->processAnswerError();
     my $connectionError = $origUrl->processAnswerConnectionError();
 
     my $checkTime = $query->checkTime();
 
     # We get this for free from Query
-    my $oldStatus = $query->previousResults() || 'up';
+    my $oldStatus = $query->previousResults()  || 'up';
 
     # this is *previous* because the current status change time has
     # not been recored in the query, see QueryManager::run() and
@@ -934,16 +971,16 @@ sub processURLAnswer
     # Save the downgrade status of the query here, so that we have it when
     # we look at the URLs later and decide to page or not
     #
-    if ($query->isDowngraded())
-    {
-        $origUrl->setIsDowngraded("yes");
+    if( $query->isDowngraded() ) {
+            $origUrl->setIsDowngraded( "yes" );
     }
-    $origUrl->setQueryCheckTime(scalar (localtime ($query->checkTime())));
+    $origUrl->setQueryCheckTime( scalar(localtime($query->checkTime())) );
 
     # save query to url for use in notifications
     $origUrl->setQuery($query);
 
     my $newStatus;
+
 
     # An error occured, so the url is either down or sick. Check the
     # hysteresis of the object to determine the status
@@ -962,37 +999,28 @@ sub processURLAnswer
 
     my $shouldForceSick = ($connectionError && $url->forceSickOnConnectionError());
 
-    if (defined $url && $url->knownOutage())
-    {
+    if ($url->knownOutage()) {
         $shouldForceSick = 1;
-        $error = $url->outageCause() if ($error && $url->outageCause());
+        $error = $url->outageCause() if($error && $url->outageCause());
     }
-    $query->setForceInfoOnWarn($url->forceInfoOnWarn())  if (defined $url && $url->forceInfoOnWarn());
+    $query->setForceInfoOnWarn($url->forceInfoOnWarn()) if (defined($url->forceInfoOnWarn()));
 
-    if ($error)
-    {
+    if ($error) {
 
-        # disable for HOA-156660: my $hysteresis = $url->hysteresis() || 0;
-        my $hysteresis = 0;
+        my $hysteresis = $url->hysteresis() || 0;
 
-        if ($oldStatus eq "up" || $oldStatus eq "")
-        {
+        if ($oldStatus eq "up" || $oldStatus eq "") {
 
-            if ($hysteresis || $shouldForceSick)
-            {
+            if ($hysteresis || $shouldForceSick) {
                 $newStatus = 'sick';
-            }
-            else
-            {
+            } else {
                 $newStatus = 'down';
             }
         }
 
-        if ($oldStatus eq "sick")
-        {
+        if ($oldStatus eq "sick") {
 
-            if ($previousStatusChangeTime + $hysteresis < $checkTime && !$shouldForceSick)
-            {
+            if ($previousStatusChangeTime + $hysteresis < $checkTime && !$shouldForceSick) {
                 $newStatus = 'down';
 
                 # any time we go from sick to down, record the time
@@ -1001,9 +1029,7 @@ sub processURLAnswer
                 #
                 $checkTime = $previousStatusChangeTime;
 
-            }
-            else
-            {
+            } else {
                 $newStatus = 'sick';
             }
         }
@@ -1013,8 +1039,7 @@ sub processURLAnswer
         $newStatus = 'down' if $oldStatus eq 'down';
 
         # There was a transition, so update the type.
-        if ($newStatus ne $oldStatus)
-        {
+        if ($newStatus ne $oldStatus) {
             $origUrl->setTransitionTime($checkTime);
             $origUrl->setTransitionType("$oldStatus->$newStatus");
         }
@@ -1026,15 +1051,12 @@ sub processURLAnswer
         $error =~ s/\n//o;
         $origUrl->setError($error);
 
-    }
-    else
-    {
+    } else {
 
         # the url is up
         $newStatus = 'up';
 
-        if ($newStatus ne $oldStatus)
-        {
+        if ($newStatus ne $oldStatus) {
             $origUrl->setTransitionTime($checkTime);
             $origUrl->setTransitionType("$oldStatus->$newStatus");
         }
@@ -1042,14 +1064,11 @@ sub processURLAnswer
 
     $origUrl->setOldStatus($oldStatus);
     $origUrl->setStatus($newStatus);
-    $query->setNote($url->error() . "\n" . $query->note()) if (defined $url && $url->error());
-
-    my $status_map = { up => 0, down => 1, sick => 2};
-    return ($status_map->{$newStatus});
+    $query->setNote($url->error()."\n".$query->note()) if ( $url->error() );
+    return $newStatus;
 }
 
-sub checkForScheduledOutage
-{
+sub checkForScheduledOutage {
     my $url       = shift;
     my $error     = shift;
     my $oldStatus = shift;
@@ -1058,30 +1077,26 @@ sub checkForScheduledOutage
     my $currOutage;
 
     my $outageName = ariba::monitor::AppRecycleOutage->instanceName($url->productName(), $url->instanceName());
-    if (ariba::monitor::AppRecycleOutage->objectWithNameExists($outageName))
-    {
+    if(ariba::monitor::AppRecycleOutage->objectWithNameExists($outageName)) {
         my $outage = ariba::monitor::AppRecycleOutage->new($outageName);
-        $currOutage = "app recycle" if (defined ($outage));
+        $currOutage = "app recycle" if(defined($outage));
 
     }
 
-    $currOutage = $url->outageSchedule()->isInScheduledOutage() if (defined ($url->outageSchedule()) and !defined ($currOutage));
+    $currOutage = $url->outageSchedule()->isInScheduledOutage() if (defined($url->outageSchedule()) and !defined($currOutage));
 
-    if (defined ($currOutage))
-    {
+    if (defined($currOutage)) {
 
-        printf ("   %s is in scheduleOutage $currOutage !!!\n", $url->instance()) if $debug;
+        printf("   %s is in scheduleOutage $currOutage !!!\n", $url->instance()) if $debug;
 
         $$error = "in scheduled outage: $currOutage";
 
         # checkSSLCerts doesn't care.
-        if (ref ($newStatus))
-        {
+        if (ref($newStatus)) {
 
             $$newStatus = 'sick';
 
-            if ($oldStatus ne "sick")
-            {
+            if ($oldStatus ne "sick") {
                 $url->setTransitionType("$oldStatus->sick");
             }
         }
@@ -1092,22 +1107,208 @@ sub checkForScheduledOutage
     return 0;
 }
 
-sub cleanLine
-{
+sub notifyPeopleFromURLStatuses {
+    my $me   = shift;
+    my $urls = shift;
+
+    my $skip = 0;
+    my %seen = ();
+
+
+    trace("notifyPeople()");
+
+    openlog("http-watcher", "ndelay,nofatal", "local1");
+
+    # TMID: 8435 - this sorts so we get the recordStatus eq yes first, as
+    # that's the more relevant instance/url
+    foreach my $url ( sort { $b->recordStatus() cmp $a->recordStatus() } grep {defined($_)} @$urls ) {
+
+        #
+        # this is in case we shifted URL in checkURL due to lastFailedURL
+        #
+        $url = ariba::monitor::Url->new( $url->query()->url() )
+            if ( $url->query() && $url->query()->url() );
+
+        my $to        = $url->notify() || $me->default('notify.email');
+        my $status    = $url->status() || 'up';
+        my $urlName   = $url->instance();
+        my $oldStatus = $url->oldStatus() || '';
+
+        my $q = $url->query();
+
+        # build up a unique skipName to cache on.
+        my $skipName = '';
+
+        if ($url->customerName()) {
+            $skipName = sprintf("%s-%s", $url->productName(), $url->customerName());
+        } else {
+            $skipName = sprintf("%s-%s", $url->productName(), ($url->applicationName() || $url->displayName()));
+        }
+
+        # skip or add to our cache
+        if (exists $seen{$skipName}) {
+            next;
+        }
+
+        my $notifyType;
+        if ($status =~ /\bdown\b/o && $oldStatus ne 'down') {
+            $notifyType = 'crit';
+        } elsif ($status =~ /\bup\b/o && $oldStatus eq 'down') {
+            $notifyType = 'crit';
+        } elsif ($status =~ /\bsick\b/o && $oldStatus ne 'sick' && $url->notifyWhenSick()) {
+            $notifyType = 'warn';
+        }
+
+        # Some URLs should not page, despite going crit, so set notify to warn
+        # But if they have been down for too long, notify should still be crit
+        if($url->noPage() && $url->noPage() eq "true") {
+            my $lastPageTime = $q->lastPageTime() || 0;
+            if($status =~ /\bdown\b/o and $url->pageAfterDownInMinutes() and ($q->checkTime() - $q->lastInfoResultTime() > ($url->pageAfterDownInMinutes() * 60)) and $lastPageTime < $q->lastInfoResultTime()) {
+                $notifyType = "crit";
+                $q->setLastPageTime($q->checkTime());
+                $q->recursiveSave();
+            } elsif($notifyType and $notifyType eq "crit") {
+                $notifyType = "warn";
+            }
+        }
+
+        next unless defined($notifyType);
+
+        my $level;
+        if($notifyType eq "warn") {
+            $level = "warning";
+        } else {
+            $level = "err";
+        }
+
+        my $product = $url->productName();
+        my $service = $me->service();
+        my $uiHint = $q->uiHint();
+        syslog($level, "HTTP $product:$service:$uiHint:$status:$oldStatus $urlName");
+
+        #
+        # only mark this as seen if we send a page for it
+        #
+        if ($url->recordStatus() && $url->recordStatus() eq 'yes') {
+            $seen{$skipName}++;
+        }
+
+        #
+        # don't notify if the related query is downgraded in mon
+        #
+        if( $url->isDowngraded() ) {
+            next;
+        }
+
+        if ($debug) {
+            print $url->instance(),"\n";
+            print "   notify: ", $to, "\n";
+            print "   status: ", $status, "\n";
+            print "   oldStatus: ", $oldStatus, "\n";
+            print "   productName: ", $url->productName(), "\n";
+            print "   customerName: ", $url->customerName(), "\n" if $url->customerName();
+            print "   recordStatus: ", $url->recordStatus(), "\n";
+            print "   queryCheckTime: ", $url->queryCheckTime(), "\n";
+            print "   program started at: $programStartTime\n";
+            print "\n";
+        }
+
+        my $severity = '';
+        $severity = ' s' . $url->severity() if (defined($url->severity()));
+        my $community = $url->community();
+        if ($community) {
+            $community = "Community: $community";
+        } else {
+            $community = "Community: default";
+        }
+        my $body = "";
+        my $subject = sprintf("%s%s: %s %s %s ", $notifyType, $severity, $url->displayName(),$community, $status);
+
+        if ( $url->error() ) {
+            if ( length($url->error()) < 20 ) {
+                $subject .= $url->error();
+            } else {
+                $body    .= "Error: " . $url->error() . "\n";
+            }
+        }
+
+        # This can be a separate error, and we don't want to overwrite
+        # the original $url->error()
+        if ( $url->sslCertError() ) {
+            $body .= "SSL Error: " . $url->sslCertError() . "\n";
+        }
+
+        $body .= "URL: $urlName\n";
+        if ( $url->finalURL() ) {
+            $body .= "\nFinal URL: " . $url->finalURL() . "\n";
+        }
+
+        $body .= join("\n",
+            "   notify: [$to]",
+            "   status: [$status]",
+            "   oldStatus: [$oldStatus]",
+            "   queryCheckTime: [" . $url->queryCheckTime() . "]",
+            "   program started at: [$programStartTime]",
+        );
+
+        if ( $url->saveRequest() && $url->requestString() ) {
+            $body .= "\n\nRequest string:\n" . $url->requestString() . "\n";
+        }
+
+        $body .= $url->query()->displayDetailsToString() if $url->query()->details();
+
+        $body =~ s/[^a-zA-Z0-9:\.'"\{\}\[\]\s\?\/!@#\$%\^&\*\(\)-=\+_]/_/g;
+
+        my $notificationRequest = ariba::Ops::NotificationRequest->newMessage(
+            $notifyType,
+            "http-watcher",
+            $url->productName(),
+            $me->service(),
+            $url->customerName(),
+            $url->clusterName(),
+            $subject,
+            $body,
+            $to
+        );
+
+        $notificationRequest->setDebug($debug);
+        $notificationRequest->send();
+
+        #
+        # XXX -- send pages for recordStatus URLs in sales to monprod via email
+        #
+        if($me->service() eq 'sales' && !$debug) {
+            if($url->recordStatus() && $url->recordStatus() eq 'yes') {
+                my $msg = Mail::Send->new();
+                $msg->set( 'From', "monsales\@ariba.com");
+                my $pagers = ariba::Ops::Constants::operationsPagerAddress();
+                my $recipient = ( $notifyType eq 'crit' ) ?  $pagers : $to;
+                $msg->to( $recipient );
+                $msg->subject( "SALES: " . $url->productName() . " - $subject" );
+                my $fh = $msg->open();
+                print $fh $body;
+                $fh->close();
+            }
+        }
+    }
+
+    closelog();
+
+    trace("finished notifyPeople()");
+}
+
+sub cleanLine {
     my $line = shift;
 
-    return $line unless ($line);
+    return $line unless($line);
 
     $line =~ s/\cM//og;
     $line =~ s/\n//og;
 
     # Make sure XML is escaped; Strip HTML
-    if ($line =~ /^<\?xml/i)
-    {
+    if ( $line =~ /^<\?xml/i ) {
         $line = CGI->escapeHTML($line);
-    }
-    else
-    {
+    } else {
         $line = ariba::Ops::Utils::stripHTML($line);
     }
 

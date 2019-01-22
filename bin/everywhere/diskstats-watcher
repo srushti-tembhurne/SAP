@@ -199,10 +199,6 @@ sub main {
 						'format' => "%d MB\n",
 						'uiHint' => "$hostname/$volumeShort",
 						'perl' => sub { return $blocksRead / 1024 * 512 / 1024; },
-                        "inf_field" => "MBRead",
-                        "inf_tags" => qq|datacenter="$datacenter",hostname="$hostname",volume="$volumeShort"|,
-                        "inf_default" => 0,
-                        "group_by" => "$datacenter,$hostname,$volumeShort",
 				};
 			}
 		}
@@ -223,10 +219,6 @@ sub main {
 						'format' => "%d MB\n",
 						'uiHint' => "$hostname/$volumeShort",
 						'perl' => sub { return $blocksWritten / 1024 * 512 / 1024; },
-                        "inf_field" => "MBWritten",
-                        "inf_tags" => qq|datacenter="$datacenter",hostname="$hostname",volume="$volumeShort"|,
-                        "inf_default" => 0,
-                        "group_by" => "$datacenter,$hostname,$volumeShort",
 				};
 			}
 		}
@@ -236,10 +228,9 @@ sub main {
 		my $pager = $me->default('notify.pagers');
 		my $tab   = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
 
-        $queries{influx_details} = {measurement => "diskstats-watcher"};
 		my $qm = ariba::monitor::QueryManager->newWithDetails("diskstats-watcher", $tab, $me->service(), $me->customer(), \%queries);
 
-		$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+		$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 
 	}
 

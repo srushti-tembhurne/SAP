@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl
 #
-# $Id: //ariba/services/monitor/bin/an/queue-status#124 $
+# $Id: //ariba/services/monitor/bin/an/queue-status#127 $
 
 use strict;
 use warnings;
@@ -18,6 +18,7 @@ use ariba::monitor::StatusPage;
 use ariba::rc::InstalledProduct;
 use ariba::Ops::ProductAPIExtensions;
 use ariba::Ops::OracleClient;
+use ariba::Ops::HanaClient;
 use ariba::Ops::NotificationRequest;
 use ariba::monitor::OutageSchedule;
 use dmail::LockLib;
@@ -270,18 +271,22 @@ sub appendRetryForNumberOfRecords {
         my @payloadIds = keys(%payloadToCxmlIdMap); 
         print "payloadIds: @payloadIds\n" if ($debug);
 
-        my $ediDbc = ariba::Ops::DBConnection->connectionsForProductOfDBType($an, ariba::Ops::DBConnection::typeMainEdi());
+	# check for oracle edi connection or else hana
+        my $ediDbc = ariba::Ops::DBConnection->connectionsForProductOfDBType($an, ariba::Ops::DBConnection::typeMainEdi()) || ariba::Ops::DBConnection->connectionsForProductOfDBType($an, ariba::Ops::DBConnection::typeHanaEdi());
         return $oldResults unless ($ediDbc);
 
-        my $oc = ariba::Ops::OracleClient->newFromDBConnection($ediDbc);
+        my $dbc = ( $ediDbc->isHana ) ? ariba::Ops::HanaClient->newFromDBConnection($ediDbc) : ariba::Ops::OracleClient->newFromDBConnection($ediDbc);
+
+        print "EDI db connection type = " . $ediDbc->dbServerType . "\n" if $debug;
+
         my $payloadIdsList = "'" . join("', '", @payloadIds) . "'";
         my $sql = "Select /*+ INDEX(c IND_UN_BCF57836_3B40FC81) USE_NL(c r e f q) */ c.payload_id, q.RETRY_COUNT, q.status, TO_CHAR(q.status_changed, 'yyyy-mm-dd hh24:mi:ss') FROM edi_cxml_document c, edi_document_relation r, edi_edi_document e, edi_functional_group f, edi_out_queue q WHERE c.payload_id IN ($payloadIdsList) AND c.BASEDOCUMENT = r.sourcedocument AND r.TARGETDOCUMENT = e.BASEDOCUMENT AND e.FUNCTIONALGROUP = f.id AND f.INTERCHANGEDOCUMENT = q.item AND c.buyer = 'AN01001506640'";
         my @retryResults;
 
-        unless ($oc->connect() && 
-                $oc->executeSqlWithTimeout($sql, undef, \@retryResults) && 
+        unless ($dbc->connect() && 
+                $dbc->executeSqlWithTimeout($sql, undef, \@retryResults) && 
                 @retryResults) {
-            $query->setError($oc->error());
+            $query->setError($dbc->error());
             return $oldResults;
         }
 
@@ -498,8 +503,9 @@ sub main {
         else {
             # these are the column identifiers for a 'normal' queue:
             my $item_col = '';
-            my $date_col = 'status_changed';
-
+	    my $date_col;
+            $date_col = 'status_changed';
+	    $date_col = 'schedule_time' if($queue eq "invoice_archive_queue");
             if($type eq 'task') {
                 # a 'task' queue is similar to a 'normal' queue, except for these two column identifiers:
                 $item_col = 'cxml_document_id';
@@ -1038,7 +1044,7 @@ sub define_prop_queue_query {
             severity => $severity,
             note => $note,
             ticketOnWarnOpenAfterMinutes => $tow,
-            sql => "SELECT /*+ INDEX($propQueue IND $propQueueIndex) */ id, item, schema_community(), DECODE(status, 1, 'Queued', 2, 'Processing', 'Unknown' || status), ROUND(($time - (status_changed/1000))/60) stuck_time FROM $propQueue WHERE status IN (1, 2) AND retry_count = 0 AND status_changed < ($time -$secondsAgo)*1000 AND status_changed > ($time - $secondsLowerLimit)",
+            sql => "SELECT /* INDEX($propQueue IND $propQueueIndex) */ id, item, schema_community(), DECODE(status, 1, 'Queued', 2, 'Processing', 'Unknown' || status), ROUND(($time - (status_changed/1000))/60) stuck_time FROM $propQueue WHERE status IN (1, 2) AND retry_count = 0 AND status_changed < ($time -$secondsAgo)*1000 AND status_changed > ($time - $secondsLowerLimit)",
         };
 
         if ($propQueue eq 'prop_disp_queue') {

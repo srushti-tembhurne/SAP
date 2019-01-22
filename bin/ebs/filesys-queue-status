@@ -40,7 +40,6 @@ sub main{
 		  crit => "numrows >= 3",
 		  timeout => 60,
 		  perl => "main::ebsJobsInStateForHours(\"$ebsJobDir\", \"Queued\", \"$hours\")",
-          inf_field => "queued_stuck",
 		};
 
 		$queries{"Items in EBS Job queue stuck more than $hours hours in processing"} =
@@ -50,14 +49,12 @@ sub main{
 		  crit => "numrows >= 3",
 		  timeout => 60,
 		  perl => "main::ebsJobsInStateForHours(\"$ebsJobDir\", \"In Progress\", \"$hours\")",
-          inf_field => "processing_stuck",
 		};
 	}
 
-    $queries{'influx_details'} = {measurement => 'ebs_queue_status'};
 	my $q = ariba::monitor::QueryManager->newWithDetails("queue-status", "ebs", $me->service(), $me->customer(), \%queries);
 
-	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 }
 
 sub ebsJobsInStateForHours {
@@ -106,7 +103,7 @@ sub ebsJobsInStateForHours {
 	}
 
 	#print "jobs $dir in state $state for more than $hours hours ", join("\n", @jobs), "\n";
-    ( @jobs ) ?  return (join("\n", @jobs)) : qq("0");
+	return (join("\n", @jobs));
 }
 
 main();

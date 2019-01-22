@@ -19,7 +19,7 @@ use ariba::SNMP::Session;
 use dmail::LockLib;
 
 my $debug = 0;
-my $lockFile = "/tmp/Stratus" . basename($0);
+my $lockFile = "/tmp/" . basename($0);
 
 sub main {
 
@@ -185,26 +185,22 @@ sub main {
 			}
 
 			my $errors = join('', @errors);
-                        my $error_count = scalar (@errors);
 
 			$queries{"$switchName port name problems"} = {
-				info => "answer > -1",
-				warn => "answer > 0", 
-				perl => "return qq{$error_count}",
-				inf_field => "error_count",
-				inf_tags => "switch_name=\"$switchName\"",
-				default => 0,
+				noRowCount => 1,
+				info => "numrows > -1",
+				warn => "numrows > 0", 
+				perl => "return qq{$errors}",
 			};
 
 		}
 
 		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
-		$queries{influx_details} = {measurement => "network_switch_port_name"};
 		my $qm = ariba::monitor::QueryManager->newWithDetails(
 			'network-switch-port-name', $pn, $me->service(), $me->customer(), \%queries
 		);
 
-		$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+		$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 	}
 	dmail::LockLib::releaselock($lockFile);
 }

@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl -w
 #
-# $Id: //ariba/services/monitor/bin/an/edi-interchange-status#7 $
+# $Id: //ariba/services/monitor/bin/an/edi-interchange-status#8 $
 
 use strict;
 
@@ -22,22 +22,16 @@ sub main{
 		if($arg =~ /^-p/o){ $sendPage = 1; };
 	}
 
-	my %queries_count = (
-		"count of edi documents stuck in queued status (status unchanged for more than 1 hour)" =>
-		{
+	my $me = ariba::rc::InstalledProduct->new();
+	my $edi = ariba::rc::InstalledProduct->new("an", $me->service());
 
-		  sql => q`
-              select count(*) as stuck_count
-			  from edi_base_document
-			  where
-				  status='Queued' and
-				  ((sysdate-status_changed) * 24) > 1 and
-				  document_type = 'EDIDocument' and
-				  direction = 1
-		  `,
-		},
+	my $ediDbc = ariba::Ops::DBConnection->connectionsForProductOfDBType($edi, ariba::Ops::DBConnection::typeMainEdi());
+	# if oracle DBC is not available check if Hana is available
+	$ediDbc = ariba::Ops::DBConnection->connectionsForProductOfDBType($edi, ariba::Ops::DBConnection::typeHanaEdi()) unless $ediDbc;
 
-	);
+	my $statusChangeHours = ($ediDbc->isHana) ? "SECONDS_BETWEEN(status_changed, CURRENT_TIMESTAMP)/3600" : "((sysdate-status_changed) * 24)";
+	my $desc = "DB Type: ".$ediDbc->dbServerType;
+
 
 	my %queries = (
 		"edi documents stuck in queued status (status unchanged for more than 1 hour)" =>
@@ -46,13 +40,14 @@ sub main{
 		  warn => "numrows > 0",
 		  crit => "numrows > 20",
 		  format => "edi_document.id %d  %s %d hours\n",
+		  description => $desc,
 
-		  sql => q`
-              select id as id,document_type as document_type,round((sysdate-status_changed)*24,3) as status_changed
-			  from edi_base_document
+		  sql => qq`
+		      select id,document_type,$statusChangeHours
+			  from edi_base_document 
 			  where
-				  status='Queued' and
-				  ((sysdate-status_changed) * 24) > 1 and
+				  status='Queued' and 
+				  $statusChangeHours > 1 and 
 				  document_type = 'EDIDocument' and
 				  direction = 1
 		  `,
@@ -60,32 +55,12 @@ sub main{
 
 	);
 
-	my $me = ariba::rc::InstalledProduct->new();
-	my $edi = ariba::rc::InstalledProduct->new("an", $me->service());
-
 	my $email = $me->default('notify.email');
-
-  # process the count query first
-
-  $queries_count{influx_details} = { measurement => 'an_edi_interchange_status_count'};
-
-  my $q_count = ariba::monitor::QueryManager->newWithDetails(
-  	"edi-order-status-count", "an", $me->service(), $me->customer(), \%queries_count
-  );
-
-  my $ediDbc = ariba::Ops::DBConnection->connectionsForProductOfDBType($edi, ariba::Ops::DBConnection::typeMainEdi());
-  $q_count->setSQLConnectInfoFromDBConnection( $ediDbc );
-
-  $q_count->processQueries($debug, $email, $sendEmail, $sendPage);
-
-  # process detail query
-
-  $queries{influx_details} = { measurement => 'an_edi_interchange_status'};
 
 	my $q = ariba::monitor::QueryManager->newWithDetails(
 		"edi-order-status", "an", $me->service(), $me->customer(), \%queries
 	);
-
+	
 	$q->setSQLConnectInfoFromDBConnection( $ediDbc );
 
 	$q->processQueries($debug, $email, $sendEmail, $sendPage);

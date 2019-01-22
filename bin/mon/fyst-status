@@ -77,35 +77,14 @@ sub main {
     }
 
     my %q;
-    my $error_index=0;
-    my $answer = '';
 
-    foreach my $err (@errors)
-    {
-        $answer = $err;
-        $error_index += 1;
+    my $answer = join("\n", @errors);
 
-        $q{"Critical fyst changes in the last 24 hours line $error_index"} = {
+    $q{"Critical fyst changes in the last 24 hours"} = {
             "info" => 1,
-            "warn" => "answer ne ''",
+            "warn" => "numrows > 0",
             "perl" => sub { return $answer; },
-            "inf_field" => "fyst_change_error",
-            "inf_tags" => "error_index=$error_index",
-        };
-
-    }
-    if ($error_index == 0)
-    {
-        $q{"Critical fyst changes in the last 24 hours"} = {
-            "info" => 1,
-            "warn" => "answer ne ''",
-            "perl" => sub { return $answer; },
-            "inf_field" => "fyst_change_error",
-            "inf_tags" => "error_index=$error_index",
-        }
-    }
-
-    $q{influx_details} = {measurement => "fyst_status"};
+    };
 
     my $qm = ariba::monitor::QueryManager->newWithDetails("fyst-status", $me->name(), $me->service(), undef, \%q);
     $qm->processQueries($debug, $email, $sendEmail, $sendPage);

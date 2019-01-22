@@ -117,9 +117,7 @@ sub main {
                     'region is splitting). Passing -fix may correct the inconsistency (This latter is an ' . 
                     'experimental feature). Escalate to Tools/Engr as necessary.', 
                 Tools => 'Debug based on error',
-            ],
-            inf_field => "Hbase_database_check",
-            inf_default => "none",
+            ]
         };
 
         foreach my $table (keys %{ $regionSplits }) {
@@ -137,11 +135,7 @@ sub main {
                     investigation is required. Too many regions causes performance issues.`,
                 correctiveActions   => [
                     Ops => 'Escalate to Engineering to investigate why the table is splitting so many times', 
-                ],
-                inf_field => "number_of_regions",
-                inf_tags => qq|table="$table"|,
-                inf_default => "none",
-                group_by => $table,
+                ]
             };
         }
 
@@ -158,17 +152,14 @@ sub main {
                 Ops => 'Ensure all the Hbase master and region nodes are up and running, otherwise ' .
                     'escalate to Tools for further troubleshooting.',
                 Tools => qq`Debug based on error`,
-            ],
-            inf_field => "Hbase_master_status",
-            inf_default => "none",
+            ]
         };
     }
 
     my $email = $me->default('notify.email');
-    $queries{influx_details} = {measurement => "hbase_status"};
 
     my $qm = ariba::monitor::QueryManager->newWithDetails('hbase', $hadoop->name(), $hadoop->service(), $hadoop->customer(), $hadoop->currentCluster(), \%queries);
-    $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+    $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 } 
 
 sub hbaseMasterStatus {

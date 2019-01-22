@@ -1,6 +1,7 @@
 #!/usr/local/bin/perl -w
 
 use strict;
+use File::Basename;
 use FindBin;
 use lib "$FindBin::Bin/../../lib";
 use ariba::monitor::QueryManager;
@@ -11,11 +12,12 @@ use ariba::Ops::NetworkUtils;
 use ariba::Ops::ProductAPIExtensions;
 use ariba::rc::InstalledProduct;
 use ariba::SNMP::Session;
+use dmail::LockLib;
 
 my $debug = 0;
+my $lockFile = "/tmp/" . basename($0);
 
 sub main {
-
 	my $sendEmail = 0;
 	my $sendPage  = 0;
 
@@ -24,6 +26,8 @@ sub main {
 		if ($arg =~ /^-p/o) { $sendPage  = 1; };
 		if ($arg =~ /^-d/o) { $debug++; };
 	}
+
+	die "can't grab lock\n" unless dmail::LockLib::requestlock($lockFile, 5);
 
 	my $me = ariba::rc::InstalledProduct->new();
 	my $email = $me->default('notify.email');
@@ -37,7 +41,6 @@ sub main {
 	}
 
 	for my $datacenter ( ariba::Ops::ProductAPIExtensions::datacentersForProducts($me) ) {
-
 
 		my %matchDatacenter = (
 			'datacenter' => $datacenter,
@@ -63,7 +66,12 @@ sub main {
 			my $routerName    = $router->hostname();
 			my $tier = ariba::Ops::NetworkUtils::hostnameToTier($routerName);
 			my $networkDevice = ariba::Ops::NetworkDeviceManager->newFromMachine($router);
-			my $snmp          = ariba::SNMP::Session->newFromMachine($router);
+
+			unless($networkDevice) {
+				print "[DEBUG] driver init failed for $routerName: '$@', skipping...\n" if $debug;
+				$@ = undef; # clear the error
+				next;
+			}
 
 			print "checking $routerName, debug value is $debug\n" if $debug;
 			print "router in tier: $tier\n" if $debug;
@@ -83,11 +91,10 @@ sub main {
 				print "Trying to connect to $routerName\n" if $debug;
 				$networkDevice->connect() || do {
 					$queries{"$routerName - $trafficFlow"} = {
-						crit => "answer =~ /Failed/",
+						crit => 1,
 						error => "Failed to log into router $routerName",
 						perl => "return qq(Failed to log into router $routerName)",
 						inf_field => "error",
-						inf_default => "none",
 						inf_tags => qq|datacenter="$datacenter",routerName="$routerName",trafficFlow="$trafficFlow"|,	
 					};
 					next;
@@ -112,8 +119,6 @@ sub main {
 					perl => "return qq(Primary Provider: $primaryStateDesc, Secondary Provider: $secondaryStateDesc)",
 					inf_field => "stateInfo",
 					inf_tags => qq|datacenter="$datacenter",routerName="$routerName",trafficFlow="$trafficFlow"|,
-					inf_default => 0,
-					group_by => "$datacenter,$routerName,$trafficFlow",
 				};
 			} elsif ($tier ==3) {
 
@@ -134,8 +139,6 @@ sub main {
 						perl => "return qq(Failed to log into router $routerName)",
 						inf_field => "connectionFailedMessage",
 						inf_tags => qq|datacenter="$datacenter",routerName="$routerName",trafficFlow="$queryName"|,
-						inf_default => 0,
-						group_by => "$datacenter,$routerName,$queryName",
 					};
 					next;
 				};
@@ -162,30 +165,25 @@ sub main {
 					perl => "return qq(Primary Provider: $n3PrimaryStateDesc, Secondary Provider: $n3SecondaryStateDesc)",
 					inf_field => "stateInfo",
 					inf_tags => qq|datacenter="$datacenter",routerName="$routerName",trafficFlow="$queryName"|,
-					inf_default => 0,
-					group_by => "$datacenter,$routerName,$queryName",
 				};
 			} else {
 				$queries{"$routerName - is running unknown ipsla"} = {
 					warn => 1,
-					perl => sub {return "is running unknown ipsla"},
 					inf_field => "stateInfo",
 					inf_tags => qq|datacenter="$datacenter",routerName="$routerName",trafficFlow="running unknown ipsla"|,
-					inf_default => 0,
-					group_by => "$datacenter,$routerName,running unknown ipsla",
 				};
 			}
 		}
 
 		if (%queries) {
-			$queries{influx_details} = {measurement => "Network-Path"};
 			my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
 			my $qm = ariba::monitor::QueryManager->newWithDetails(
 				'Network Path', $pn, $me->service(), $me->customer(), \%queries
 			);
-			$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+			$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 		}
 	}
+	dmail::LockLib::releaselock($lockFile);
 }
 
 sub setStateDescription {

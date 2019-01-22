@@ -30,13 +30,15 @@ sub main {
 
     my $sendEmail = 1;
     my $sendPage = 1;
-    
+
     while (my $arg = shift(@ARGV)) {
         if ($arg =~ /^-d/o) { $debug++; next;}
     }
 
     my $hostname = ariba::Ops::NetworkUtils::hostname();
     my $machine  = ariba::Ops::Machine->new($hostname);
+    my $dataCenter = $machine->monitoringDatacenter() || $machine->datacenter();
+    my $product  = ariba::monitor::StatusPage::fakeProductNameForDatacenter($dataCenter);
     my @services = $machine->providesServices();
     my %queries  = ();
 
@@ -44,7 +46,6 @@ sub main {
     exit unless $machine->provides( 'clamav' ); ## This shouldn't happen but to be safe ...
 
     my $service = $machine->service();
-    my $dataCenter = $machine->monitoringDatacenter() || $machine->datacenter();
 
     ## clamd process monitor
     my $processTable = ariba::Ops::ProcessTable->new();
@@ -53,7 +54,7 @@ sub main {
 
         ## We want to check for a process that STARTS with clamd:
         my $status = $processTable->processWithNameExists( "^$process" ) ? 'up' : 'down';
-
+        my %influx_data = ();
         $queries{"$process-$hostname"} = {
             info => "answer eq 'up'",
             crit => "answer eq 'down'",
@@ -64,11 +65,24 @@ sub main {
             ticketOwner => "unassigned-sysadmin",
             perl => "return '$status'",
             uiHint => "$hostname/Processes",
-            inf_field => "status",
-            inf_tags => "uihint=\"$hostname/Processes\",datacenter=\"$dataCenter\"",
-            inf_default => 0,
-            group_by => "$hostname/Processes,$dataCenter",
         };
+        $influx_data{'measurement'} = 'clamav_processes';
+        $influx_data{'tags'} = { host => $hostname, service => $service, product => $dataCenter, processes => $process };
+        # save as number, not as string (influx/grafana thresholds)
+        my $int_result;
+        if ($status =~ /down/) {
+            $int_result = 0;
+        } else {
+            $int_result = 1;   # OK
+        }
+        $influx_data{'data'}->{'is_up'} = $int_result;
+
+        eval {
+            my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+            ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line);
+        };
+
+
     }
 
     ## %iowait monitoring
@@ -94,6 +108,9 @@ sub main {
             $cpuid = 'Total';
         }
         #$queries{"$hostname: CPU $cpuid IO Wait"} = {
+        my %influx_data = ();
+        $influx_data{'measurement'} = 'clamav_io_wait';
+        $influx_data{'tags'} = { host => $hostname, service => $service, product => $dataCenter, cpuid => $cpuid};
         $queries{"CPU $cpuid IO Wait-$hostname"} = {
             'recordMaxResults' => 110000,
             'recordDataType' => 'gauge',
@@ -101,11 +118,14 @@ sub main {
             'info' => 1,
             'uiHint' => "$hostname/IO Wait",
             'perl' => "return $cpu->[6]",
-            inf_field => "IOWait",
-            inf_tags => "uihint=\"$hostname/IO Wait\",datacenter=\"$dataCenter\"",
-            inf_default => 0,
-            group_by => "$hostname/IO Wait,$dataCenter",
         };
+        $influx_data{'data'}->{'io_wait'} = $cpu->[6];
+
+        eval {
+            my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+            ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line);
+        };
+
     }
 
     ## Network IO monitoring
@@ -127,16 +147,15 @@ sub main {
         } else {
             next IF;
         }
+        my %influx_data = ();
+        $influx_data{'measurement'} = 'clamav_net_io';
+        $influx_data{'tags'} = { host => $hostname, service => $service, product => $dataCenter, interface => $descr};
         $queries{"Network IO (total): $descr-$hostname"} = {
             'recordMaxResults' => 110000,
             'recordDataType' => 'gauge',
             'info' => 1,
             'uiHint' => "$hostname/Network IO/$descr",
             'perl' => "return $tot",
-            inf_field => "NetworkIOTotal",
-            inf_tags => "uihint=\"$hostname/Network IO/$descr\",datacenter=\"$dataCenter\"",
-            inf_default => 0,
-            group_by => "$hostname/Network IO/$descr,$dataCenter",
         };
         $queries{"Network IO (inbound): $descr-$hostname"} = {
             'recordMaxResults' => 110000,
@@ -144,10 +163,6 @@ sub main {
             'info' => 1,
             'uiHint' => "$hostname/Network IO/$descr",
             'perl' => "return $in",
-            inf_field => "NetwokIOinbound",
-            inf_tags => "uihint=\"$hostname/Network IO/$descr\",datacenter=\"$dataCenter\"",
-            inf_default => 0,
-            group_by => "$hostname/Network IO/$descr,$dataCenter",
         };
         $queries{"Network IO (outbound): $descr-$hostname"} = {
             'recordMaxResults' => 110000,
@@ -155,10 +170,15 @@ sub main {
             'info' => 1,
             'uiHint' => "$hostname/Network IO/$descr",
             'perl' => "return $out",
-            inf_field => "NetworkIOoutbound",
-            inf_tags => "uihint=\"$hostname/Network IO/$descr\",datacenter=\"$dataCenter\"",
-            inf_default => 0,
-            group_by => "$hostname/Network IO/$descr,$dataCenter",
+        };
+
+        $influx_data{'data'}->{'inbound'} = $in;
+        $influx_data{'data'}->{'outbound'} = $out;
+        $influx_data{'data'}->{'total'} = $tot;
+
+        eval {
+            my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+            ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line);
         };
     }
 
@@ -170,18 +190,16 @@ sub main {
     ## calling die here rather than exit.  We should note this and not just blindly exit.
     die "Unrecoverable error: Cannot find Monitoring server!!\n" unless defined $server;
 
-    my $product  = ariba::monitor::StatusPage::fakeProductNameForDatacenter($dataCenter);
     my $customer = undef;
 
     print "PRODUCT: $product \n", if $debug;
     print "SERVICE: $service \n", if $debug;
 
-    queries{influx_details} = {measurement => "ClamAVStatus"};
     my $q = ariba::monitor::QueryManager->newWithDetails(
         'ClamAV Status', $product, $service, $customer, \%queries
     );
 
-    $q->processQueries($debug, ariba::Ops::Constants->operationsEmailNotificationAddress(), $sendEmail, $sendPage, $server);
+    $q->processQueriesUsingServer($debug, ariba::Ops::Constants->operationsEmailNotificationAddress(), $sendEmail, $sendPage, $server);
 }
 
 main();
@@ -257,3 +275,4 @@ Fri Jan 30 08:00:47 2015 -> daily.cld is up to date (version: 20000, sigs: 13163
 Fri Jan 30 08:00:47 2015 -> bytecode.cvd version from DNS: 245
 Fri Jan 30 08:00:47 2015 -> Connecting via proxy.ariba.com
 Fri Jan 30 08:00:47 2015 -> bytecode.cld is up to date (version: 245, sigs: 43, f-level: 63, builder: dgoddard)
+

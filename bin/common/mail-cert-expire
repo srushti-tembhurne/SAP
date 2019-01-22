@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/common/mail-cert-expire#5 $
+# $Id: //ariba/services/monitor/bin/common/mail-cert-expire#6 $
 
 use strict;
 use FindBin;
@@ -42,12 +42,11 @@ sub main {
 
 	if (%queries) {
 		my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
-        $queries{influx_details} = {measurement => "mail-cert-expire"};
-        my $q  = ariba::monitor::QueryManager->newWithDetails(
+		my $q  = ariba::monitor::QueryManager->newWithDetails(
 			"mail-cert-expire", $pn, $me->service(), $me->customer(), \%queries
 		);
 
-		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+		$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 	}
 }
 
@@ -76,12 +75,11 @@ sub processCertDir {
 				warn => "answer < 20",
 				crit => "answer < 10 ",
 				perl => "return $days",
-                inf_field => "dayToExpire",
-                inf_tags => qq|datacenter="$datacenter",hostname="$hostname",cert="$file"|,
-                inf_default => 0,
 				ticketOnWarnOpenAfterMinutes => 30,
 				openTicketInServices => "prod, sales",	
 				description => "For initial debugging refer to $path",
+                inf_field => "dayToExpire",
+                inf_tags => qq|datacenter="$datacenter",hostname="$hostname",cert="$file"|,
 			};
 		}
 

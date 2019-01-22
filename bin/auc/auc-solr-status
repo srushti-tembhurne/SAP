@@ -1,4 +1,4 @@
-#!/usr/local/bin/perl
+#!/usr/local/bin/perl -w
 
 # $Id: //ariba/services/monitor/bin/auc/auc-solr-status#1 $
 
@@ -64,8 +64,8 @@ sub main {
     my $fortyeightHours = 2 * $twentyfourHours;
 
     $queries{'Indexer Status'} = {
-        crit    => 'answer eq "Down"',
-        info    => 'answer eq "Up"',
+        crit    => 'answer == 0',
+        info    => 'answer == 1',
         perl    => sub { return main::checkIndexerStatus($me); },
         ticketOwner => 'unassigned-sre',
 	    uiHint => 'Search handler status',
@@ -76,13 +76,12 @@ sub main {
         ],
         inf_field => "indexer_status",
         inf_tags  => qq(uihint="search handler status"),
-        group_by => 'search_handler_status',
     };
 
   
     $queries{'Search Status'} = {
-        crit    => 'answer eq "Down"',
-        info    => 'answer eq "Up"',
+        crit    => 'answer == 0',
+        info    => 'answer == 1',
         perl    => sub { return main::checkSearchStatus($me); },
         ticketOwner => 'unassigned-sre',
 	    uiHint => 'Search handler status',
@@ -93,13 +92,12 @@ sub main {
         ],
         inf_field => "search_status",
         inf_tags  => qq(uihint="search handler status"),
-        group_by => 'search_handler_status',
     };
 
 
     $queries{'Search Handler Status'} = {
-        crit    => 'answer eq "Down"',
-        info    => 'answer eq "Up"',
+        crit    => 'answer == 0',
+        info    => 'answer == 1',
         perl    => sub { return main::checkSearchHandlerStatus($me); },
         ticketOwner => 'unassigned-sre',
 	    uiHint => 'Solr Node Status',
@@ -111,7 +109,6 @@ sub main {
         ],
         inf_field => "search_handler_status",
         inf_tags  => qq(uihint="solr node status"),
-        group_by => 'solr_node_status',
     };
 
     my @instances = $me->appInstancesInCluster( $me->currentCluster() );
@@ -145,9 +142,9 @@ sub main {
         }
 
         $queries{"Solr Node Status [$hostname:$port]"} = {
-            crit    => 'answer eq "Down"',
-            info    => 'answer eq "Up"',
-            perl    => sub { return $url->error() ? 'Down' : 'Up'; },
+            crit    => 'answer == 0',
+            info    => 'answer == 1',
+            perl    => sub { return $url->error() ? '0' : '1'; },
             ticketOwner => 'unassigned-sre',
 	        uiHint => 'Search handler status',
             severity    => 1,
@@ -158,7 +155,6 @@ sub main {
             ],
             inf_field => "solr_node_status",
             inf_tags  => qq(uihint="search handler status",host="$hostname:$port"),
-            group_by => qq(search_handler_status,"$hostname:$port"),
         };
         
 	    my $new_instUrl  = "http://$hostname.ariba.com:$port/solr/admin/cores?action=STATUS&core=auc_core&wt=json";
@@ -184,8 +180,8 @@ sub main {
         }
 
         $queries{"Solr Node Status[$hostname:$port]"} = {
-            crit    => 'answer ne "Up"',
-            info    => 'answer eq "Up"',
+            crit    => 'answer == 0',
+            info    => 'answer == 1',
             perl    => sub { return main::checkSolrNodeStatus($new_response); },
             ticketOwner => 'unassigned-sre',
 	        uiHint => 'Solr Node Status',
@@ -198,7 +194,6 @@ sub main {
             ],
             inf_field => "solr_node_status",
             inf_tags  => qq(uihint="solr node status",host="$hostname:$port"),
-            group_by => qq("solr_node_status,"$hostname:$port"),
         };
 
     }
@@ -217,7 +212,7 @@ sub main {
 #    };
 
     my $email = $mon->default('notify.email');
-    $queries{'influx_details'} = { measurement => 'community_solr_status'};
+
     my $qm = ariba::monitor::QueryManager->newWithDetails('solr-status', $me->name(), $me->service(), $me->customer(), \%queries);
     $qm->processQueries($debug, $email, $sendEmail, $sendPage);
 }
@@ -236,7 +231,7 @@ sub checkIndexerStatus {
 
     if( my $errors = $url->errors() ) {
     print "URL Errors: ", $errors, "\n";
-        return 'Down';
+        return '0';
     }
 
     my @status = split /\n/, $response;
@@ -257,7 +252,7 @@ sub checkIndexerStatus {
     }
     print "Indexer Status '$status'\n" if $debug;
 
-    return ( $status == 0 ) ? 'Up' : 'Down';
+    return ( $status == 0 ) ? '1' : '0';
 }
 
 sub checkSearchStatus {
@@ -274,7 +269,7 @@ sub checkSearchStatus {
     my $response = $url->request();
 
     if( $url->errors() ) {
-        return 'Down';
+        return '0';
     }
 
     my @status = split /\n/, $response;
@@ -289,7 +284,7 @@ sub checkSearchStatus {
         print "Search Status '$status'\n" if $debug;
     }
 
-    return ( $status == 0 ) ? 'Down' : 'Up';
+    return ( $status == 0 ) ? '0' : '1';
 }
 
 
@@ -307,7 +302,7 @@ sub checkSearchHandlerStatus {
     my $response = $url->request();
 
     if( $url->errors() ) {
-        return 'Down';
+        return '0';
     }
 
         print "response [ $siteUrl ] : $response \n" if($debug>1);
@@ -318,7 +313,7 @@ sub checkSearchHandlerStatus {
     };
 
     if( $@ or ref($xml_href) !~/Hash/si ) {
-        return('Down');
+        return('0');
     }
 
     my $numFound = 0;
@@ -328,7 +323,7 @@ sub checkSearchHandlerStatus {
 
     $numFound = $xml_href->{'result'}->{'response'}->{'numFound'};
 
-    return ( $numFound > 0 ) ? 'Up' : 'Down';
+    return ( $numFound > 0 ) ? '1' : '0';
 }
 
 
@@ -345,7 +340,8 @@ sub checkSolrNodeStatus {
         my $status = $json_results->{'responseHeader'}->{'status'};
         my $initFailures = Dumper($json_results->{'initFailures'});
 
-        return ( ($status == 0) && ($initFailures =~/VAR1 = {}/si) ) ? 'Up' : $initFailures;
+        return ( ($status == 0) && ($initFailures =~/VAR1 = {}/si) ) ? '1' : $initFailures;
+
 }
 
 
@@ -353,4 +349,3 @@ sub checkSolrNodeStatus {
 main(@ARGV);
 
 __END__
-

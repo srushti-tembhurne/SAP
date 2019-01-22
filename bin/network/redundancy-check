@@ -1,25 +1,28 @@
 #!/usr/local/bin/perl -w
 
-# $Id: //ariba/services/monitor/bin/network/redundancy-check#15 $
+# $Id: //ariba/services/monitor/bin/network/redundancy-check#18 $
 
 use strict;
+use File::Basename;
 use FindBin;
 use lib "$FindBin::Bin/../../lib";
 
 use ariba::Ops::NetworkDeviceManager;
+use ariba::Ops::HaState;
 use ariba::monitor::QueryManager;
 use ariba::monitor::StatusPage;
 use ariba::Ops::Machine;
 use ariba::Ops::NetworkUtils;
 use ariba::Ops::ProductAPIExtensions;
 use ariba::rc::InstalledProduct;
+use dmail::LockLib;
 
 my $debug = 0;
+my $lockFile = "/tmp/" . basename($0);
 my $BIGIP_ACTIVE_STATE = 'active';
 my $BIGIP_STANDBY_STATE = 'standby';
 
 sub main {
-
     my $sendEmail = 0;
     my $sendPage  = 0;
 
@@ -29,6 +32,7 @@ sub main {
         if ($arg =~ /^-d/o) { $debug     = 1; };
     }
 
+    die "can't grab lock\n" unless dmail::LockLib::requestlock($lockFile, 5);
     my $me    = ariba::rc::InstalledProduct->new();
     my $email = $me->default('notify.email');
 
@@ -42,14 +46,14 @@ sub main {
         checkBigIpFailoverState (\%queries, $datacenter);
 
         if (%queries) {
-            $queries{influx_details} = {measurement => "Network-Redundancy"};
             my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
             my $qm = ariba::monitor::QueryManager->newWithDetails(
                 'Network Redundancy', $pn, $me->service(), $me->customer(), \%queries
             );
-            $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+            $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
         }
     }
+    dmail::LockLib::releaselock($lockFile);
 }
 
 sub checkFirewallRedundancy {
@@ -59,17 +63,13 @@ sub checkFirewallRedundancy {
 
     my %matchDatacenter = (
         'datacenter' => $datacenter,
-        'os' => 'pix',
-        #Ignoring osVersion to allow mutiple OS version host HOA-30294
-        #'osVersion' => '8.+',
+        'os' => 'pix,panos',
         'status'           => 'inservice',
         'monitoringDatacenter' => '',
     );
 
     my %matchMonitoringDatacenter = (
-        'os' => 'pix',
-        #Ignoring osVersion to allow mutiple OS version host HOA-30294
-        #'osVersion' => '8.+',
+        'os' => 'pix,panos',
         'status'           => 'inservice',
         'monitoringDatacenter' => $datacenter,
     );
@@ -77,6 +77,113 @@ sub checkFirewallRedundancy {
     my @networkDevices = ariba::Ops::Machine->machinesWithProperties(%matchDatacenter);
     @networkDevices = (@networkDevices , ariba::Ops::Machine->machinesWithProperties(%matchMonitoringDatacenter));
 
+    # the following prcoessing can be dropped once pix driver is updated with getHaState
+    my @ndPix = grep { $_->os() eq 'pix' } @networkDevices;
+    checkFirewallForPix($queriesRef, $datacenter, \@ndPix);
+    @networkDevices = grep { $_->os() ne 'pix' } @networkDevices;
+    #-------------------------------------------------------------
+
+
+    #
+    # for new firewall devices, they are set up as pairs for ha
+    # The alerts have to be set up by checking the states of
+    # both devices. The pairing here is following a naming convention
+    # that the devices names will contain fw1 or fw2, with
+    # all the other parts be same
+    # For each pair, the normal state is the combination of active and passive.
+    #
+    # the pair information is stored with a hash. key will be the names of 
+    # the devcies (device1:device2)
+    # primary for fw1 and secondary for fw2
+
+    my $PRIMARY = "primary";
+    my $SECONDARY = "secondary";
+    my $DELIMITER = ",";
+
+    my %fwPairs = ();
+    for my $networkDevice (@networkDevices) {
+        my $deviceName = $networkDevice->hostname();
+
+        # Create a networkDevice, and get failover details
+        my $nd = ariba::Ops::NetworkDeviceManager->newFromMachine($networkDevice);
+
+        unless($nd) {
+            print "[DEBUG] driver init failed for $deviceName: '$@', skipping...\n" if $debug;
+            $@ = undef; # clear the error
+            next;
+        }
+
+        # ha state object of the device
+        my $haState = $nd->getHaState();
+
+        my $key = $deviceName; # for any device not following naming convention
+        my $nodeType = $PRIMARY;
+        if ( $deviceName =~ /(.*fw)2(.*)/i ) {
+            # this is the secondary device
+            $nodeType = $SECONDARY;
+            my $device1 = "${1}1${2}";
+            $key = "$device1$DELIMITER$deviceName";
+        } elsif ( $deviceName =~ /(.*fw)1(.*)/i ) { 
+            my $device2 = "${1}2${2}";
+            $key = "$deviceName$DELIMITER$device2";
+        }
+
+        $fwPairs{$key}{$nodeType}->{'name'} = $deviceName;
+        $fwPairs{$key}{$nodeType}->{'state'} = $haState;
+        $fwPairs{$key}{$nodeType}->{'device'} = $nd;
+    }
+
+    # query and alert are defined on each pair
+    foreach my $key ( keys %fwPairs ) {
+        my $monitorName = $key;
+        my $output;
+        my $crit = 0;
+
+        my $s1state;
+        my $s2state;
+
+        if ( exists $fwPairs{$key}{$PRIMARY} && exists $fwPairs{$key}{$SECONDARY} ) {
+            $s1state = $fwPairs{$key}{$PRIMARY}->{'state'};
+            $s2state = $fwPairs{$key}{$SECONDARY}->{'state'};
+            $crit = 1 unless  ($s1state->isActive() && $s2state->isPassive() ) ||
+                        ($s1state->isPassive && $s2state ->isActive() ) ;
+            $output = $s1state->rawHaState() . $DELIMITER . $s2state->rawHaState();
+        }
+        else {
+            if ( exists $fwPairs{$key}{$PRIMARY} ) {
+                $output = $fwPairs{$key}{$PRIMARY}->{'state'}->rawHaState() . $DELIMITER;
+            }
+            else {
+                $output = "$PRIMARY device missing$DELIMITER";
+            }
+            if ( exists $fwPairs{$key}{$SECONDARY} ) {
+                $output .= $fwPairs{$key}{$SECONDARY}->{'state'}->rawHaState();
+            }
+            else {
+                $output .= "$SECONDARY device missing";
+            }
+
+            # this is an alert condition: missing either one of the pair
+            $crit = 1;
+        }
+            
+        $queriesRef->{"$monitorName ha states"} = {
+            uiHint => 'firewall',
+            crit => "$crit",
+            perl => "return qq($output)",
+            inf_field => "primaryStatus",
+            inf_tags => qq|datacenter="$datacenter",deviceName="$key",uiHint="firewall"|,
+        };
+    }
+
+}
+
+sub checkFirewallForPix {
+    my $queriesRef = shift;
+    my $datacenter = shift;
+    my $deviceRef = shift;
+
+    my @networkDevices = @$deviceRef;
     for my $networkDevice (@networkDevices) {
         # Unit will either be Primary or Secondary
         my $primaryStatus;
@@ -89,6 +196,12 @@ sub checkFirewallRedundancy {
         # Create a networkDevice, and get failover details
         my $networkDevice = ariba::Ops::NetworkDeviceManager->newFromMachine($networkDevice);
 
+        unless($networkDevice) {
+            print "[DEBUG] driver init failed for $deviceName: '$@', skipping...\n" if $debug;
+            $@ = undef; # clear the error
+            next;
+        }
+
         # Active or Standby
         ($primaryStatus, $secondaryStatus) = $networkDevice->getSystemStatus();
 
@@ -100,8 +213,6 @@ sub checkFirewallRedundancy {
         perl => "return qq($primaryStatus)",
         inf_field => "primaryStatus",
         inf_tags => qq|datacenter="$datacenter",deviceName="$deviceName",uiHint="firewall"|,
-        inf_default => 0,
-        group_by => "$datacenter,$deviceName,firewall",
         };
 
         $queriesRef->{"$deviceName Secondary Status is"} = {
@@ -110,8 +221,6 @@ sub checkFirewallRedundancy {
         perl => "return qq($secondaryStatus)",
         inf_field => "secondaryStatus",
         inf_tags => qq|datacenter="$datacenter",deviceName="$deviceName",uiHint="firewall"|,
-        inf_default => 0,
-        group_by => "$datacenter,$deviceName,firewall",
         };
     }
 }
@@ -145,6 +254,12 @@ sub checkActiveSupervisorModule {
         # Create a networkDevice, and get failover details
         my $networkDeviceManager = ariba::Ops::NetworkDeviceManager->newFromMachine($networkDevice);
 
+        unless($networkDevice) {
+            print "[DEBUG] driver init failed for $deviceName: '$@', skipping...\n" if $debug;
+            $@ = undef; # clear the error
+            next;
+        }
+
         # Find Active / Standby details
         my ($activeUnitModule, $peerUnitState) = $networkDeviceManager->getActiveSupervisorModule();
 
@@ -177,8 +292,6 @@ sub checkActiveSupervisorModule {
             perl => "return qq($activeUnitModule)",
             inf_field => "activeSupervisorStatus",
             inf_tags => qq|datacenter="$datacenter",deviceName="$deviceName",uiHint="Switch"|,
-            inf_default => 0,
-            group_by => "$datacenter,$deviceName,Switch",
         };
 
         $queriesRef->{"$deviceName Standby module state is"} = {
@@ -188,8 +301,6 @@ sub checkActiveSupervisorModule {
             perl => "return qq($peerUnitState)",
             inf_field => "standbySupervisorStatus",
             inf_tags => qq|datacenter="$datacenter",deviceName="$deviceName",uiHint="Switch"|,
-            inf_default => 0,
-            group_by => "$datacenter,$deviceName,Switch",
         };
     }
 }
@@ -229,11 +340,7 @@ sub checkBigIpFailoverState {
             crit    => $activeUnit ? "answer ne '$BIGIP_ACTIVE_STATE'" : "answer ne '$BIGIP_STANDBY_STATE'",
             snmp    => "$hostname, .1.3.6.1.4.1.3375.2.1.14.3.1.0",
             processAnswer => sub { main::translateFailoverAnswer() },
-            uiHint  => 'bigip',
-            inf_field => "failoverState",
-            inf_tags => qq|datacenter="$datacenter",deviceName="$hostname",uiHint="bigip"|,
-            inf_default => 0,
-            group_by => "$datacenter,$hostname,bigip",
+            uiHint  => 'bigip'
         };
     }
 }

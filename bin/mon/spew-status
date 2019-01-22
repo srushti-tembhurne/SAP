@@ -79,14 +79,14 @@ sub main {
 		my $d = sprintf("$script (%d spews):", $spews{$script});
 		my $ct = 0;
 		my @instances = (sort keys %{$details{$script}});
-		while ((my $k = shift(@instances)) && $ct < 2) {
+		while ((my $k = shift(@instances)) && $ct < 5) {
 			my ($user, $host) = split(/\@/, $k);
 			my $port = ariba::Ops::Constants->logViewerPort();
 			my $escapedScript = $script;
 			$escapedScript =~ s|/|_|g;
 			my $logURL = "http://$host:$port/cat/spew-$user-$escapedScript";
 			
-			$d .= " $logURL ";
+			$d .= " <a href=\"$logURL\">$k</a>";
 			$ct++;
 		}
 		$d = sprintf("%s ... and %d more...", $d, scalar(@instances))
@@ -95,21 +95,14 @@ sub main {
 	}
 
 	my $q;
-        my $spew_id = 0;
 	my $datacenter = $machine->datacenter();
-        foreach my $spew (@spewList)
-        {
-	    $q->{"$spew_id:Scripts spewing in $datacenter in last 4 hours"} = {
+	$q->{"Scripts spewing in $datacenter in last 4 hours"} = {
 		info => 1,
-		perl => sub { return $spew; },
-                inf_field => "spew_message",
-                inf_tags =>"spew_id=$spew_id,datacenter=$datacenter",
-	    };
-            $spew_id += 1;
-        }
-        $q->{influx_details} = {measurement => "spew_status"};
+		perl => sub { return join("\n", @spewList); },
+	};
+
 	my $qm = ariba::monitor::QueryManager->newWithDetails("spew-status", $me->name(), $me->service(), $me->customer(), $q);
-	$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 }
 
 main(@ARGV);

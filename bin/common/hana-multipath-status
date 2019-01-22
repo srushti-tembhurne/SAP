@@ -1,6 +1,6 @@
 #!/usr/local/bin/perl
 
-# $Id: //ariba/services/monitor/bin/common/hana-multipath-status#3 $
+# $Id: //ariba/services/monitor/bin/common/hana-multipath-status#5 $
 
 use strict;
 use warnings;
@@ -55,25 +55,33 @@ sub main {
     my $user = "mon$service";
     my $password = $cipher->valueForName($user);
     my %queries;
-    my $hana_role = 'hana-db-server';
-    my @hana_servers = my @hosts = $me->hostsForRoleInCluster( $hana_role, 'primary' ); 
     my $queryManagerName = "Hana Multipath Status";
 
-    foreach my $hana_host (@hana_servers) {
-        my $cmd = "ssh $user\@$hana_host 'sudo /sbin/service multipathd status'";
-    
-        my @output;
-    
-        ariba::rc::Utils::executeRemoteCommand( $cmd, $password, 0, undef, undef, \@output );
-    
-        my $result = join(" ", @output);
+    my %hostHash;
+    my @products = ariba::rc::InstalledProduct->installedProductsList($me->service());
+    foreach my $pd (@products) {
+        my(@hanadbhost ) =   $pd->hostsForRolePrefixInCluster('hanadatabase');
+        push(@hanadbhost, $pd->hostsForRolePrefixInCluster('hanatxdatabase') );
+        foreach my $hana_host ( @hanadbhost) {
+            next if $pd->virtualHostsForHostInCluster($hana_host);
+            next if (defined $hostHash{$hana_host});
 
-        print "$hana_host Status is $result\n" if $debug;
+            $hostHash{$hana_host} = 1;
 
-        my $status = "Error: Multipathd is not Running"; 
-        $status = "OK", if ($result =~ /running/i);    
+            my $cmd = "ssh $user\@$hana_host 'sudo /sbin/service multipathd status'";
+    
+            my @output;
+    
+            ariba::rc::Utils::executeRemoteCommand( $cmd, $password, 0, undef, undef, \@output );
+    
+            my $result = join(" ", @output);
+
+            print "$hana_host Status is $result\n";
+
+            my $status = "Error: Multipathd is not Running"; 
+            $status = "OK", if ($result =~ /running/i);    
  
-        $queries{"$hana_host"} = {
+            $queries{"$hana_host"} = {
             crit    => 'answer !~ /OK/i',
             perl    => sub { return $status; },
             description => 'Running $cmd',
@@ -82,13 +90,12 @@ sub main {
             ],
             inf_field => "status",
             inf_tags => "hana_host=\"$hana_host\"",
-        };
+           };
 
+       }
     }
 
     my $email = $me->default('notify.email');
-
-    $queries{influx_details} = {measurement => "hana_multipath_status"};
 
     my $qm = ariba::monitor::QueryManager->newWithDetails($queryManagerName, $me->name(), $me->service(), $me->customer(), \%queries);
     $qm->processQueries($debug, $email, $sendEmail, $sendPage);

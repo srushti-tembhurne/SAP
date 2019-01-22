@@ -19,7 +19,6 @@ sub main {
 	my $sendEmail = 0;
 	my $sendPage = 0;
 	my $queries = {};
-    $queries->{"influx_details"} = { 'measurement' => "an_misc_status"};
 
 	while (my $arg = shift(@ARGV)) {
 		if ($arg =~ m/^-d/o) { $debug = 1; }
@@ -36,7 +35,7 @@ sub main {
 		noRowCount	=> 1,
 		info		=> "answer eq 'Yes'",
 		crit		=> "answer ne 'Yes'",
-		sql		=> "select value as value from configuration where name = 'WalkupCatalogEnabled'",
+		sql		=> "select value from configuration where name = 'WalkupCatalogEnabled'",
 	};
 
 	$queries->{'Walkup Suppliers registered in past hour'} = {
@@ -47,10 +46,10 @@ sub main {
 		recordDatatype	=>	"gauge",
 		recordItem		=>	"numrows",
 		sql             => qq`
-			SELECT /*+ ORDERED use_nl(p o pr r) */ as ordered
-			        to_char(p.created_on, 'YYYY-MM-DD HH24:MI:SS') as create_on
-			        o.name as name,
-			        p.user_id as user_id
+			SELECT /*+ ORDERED use_nl(p o pr r) */
+			        to_char(p.created_on, 'YYYY-MM-DD HH24:MI:SS'),
+			        o.name,
+			        p.user_id
 			FROM
 			        person p,
 			        org o,
@@ -89,7 +88,7 @@ sub main {
 			crit            => "answer > previousAnswer",
 			runForCommunities => $communitiesList,
 			sql             => qq`
-				SELECT count(*) as count FROM idl_ana_log WHERE
+				SELECT count(*) FROM idl_ana_log WHERE
 				sqlerror != 0
 			`
 		};
@@ -99,7 +98,7 @@ sub main {
 			crit            => "answer > previousAnswer",
 			runForCommunities => $communitiesList,
 			sql             => qq`
-				SELECT count(*) as idl_ana_log_cnt FROM idl_ana_log WHERE
+				SELECT count(*) FROM idl_ana_log WHERE
 				end_time is null and start_time < sysdate-1
 			`
 		};
@@ -111,7 +110,7 @@ sub main {
 			crit            => "answer > 0",
 			runForCommunities => $communitiesList,
 			sql             => qq`
-				select count(*) as table_stats_cnt_$level from 
+				select count(*) from 
 				user_objects o, user_tables t 
 				where o.object_type = 'TABLE' and 
 				o.status = 'VALID' and 
@@ -129,7 +128,7 @@ sub main {
 			crit            => "answer > 0",
 			runForCommunities => $communitiesList,
 			sql             => qq`
-				select count(*) index_stats_cnt_$level
+				select count(*)
 				from user_objects o, user_indexes t 
 				where 
 				o.object_type = 'INDEX' and
@@ -153,7 +152,7 @@ sub main {
 	$q->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
         ariba::Ops::ProductAPIExtensions::setCommunitiesSQLConnectInfoOnQueryManager($an, $q);
 
-	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 }
 
 main();

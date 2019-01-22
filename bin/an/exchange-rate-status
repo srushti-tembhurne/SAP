@@ -5,7 +5,6 @@
 use strict;
 use FindBin;
 use lib "$FindBin::Bin/../../lib";
-use Data::Dumper;
 
 use ariba::rc::InstalledProduct;
 use ariba::monitor::QueryManager;
@@ -43,17 +42,16 @@ sub main {
 			format => "localtime(answer)",
 			info => "(($now - answer) / $DAY) < 2",
 			crit => "(($now - answer) / $DAY) > 2",
-			sql  => "select ((timestamp - to_date('01-01-1970','MM-DD-YYYY')) * 86400) as last_updated from fx_spot where id = 100",
-            inf_field => "last_updated",
+			sql  => "select ((timestamp - to_date('01-01-1970','MM-DD-YYYY')) * 86400) from fx_spot where id = 100",
 		},
 	);
 
 	my $email = $me->default('notify.email');
-    $queries{influx_details} = { measurement => "exchange_rate_status" };
 
 	my $q = ariba::monitor::QueryManager->newWithDetails("exchange-rate-status", 'an', $service, $me->customer(), \%queries);
 
-	$q->setSQLConnectInfo(ariba::Ops::ProductAPIExtensions::connectInfoForOracleClient($an));
+	my $dbc = ariba::Ops::DBConnection->connectionsForProductOfDBTypeAndSchemaId ( $an, ariba::Ops::DBConnection->typeMain() );
+	$q->setSQLConnectInfoFromDBConnection($dbc);
 
 	$q->processQueries($debug, $email, $sendEmail, $sendPage);
 }

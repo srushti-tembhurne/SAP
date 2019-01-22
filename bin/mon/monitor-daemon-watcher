@@ -72,9 +72,8 @@ sub main {
 	my $processTable = ariba::Ops::ProcessTable->new();
 
 	for my $process (sort @processes) {
-                my $process_name= $process;
-                $process_name=~ s/ /_/g;
-		my $status = $processTable->processWithNameExists($process) ? 0 : 1;
+        (my $process_name = $process) =~ s/ /_/g;
+		my $status = $processTable->processWithNameExists($process) ? 'up' : 'down';
 		my $openTicket;
 		my $openTicketService;
 	
@@ -84,16 +83,15 @@ sub main {
 		}
 
 		$queries{$process} = {
-			info => "answer eq 0",
-			crit => "answer eq 1",
+			info => "answer eq 'up'",
+			crit => "answer eq 'down'",
 			perl => "return '$status'",
 			ticketOnWarnOpenAfterMinutes => $openTicket,
 			openTicketInServices => $openTicketService,
-                        inf_field => "$process_name",
-                        inf_default => 0,
+            inf_field => "$process_name",
 		};
 	}
-	$queries{"influx_details"} = { 'measurement' => "monitor_daemon_watcher" };
+	
 	my $email = $me->default('notify.email');
 
 	my $q = ariba::monitor::QueryManager->newWithDetails(
@@ -103,8 +101,7 @@ sub main {
 			$me->customer(),
 			\%queries
 	);
-        #$queries{"influx_details"} = { 'measurement' => "monitor_daemon_watcher" };
-	$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	$q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
 }
 
 main();

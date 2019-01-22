@@ -3,6 +3,7 @@
 # $Id: $
 
 use strict;
+use File::Basename;
 use FindBin;
 use lib "$FindBin::Bin/../../lib";
 
@@ -13,8 +14,10 @@ use ariba::Ops::NetworkUtils;
 use ariba::Ops::ProductAPIExtensions;
 use ariba::rc::InstalledProduct;
 use ariba::SNMP::Session;
+use dmail::LockLib;
 
 my $debug = 0;
+my $lockFile = "/tmp/" . basename($0);
 
 # We will start with a list of all images currently running in production
 # and narrow this list down later.
@@ -36,7 +39,6 @@ my @KNOW_GOOD_VERSIONS = ( '6.3(3)', '7.0(7)',              # PIX OS
     );
 
 sub main {
-
     my $send_email = 0;
     my $send_page  = 0;
 
@@ -45,6 +47,8 @@ sub main {
         if ($arg =~ /^-p/o) { $send_page  = 1; };
         if ($arg =~ /^-d/o) { $debug     = 1; };
     }
+
+    die "can't grab lock\n" unless dmail::LockLib::requestlock($lockFile, 5);
 
     my $me    = ariba::rc::InstalledProduct->new();
     my $email = $me->default('notify.email');
@@ -91,7 +95,6 @@ sub main {
 
             my @output = split (/\n/, $output);
 
-
             for my $line (@output) {
 
                 # Only care about line with OS information
@@ -108,11 +111,9 @@ sub main {
     
                 my $info = 1;
                 my $warn = 0;
-                my $osversion_status = 1; # good
 
                 if (!$is_OS_version_correct){
                     $info = 0;
-                    $osversion_status = 2; # waring
                     $warn = "OS Version in MDB is $mdb_OS_version but the device is actually running $version\n";
                     $line = $line . "\nOS Version in MDB is $mdb_OS_version but the device is actually running $version.";
                 }
@@ -120,7 +121,6 @@ sub main {
                 my $version_to_compare = quotemeta($version);
                 if (! grep (/$version_to_compare/, @KNOW_GOOD_VERSIONS)) {
                     $info = 0;
-                    $osversion_status = 2; #warning
                     if ($warn ne 0) {
                         $warn = $warn . "\n$version is not a know good os";
                     } else {
@@ -132,22 +132,18 @@ sub main {
                 $queries{"$device_name is running"} = {
                     info => "'$info'",
                     warn => "'$warn'",
-                    perl => "return qq($osversion_status)",
-                    inf_field => "osversion_status",
-                    inf_tags => qq|datacenter="$datacenter",device="$device_name",device_os="$device_OS",osversion_msg="$version"|,
-                    inf_default => 0,
-                    group_by => "$datacenter,$device_name",
+                    perl => "return qq($line)",
                 };
             }
         }
-   
-        $queries{influx_details} = {measurement => "network_os"};
+    
         my $pn = ariba::monitor::StatusPage::fakeProductNameForDatacenter($datacenter);
         my $qm = ariba::monitor::QueryManager->newWithDetails(
             'Network OS', $pn, $me->service(), $me->customer(), \%queries
         );
-        $qm->processQueries($debug, $email, $send_email, $send_page);
+        $qm->processQueriesUsingServer($debug, $email, $send_email, $send_page);
     }
+    dmail::LockLib::releaselock($lockFile);
 }
 
 sub findVersion {

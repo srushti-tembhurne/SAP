@@ -1,7 +1,7 @@
 #!/usr/local/bin/perl -w
 
 ###############################################################################
-# $Id: //ariba/services/monitor/bin/dba/physical-dataguard-status-replicated#5 $
+# $Id: //ariba/services/monitor/bin/dba/physical-dataguard-status-replicated#6 $
 #
 # physical-dataguard-status-replicated - Monitor Physical Dataguard for Replicated DB
 #
@@ -83,8 +83,7 @@ sub main {
             $inBackup = 0;
             warn "backupIsrunning threw: $@";
         } 
-        # make sure we normalize the boolean $inBackup variable to 1/0 int value
-        $inBackup = ( $inBackup ) ? 1 : 0;
+        
         
         $shipWarn = 5*60 if $dbc->isPhysicalActiveRealtimeReplication();
         $shipCrit = 20*60 if $dbc->isPhysicalActiveRealtimeReplication();
@@ -104,35 +103,19 @@ sub main {
             
             my %queries;
             my $uiHint;
-            #my ( $db_link, $repInstance ) = split('\s+',$link_instance);
-            my ( $db_link, $repInstance ) = ($link_instance->{DB_LINK},$link_instance->{HOST});
+            my ( $db_link, $repInstance ) = split('\s+',$link_instance);
             
             next unless ($db_link && $repInstance);
 
             $uiHint = 'Local' if($db_link =~ /REPLICATED/);
             $uiHint = 'Cascaded' if($db_link =~ /CASCADED/);
-
        
             my $query = "select host_name from v\$instance\@$db_link";
-            my $r = $oc->executeSql($query);
-            my $repHost = $r->{HOST_NAME};
+            my $repHost = $oc->executeSql($query);
 
             if ($repHost){
-                my $inf_tags = qq(db_type=$uiHint,rep_instance=$repInstance,instance_host=$repHost);
-                $queries{"shipping warn"} = {
-                    perl => sub { return $shipWarn},
-                    inf_field => "shipWarn",
-                    inf_tags => $inf_tags,
-                };
-                $queries{"shipping crit"} = {
-                    perl => sub { return $shipCrit},
-                    inf_field => "shipCrit",
-                    inf_tags => $inf_tags,
-                };
                 $queries{"$uiHint Physical Dataguard shipping lag for [$repInstance] on $repHost"} = {
-                    inf_tags => $inf_tags,
-                    warn    => "answer > $shipWarn",
-                    crit    => "answer > $shipCrit && previousAnswer > $shipCrit",
+                    info => 1,
                     description => 'Amount of data generated on primary but not yet shipped to DR in seconds', 
                     uiHint => "$uiHint/$repInstance",
                     correctiveActions => [
@@ -142,7 +125,7 @@ sub main {
                     timeout => 120,
                     format => '%d secs',
                     recordMaxResults => 51840,
-                    sql => "select(next_time_onpri-next_time_ondr)*86400 shipping_lag
+                    sql => "select(next_time_onpri-next_time_ondr)*86400
                              from
                              (select  max(sequence#) max_seq_onpri, max(next_time) next_time_onpri
                              from v\$archived_log val, v\$database vdb
@@ -155,9 +138,7 @@ sub main {
                 };
 
                 $queries{"$uiHint Physical Dataguard apply lag for [$repInstance] on $repHost"} = {
-                    inf_tags => $inf_tags,
-                    warn => "answer > $applyWarn",
-                    crit => "answer > $applyCrit && previousAnswer > $applyCrit",
+                    info => 1,
                     description => 'Amount of data received by DR but not yet applied in seconds',
                     uiHint => "$uiHint/$repInstance",
                     correctiveActions => [
@@ -171,13 +152,12 @@ sub main {
                              extract(day from to_dsinterval(value)) * 86400 +
                              extract(hour from to_dsinterval(value)) * 3600 +
                              extract(minute from to_dsinterval(value)) * 60 +
-                             extract(second from to_dsinterval(value)) as apply_lag_duration
+                             extract(second from to_dsinterval(value))
                              from v\$dataguard_stats\@$db_link
                              where name = 'apply lag'",
                 };
 
                 $queries{"$uiHint Physical Dataguard total lag for [$repInstance] on $repHost"} = {
-                    inf_tags => $inf_tags,
                     warn => "answer > $totalWarn",
                     crit => "answer > $totalCrit && previousAnswer > $totalCrit",
                     description => 'How far behind DR is from primary in seconds',
@@ -189,7 +169,7 @@ sub main {
                     timeout => 120,
                     format => '%d secs',
                     recordMaxResults => 51840,
-                    sql => "select (primary_date-standby_date) * 86400 as total_lag_duration
+                    sql => "select (primary_date-standby_date) * 86400
                              from
                              (select cast(scn_to_timestamp(current_scn) as date) primary_date
                              from v\$database) primary_date,
@@ -198,13 +178,13 @@ sub main {
                 };
          
                 $queries{"$uiHint Physical Dataguard quantity of unapplied logs for [$repInstance] on $repHost"} = {
-                    inf_tags => $inf_tags,
+                    info => 1,
                     description => 'Amount of unapplied redo in GB',
                     uiHint => "$uiHint/$repInstance",
                     timeout => 120,
                     format => '%.2f GB',
                     recordMaxResults => 51840,
-                    sql => "select max(unapp_redo) as unapplied_logs_quantity from 
+                    sql => "select max(unapp_redo) from 
                              (select round((sum(blocks*block_size)/1024/1024/1024),2) unapp_redo
                              from v\$archived_log\@$db_link where archived='YES' and applied='NO'
                              and registrar='RFS'
@@ -216,24 +196,24 @@ sub main {
                 };
                     
                 $queries{"$uiHint Physical Dataguard average apply rate for [$repInstance] on $repHost"} = {
-                    inf_tags => $inf_tags,
+                    info => 1,
                     description => 'Average apply rate, can be used to calculate how fast we can roll forward',
                     uiHint => "$uiHint/$repInstance",
                     timeout => 120,
                     recordMaxResults => 51840,
                     format => '%.2f GB/hour',
-                    sql => "select avg(sofar) as average_apply_rate from v\$recovery_progress\@$db_link
+                    sql => "select avg(sofar) from v\$recovery_progress\@$db_link
                              where item='Active Apply Rate'",
                 };
          
                 $queries{"$uiHint Physical Dataguard time to apply for [$repInstance] on $repHost"} = {
-                    inf_tags => $inf_tags,
+                    info => 1,
                     description => 'Approximate time to roll-forward all unapplied logs in seconds',
                     uiHint => "$uiHint/$repInstance",
                     timeout => 120,
                     recordMaxResults => 51840,
                     format => '%d secs',
-                    sql => "select round(unapplied_redo/apply_rate,2) as time_to_apply
+                    sql => "select round(unapplied_redo/apply_rate,2)
                              from (select max(unapp_redo) unapplied_redo from
                              (select sum(blocks*block_size)/1024 unapp_redo
                              from v\$archived_log\@$db_link where archived='YES' and applied='NO'
@@ -250,19 +230,8 @@ sub main {
                 my $crit = "answer ne '$mode'";
                 $crit = undef if $inBackup;
 
-                $queries{"mode"} = {
-                    perl => sub {return $mode},
-                    inf_field => "mode",
-                    inf_tags => $inf_tags,
-                };
-                $queries{"inBackup"} = {
-                    perl => sub {return $inBackup},
-                    inf_field => "in_backup",
-                    inf_tags => $inf_tags,
-                };
                 $queries{"$uiHint Physical Dataguard recovery mode for [$repInstance] on $repHost"} = {
-                    inf_tags => $inf_tags,
-                    crit => "answer eq $crit && previousAnswer eq $crit",
+                    info => 1,
                     description => 'The recovery mode of the standby DB',
                     uiHint => "$uiHint/$repInstance",
                     correctiveActions => [
@@ -270,14 +239,13 @@ sub main {
                         DBA => 'Fix it',
                     ],
                     timeout => 120,
-                    sql => q`select recovery_mode as recovery_mode from v$archive_dest_status where type='PHYSICAL'`,
+                    sql => q`select recovery_mode from v$archive_dest_status where type='PHYSICAL'`,
                 };
          
                 my $warn = 'answer ne "No Gap"';
                 $warn = undef if $inBackup;
                 $queries{"$uiHint Physical Dataguard gap status for [$repInstance] on $repHost"} = {
-                    inf_tags => $inf_tags,
-                    warn => $warn,
+                    info => 1,
                     description => 'Log gap status, or Recovery Not Running if DR is not running',
                     uiHint => "$uiHint/$repInstance",
                     correctiveActions => [
@@ -289,7 +257,7 @@ sub main {
                              when is_running = 'RUNNING' then
                              (case when status = 'WAIT_FOR_GAP' then 'Gap Waiting for Log '||sequence#
                              else 'No Gap' end)
-                             else 'Recovery not Running' end) as gap_status from
+                             else 'Recovery not Running' end) \"Gap status\" from
                              (select '1' joinit, status, sequence#, process
                              from v\$managed_standby\@$db_link
                              where process like 'MRP%') a,
@@ -302,8 +270,7 @@ sub main {
                 $crit = 'numrows == 0 || answer eq "UNUSED" || answer eq "ERROR" || answer eq "WAIT_FOR_GAP"';
                 $crit = undef if $inBackup;
                 $queries{"$uiHint Physical Dataguard apply status for [$repInstance] on $repHost"} = {
-                    inf_tags => $inf_tags,
-                    crit     => $crit,
+                    info => 1,
                     description => 'Current status of the apply process',
                     uiHint => "$uiHint/$repInstance",
                     correctiveActions => [
@@ -311,11 +278,11 @@ sub main {
                         DBA => 'Fix it',
                     ],
                     timeout => 180,
-                    sql => "select status as apply_status from v\$managed_standby\@$db_link where process='MRP0'",
+                    sql => "select status from v\$managed_standby\@$db_link where process='MRP0'",
                 };
             }
             $queries{"$uiHint Physical Dataguard archive destination errors for [$repInstance] on $virtualHost"} = {
-                inf_tags => qq(db_type=$uiHint,rep_instance=$repInstance,instance_host=$virtualHost),
+                info => 1,
                 description => 'Errors for the archive destination',
                 uiHint => "$uiHint/$repInstance",
                 correctiveActions => [
@@ -323,12 +290,12 @@ sub main {
                     DBA => 'Fix it',
                 ],
                 timeout => 120,
-                sql => q`select error as archive_destination_error from v$archive_dest_status where dest_id=2`,
+                sql => q`select error from v$archive_dest_status where dest_id=2`,
             };    
-            $queries{influx_details} = {measurement => "physical_dataguard_replicated"}; 
+     
             my $qm = ariba::monitor::QueryManager->newWithDetails('physical-dataguard-status-replicated', $productName, $mon->service(), undef, \%queries);
             $qm->setSQLConnectInfo($systemUser, $systemPass, $instance, $virtualHost);
-            $qm->processQueries($debug, $email, $sendEmail, $sendPage);
+            $qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
         }
         $oc->disconnect();
     }

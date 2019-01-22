@@ -2,7 +2,7 @@
 
 # Check the ssl session cache size
 # 
-# $Id: //ariba/services/monitor/bin/ws/cache-and-log-size#5 $
+# $Id: //ariba/services/monitor/bin/ws/cache-and-log-size#6 $
 
 use strict;
 use FindBin;
@@ -106,8 +106,6 @@ sub main {
 			perl	=> sub { return $error || $sslCacheSize / $MB; },
             inf_field   => "ssl_session_cache_size",
             inf_tags    => "web_server=\"$webserver\"",
-            inf_default => 0,
-            group_by    => "$webserver",
         } unless ($productName eq 'ws');
 
 		$queries{"$webserver - error log size"} = {
@@ -123,12 +121,9 @@ sub main {
 			perl	=> sub { return $error || $errorLogSize / $MB; },
             inf_field   => "error_log_size",
             inf_tags    => "web_server=\"$webserver\"",
-            inf_default => 0,
-            group_by    => "$webserver",
         };
 	}
 
-    $queries{'influx_details'} = { measurement => 'ws_cache_log_size' };
 	my $notify = $me->default("notify.email");
 	my $qm = ariba::monitor::QueryManager->newWithDetails(
 			"cache-and-log-size", $productName, $service, $me->customer(), \%queries

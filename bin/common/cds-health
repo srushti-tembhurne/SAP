@@ -49,236 +49,191 @@ use Data::Dumper;
 #
 
 sub main {
-    my $debug = 0;
-    my $quiet = 0;
-    my $sendEmail = 0;
-    my $sendPage = 0;
-    my $productName;
+	my $debug = 0;
+	my $quiet = 0;
+	my $sendEmail = 0;
+	my $sendPage = 0;
+	my $productName;
 
-    while(my $arg=shift(@ARGV)){
-            print STDERR "parsing arg $arg\n" if $debug && !$quiet;
-            if($arg =~ /^-d/o){ ++$debug; }
-            if($arg =~ /^-e/o){ $sendEmail=1; };
-            if($arg =~ /^-p$/o){ $sendPage=1; };
-            if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
-    }
+	while(my $arg=shift(@ARGV)){
+			print STDERR "parsing arg $arg\n" if $debug && !$quiet;
+			if($arg =~ /^-d/o){ ++$debug; }
+			if($arg =~ /^-e/o){ $sendEmail=1; };
+			if($arg =~ /^-p$/o){ $sendPage=1; };
+			if($arg =~ /^-prod/o){ $productName=shift(@ARGV); };
+	}
 
-    my $me = ariba::rc::InstalledProduct->new();
-    my $cluster = $me->currentCluster();
-    my $service = $me->service();
-    my $email = $me->default('notify.email');
+	my $me = ariba::rc::InstalledProduct->new();
+	my $cluster = $me->currentCluster();
+	my $service = $me->service();
+	my $email = $me->default('notify.email');
 
-    my @products;
+	my @products;
 
-    my $isAspProduct = 0;
-    if (ariba::rc::Globals::isASPProduct($productName)) {
-        @products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
-        $isAspProduct = 1;
+	my $isAspProduct = 0;
+	if (ariba::rc::Globals::isASPProduct($productName)) {
+		@products = ariba::rc::InstalledProduct->installedProductsList($service, $productName);
+		$isAspProduct = 1;
 
-    } else {
-        unless (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
-            exit(0);
-        }
+	} else {
+		unless (ariba::rc::InstalledProduct->isInstalled($productName, $service)) {
+			exit(0);
+		}
 
-        @products = (ariba::rc::InstalledProduct->new($productName, $service));
-        my $product = $products[0];
+		@products = (ariba::rc::InstalledProduct->new($productName, $service));
+		my $product = $products[0];
 
-    }
+	}
 
-    for my $product (@products) {
-        my $skip = 0;
+	for my $product (@products) {
+		my $skip = 0;
 
-        my %queries  = ();
-        my %communitiesDone;
-        my $incremental_pull_status = 0;
-        
-        for my $instance ($product->appInstancesInCluster($cluster)) {
+		my %queries  = ();
+		my %communitiesDone;
+		my $incremental_pull_status = 0;
+		
+		for my $instance ($product->appInstancesInCluster($cluster)) {
 
-            my $community = $instance->community();
-            if ($community) {
-                $community = "community $community";
-            } else {
-                $community = "default community";
-            }
+			my $community = $instance->community();
+			if ($community) {
+				$community = "community $community";
+			} else {
+				$community = "default community";
+			}
 
-            next if ($communitiesDone{$community});
-            $communitiesDone{$community} = 1;
+			next if ($communitiesDone{$community});
+			$communitiesDone{$community} = 1;
 
-            my ($uiHint, $communityString);
-            if ($isAspProduct) {
-                $uiHint = undef;
-                $communityString = "";
-            } else {
-                $uiHint = $community;
-                $communityString = "in $community";
-            }
+			my ($uiHint, $communityString);
+			if ($isAspProduct) {
+				$uiHint = undef;
+				$communityString = "";
+			} else {
+				$uiHint = $community;
+				$communityString = "in $community";
+			}
 
-            my $url = $instance->cdsActivityURL();
-            next unless $url;
+			my $url = $instance->cdsActivityURL();
+			next unless $url;
 
-            print "url = $url\n" if ($debug);
+			print "url = $url\n" if ($debug);
 
-            my $cdsActivity = ariba::monitor::Url->new($url);
+			my $cdsActivity = ariba::monitor::Url->new($url);
 
-            my @results = $cdsActivity->request(45);
+			my @results = $cdsActivity->request(45);
 
-            print "\n---\n", join("", @results), "\n---\n" if ($debug > 1);
+			print "\n---\n", join("", @results), "\n---\n" if ($debug > 1);
 
-            my ($peerProductStatus, $workingRealmsRef, $errorRealmsRef, $taskErrorsRef, $error) = parseCdsActivityDetails(\@results);
+			my ($peerProductStatus, $workingRealmsRef, $errorRealmsRef, $taskErrorsRef, $error) = parseCdsActivityDetails(\@results);
 
-            #
-            # Note the peer products health
-            #
-            $queries{"CDS peer product status $communityString"} = {
+			#
+			# Note the peer products health
+			#
+			$queries{"CDS peer product status $communityString"} = {
 
-                'info' => 1,
-                'skip' => $skip,
-                'warn' => "!defined(answer) || answer !~ /OK/",
-                'error' => $error,
-                'note' => $error,
-                'uiHint' => $uiHint,
-                'perl' => sub { return $peerProductStatus},
-                'inf_field' => "peer_prod_status",
-                'inf_default' => "none",
-                'inf_tags' =>  qq(community="$community"),
-                'group_by' =>  "$community"
-            };
+				'info' => 1,
+				'skip' => $skip,
+				'warn' => "!defined(answer) || answer !~ /OK/",
+				'error' => $error,
+				'note' => $error,
+				'uiHint' => $uiHint,
+				'perl' => sub { return $peerProductStatus},
+			};
 
-            #
-            # working cds integrated realms
-            #
-            $queries{"CDS integrated realms with working peer connection $communityString"} = {
+			#
+			# working cds integrated realms
+			#
+			$queries{"CDS integrated realms with working peer connection $communityString"} = {
 
-                'info' => 1,
-                'skip' => $skip,
-                'uiHint' => $uiHint,
-                'error' => $error,
-                'note' => $error,
-                'perl' => sub { return join("\n", @$workingRealmsRef); },
-                'inf_field' => "integrated_realms_with_working_peer",
-                'inf_default' => "none",
-                'inf_tags' =>  "community=\"$community\"",
-                'group_by' =>  "$community"
-            };
+				'info' => 1,
+				'skip' => $skip,
+				'uiHint' => $uiHint,
+				'error' => $error,
+				'note' => $error,
+				'perl' => sub { return join("\n", @$workingRealmsRef); },
+			};
 
-            $queries{"CDS integrated realms with working peer connection count $communityString"} = {
+			#
+			# cds integrated realms that have problems
+			#
+			$queries{"CDS integrated realms with peer connection in error $communityString"} = {
 
-                'info' => 1,
-                'skip' => $skip,
-                'uiHint' => $uiHint,
-                'error' => $error,
-                'note' => $error,
-                'perl' => sub { return scalar(@$workingRealmsRef); },
-                'inf_field' => "integrated_realms_with_working_peer_cnt",
-                'inf_default' => 0,
-                'inf_tags' =>  qq(community="$community"),
-                'group_by' =>  "$community"
-            };
+				'info' => 1,
+				'warn' => "numrows > 1",
+				'crit' => "numrows > 5 and previousAnswer > 5",
+				'skip' => $skip,
+				'uiHint' => $uiHint,
+				'note' => $error,
+				'perl' => sub { return join("\n", @$errorRealmsRef); },
+			};
+			#
+			# tasks that had errors
+			$queries{"CDS tasks with errors $communityString"} = {
+				'info' => 1,
+				'warn' => "numrows > 0",
+				#'ticketOnWarnOpenAfterMinutes' => 10,
+				'error' => $error,
+				'note' => $error,
+				'uiHint' => $uiHint,
+				'skip' => $skip,
+				'perl' => sub { return join("\n", @$taskErrorsRef); },
+			};
 
-            #
-            # cds integrated realms that have problems
-            #
-            $queries{"CDS integrated realms with peer connection in error $communityString"} = {
+	
+			#
+			#ForMasterDataPullErrors
+			#
+			#skipping if DA is parsed already .For first time $incremental_pull_status is set as zero.Next it is set as 1
+			unless( $incremental_pull_status ) {
+				my $pull_url = $instance->incrementalPullStatusURL();
+				next unless $pull_url;
+				print "url = $pull_url\n" if ($debug);
+	
+				my $incrementalPullStatus = ariba::monitor::Url->new($pull_url);
+				my $xml_results = $incrementalPullStatus->request(45);
+				print "\n---\n", join("", $xml_results), "\n---\n" if ($debug > 4);
+				my ($xml_ref) = parseIncrementalPullStatusDetails($xml_results);
+	
+				if($xml_ref) {	
+					
+					print Dumper($xml_ref) if( $debug > 1);
+					my $pull_status;
+					foreach my $realm_id( keys( %{$xml_ref->{realm}} ) ) {
+					
+						my $failure_count = $xml_ref->{realm}->{$realm_id}->{'failure_count'};
+						my $pull_error = Dumper($xml_ref->{realm}->{$realm_id}->{'message'});
+						print "realm_id:$realm_id,failure_count:$failure_count,errors:$pull_error\n" if($debug >1);
+					
+						my ($pull_note,$pull_severity);
+						if($failure_count > 20 ) {
+							$pull_severity = 1;
+							$pull_note = "Notify Dinesh Kumar";
+							$pull_status .= "CRITICAL realm $realm_id: $failure_count\n";
+						}elsif($failure_count > 10 ) {
+							$pull_note = "Notify Dinesh Kumar, Raghavendra Rao, Namrata Sarada";#This will be replaced with team-specific DL
+							$pull_status .= "Warning  realm $realm_id: $failure_count\n";
+						}
+				
+						$queries{"Master Data Pull Error Failure Count "} = {
+							'warn' => "answer =~/Warning/si",
+							'crit' => "answer =~/Critical/si",
+							'url'  => $pull_url,
+							'correctiveActions' => "$pull_note",
+							'severity' => $pull_severity,
+							'perl' => sub { return "$pull_status"; },
+						};
+					}
+				}
+				$incremental_pull_status = 1;
+			}
+		}
 
-                'info' => 1,
-                'warn' => "numrows > 1",
-                'crit' => "numrows > 5 and previousAnswer > 5",
-                'skip' => $skip,
-                'uiHint' => $uiHint,
-                'note' => $error,
-                'perl' => sub { return join("\n", @$errorRealmsRef); },
-                'inf_field' => "integrated_realms_with_peer_error",
-                'inf_default' => "none",
-                'inf_tags' =>  "community=\"$community\"",
-                'group_by' =>  "$community"
-            };
 
-            $queries{"CDS integrated realms with peer connection in error cnt $communityString"} = {
-
-                'info' => 1,
-                'warn' => "numrows > 1",
-                'crit' => "numrows > 5 and previousAnswer > 5",
-                'skip' => $skip,
-                'uiHint' => $uiHint,
-                'note' => $error,
-                'perl' => sub { return scalar(@$errorRealmsRef); },
-                'inf_field' => "integrated_realms_with_peer_error_cnt",
-                'inf_default' => 0,
-                'inf_tags' =>  qq(community="$community"),
-                'group_by' =>  "$community"
-            };
-            #
-            # tasks that had errors
-            $queries{"CDS tasks with errors $communityString"} = {
-                'info' => 1,
-                'warn' => "numrows > 0",
-                #'ticketOnWarnOpenAfterMinutes' => 10,
-                'error' => $error,
-                'note' => $error,
-                'uiHint' => $uiHint,
-                'skip' => $skip,
-                'perl' => sub { return join("\n", @$taskErrorsRef); },
-                'inf_field' => "tasks_with_errors",
-                'inf_default' => "none",
-                'inf_tags' =>  "community=\"$community\"",
-                'group_by' =>  "$community"
-            };
-
-    
-            #
-            #ForMasterDataPullErrors
-            #
-            #skipping if DA is parsed already .For first time $incremental_pull_status is set as zero.Next it is set as 1
-            unless( $incremental_pull_status ) {
-                my $pull_url = $instance->incrementalPullStatusURL();
-                next unless $pull_url;
-                print "url = $pull_url\n" if ($debug);
-    
-                my $incrementalPullStatus = ariba::monitor::Url->new($pull_url);
-                my $xml_results = $incrementalPullStatus->request(45);
-                print "\n---\n", join("", $xml_results), "\n---\n" if ($debug > 4);
-                my ($xml_ref) = parseIncrementalPullStatusDetails($xml_results);
-    
-                if($xml_ref) {  
-                    
-                    print Dumper($xml_ref) if( $debug > 1);
-                    my $pull_status;
-                    foreach my $realm_id( keys( %{$xml_ref->{realm}} ) ) {
-                    
-                        my $failure_count = $xml_ref->{realm}->{$realm_id}->{'failure_count'};
-                        my $pull_error = Dumper($xml_ref->{realm}->{$realm_id}->{'message'});
-                        print "realm_id:$realm_id,failure_count:$failure_count,errors:$pull_error\n" if($debug >1);
-                    
-                        my ($pull_note,$pull_severity);
-                        if($failure_count > 20 ) {
-                            $pull_severity = 1;
-                            $pull_note = "Notify Dinesh Kumar";
-                            $pull_status .= "CRITICAL realm $realm_id: $failure_count\n";
-                        }elsif($failure_count > 10 ) {
-                            $pull_note = "Notify Dinesh Kumar, Raghavendra Rao, Namrata Sarada";#This will be replaced with team-specific DL
-                            $pull_status .= "Warning  realm $realm_id: $failure_count\n";
-                        }
-                
-                        $queries{"Master Data Pull Error Failure Count "} = {
-                            'warn' => "answer =~/Warning/si",
-                            'crit' => "answer =~/Critical/si",
-                            'url'  => $pull_url,
-                            'correctiveActions' => "$pull_note",
-                            'severity' => $pull_severity,
-                            'perl' => sub { return "$pull_status"; },
-                            inf_field => "master_data_pull_error_cnt",
-                            inf_default  => 0,
-                        };
-                    }
-                }
-                $incremental_pull_status = 1;
-            }
-        }
-
-            $queries{"influx_details"} = { 'measurement' => "cds_health"  };
-        my $q = ariba::monitor::QueryManager->newWithDetails( "cds-health", $product->name(), $service, $product->customer(), \%queries);
-        $q->processQueries($debug, $email, $sendEmail, $sendPage);
-    }
+		my $q = ariba::monitor::QueryManager->newWithDetails(
+				"cds-health", $product->name(), $service, $product->customer(), \%queries
+				);
+		$q->processQueries($debug, $email, $sendEmail, $sendPage);
+	}
 
 }
 
@@ -366,72 +321,72 @@ sub main {
 # XML, this parsing is going to be hacky as well.
 
 sub parseCdsActivityDetails {
-    my $results = shift;
-    my @output;
-    my $peerProductStatus = "OK";
-    my @workingRealms = ();
-    my @errorRealms = ();
-    my @taskErrors = ();
-    my %taskErrorsForRealm = ();
+	my $results = shift;
+	my @output;
+	my $peerProductStatus = "OK";
+	my @workingRealms = ();
+	my @errorRealms = ();
+	my @taskErrors = ();
+	my %taskErrorsForRealm = ();
 
-    my $error = undef;
+	my $error = undef;
 
-    if (!@$results || $results->[0] !~ m!^<\?xml version="[^"]+"\?>!i) {
-        $error = "Error: cds direct action failed\n" . join("", @$results) . "\n";
-        $peerProductStatus = "Uknown";
-    }
-    
-    while (my $line = shift(@$results) ) {
+	if (!@$results || $results->[0] !~ m!^<\?xml version="[^"]+"\?>!i) {
+		$error = "Error: cds direct action failed\n" . join("", @$results) . "\n";
+		$peerProductStatus = "Uknown";
+	}
+	
+	while (my $line = shift(@$results) ) {
 
-        my $realmName = "";
+		my $realmName = "";
 
-        if ($line =~ m|^<Realms>(.*)</Realms>|i) {
-            $peerProductStatus = "Error: $1";
-            next;
-        }
-        if ($line =~ m!(Cannot connect to Peer Service)\s*<\s*/Realms\s*>!) {
-            $peerProductStatus = "Error: $1";
-            next;
-        }
-        if ($line =~ m!<Realm\s+name="\s*([^"]*)\s*"\s*Status="\s*([^"]*)\s*"\s*/?>!i) {
-            $realmName = $1;
-            my $status = $2;
+		if ($line =~ m|^<Realms>(.*)</Realms>|i) {
+			$peerProductStatus = "Error: $1";
+			next;
+		}
+		if ($line =~ m!(Cannot connect to Peer Service)\s*<\s*/Realms\s*>!) {
+			$peerProductStatus = "Error: $1";
+			next;
+		}
+		if ($line =~ m!<Realm\s+name="\s*([^"]*)\s*"\s*Status="\s*([^"]*)\s*"\s*/?>!i) {
+			$realmName = $1;
+			my $status = $2;
 
-            #
-            # peer connected realms are code, all others are in
-            # error
-            #
-            if ($status =~ m!peer connected!i) {
-                push(@workingRealms, $realmName);
-            } else {
-                push(@errorRealms, "$realmName: $status");
-            }
-            next;
-        }
+			#
+			# peer connected realms are code, all others are in
+			# error
+			#
+			if ($status =~ m!peer connected!i) {
+				push(@workingRealms, $realmName);
+			} else {
+				push(@errorRealms, "$realmName: $status");
+			}
+			next;
+		}
 
-        if ($line =~ m!<Task\s+name="([^"]*)"\s*>!i) {
-            my $taskName = $1;
-            my $taskError = "$realmName $taskName ";
-            while ($line = shift (@$results)) {
+		if ($line =~ m!<Task\s+name="([^"]*)"\s*>!i) {
+			my $taskName = $1;
+			my $taskError = "$realmName $taskName ";
+			while ($line = shift (@$results)) {
 
-            if ($line =~ m!</(\S+)\s*>!) {
-                    if ($1 =~ /Task/) {
-                        push(@taskErrors, $taskError);
-                        last;
-                    } else {
-                        next;
-                    }
-                }
+			if ($line =~ m!</(\S+)\s*>!) {
+					if ($1 =~ /Task/) {
+						push(@taskErrors, $taskError);
+						last;
+					} else {
+						next;
+					}
+				}
 
-                my ($name, $param, $value) = $line =~ m!<(\S+)\s+(\S+)\s*=\s*"([^"]+)"\s*/?>!i;
-                next unless ($name and $param);
-                $taskError .= " $name=$value";
-                $taskErrorsForRealm{$realmName} = $taskError;
-            }
-        }
-    }
+				my ($name, $param, $value) = $line =~ m!<(\S+)\s+(\S+)\s*=\s*"([^"]+)"\s*/?>!i;
+				next unless ($name and $param);
+				$taskError .= " $name=$value";
+				$taskErrorsForRealm{$realmName} = $taskError;
+			}
+		}
+	}
 
-    return ($peerProductStatus, \@workingRealms, \@errorRealms, \@taskErrors, $error);
+	return ($peerProductStatus, \@workingRealms, \@errorRealms, \@taskErrors, $error);
 }
 
 sub parseIncrementalPullStatusDetails {
@@ -453,4 +408,3 @@ sub parseIncrementalPullStatusDetails {
 
 
 main();
-

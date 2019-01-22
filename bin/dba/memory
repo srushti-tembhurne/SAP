@@ -88,17 +88,23 @@ sub main {
 	my $sgaDetails = "<html><blockquote><table style='text-align:left'><tr><th width=100>SID</th><th width=100>SGA</th><th width=100>SGA Type</th></tr>"; 
 	my $ps = ariba::Ops::ProcessTable->new(); 
 	my @processNames = $ps->processNamesMatching("ora_pmon"); 
+	my $sid_info = {};
 	for my $processName (sort @processNames) { 
 		my $sid =  ariba::util::OraInfo::sidFromProcessName($processName); 
 		my %sgaInfo = ariba::util::OraInfo::sgaInfoForSid($sid); 
 		my $sga = defined($sgaInfo{size}) ? (($sgaInfo{size} >= 0) ? $sgaInfo{size} : 'Failed to convert value') : 'n/a'; 
 		my $sga_type = $sgaInfo{type} || 'n/a'; 
 		$sgaDetails .= "<tr><td>$sid</td><td>$sga MB(s)</td><td>$sga_type</td></tr>"; 
+		$sid_info->{$sid}{sgatype} = $sga_type;
 	} 
 	$sgaDetails .= "</table></blockquote></html>"; 
+	
+	my %influx_data;
+	$influx_data{measurement} = 'cookies_dba_db_memory';	
 
 	my %queries = ();
 
+	$influx_data{data}{total_phys_mem_mb} = $totalPhysicalMemory; 
 	$queries{"1. $hostname total physical"} = {
 		'warn'		=> "!answer", 
 		'info'		=> "answer",
@@ -107,10 +113,9 @@ sub main {
 		'uiHint'	=> "memory/$hostname",
         "inf_field" => "totalPhysicalMemory",
         "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
-        "default"   => 0,
-        "group_by"  => "$datacenter,memory/$hostname",
 	};
 
+	$influx_data{data}{total_shared_mem_mb} = $totalSharedMemory; 
 	$queries{"2. $hostname total shared"} = { 
 		'warn'		=> "!answer", 
 		'info'		=> "answer", 
@@ -119,10 +124,9 @@ sub main {
 		'uiHint' 	=> "memory/$hostname",
         "inf_field" => "totalSharedMemory",
         "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
-        "default"   => 0,
-        "group_by"  => "$datacenter,memory/$hostname",
 	};
 	 
+	$influx_data{data}{shared_to_phys_mem_ratio} = $sharedToPhysicalRatio; 
 	$queries{"3. $hostname shared to physical ratio"} = { 
 		'warn'		=> "answer > 0.5", 
 		'info'		=> "answer", 
@@ -131,10 +135,9 @@ sub main {
 		'uiHint' 	=> "memory/$hostname",
         "inf_field" => "SharedToPhysicalRatio",
         "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
-        "default"   => 0,
-        "group_by"  => "$datacenter,memory/$hostname",
 	};
 
+	$influx_data{data}{available_sga_mb} = $availableSga; 
 	$queries{"4. $hostname sga - available"} = { 
 		'crit'		=> "answer <= 0",
 		'info'		=> "answer > 0", 
@@ -143,10 +146,9 @@ sub main {
 		'uiHint' 	=> "memory/$hostname",
         "inf_field" => "SGAAvailable",
         "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
-        "default"   => 0,
-        "group_by"  => "$datacenter,memory/$hostname",
 	};
 	
+	$influx_data{data}{used_sga_mb} = $totalUsedSga; 
 	$queries{"5. $hostname sga - used"} = { 
 		'info'		=> "defined(answer)", 
 		'perl' 		=> $totalUsedSga, 
@@ -154,10 +156,9 @@ sub main {
 		'uiHint' 	=> "memory/$hostname",
         "inf_field" => "SGAUsed",
         "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
-        "default"   => 0,
-        "group_by"  => "$datacenter,memory/$hostname",
 	}; 
 
+	$influx_data{data}{used_huge_pages_mb} = $usedHugePages; 
 	$queries{"6. $hostname hugepages - used"} = { 
 		'info'		=> "defined(answer)", 
 	#	'warn'		=> "answer < $totalUsedSga",
@@ -166,22 +167,18 @@ sub main {
 		'uiHint' 	=> "memory/$hostname",
         "inf_field" => "HugePagesUsed",
         "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
-        "default"   => 0,
-        "group_by"  => "$datacenter,memory/$hostname",
 	};
 
+	$influx_data{data}{used_pga_mb} = $totalUsedPga; 
 	$queries{"7. $hostname pga - used"} = { 
 		'info'		=> "defined(answer)", 
 		'perl' 		=> $totalUsedPga, 
 		'format' 	=> "%i MB(s)", 
 		'uiHint' 	=> "memory/$hostname",
-		'recordMaxResults' => 110000,
-        "inf_field" => "totalUsedPGA",
-        "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
-        "default"   => 0,
-        "group_by"  => "$datacenter,memory/$hostname",	
+		'recordMaxResults' => 110000,	
 	};
 
+	$influx_data{data}{hugepages_percent_used} = $percentHugePages; 
 	$queries{"8. $hostname hugepages - percent used"} = { 
 		'warn'		=> "answer > 90", 
 		'info'		=> "answer", 
@@ -190,10 +187,9 @@ sub main {
 		'uiHint' 	=> "memory/$hostname",
         "inf_field" => "percentHugePages",
         "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname\",hostname=\"$hostname\"",
-        "default"   => 0,
-        "group_by"  => "$datacenter,memory/$hostname",
 	};
 
+	$influx_data{data}{num_sids} = scalar(@processNames); 
 	$queries{"# of sids for $hostname"} = {
 		'info'		=> "answer", 
 		'perl'		=> scalar(@processNames), 
@@ -201,16 +197,21 @@ sub main {
 		'uiHint' 	=> "memory/$hostname/sga details",
         "inf_field" => "NumberofSids",
         "inf_tags"  => "datacenter=\"$datacenter\",uihint=\"memory/$hostname/sga details\",hostname=\"$hostname\"",
-        "default"   => 0,
-        "group_by"  => "$datacenter,memory/$hostname/sga details",
 	};
 
-    queries{influx_details} = {measurement => "dba"};
 	my $qm = ariba::monitor::QueryManager->newWithDetails(
 		'dba', $tab, $me->service(), $me->customer(), \%queries
 	);
 
 	$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+
+	eval {
+		foreach my $sid (keys %{$sid_info}) {
+			$influx_data{tags} = { sid => $sid, sga_type => $sid_info->{$sid}{sgatype}, hostname => $hostname, product => $datacenter, datacenter => $datacenter, service => $me->service() };
+			my $statsd_line = ariba::Ops::Utils::generateStatsDLine(\%influx_data);
+			ariba::Ops::Utils::sendToStatsD($statsd_line) if ( $statsd_line );
+		}
+	};
 }
 
 main(@ARGV);

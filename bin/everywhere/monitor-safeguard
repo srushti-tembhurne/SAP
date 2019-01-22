@@ -96,18 +96,13 @@ sub main {
 				recordDataType		=> 'gauge',
 				recordDataUnits		=> 'sec',
 				hasErraticSchedule	=> 1,
-                inf_field => "activationTime",
-                inf_tags => qq|datacenter="$datacenter",masterAccount="$masterAccount"|,
-                inf_default => 0,
-                group_by => "$datacenter,$masterAccount",
 			};
-	
-            $queries{influx_details} = {measurement => "Safeguard"};
+		
 			my $qm = ariba::monitor::QueryManager->newWithDetails(
 				'Safeguard', $product, $service, $customer, \%queries
 			);
 
-			$qm->processQueries($debug, $email, $sendEmail, $sendPage);
+			$qm->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage, $monServer);
 
 			reloadIfUpdated();
 		}

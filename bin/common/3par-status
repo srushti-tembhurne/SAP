@@ -27,7 +27,7 @@ use Data::Dumper;
 use File::Path;
 use File::Basename;
 use dmail::LockLib;
-
+use POSIX;
 
 # keep about 5 year's worth of results, at 1 sample every 10 minutes
 my $MAX_RESULTS = 262800;
@@ -72,6 +72,8 @@ sub main{
     # Find a load up the inserv machinedb entry
     #
 
+
+
     my @datacenters = ariba::Ops::ProductAPIExtensions::datacentersForProducts($me);
     for my $datacenter (@datacenters) {
 
@@ -89,7 +91,7 @@ sub main{
 
         next unless scalar(@inservDevices);
 
-        my $lockFile = "/tmp/stratus-" . basename($0) . ".$datacenter";
+        my $lockFile = "/tmp/" . basename($0) . ".$datacenter";
         die "can't grab lock\n" unless dmail::LockLib::requestlock($lockFile, 5);
 
         for my $nm (@inservDevices) {
@@ -99,15 +101,22 @@ sub main{
 
             ## us1 and us1-ms shared inserv devices but inserv3.us1 is only for us1 dc, so skipping inserv3.us1 
             next if($inservHostname =~ /inserv3.us1/ && $original_dc =~ /us1-ms/ );
+
+            my $connectivity = $nm->checkConnectivity();
+
+            my $connectivityStatus = $connectivity ? 'good' : 'lost';
+
+            $queries{"$inservHostname: Login response"} = {
+                uiHint => "$inservHostname",
+                info => "answer eq 'good'",
+                crit => "answer eq 'lost'",
+                perl => sub { return $connectivityStatus; },
+                inf_field => "inservLoginResponse",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+            };
+          
             my ($space,$unit) = split(/\s+/, $nm->usableFreeNew());
-
-            # we can't mix datatypes in influxdb, so we have to normalize the numeric value of $space
-            if ( $space !~ /^\d+(\.\d+)?$/ ) {
-                # also, trigger warning by setting $space value midway between warn and crit
-                $space = 200;
-            }
-
-            $queries{"$inservHostname: Free Space on Fibre Channel Storage in $unit"} = {  
+            $queries{"$inservHostname: Free Space on Fibre Channel Storage in $unit"} = {
                 uiHint => "$inservHostname",
                 recordMaxResults => $MAX_RESULTS,
                 recordDataType => 'gauge',
@@ -117,8 +126,6 @@ sub main{
                 perl => sub { return $space; },
                 inf_field => "GBFreeSpaceOnFibreChannelStorage",
                 inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
-                group_by  => "$datacenter,$inservHostname",
-                inf_default => 0
             };
 
             # Free space on Near Line Storage
@@ -126,41 +133,17 @@ sub main{
             #    all the CPGs growing one more time
             #  warn means frame is within 15% of crit
             my $totalIncrementSize = $nm->cpgTotalIncrementSize();
-            my $crit = $totalIncrementSize;
-            my $warn = 0.85 * $totalIncrementSize;      # this should probably be 1.15 instead of 0.85 (HOA-164217)
-
             my ($nl_space,$nl_unit) = split(/\s+/, $nm->usableFreeNew(1));
-            # we can't mix datatypes in influxdb, so we have to normalize the numeric value of $nl_space
-            if ( $nl_space !~ /^\d+(\.\d+)?$/ ) {
-                # also, trigger warning by setting $nl_space value midway between warn and crit
-                # NOTE: since warn is probably buggy (HOA-164217) at the moment, this will trigger crit, too
-                $nl_space = $warn - abs( $warn - $crit );
-            }
-
             $queries{"$inservHostname: Free Space on Near Line Storage in $nl_unit"} = {
                 uiHint => "$inservHostname",
                 recordMaxResults => $MAX_RESULTS,
                 recordDataType => 'gauge',
-                info => "answer ne '' && answer > $warn",
-                warn => "answer eq '' || answer !~ /^\\d+(\.\\d+)?\$/ || answer <= $warn",
-                crit => "answer ne '' && answer <= $crit",
+                info => "answer ne ''  && answer >  (0.85 * $totalIncrementSize)",
+                warn => "answer eq '' || answer !~ /^\\d+(\.\\d+)?\$/ || answer <= (0.85 * $totalIncrementSize)",
+                crit => "answer ne '' && answer <= $totalIncrementSize",
                 perl => sub { return $nl_space },
                 inf_field => "GBFreeSpaceOnNearLineStorage",
                 inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
-                group_by  => "$datacenter,$inservHostname",
-                inf_default => 0,
-            };
-            $queries{"$inservHostname: Free Space on Near Line Storage in $nl_unit warn threshold"} = {
-                perl      => sub { $warn },
-                inf_field => "ls_warn_threshold",
-                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
-                group_by  => "$datacenter,$inservHostname",
-            };
-            $queries{"$inservHostname: Free Space on Near Line Storage in $nl_unit crit threshold"} = {
-                perl      => sub { $crit },
-                inf_field => "ls_crit_threshold",
-                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
-                group_by  => "$datacenter,$inservHostname",
             };
 
             # The following 6 queries report on 3par raw space.  We return total space, used space
@@ -173,8 +156,6 @@ sub main{
                 perl => sub { return $nm->totalRawSpace() },
                 inf_field => "TBFCTotalRawSpace",
                 inf_tags  => "datacenter=datacenter,hostname=$inservHostname",
-                group_by  => "$datacenter,$inservHostname",
-                inf_default => 0,
             };
 
             $queries{"$inservHostname: FC used raw space in TB"} = {
@@ -182,13 +163,24 @@ sub main{
                 recordMaxResults => $MAX_RESULTS,
                 recordDataType => 'gauge',
                 info => 1,
-                perl => sub { return $nm->usedRawSpace() || 0 },
+                perl => sub { return $nm->usedRawSpace() },
                 inf_field => "TBFCUsedRawSpace",
                 inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
-                group_by  => "$datacenter,$inservHostname",
-                inf_default => 0,
-                crit => "answer ne '' && answer <= 85",
             };
+
+
+            $queries{"$inservHostname: FC used raw space in Percentage"} = {
+                uiHint => "$inservHostname",
+                recordMaxResults => $MAX_RESULTS,
+                recordDataType => 'gauge',
+                info => 1,
+                perl => sub { return ceil(($nm->usedRawSpace()/$nm->totalRawSpace())*100) },
+                inf_field => "TBFCUsedRawSpacePercent",
+                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
+                crit => "answer ne '' && answer >= 85",
+                warn => "answer eq '' || answer >= 75",
+            };
+
 
             $queries{"$inservHostname: FC spare space in TB"} = {
                 uiHint => "$inservHostname",
@@ -198,8 +190,6 @@ sub main{
                 perl => sub { return $nm->spareSpace() },
                 inf_field => "TBFCSpareSpace",
                 inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
-                group_by  => "$datacenter,$inservHostname",
-                inf_default => 0
             };
 
             $queries{"$inservHostname: NL total raw space in TB"} = {
@@ -210,8 +200,6 @@ sub main{
                 perl => sub { return $nm->totalRawSpace(1) },
                 inf_field => "TBNLTotalRawSpace",
                 inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
-                group_by  => "$datacenter,$inservHostname",
-                inf_default => 0
             };
 
             $queries{"$inservHostname: NL used raw space in TB"} = {
@@ -222,8 +210,6 @@ sub main{
                 perl => sub { return $nm->usedRawSpace(1) },
                 inf_field => "TBNLUsedRawSpace",
                 inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
-                group_by  => "$datacenter,$inservHostname",
-                inf_default => 0
             };
 
             $queries{"$inservHostname: NL spare space in TB"} = {
@@ -234,8 +220,6 @@ sub main{
                 perl => sub { return $nm->spareSpace(1) },
                 inf_field => "TBNLSpareSpace",
                 inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
-                group_by  => "$datacenter,$inservHostname",
-                inf_default => 0
             };
 
             my ( $iops, $maxIops ) = $nm->ioPerSecond("NL");
@@ -253,8 +237,6 @@ sub main{
                 format => "$iops/$maxIops iops per sec (answer%%)",
                 inf_field => "NLDriveRate",
                 inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
-                group_by  => "$datacenter,$inservHostname",
-                inf_default => 0
             };
 
             ( $iops, $maxIops ) = $nm->ioPerSecond("FC");
@@ -272,8 +254,6 @@ sub main{
                 format => "$iops/$maxIops iops per sec (answer%%)",
                 inf_field => "FCDriveRate",
                 inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
-                group_by  => "$datacenter,$inservHostname",
-                inf_default => 0
             };
 
             # We want to know about VV's with snapshot policies set to 'no_stale_ss' in prod.
@@ -287,7 +267,7 @@ sub main{
             }
 
             $queries{"$inservHostname: VVs with policy type of $interestingPolicyType"} = {
-                uiHint => "$inservHostname/Policies-$interestingPolicyType",
+                uiHint => "$inservHostname/Policies",
                 info => 1,
                 perl => sub {
                     my @vvs = $nm->cmdShowVvsForPolicy($interestingPolicyType);
@@ -295,14 +275,11 @@ sub main{
                     # Ignore vvs from beta in bou. TMID:87597
                     @vvs = grep(!/(?:\b|-)030[12356]-\d$/, @vvs) if ($datacenter eq 'bou');
 
-                    #return join("\n", sort { $a cmp $b } @vvs);
-                    return  scalar(@vvs);
+                    return join("\n", sort { $a cmp $b } @vvs);
                 },
                 warn => "answer ne ''",
                 inf_field => "VVsWithPolicyType",
                 inf_tags  => "datacenter=$datacenter,hostname=$inservHostname,policy_type=$interestingPolicyType",
-                group_by  => "$datacenter,$inservHostname,$interestingPolicyType",
-                inf_default => 0,
             };
 
             for my $cpgName ($nm->cpgNames()) {
@@ -321,8 +298,6 @@ sub main{
                     perl => sub { return $dataGrowthLimit },
                     inf_field => "SDAutoGrowLimit",
                     inf_tags  => "datacenter=$datacenter,hostname=$inservHostname,cpg_name=$cpgName",
-                    group_by  => "$datacenter,$inservHostname,$cpgName",
-                    inf_default => 0,
                 };
 
                 my $dataInc = $nm->cpgDataIncrementSize($cpgName);
@@ -333,8 +308,6 @@ sub main{
                     perl => sub { return $dataInc; },
                     inf_field => "SDAutoGrowSize",
                     inf_tags  => "datacenter=$datacenter,hostname=$inservHostname,cpg_name=$cpgName",
-                    group_by  => "$datacenter,$inservHostname,$cpgName",
-                    inf_default => 0,
                 };
 
                 # Used data snap space
@@ -357,8 +330,6 @@ sub main{
                     },
                     inf_field => "SDSpaceUsed",
                     inf_tags  => "datacenter=$datacenter,hostname=$inservHostname,cpg_name=$cpgName",
-                    group_by  => "$datacenter,$inservHostname,$cpgName",
-                    inf_default => 0
                 };
 
                 # snap space needed for next growth
@@ -386,8 +357,6 @@ sub main{
                     },
                     inf_field => "SDAutoGrowStatus",
                     inf_tags  => "datacenter=$datacenter,hostname=$inservHostname,cpg_name=$cpgName",
-                    group_by  => "$datacenter,$inservHostname,$cpgName",
-                    inf_default => 0
                 };
 
                 $queries{"$inservHostname: $cpgName VVs associated with cpg (Name|SnapMB|userMB|% used of base)"} = {
@@ -403,13 +372,8 @@ sub main{
                                     ($vv->snapMB()/$vv->userMB())*100) 
                             );
                         }
-                        #return join("\n", @results);
-                        return scalar(@results);
-                    },
-                    inf_field => "VVsAssociatedWithCpg",
-                    inf_tags  => "datacenter=$datacenter,hostname=$inservHostname,cpg_name=$cpgName\"",
-                    group_by  => "$datacenter,$inservHostname,$cpgName",
-                    inf_default => 0
+                        return join("\n", @results);
+                    }
                 }
 
             }
@@ -481,7 +445,8 @@ sub main{
                         # Page if disk was replaced with wrong drive type
                         # Contact SAs and 3Par support immediately
                         # tmid: 160087
-                        if ($event->message() =~ /disk has an unsupported drive type/) {
+            #HOA-125797 added 'Slow disk' as crit
+            if ($event->message() =~ /disk has an unsupported drive type/ || $event->message() =~ /Slow disk/ ) {
                             $isCrit = 1;
                             push(@displayEvents, "CRITICAL: $t: ". $event->message());
                         } elsif ($event->message() =~ /servicemag start -log/) {
@@ -516,8 +481,9 @@ sub main{
             #   1. Look for any "MAJOR.*SQLite error" and skip them all;
             #   2. Look for "Major.*SQLite error.*INSERT INTO" to skip any/all 'INSERT' statements;
             #   3. Look for "Major.*SQLite error.*INSERT INTO hires.vvspace" to skip only INSERTS into the 'hires.vvspace' table.
+            #      or for "Major.*SQLite DB error.*INSERT INTO hires.vvspace" to skip only INSERTS into the 'hires.vvspace' table.
             # Initially taking the most restrictive viewpoint (3), to limit what we don't see to only one item.
-            if (join (' ', @displayEvents) !~ /MAJOR.*SQLite error.*INSERT INTO hires.vvspace/)
+            if (join (' ', @displayEvents) !~ /MAJOR.*SQLite.*error.*INSERT INTO hires.vvspace/)
             {
                 $queries{"$inservHostname: EventLog messages"} = {
                     uiHint => "$inservHostname",
@@ -525,12 +491,7 @@ sub main{
                     warn => $eventLevel == 2,
                     crit => $eventLevel == 3,
                     ticketOnWarnOpenAfterMinutes => $eventLevel == 4,
-                    #perl => sub { return join("\n", @displayEvents); },
-                    perl => sub { return scalar(@displayEvents); },
-                    inf_field => "EventLogLevel",
-                    inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
-                    group_by  => "$datacenter,$inservHostname",
-                    inf_default => 0
+                    perl => sub { return join("\n", @displayEvents); },
                 };
             }
 
@@ -648,11 +609,7 @@ sub main{
                 warn => $alertLevel == 2,
                 crit => $alertLevel == 3,
                 pageInServices => "load",
-                perl => sub { return $alertLevel; },
-                inf_field => "alertLevel",
-                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
-                inf_default => 0,
-                group_by  => "$datacenter,$inservHostname",
+                perl => sub { return join("\n", @displayAlerts); },
             };
 
 
@@ -686,15 +643,8 @@ sub main{
                 uiHint => "$inservHostname/Port Personas",
                 info => "numrows > -1",
                 warn => "numrows > 0",
-                #perl => sub { return join("\n", @badPorts); },
-                perl => sub { return scalar(@badPorts); },
-                inf_field => "invalidPortPersonasCount",
-                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
-                group_by  => "$datacenter,$inservHostname",
-                inf_default => 0,
+                perl => sub { return join("\n", @badPorts); },
             };
-
-			my @diff_arr = main::wwnsDiffForInserv($nm);
 
             $queries{"$inservHostname: wwns diff vs machinedb"} = {
                 uiHint => $inservHostname,
@@ -702,22 +652,15 @@ sub main{
                 warn => 'numrows > 0', 
                 ticketOnWarnOpenAfterMinutes => 1, 
                 ticketOwner => "unassigned-sysadmin",
-                #perl => sub { main::wwnsDiffForInserv($nm); },
-                perl => sub { scalar @diff_arr ? ($diff_arr[0] =~ tr/\n//) + 1 : 0; },
-                inf_field => "wwnsDiffvsMachineDb",
-                inf_tags  => "datacenter=$datacenter,hostname=$inservHostname",
-                group_by  => "$datacenter,$inservHostname",
-                inf_default => 0,
+                perl => sub { main::wwnsDiffForInserv($nm); },
             };
-
         }
 
         my $email = $me->default('notify.email');
 
-		$queries{"influx_details"} = { 'measurement' => "3par_status"};
         my $q = ariba::monitor::QueryManager->newWithDetails("3par-storage-health", $tab, $me->service(), $me->customer(), \%queries);
-        $q->processQueries($debug, $email, $sendEmail, $sendPage);
-        dmail::LockLib::releaselock($lockFile);
+        $q->processQueriesUsingServer($debug, $email, $sendEmail, $sendPage);
+         dmail::LockLib::releaselock($lockFile);
     }
 }
 

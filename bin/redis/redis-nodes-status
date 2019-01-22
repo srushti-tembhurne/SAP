@@ -39,9 +39,9 @@ sub main {
         if($arg =~ /^-p/o){ $sendPage = 1; };
     }
     my $service = $me->service();
-    my $monserver = ariba::Ops::PageUtils::monitorServer();
-    my @split = split /\./, $monserver;
-    my $dc = $split[1];
+    my $hostname = ariba::Ops::NetworkUtils::hostname();
+    my $machine  = ariba::Ops::Machine->new($hostname);
+    my $dc = $machine->datacenter();
 
     my $host = 'redis'.$service.'.'.$dc.'.ariba.com';
 
@@ -63,12 +63,11 @@ sub main {
     $result =~ s/\s+/$mid/g;
     $result = '<html><blockquote><table><tr><td>' . $result;
     $result = $result . '</td></tr></table></blockquote></html>';
-######  Too Much Information #####
-#    $queries{"Redis Summary"} = {
-#                    perl    => sub { return $result; },
-#                    description => "Redis Cluster Details",
-#                    uiHint => "Summary",
-#    };
+    $queries{"Redis Summary"} = {
+                    perl    => sub { return $result; },
+                    description => "Redis Cluster Details",
+                    uiHint => "Summary",
+    };
     my $url = 'https://'.$host.':'.$redport;
     my $surl = $url.'/v1/nodes';
     my $cmd = "curl -s -u $muser:$mpass ". '--insecure '.$surl;
@@ -95,6 +94,7 @@ sub main {
 	    print "\n Output = ", join "\n", @output if($debug);
 	    foreach my $line(@output){
 		    chomp($line);
+                    next if($line !~/\S+/);
 		    my $status = 'error';
 		    my $param;
             #if($line =~ /(\S+)\s+\(pid  (\d+)\) is running\.\.\./){
@@ -114,15 +114,12 @@ sub main {
 			            crit => "answer ne 'Running'",
 			            info => "answer eq 'Running'",
                 	    uiHint => "Node ".$nid,
-                            inf_field => "node_status",
-                            inf_tags => qq|node_id=$nid,param=$param|,
+                        inf_field => "node_status",
+                        inf_tags => qq|node_id=$nid,param=$param|,
          	};
 	    }
 
     }
- 
-    $queries{influx_details} = {measurement => "redis_nodes_details"};
-
     my $qm = ariba::monitor::QueryManager->newWithDetails('Redis Nodes Details', 'mon', $service, "", '', \%queries);
     my $email = $me->default('notify.email') || $me->default('notify');
     $qm->processQueries($debug, $email, $sendEmail, $sendPage);
@@ -151,4 +148,3 @@ sub format {
 	}
 	return join "\n", @res;
 }
-
