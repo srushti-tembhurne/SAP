@@ -1,7 +1,7 @@
 #!/usr/local/bin/perl -w
 #
 # $Id: //ariba/services/monitor/bin/common/serviceguard-packages#21 $
-
+#test changes
 use strict;
 use FindBin;
 use lib "$FindBin::Bin/../../lib";
