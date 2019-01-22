@@ -1,7 +1,7 @@
 #!/usr/local/bin/perl -w
 
 # $Id: //ariba/services/monitor/etc/monitor-query-template#6 $
-
+#ebay-watcher
 use strict;
 use FindBin;
 use Data::Dumper;
